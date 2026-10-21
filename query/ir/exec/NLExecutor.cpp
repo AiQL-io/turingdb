@@ -1561,7 +1561,7 @@ void fetchNamedNodes(const Column* ids, const NLExecutionContext* context, Colum
 }
 
 bool isMaskConstant(const Column* mask) {
-    return mask->getContainerKind() == ContainerKind::code<ColumnConst<CustomBool>>();
+    return mask->getKind() == ColumnConst<CustomBool>::staticKind();
 }
 
 void applyNotOnMask(Column* result, const Column* operand) {
@@ -1579,6 +1579,12 @@ void applyNotOnConst(Column* result, const Column* operand) {
     const ColumnConst<CustomBool>* typedOperand = static_cast<const ColumnConst<CustomBool>*>(operand);
     ColumnConst<CustomBool>* typedResult = static_cast<ColumnConst<CustomBool>*>(result);
     UnaryPredicateExecutor<Not, CustomBool>::apply(typedResult, typedOperand);
+}
+
+void applyNotOnOptConst(Column* result, const Column* operand) {
+    using OptBool = std::optional<CustomBool>;
+    UnaryPredicateExecutor<Not, OptBool>::apply(static_cast<ColumnConst<OptBool>*>(result),
+                                               static_cast<const ColumnConst<OptBool>*>(operand));
 }
 
 // NOT of an unknown truth value is unknown; the ColumnConst<PropertyNull> result already
@@ -8901,17 +8907,17 @@ NLCaseTestFn NLExecutor::selectCaseTest(const Column* condition, bool nullable, 
 NLUnaryFn NLExecutor::selectIsNotTrue(const Column* operand, bool untypedNull, LocalMemory* memory, Column*& result) {
     result = memory->alloc<ColumnMask>();
 
-    const ContainerKind::Code kind = operand->getContainerKind();
+    const ColumnKind::Code kind = operand->getKind();
 
     if (untypedNull) {
         return &applyIsNotTrueOnNull;
-    } else if (kind == ContainerKind::code<ColumnMask>()) {
+    } else if (kind == ColumnMask::staticKind()) {
         return &applyIsNotTrueOnMask;
-    } else if (kind == ContainerKind::code<ColumnOptMask>()) {
+    } else if (kind == ColumnOptMask::staticKind()) {
         return &applyIsNotTrueOnOptMask;
-    } else if (kind == ContainerKind::code<ColumnVector<ListElementView>>()) {
+    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
         return &applyIsNotTrueOnTaggedCells;
-    } else if (kind == ContainerKind::code<ColumnOptVector<ListElementView>>()) {
+    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
         return &applyIsNotTrueOnOptTaggedCells;
     }
 
@@ -8961,21 +8967,18 @@ NLCaseWriteFn NLExecutor::selectCaseWrite(ValueType valueType,
 }
 
 NLUnaryFn NLExecutor::selectNot(const Column* operand, LocalMemory* memory, Column*& result) {
-    const ContainerKind::Code kind = operand->getContainerKind();
+    const ColumnKind::Code kind = operand->getKind();
 
-    // The untyped null constant negates to a null rather than to the boolean the constant
-    // branch below would read out of it
-    if (dynamic_cast<const ColumnConst<PropertyNull>*>(operand)) {
+    if (kind == ColumnConst<PropertyNull>::staticKind()) {
         result = memory->alloc<ColumnConst<PropertyNull>>();
         return &applyNotOnNullConst;
-    }
-
-    if (kind == ContainerKind::code<ColumnConst<CustomBool>>()) {
+    } else if (kind == ColumnConst<CustomBool>::staticKind()) {
         result = memory->alloc<ColumnConst<CustomBool>>();
         return &applyNotOnConst;
-    }
-
-    if (kind == ContainerKind::code<ColumnOptMask>()) {
+    } else if (kind == ColumnConst<std::optional<CustomBool>>::staticKind()) {
+        result = memory->alloc<ColumnConst<std::optional<CustomBool>>>();
+        return &applyNotOnOptConst;
+    } else if (kind == ColumnOptMask::staticKind()) {
         result = memory->alloc<ColumnOptMask>();
         return &applyNotOnOptMask;
     }

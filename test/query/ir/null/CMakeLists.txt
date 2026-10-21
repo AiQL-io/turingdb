@@ -51,3 +51,5 @@ target_include_directories(test_query_ir_type_test_on_a_null_entity PRIVATE ${IR
 add_turing_test(test_query_ir_label_predicate_on_null LabelPredicateOnNullTest.cpp)
 target_sources(test_query_ir_label_predicate_on_null PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
 target_include_directories(test_query_ir_label_predicate_on_null PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_not_of_a_null_boolean_conversion NotOfANullBooleanConversionTest.cpp)

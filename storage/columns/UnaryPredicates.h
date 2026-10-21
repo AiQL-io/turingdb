@@ -81,9 +81,7 @@ struct UnaryPredicateExecutor {
             const bool result = op(arg->getRaw());
             res->set(result);
         } else {
-            // Should not occur. Optional T implies property, which will fill a mask.
-            // Implementation is purely to satsify compiler when expanding templates.
-            throw FatalException("Invalid unary-predicate operation on ColumnConst.");
+            res->set(op(arg->getRaw()));
         }
     }
 
