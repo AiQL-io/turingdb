@@ -212,6 +212,7 @@
 %token<std::string_view> COUNT
 %token<std::string_view> REDUCE
 %token<std::string_view> NORMALIZE
+%token<std::string_view> NORMALIZED
 %token<std::string_view> NFC
 %token<std::string_view> NFD
 %token<std::string_view> NFKC
@@ -310,6 +311,7 @@
 %type<db::FunctionInvocation*> countFunc
 %type<db::FunctionInvocation*> normalizeFunc
 %type<db::UnicodeNormalForm> normalForm
+%type<db::UnicodeNormalForm> optionalNormalForm
 
 %type<db::Parameter*> parameter
 %type<db::SymbolChain*> nodeLabels
@@ -363,6 +365,7 @@
 %type<db::Projection*> projectionBody
 
 %type<db::BinaryOperator> comparisonSign
+%type<bool> isKeyword
 %type<db::StringOperator> stringExpPrefix
 
 %type<db::Pattern*> pattern
@@ -1430,10 +1433,30 @@ comparisonChain
     : addSubExpr comparisonSign addSubExpr {
         ParserUtils::startComparisonChain(ast, $$, $1, $2, $3, @3, @$);
       }
+    | addSubExpr isKeyword addSubExpr {
+        const BinaryOperator nullTest = $2 ? BinaryOperator::IsNotNull : BinaryOperator::IsNull;
+        ParserUtils::startComparisonChain(ast, $$, $1, nullTest, $3, @3, @$);
+      }
+    | addSubExpr isKeyword optionalNormalForm NORMALIZED {
+        $$._expr = ParserUtils::createIsNormalized(ast, $1, $3, $2, @$);
+      }
     | comparisonChain comparisonSign addSubExpr {
         $$ = $1;
         ParserUtils::extendComparisonChain(ast, $$, $2, $3, @3, @$);
       }
+    | comparisonChain isKeyword addSubExpr {
+        const BinaryOperator nullTest = $2 ? BinaryOperator::IsNotNull : BinaryOperator::IsNull;
+        $$ = $1;
+        ParserUtils::extendComparisonChain(ast, $$, nullTest, $3, @3, @$);
+      }
+    | comparisonChain isKeyword optionalNormalForm NORMALIZED {
+        $$._expr = ParserUtils::createIsNormalized(ast, $1._expr, $3, $2, @$);
+      }
+    ;
+
+isKeyword
+    : IS { $$ = false; }
+    | IS_NOT { $$ = true; }
     ;
 
 comparisonSign
@@ -1443,8 +1466,6 @@ comparisonSign
     | GT { $$ = BinaryOperator::GreaterThan; }
     | LT { $$ = BinaryOperator::LessThan; }
     | NOT_EQUAL { $$ = BinaryOperator::NotEqual; }
-    | IS { $$ = BinaryOperator::IsNull; }
-    | IS_NOT { $$ = BinaryOperator::IsNotNull; }
     | IN { $$ = BinaryOperator::In; }
     ;
 
@@ -2013,6 +2034,11 @@ normalizeFunc
       }
     ;
 
+optionalNormalForm
+    : %empty { $$ = UnicodeNormalForm::NFC; }
+    | normalForm { $$ = $1; }
+    ;
+
 normalForm
     : NFC { $$ = UnicodeNormalForm::NFC; }
     | NFD { $$ = UnicodeNormalForm::NFD; }
@@ -2232,6 +2258,7 @@ reservedWord
     | FALSE { $$ = Symbol::create(ast, $1); }
     | COUNT { $$ = Symbol::create(ast, $1); }
     | NORMALIZE { $$ = Symbol::create(ast, $1); }
+    | NORMALIZED { $$ = Symbol::create(ast, $1); }
     | HEADERS { $$ = Symbol::create(ast, $1); }
     | JSONL { $$ = Symbol::create(ast, $1); }
     | CSV { $$ = Symbol::create(ast, $1); }

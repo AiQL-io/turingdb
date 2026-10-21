@@ -114,6 +114,13 @@ public:
     // `normalize(s)` is `normalize(s, NFC)`
     static FunctionInvocation* createNormalizeInvocation(CypherAST* ast, Expr* string, UnicodeNormalForm form);
 
+    // `s IS [NOT] form NORMALIZED` is `[NOT] is_normalized(s, form)`
+    static Expr* createIsNormalized(CypherAST* ast,
+                                    Expr* string,
+                                    UnicodeNormalForm form,
+                                    bool negated,
+                                    const SourceLocation& location);
+
     // `[x IN xs]` is the comprehension that copies xs, not a list holding one IN test
     static Expr* createListOrComprehension(CypherAST* ast, ListLiteral* list);
 

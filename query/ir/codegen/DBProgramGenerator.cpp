@@ -9342,7 +9342,10 @@ void DBProgramGenerator::translateFunctionExpr(const Expr* expr,
         translateReplace(expr, args);
         return;
     } else if (funcName == "normalize") {
-        translateNormalize(expr, args);
+        translateNormalFormFunction<mlir::db::Normalize>(expr, args, mlir::storage::StringType::get(_mlirCtxt));
+        return;
+    } else if (funcName == "is_normalized") {
+        translateNormalFormFunction<mlir::db::IsNormalized>(expr, args, mlir::storage::BoolType::get(_mlirCtxt));
         return;
     }
 
@@ -9530,27 +9533,26 @@ void DBProgramGenerator::translateReplace(const Expr* expr, const ExprChain* arg
     _part._exprMap[expr] = replace.getResult();
 }
 
-void DBProgramGenerator::translateNormalize(const Expr* expr, const ExprChain* args) {
-    bioassert(args && args->size() == 2, "normalize() takes a string and a normal form.");
+template <typename NormalFormOp>
+void DBProgramGenerator::translateNormalFormFunction(const Expr* expr, const ExprChain* args, mlir::Type resultElement) {
+    bioassert(args && args->size() == 2, "A normal form function takes a string and a normal form.");
 
     const ExprChain::ExprVector& argExprs = args->getExprs();
 
     const mlir::Value string = translateArg(argExprs[0]);
 
-    bioassert(argExprs[1]->getType() == EvaluatedType::NormalForm, "normalize() reads its normal form from a literal.");
+    bioassert(argExprs[1]->getType() == EvaluatedType::NormalForm, "A normal form function reads its normal form from a literal.");
 
     const LiteralExpr* formExpr = static_cast<const LiteralExpr*>(argExprs[1]);
     const NormalFormLiteral* formLiteral = static_cast<const NormalFormLiteral*>(formExpr->getLiteral());
     const mlir::storage::UnicodeNormalForm form = toStorageNormalForm(formLiteral->getForm());
 
-    const mlir::Type stringType = mlir::storage::StringType::get(_mlirCtxt);
+    NormalFormOp normalFormOp = _opBuilder.create<NormalFormOp>(_opBuilder.getUnknownLoc(),
+                                                                allocColumnType(resultElement),
+                                                                string,
+                                                                form);
 
-    mlir::db::Normalize normalize = _opBuilder.create<mlir::db::Normalize>(_opBuilder.getUnknownLoc(),
-                                                                           allocColumnType(stringType),
-                                                                           string,
-                                                                           form);
-
-    _part._exprMap[expr] = normalize.getResult();
+    _part._exprMap[expr] = normalFormOp.getResult();
 }
 
 void DBProgramGenerator::translateCoalesce(const Expr* expr, const ExprChain* args) {

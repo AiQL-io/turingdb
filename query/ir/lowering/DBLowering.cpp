@@ -104,14 +104,15 @@ mlir::Value emitNLUnaryFunction(mlir::OpBuilder& builder,
     return builder.create<NLOp>(loc, resultType, input).getResult();
 }
 
-mlir::Value emitNLNormalize(mlir::OpBuilder& builder,
-                            mlir::Location loc,
-                            nl::ChunkType resultType,
-                            mlir::Value input,
-                            mlir::Operation* source) {
-    mlir::db::Normalize normalize = mlir::cast<mlir::db::Normalize>(source);
+template <typename DBOp, typename NLOp>
+mlir::Value emitNLNormalFormFunction(mlir::OpBuilder& builder,
+                                     mlir::Location loc,
+                                     nl::ChunkType resultType,
+                                     mlir::Value input,
+                                     mlir::Operation* source) {
+    DBOp normalFormOp = mlir::cast<DBOp>(source);
 
-    return builder.create<nl::Normalize>(loc, resultType, input, normalize.getForm()).getResult();
+    return builder.create<NLOp>(loc, resultType, input, normalFormOp.getForm()).getResult();
 }
 
 mlir::Type stringFunctionElement(mlir::OpBuilder& builder, mlir::Type inputElement) {
@@ -332,7 +333,8 @@ const std::unordered_map<std::string_view, UnaryFunctionLowering> unaryFunctionL
     {"db.ltrim",    {&emitNLUnaryFunction<nl::LTrim>,    &stringFunctionElement,  ResultNullability::FollowsInput}},
     {"db.rtrim",    {&emitNLUnaryFunction<nl::RTrim>,    &stringFunctionElement,  ResultNullability::FollowsInput}},
     {"db.reverse",  {&emitNLUnaryFunction<nl::Reverse>,  &reverseFunctionElement, ResultNullability::FollowsInput}},
-    {"db.normalize", {&emitNLNormalize,                  &stringFunctionElement,  ResultNullability::FollowsInput}}
+    {"db.normalize", {&emitNLNormalFormFunction<mlir::db::Normalize, nl::Normalize>, &stringFunctionElement, ResultNullability::FollowsInput}},
+    {"db.is_normalized", {&emitNLNormalFormFunction<mlir::db::IsNormalized, nl::IsNormalized>, &booleanFunctionElement, ResultNullability::FollowsInput}}
 };
 
 const UnaryFunctionLowering* lookupUnaryFunctionLowering(mlir::Operation& operation) {

@@ -9396,6 +9396,10 @@ template NLUnaryFunctionKernel NLExecutor::selectFunction<NormalizeFunction<Unic
 template NLUnaryFunctionKernel NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFD>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFKC>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFKD>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<IsNormalizedFunction<UnicodeNormalForm::NFC>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<IsNormalizedFunction<UnicodeNormalForm::NFD>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<IsNormalizedFunction<UnicodeNormalForm::NFKC>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<IsNormalizedFunction<UnicodeNormalForm::NFKD>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 
 template NLUnaryFunctionKernel NLExecutor::selectConversion<ToIntegerFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectConversion<ToFloatFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);

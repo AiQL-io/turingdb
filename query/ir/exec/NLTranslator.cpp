@@ -205,19 +205,20 @@ const std::unordered_map<std::string_view, NLUnaryFunctionSelector> unaryFunctio
     {"nl.reverse",  &NLExecutor::selectReverse},
 };
 
-NLUnaryFunctionSelector selectNormalize(storage::UnicodeNormalForm form) {
+template <template <UnicodeNormalForm> typename NormalFormFunction>
+NLUnaryFunctionSelector selectNormalFormFunction(storage::UnicodeNormalForm form) {
     switch (form) {
         case storage::UnicodeNormalForm::NFC:
-            return &NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFC>>;
+            return &NLExecutor::selectFunction<NormalFormFunction<UnicodeNormalForm::NFC>>;
         break;
         case storage::UnicodeNormalForm::NFD:
-            return &NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFD>>;
+            return &NLExecutor::selectFunction<NormalFormFunction<UnicodeNormalForm::NFD>>;
         break;
         case storage::UnicodeNormalForm::NFKC:
-            return &NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFKC>>;
+            return &NLExecutor::selectFunction<NormalFormFunction<UnicodeNormalForm::NFKC>>;
         break;
         case storage::UnicodeNormalForm::NFKD:
-            return &NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFKD>>;
+            return &NLExecutor::selectFunction<NormalFormFunction<UnicodeNormalForm::NFKD>>;
         break;
         default:
             bioassert(false, "Unhandled Unicode normal form");
@@ -228,7 +229,9 @@ NLUnaryFunctionSelector selectNormalize(storage::UnicodeNormalForm form) {
 
 NLUnaryFunctionSelector lookupUnaryFunctionSelector(mlir::Operation& operation) {
     if (nl::Normalize normalize = mlir::dyn_cast<nl::Normalize>(operation)) {
-        return selectNormalize(normalize.getForm());
+        return selectNormalFormFunction<NormalizeFunction>(normalize.getForm());
+    } else if (nl::IsNormalized isNormalized = mlir::dyn_cast<nl::IsNormalized>(operation)) {
+        return selectNormalFormFunction<IsNormalizedFunction>(isNormalized.getForm());
     }
 
     const llvm::StringRef name = operation.getName().getStringRef();

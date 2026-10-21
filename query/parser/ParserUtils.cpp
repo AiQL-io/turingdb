@@ -11,6 +11,7 @@
 #include "expr/EntityTypeExpr.h"
 #include "expr/ExistsExpr.h"
 #include "expr/ExprChain.h"
+#include "expr/FunctionInvocationExpr.h"
 #include "expr/ListComprehensionExpr.h"
 #include "expr/ListExpr.h"
 #include "expr/LiteralExpr.h"
@@ -129,6 +130,23 @@ PatternElement* createHop(CypherAST* ast, Expr* lhs, Expr* rhs, const SourceLoca
     }
 
     return hop;
+}
+
+FunctionInvocation* createNormalFormInvocation(CypherAST* ast,
+                                               std::string_view functionName,
+                                               Expr* string,
+                                               UnicodeNormalForm form) {
+    QualifiedName* name = QualifiedName::create(ast);
+    name->addName(Symbol::create(ast, functionName));
+
+    ExprChain* arguments = ExprChain::create(ast);
+    arguments->add(string);
+    arguments->add(LiteralExpr::create(ast, NormalFormLiteral::create(ast, form)));
+
+    FunctionInvocation* invocation = FunctionInvocation::create(ast, name);
+    invocation->setArguments(arguments);
+
+    return invocation;
 }
 
 }
@@ -431,17 +449,30 @@ Expr* ParserUtils::createSubtraction(CypherAST* ast,
 }
 
 FunctionInvocation* ParserUtils::createNormalizeInvocation(CypherAST* ast, Expr* string, UnicodeNormalForm form) {
-    QualifiedName* name = QualifiedName::create(ast);
-    name->addName(Symbol::create(ast, "normalize"));
+    return createNormalFormInvocation(ast, "normalize", string, form);
+}
 
-    ExprChain* arguments = ExprChain::create(ast);
-    arguments->add(string);
-    arguments->add(LiteralExpr::create(ast, NormalFormLiteral::create(ast, form)));
+Expr* ParserUtils::createIsNormalized(CypherAST* ast,
+                                      Expr* string,
+                                      UnicodeNormalForm form,
+                                      bool negated,
+                                      const SourceLocation& location) {
+    SourceManager* const sourceManager = ast->getSourceManager();
 
-    FunctionInvocation* invocation = FunctionInvocation::create(ast, name);
-    invocation->setArguments(arguments);
+    FunctionInvocation* invocation = createNormalFormInvocation(ast, "is_normalized", string, form);
+    sourceManager->setLocation(invocation, location);
 
-    return invocation;
+    Expr* predicate = FunctionInvocationExpr::create(ast, invocation);
+    sourceManager->setLocation(predicate, location);
+
+    if (!negated) {
+        return predicate;
+    }
+
+    Expr* negation = UnaryExpr::create(ast, UnaryOperator::Not, predicate);
+    sourceManager->setLocation(negation, location);
+
+    return negation;
 }
 
 Expr* ParserUtils::createListOrComprehension(CypherAST* ast, ListLiteral* list) {

@@ -1025,14 +1025,60 @@ private:
     StringBuffer* _stringBuffer {nullptr};
 };
 
+// The text a normalizer answers lives in its codepoint buffer until its next call
+template <UnicodeNormalForm Form>
+class UnicodeNormalizer {
+public:
+    explicit UnicodeNormalizer(std::string_view operationName);
+    ~UnicodeNormalizer();
+
+    std::string_view normalize(std::string_view text);
+
+private:
+    std::string_view _operationName;
+    std::vector<int32_t> _codepoints;
+};
+
+// A cell holding no string has no normal form, so it answers null rather than raising
+template <typename NormalFormFunctor>
+class TaggedNormalFormFunction {
+public:
+    using ArgType = ListElementView;
+    using ResultType = std::optional<typename NormalFormFunctor::ResultType>;
+
+    TaggedNormalFormFunction()
+        requires std::is_default_constructible_v<NormalFormFunctor>
+    {
+    }
+
+    explicit TaggedNormalFormFunction(StringBuffer* stringBuffer)
+        requires std::is_constructible_v<NormalFormFunctor, StringBuffer*>
+        : _functor(stringBuffer)
+    {
+    }
+
+    ResultType operator()(const ArgType cell) {
+        if (cell.getTag() != ListBufferTypeTag::String) {
+            return std::nullopt;
+        }
+
+        return _functor(cell.getAs<types::String::Primitive>());
+    }
+
+    ResultType operator()(const std::optional<ArgType>& cell) {
+        return cell.has_value() ? (*this)(*cell) : std::nullopt;
+    }
+
+private:
+    NormalFormFunctor _functor;
+};
+
 template <UnicodeNormalForm Form>
 class NormalizeFunction {
 public:
     using ArgType = types::String::Primitive;
     using ResultType = types::String::Primitive;
-    using TaggedCounterpart = TaggedTextFunction<NormalizeFunction<Form>>;
-
-    static constexpr std::string_view NAME = "normalize";
+    using TaggedCounterpart = TaggedNormalFormFunction<NormalizeFunction<Form>>;
 
     explicit NormalizeFunction(StringBuffer* stringBuffer);
 
@@ -1040,7 +1086,22 @@ public:
 
 private:
     StringBuffer* _stringBuffer {nullptr};
-    std::vector<int32_t> _codepoints;
+    UnicodeNormalizer<Form> _normalizer;
+};
+
+template <UnicodeNormalForm Form>
+class IsNormalizedFunction {
+public:
+    using ArgType = types::String::Primitive;
+    using ResultType = types::Bool::Primitive;
+    using TaggedCounterpart = TaggedNormalFormFunction<IsNormalizedFunction<Form>>;
+
+    IsNormalizedFunction();
+
+    ResultType operator()(const ArgType string);
+
+private:
+    UnicodeNormalizer<Form> _normalizer;
 };
 
 enum class TrimSide : uint8_t {

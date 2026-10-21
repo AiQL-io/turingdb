@@ -112,7 +112,9 @@ TEST_F(NormalizeFunctionTest, constantIsLaidOutOverEveryRow) {
 TEST_F(NormalizeFunctionTest, normalizeReadsTaggedCells) {
     expectRows("MATCH (p:Person {name: 'Remy'}) RETURN normalize(p.words[0]), normalize(p.words[0], NFD), normalize(p.words[2], NFKC)",
                {{COMPOSED_E_ACUTE, DECOMPOSED_E_ACUTE, "null"}});
-    expectError("MATCH (p:Person {name: 'Remy'}) RETURN normalize(p.words[1])", "normalize()");
+    expectRows("MATCH (p:Person {name: 'Remy'}) RETURN normalize(p.words[1]), normalize(p.words[1], NFKD)", {{"null", "null"}});
+    expectRows("MATCH (p:Person {name: 'Remy'}) UNWIND p.words AS w RETURN normalize(w, NFD)",
+               {{DECOMPOSED_E_ACUTE}, {"null"}, {"null"}});
 }
 
 TEST_F(NormalizeFunctionTest, formNamesRemainUsableAsNames) {
@@ -128,9 +130,13 @@ TEST_F(NormalizeFunctionTest, invalidFormIsRejected) {
     expectError("RETURN normalize()", "syntax error");
 }
 
-TEST_F(NormalizeFunctionTest, nonStringIsRejected) {
-    expectError("RETURN normalize(1)", "Invalid arguments for function 'normalize'");
-    expectError("RETURN normalize([1], NFC)", "Invalid arguments for function 'normalize'");
+TEST_F(NormalizeFunctionTest, nonStringIsNull) {
+    expectRows("RETURN normalize(1), normalize(1, NFD), normalize([1], NFC), normalize(true), normalize(1.5, NFKC), "
+               "normalize({a: 'b'}, NFKD)",
+               {{"null", "null", "null", "null", "null", "null"}});
+    expectRows("MATCH (p:Person {name: 'Remy'}) RETURN normalize(p), normalize(p, NFD)", {{"null", "null"}});
+    expectRows("MATCH (p:Person) WHERE p.age IS NOT NULL RETURN p.name, normalize(p.age), normalize(p.age, NFKC)",
+               {{"Remy", "null", "null"}, {"Adam", "null", "null"}});
 }
 
 int main(int argc, char** argv) {

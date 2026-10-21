@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <algorithm>
+#include <utility>
 
 using namespace db;
 
@@ -802,11 +803,34 @@ void FunctionDecls::initDefault() {
         replace->setReturnTypes({{EvaluatedType::String}});
     }
 
-    std::vector<FunctionSignature*> normalizes;
-    createOverloads("normalize", {stringOrCell, {EvaluatedType::NormalForm}}, normalizes);
+    // Only a string has a normal form, so both answer null for any other value
+    const std::vector<FunctionArgumentType> nonString = {
+        EvaluatedType::Integer, EvaluatedType::Double, EvaluatedType::Bool, EvaluatedType::List,
+        EvaluatedType::Map, EvaluatedType::NodePattern, EvaluatedType::EdgePattern, EvaluatedType::GraphPath,
+        EvaluatedType::DateTime, EvaluatedType::Duration, EvaluatedType::Embedding,
+    };
 
-    for (FunctionSignature* normalize : normalizes) {
-        normalize->setReturnTypes({{EvaluatedType::String}});
+    const std::vector<FunctionArgumentType> normalForm = {EvaluatedType::NormalForm};
+
+    const std::vector<std::pair<std::string_view, EvaluatedType>> normalFormFunctions = {
+        {"normalize", EvaluatedType::String},
+        {"is_normalized", EvaluatedType::Bool},
+    };
+
+    for (const auto& [name, resultType] : normalFormFunctions) {
+        std::vector<FunctionSignature*> ofStrings;
+        createOverloads(name, {stringOrCell, normalForm}, ofStrings);
+
+        for (FunctionSignature* ofString : ofStrings) {
+            ofString->setReturnTypes({{resultType}});
+        }
+
+        std::vector<FunctionSignature*> ofNonStrings;
+        createOverloads(name, {nonString, normalForm}, ofNonStrings);
+
+        for (FunctionSignature* ofNonString : ofNonStrings) {
+            ofNonString->setReturnTypes({{EvaluatedType::Null}});
+        }
     }
 
     for (const std::string_view name : {"char_length", "character_length"}) {

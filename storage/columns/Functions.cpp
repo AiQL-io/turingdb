@@ -46,9 +46,17 @@ constexpr utf8proc_option_t normalFormOptions(UnicodeNormalForm form) {
     }
 }
 
-[[noreturn]] void throwNormalizeError(utf8proc_ssize_t error) {
-    throw TuringException(fmt::format("normalize() reads UTF-8 text, and this row holds a string it cannot read: {}",
+[[noreturn]] void throwNormalizeError(std::string_view operationName, utf8proc_ssize_t error) {
+    throw TuringException(fmt::format("{} reads UTF-8 text, and this row holds a string it cannot read: {}",
+                                      operationName,
                                       utf8proc_errmsg(error)));
+}
+
+// Every normal form leaves ASCII text as it is
+bool isAscii(std::string_view text) {
+    return std::ranges::all_of(text, [](const char byte) {
+        return static_cast<unsigned char>(byte) < 0x80;
+    });
 }
 
 // The list a tagged cell holds, or nothing when it holds a null. Only these two answer a
@@ -522,24 +530,20 @@ ToLowerFunction::ResultType ToLowerFunction::operator()(const ArgType string) co
 }
 
 template <UnicodeNormalForm Form>
-NormalizeFunction<Form>::NormalizeFunction(StringBuffer* stringBuffer)
-    : _stringBuffer(stringBuffer)
+UnicodeNormalizer<Form>::UnicodeNormalizer(std::string_view operationName)
+    : _operationName(operationName)
 {
 }
 
 template <UnicodeNormalForm Form>
-typename NormalizeFunction<Form>::ResultType NormalizeFunction<Form>::operator()(const ArgType string) {
-    const bool isAscii = std::ranges::all_of(string, [](const char byte) {
-        return static_cast<unsigned char>(byte) < 0x80;
-    });
+UnicodeNormalizer<Form>::~UnicodeNormalizer() {
+}
 
-    if (isAscii) {
-        return string;
-    }
-
+template <UnicodeNormalForm Form>
+std::string_view UnicodeNormalizer<Form>::normalize(std::string_view text) {
     constexpr utf8proc_option_t options = normalFormOptions(Form);
-    const utf8proc_uint8_t* bytes = reinterpret_cast<const utf8proc_uint8_t*>(string.data());
-    const utf8proc_ssize_t byteCount = static_cast<utf8proc_ssize_t>(string.size());
+    const utf8proc_uint8_t* bytes = reinterpret_cast<const utf8proc_uint8_t*>(text.data());
+    const utf8proc_ssize_t byteCount = static_cast<utf8proc_ssize_t>(text.size());
 
     utf8proc_ssize_t codepointCount = utf8proc_decompose(bytes, byteCount, _codepoints.data(), _codepoints.size(), options);
 
@@ -550,21 +554,62 @@ typename NormalizeFunction<Form>::ResultType NormalizeFunction<Form>::operator()
     }
 
     if (codepointCount < 0) {
-        throwNormalizeError(codepointCount);
+        throwNormalizeError(_operationName, codepointCount);
     }
 
     const utf8proc_ssize_t normalizedSize = utf8proc_reencode(_codepoints.data(), codepointCount, options);
     if (normalizedSize < 0) {
-        throwNormalizeError(normalizedSize);
+        throwNormalizeError(_operationName, normalizedSize);
     }
 
-    return _stringBuffer->insert({reinterpret_cast<const char*>(_codepoints.data()), static_cast<size_t>(normalizedSize)});
+    return {reinterpret_cast<const char*>(_codepoints.data()), static_cast<size_t>(normalizedSize)};
 }
+
+template <UnicodeNormalForm Form>
+NormalizeFunction<Form>::NormalizeFunction(StringBuffer* stringBuffer)
+    : _stringBuffer(stringBuffer),
+    _normalizer("normalize()")
+{
+}
+
+template <UnicodeNormalForm Form>
+typename NormalizeFunction<Form>::ResultType NormalizeFunction<Form>::operator()(const ArgType string) {
+    if (isAscii(string)) {
+        return string;
+    }
+
+    return _stringBuffer->insert(_normalizer.normalize(string));
+}
+
+template <UnicodeNormalForm Form>
+IsNormalizedFunction<Form>::IsNormalizedFunction()
+    : _normalizer("IS NORMALIZED")
+{
+}
+
+template <UnicodeNormalForm Form>
+typename IsNormalizedFunction<Form>::ResultType IsNormalizedFunction<Form>::operator()(const ArgType string) {
+    if (isAscii(string)) {
+        return true;
+    }
+
+    return _normalizer.normalize(string) == string;
+}
+
+template class db::UnicodeNormalizer<UnicodeNormalForm::NFC>;
+template class db::UnicodeNormalizer<UnicodeNormalForm::NFD>;
+template class db::UnicodeNormalizer<UnicodeNormalForm::NFKC>;
+template class db::UnicodeNormalizer<UnicodeNormalForm::NFKD>;
 
 template class db::NormalizeFunction<UnicodeNormalForm::NFC>;
 template class db::NormalizeFunction<UnicodeNormalForm::NFD>;
 template class db::NormalizeFunction<UnicodeNormalForm::NFKC>;
 template class db::NormalizeFunction<UnicodeNormalForm::NFKD>;
+
+template class db::IsNormalizedFunction<UnicodeNormalForm::NFC>;
+template class db::IsNormalizedFunction<UnicodeNormalForm::NFD>;
+template class db::IsNormalizedFunction<UnicodeNormalForm::NFKC>;
+template class db::IsNormalizedFunction<UnicodeNormalForm::NFKD>;
 
 ListReverseFunction::ListReverseFunction(QueryListBuffer* listBuffer)
     : _listBuffer(listBuffer)
