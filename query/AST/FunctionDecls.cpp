@@ -802,6 +802,13 @@ void FunctionDecls::initDefault() {
         replace->setReturnTypes({{EvaluatedType::String}});
     }
 
+    std::vector<FunctionSignature*> normalizes;
+    createOverloads("normalize", {stringOrCell, {EvaluatedType::NormalForm}}, normalizes);
+
+    for (FunctionSignature* normalize : normalizes) {
+        normalize->setReturnTypes({{EvaluatedType::String}});
+    }
+
     for (const std::string_view name : {"char_length", "character_length"}) {
         for (const EvaluatedType argumentType : {EvaluatedType::String, EvaluatedType::ListItem}) {
             FunctionSignature* charLength = createFunction(name);

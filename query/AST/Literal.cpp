@@ -270,3 +270,17 @@ WildcardLiteral* WildcardLiteral::create(CypherAST* ast) {
     ast->addLiteral(literal);
     return literal;
 }
+
+NormalFormLiteral::NormalFormLiteral(UnicodeNormalForm form)
+    : _form(form)
+{
+}
+
+NormalFormLiteral::~NormalFormLiteral() {
+}
+
+NormalFormLiteral* NormalFormLiteral::create(CypherAST* ast, UnicodeNormalForm form) {
+    NormalFormLiteral* literal = new NormalFormLiteral(form);
+    ast->addLiteral(literal);
+    return literal;
+}

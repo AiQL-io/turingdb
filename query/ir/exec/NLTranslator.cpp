@@ -205,7 +205,32 @@ const std::unordered_map<std::string_view, NLUnaryFunctionSelector> unaryFunctio
     {"nl.reverse",  &NLExecutor::selectReverse},
 };
 
+NLUnaryFunctionSelector selectNormalize(storage::UnicodeNormalForm form) {
+    switch (form) {
+        case storage::UnicodeNormalForm::NFC:
+            return &NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFC>>;
+        break;
+        case storage::UnicodeNormalForm::NFD:
+            return &NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFD>>;
+        break;
+        case storage::UnicodeNormalForm::NFKC:
+            return &NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFKC>>;
+        break;
+        case storage::UnicodeNormalForm::NFKD:
+            return &NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFKD>>;
+        break;
+        default:
+            bioassert(false, "Unhandled Unicode normal form");
+            return nullptr;
+        break;
+    }
+}
+
 NLUnaryFunctionSelector lookupUnaryFunctionSelector(mlir::Operation& operation) {
+    if (nl::Normalize normalize = mlir::dyn_cast<nl::Normalize>(operation)) {
+        return selectNormalize(normalize.getForm());
+    }
+
     const llvm::StringRef name = operation.getName().getStringRef();
     const auto it = unaryFunctionSelectors.find(std::string_view(name.data(), name.size()));
     return it == unaryFunctionSelectors.end() ? nullptr : it->second;

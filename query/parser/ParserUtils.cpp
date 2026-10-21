@@ -10,6 +10,7 @@
 #include "expr/BinaryExpr.h"
 #include "expr/EntityTypeExpr.h"
 #include "expr/ExistsExpr.h"
+#include "expr/ExprChain.h"
 #include "expr/ListComprehensionExpr.h"
 #include "expr/ListExpr.h"
 #include "expr/LiteralExpr.h"
@@ -26,6 +27,7 @@
 #include "stmt/UnwindStmt.h"
 #include "CypherAST.h"
 #include "EdgePattern.h"
+#include "FunctionInvocation.h"
 #include "Literal.h"
 #include "NodePattern.h"
 #include "Parameter.h"
@@ -426,6 +428,20 @@ Expr* ParserUtils::createSubtraction(CypherAST* ast,
     ast->getSourceManager()->setLocation(subtraction, location);
 
     return subtraction;
+}
+
+FunctionInvocation* ParserUtils::createNormalizeInvocation(CypherAST* ast, Expr* string, UnicodeNormalForm form) {
+    QualifiedName* name = QualifiedName::create(ast);
+    name->addName(Symbol::create(ast, "normalize"));
+
+    ExprChain* arguments = ExprChain::create(ast);
+    arguments->add(string);
+    arguments->add(LiteralExpr::create(ast, NormalFormLiteral::create(ast, form)));
+
+    FunctionInvocation* invocation = FunctionInvocation::create(ast, name);
+    invocation->setArguments(arguments);
+
+    return invocation;
 }
 
 Expr* ParserUtils::createListOrComprehension(CypherAST* ast, ListLiteral* list) {

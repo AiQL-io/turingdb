@@ -324,6 +324,11 @@ bool StructuralExpressionComparator::equalLiterals(const Literal* lhs, const Lit
                    == static_cast<const CharLiteral*>(rhs)->getValue();
         break;
 
+        case Literal::Kind::NORMAL_FORM:
+            return static_cast<const NormalFormLiteral*>(lhs)->getForm()
+                   == static_cast<const NormalFormLiteral*>(rhs)->getForm();
+        break;
+
         case Literal::Kind::EMBEDDING:
             return std::ranges::equal(static_cast<const EmbeddingLiteral*>(lhs)->getValue(),
                                       static_cast<const EmbeddingLiteral*>(rhs)->getValue());

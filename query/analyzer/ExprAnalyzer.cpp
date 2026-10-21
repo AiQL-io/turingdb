@@ -1041,6 +1041,9 @@ void ExprAnalyzer::analyzeLiteralExpr(LiteralExpr* expr) {
         case Literal::Kind::WILDCARD: {
             expr->setType(EvaluatedType::Wildcard);
         } break;
+        case Literal::Kind::NORMAL_FORM: {
+            expr->setType(EvaluatedType::NormalForm);
+        } break;
     }
 
     expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, expr->getType()));
@@ -2038,6 +2041,7 @@ bool ExprAnalyzer::propTypeCompatible(ValueType vt, EvaluatedType exprType) {
             return vt == ValueType::Map;
         case EvaluatedType::MapValue:
         case EvaluatedType::Wildcard:
+        case EvaluatedType::NormalForm:
         case EvaluatedType::Invalid:
         case EvaluatedType::Tuple:
         case EvaluatedType::GraphPath:

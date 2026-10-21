@@ -148,6 +148,27 @@ std::string_view toStringView(llvm::StringRef text) {
     return std::string_view(text.data(), text.size());
 }
 
+mlir::storage::UnicodeNormalForm toStorageNormalForm(UnicodeNormalForm form) {
+    switch (form) {
+        case UnicodeNormalForm::NFC:
+            return mlir::storage::UnicodeNormalForm::NFC;
+        break;
+        case UnicodeNormalForm::NFD:
+            return mlir::storage::UnicodeNormalForm::NFD;
+        break;
+        case UnicodeNormalForm::NFKC:
+            return mlir::storage::UnicodeNormalForm::NFKC;
+        break;
+        case UnicodeNormalForm::NFKD:
+            return mlir::storage::UnicodeNormalForm::NFKD;
+        break;
+        default:
+            bioassert(false, "Unhandled Unicode normal form");
+            return mlir::storage::UnicodeNormalForm::NFC;
+        break;
+    }
+}
+
 // Whether @param column is one @param aggregateOp bound, or one computed from what it
 // bound: anything computed before it holds the matched rows the aggregate consumed. A
 // column of another block is one the body being generated binds, which no aggregate reduced
@@ -9320,6 +9341,9 @@ void DBProgramGenerator::translateFunctionExpr(const Expr* expr,
     } else if (funcName == "replace") {
         translateReplace(expr, args);
         return;
+    } else if (funcName == "normalize") {
+        translateNormalize(expr, args);
+        return;
     }
 
     const bool readsTheMapItself = funcName == "properties"
@@ -9504,6 +9528,29 @@ void DBProgramGenerator::translateReplace(const Expr* expr, const ExprChain* arg
                                                                      replacement);
 
     _part._exprMap[expr] = replace.getResult();
+}
+
+void DBProgramGenerator::translateNormalize(const Expr* expr, const ExprChain* args) {
+    bioassert(args && args->size() == 2, "normalize() takes a string and a normal form.");
+
+    const ExprChain::ExprVector& argExprs = args->getExprs();
+
+    const mlir::Value string = translateArg(argExprs[0]);
+
+    bioassert(argExprs[1]->getType() == EvaluatedType::NormalForm, "normalize() reads its normal form from a literal.");
+
+    const LiteralExpr* formExpr = static_cast<const LiteralExpr*>(argExprs[1]);
+    const NormalFormLiteral* formLiteral = static_cast<const NormalFormLiteral*>(formExpr->getLiteral());
+    const mlir::storage::UnicodeNormalForm form = toStorageNormalForm(formLiteral->getForm());
+
+    const mlir::Type stringType = mlir::storage::StringType::get(_mlirCtxt);
+
+    mlir::db::Normalize normalize = _opBuilder.create<mlir::db::Normalize>(_opBuilder.getUnknownLoc(),
+                                                                           allocColumnType(stringType),
+                                                                           string,
+                                                                           form);
+
+    _part._exprMap[expr] = normalize.getResult();
 }
 
 void DBProgramGenerator::translateCoalesce(const Expr* expr, const ExprChain* args) {

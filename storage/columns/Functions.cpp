@@ -8,6 +8,7 @@
 
 #include <range/v3/view/drop.hpp>
 #include <spdlog/fmt/bundled/format.h>
+#include <utf8proc.h>
 
 #include "datapart/EdgeRecord.h"
 #include "list/ListBufferTypeTag.h"
@@ -24,6 +25,31 @@ namespace rg = ranges;
 namespace rv = rg::views;
 
 namespace {
+
+constexpr utf8proc_option_t normalFormOptions(UnicodeNormalForm form) {
+    switch (form) {
+        case UnicodeNormalForm::NFC:
+            return static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE);
+        break;
+        case UnicodeNormalForm::NFD:
+            return static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_DECOMPOSE);
+        break;
+        case UnicodeNormalForm::NFKC:
+            return static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_COMPOSE | UTF8PROC_COMPAT);
+        break;
+        case UnicodeNormalForm::NFKD:
+            return static_cast<utf8proc_option_t>(UTF8PROC_STABLE | UTF8PROC_DECOMPOSE | UTF8PROC_COMPAT);
+        break;
+        default:
+            return static_cast<utf8proc_option_t>(0);
+        break;
+    }
+}
+
+[[noreturn]] void throwNormalizeError(utf8proc_ssize_t error) {
+    throw TuringException(fmt::format("normalize() reads UTF-8 text, and this row holds a string it cannot read: {}",
+                                      utf8proc_errmsg(error)));
+}
 
 // The list a tagged cell holds, or nothing when it holds a null. Only these two answer a
 // list function: a cell of any other type is a list function applied to something that is
@@ -494,6 +520,51 @@ ToLowerFunction::ResultType ToLowerFunction::operator()(const ArgType string) co
 
     return {lower.data(), lower.size()};
 }
+
+template <UnicodeNormalForm Form>
+NormalizeFunction<Form>::NormalizeFunction(StringBuffer* stringBuffer)
+    : _stringBuffer(stringBuffer)
+{
+}
+
+template <UnicodeNormalForm Form>
+typename NormalizeFunction<Form>::ResultType NormalizeFunction<Form>::operator()(const ArgType string) {
+    const bool isAscii = std::ranges::all_of(string, [](const char byte) {
+        return static_cast<unsigned char>(byte) < 0x80;
+    });
+
+    if (isAscii) {
+        return string;
+    }
+
+    constexpr utf8proc_option_t options = normalFormOptions(Form);
+    const utf8proc_uint8_t* bytes = reinterpret_cast<const utf8proc_uint8_t*>(string.data());
+    const utf8proc_ssize_t byteCount = static_cast<utf8proc_ssize_t>(string.size());
+
+    utf8proc_ssize_t codepointCount = utf8proc_decompose(bytes, byteCount, _codepoints.data(), _codepoints.size(), options);
+
+    // The re-encoding writes a terminating byte past the last codepoint
+    if (codepointCount >= static_cast<utf8proc_ssize_t>(_codepoints.size())) {
+        _codepoints.resize(codepointCount + 1);
+        codepointCount = utf8proc_decompose(bytes, byteCount, _codepoints.data(), _codepoints.size(), options);
+    }
+
+    if (codepointCount < 0) {
+        throwNormalizeError(codepointCount);
+    }
+
+    const utf8proc_ssize_t normalizedSize = utf8proc_reencode(_codepoints.data(), codepointCount, options);
+    if (normalizedSize < 0) {
+        throwNormalizeError(normalizedSize);
+    }
+
+    return _stringBuffer->insert({reinterpret_cast<const char*>(_codepoints.data()), static_cast<size_t>(normalizedSize)});
+}
+
+template class db::NormalizeFunction<UnicodeNormalForm::NFC>;
+template class db::NormalizeFunction<UnicodeNormalForm::NFD>;
+template class db::NormalizeFunction<UnicodeNormalForm::NFKC>;
+template class db::NormalizeFunction<UnicodeNormalForm::NFKD>;
 
 ListReverseFunction::ListReverseFunction(QueryListBuffer* listBuffer)
     : _listBuffer(listBuffer)

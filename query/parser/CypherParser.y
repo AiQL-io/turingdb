@@ -211,6 +211,11 @@
 %token<std::string_view> FALSE
 %token<std::string_view> COUNT
 %token<std::string_view> REDUCE
+%token<std::string_view> NORMALIZE
+%token<std::string_view> NFC
+%token<std::string_view> NFD
+%token<std::string_view> NFKC
+%token<std::string_view> NFKD
 %token<std::string_view> GRAPH
 %token<std::string_view> GRAPHS
 %token<std::string_view> AVAILABLE
@@ -303,6 +308,8 @@
 %type<db::Symbol*> reservedWord
 %type<db::FunctionInvocation*> functionInvocation
 %type<db::FunctionInvocation*> countFunc
+%type<db::FunctionInvocation*> normalizeFunc
+%type<db::UnicodeNormalForm> normalForm
 
 %type<db::Parameter*> parameter
 %type<db::SymbolChain*> nodeLabels
@@ -1573,6 +1580,7 @@ atomExpr
     | parameter { scanner.notImplemented(@$, "Parameters"); }
     | caseExpr { $$ = $1; }
     | countFunc { $$ = FunctionInvocationExpr::create(ast, $1); LOC($$, @$); }
+    | normalizeFunc { $$ = FunctionInvocationExpr::create(ast, $1); LOC($$, @$); }
     | bracketExpr { $$ = $1; }
     | filterWith { $$ = $1; }
     | reduceExpr { $$ = $1; }
@@ -1994,6 +2002,24 @@ countFunc
       }
     ;
 
+normalizeFunc
+    : NORMALIZE OPAREN expr CPAREN {
+        $$ = ParserUtils::createNormalizeInvocation(ast, $3, UnicodeNormalForm::NFC);
+        LOC($$, @$);
+      }
+    | NORMALIZE OPAREN expr COMMA normalForm CPAREN {
+        $$ = ParserUtils::createNormalizeInvocation(ast, $3, $5);
+        LOC($$, @$);
+      }
+    ;
+
+normalForm
+    : NFC { $$ = UnicodeNormalForm::NFC; }
+    | NFD { $$ = UnicodeNormalForm::NFD; }
+    | NFKC { $$ = UnicodeNormalForm::NFKC; }
+    | NFKD { $$ = UnicodeNormalForm::NFKD; }
+    ;
+
 caseExpr
     : CASE whenThenChain END { $$ = $2; LOC($$, @$); }
     | CASE expr whenThenChain END  { $3->setSubject($2); $$ = $3; LOC($$, @$); }
@@ -2132,6 +2158,10 @@ symbol
     | EMBEDDING { $$ = Symbol::create(ast, $1); }
     | TYPE { $$ = Symbol::create(ast, $1); }
     | LIST { $$ = Symbol::create(ast, $1); }
+    | NFC { $$ = Symbol::create(ast, $1); }
+    | NFD { $$ = Symbol::create(ast, $1); }
+    | NFKC { $$ = Symbol::create(ast, $1); }
+    | NFKD { $$ = Symbol::create(ast, $1); }
     //| ANY { $$ = Symbol::create(ast, $1); } // Causes conflicts
     //| NONE { $$ = Symbol::create(ast, $1); } // Causes conflicts
     //| SINGLE { $$ = Symbol::create(ast, $1); } // Causes conflicts
@@ -2201,6 +2231,7 @@ reservedWord
     | UNION { $$ = Symbol::create(ast, $1); }
     | FALSE { $$ = Symbol::create(ast, $1); }
     | COUNT { $$ = Symbol::create(ast, $1); }
+    | NORMALIZE { $$ = Symbol::create(ast, $1); }
     | HEADERS { $$ = Symbol::create(ast, $1); }
     | JSONL { $$ = Symbol::create(ast, $1); }
     | CSV { $$ = Symbol::create(ast, $1); }

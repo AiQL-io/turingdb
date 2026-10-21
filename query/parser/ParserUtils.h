@@ -6,6 +6,7 @@
 #include "stmt/CallSubqueryStmt.h"
 #include "SourceLocation.h"
 #include "UnionQuery.h"
+#include "UnicodeNormalForm.h"
 
 namespace db {
 
@@ -15,6 +16,7 @@ class EmbeddingLiteral;
 class EntityTypeExpr;
 class ExistsExpr;
 class Expr;
+class FunctionInvocation;
 class ListLiteral;
 class MapLiteral;
 class NodePattern;
@@ -108,6 +110,9 @@ public:
                                    Expr* lhs,
                                    Expr* rhs,
                                    const SourceLocation& location);
+
+    // `normalize(s)` is `normalize(s, NFC)`
+    static FunctionInvocation* createNormalizeInvocation(CypherAST* ast, Expr* string, UnicodeNormalForm form);
 
     // `[x IN xs]` is the comprehension that copies xs, not a list holding one IN test
     static Expr* createListOrComprehension(CypherAST* ast, ListLiteral* list);

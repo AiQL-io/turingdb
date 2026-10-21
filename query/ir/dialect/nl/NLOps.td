@@ -2883,6 +2883,12 @@ def LTrim : NLUnaryFunctionOp<"ltrim", [ConstantThroughOperands]>;
 def RTrim : NLUnaryFunctionOp<"rtrim", [ConstantThroughOperands]>;
 def Reverse : NLUnaryFunctionOp<"reverse", [ConstantThroughOperands]>;
 
+def Normalize : NLUnaryFunctionOp<"normalize", [ConstantThroughOperands]> {
+  let arguments = (ins NLChunk:$operand, UnicodeNormalForm:$form);
+
+  let assemblyFormat = "$operand `,` $form attr-dict `:` functional-type(operands, results)";
+}
+
 def Substring : NLOp<"substring", [Pure, RowAlignedThroughOperands]> {
   let summary = "Row-wise substring [start, start + length)";
 

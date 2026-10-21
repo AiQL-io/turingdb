@@ -35,6 +35,7 @@
 
 #include "BioAssert.h"
 #include "FatalException.h"
+#include "UnicodeNormalForm.h"
 
 namespace db {
 
@@ -976,13 +977,13 @@ public:
     {
     }
 
-    ResultType operator()(const ArgType cell) const {
+    ResultType operator()(const ArgType cell) {
         const std::optional<types::String::Primitive> text = cellString(cell, TextFunctor::NAME);
 
         return text.has_value() ? ResultType {_functor(*text)} : std::nullopt;
     }
 
-    ResultType operator()(const std::optional<ArgType>& cell) const {
+    ResultType operator()(const std::optional<ArgType>& cell) {
         return cell.has_value() ? (*this)(*cell) : std::nullopt;
     }
 
@@ -1022,6 +1023,24 @@ public:
 
 private:
     StringBuffer* _stringBuffer {nullptr};
+};
+
+template <UnicodeNormalForm Form>
+class NormalizeFunction {
+public:
+    using ArgType = types::String::Primitive;
+    using ResultType = types::String::Primitive;
+    using TaggedCounterpart = TaggedTextFunction<NormalizeFunction<Form>>;
+
+    static constexpr std::string_view NAME = "normalize";
+
+    explicit NormalizeFunction(StringBuffer* stringBuffer);
+
+    ResultType operator()(const ArgType string);
+
+private:
+    StringBuffer* _stringBuffer {nullptr};
+    std::vector<int32_t> _codepoints;
 };
 
 enum class TrimSide : uint8_t {

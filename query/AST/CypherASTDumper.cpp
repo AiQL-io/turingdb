@@ -1184,6 +1184,11 @@ void CypherASTDumper::dump(std::ostream& out, const LiteralExpr* expr) {
             out << "]\n";
             break;
         }
+        case Literal::Kind::NORMAL_FORM: {
+            const NormalFormLiteral* normalFormLiteral = static_cast<const NormalFormLiteral*>(literal);
+            out << "        NormalFormLiteral " << UnicodeNormalFormName::value(normalFormLiteral->getForm()) << "\n";
+            break;
+        }
         default: {
             throw CompilerException("Unknown literal type");
             break;

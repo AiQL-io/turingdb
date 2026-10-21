@@ -189,4 +189,14 @@ def ListPredicateKind : I64EnumAttr<"ListPredicateKind", "The quantifier of a li
     let cppNamespace = "::mlir::storage";
 }
 
+// The Unicode normalization form a normalize op rewrites each string to.
+def UnicodeNormalForm : I64EnumAttr<"UnicodeNormalForm", "A Unicode normalization form", [
+    I64EnumAttrCase<"NFC", 0, "nfc">,
+    I64EnumAttrCase<"NFD", 1, "nfd">,
+    I64EnumAttrCase<"NFKC", 2, "nfkc">,
+    I64EnumAttrCase<"NFKD", 3, "nfkd">,
+]> {
+    let cppNamespace = "::mlir::storage";
+}
+
 #endif // STORAGE_ENUMS

@@ -189,6 +189,7 @@ target_include_directories(turing_db_storage_s
 
 target_link_libraries(turing_db_storage_s
     PRIVATE turing_db_jobs_s
+            utf8proc::utf8proc
     PUBLIC  turing_db_base_s
             turing_db_io_fs_s
             turing_common_s

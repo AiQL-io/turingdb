@@ -188,7 +188,7 @@ jobs:
         --base /opt/actions-local-cache
         --path external/dependencies
         --clean-key ${{ matrix.os }}-dependencies-
-        --key ${{ matrix.os }}-dependencies-v4-${{ hashFiles('install_build_tools.sh', 'dependencies.sh', '.gitmodules') }}-${{ steps.submodules.outputs.hash }}
+        --key ${{ matrix.os }}-dependencies-v5-${{ hashFiles('install_build_tools.sh', 'dependencies.sh', '.gitmodules') }}-${{ steps.submodules.outputs.hash }}
 
     - name: Cache dependencies (GitHub-hosted)
       id: cache-dependencies-github-hosted

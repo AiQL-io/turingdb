@@ -438,6 +438,7 @@ db::ValueType WriteStmtAnalyzer::evaluatedToValueType(EvaluatedType type) {
         case EvaluatedType::StringTable:
         case EvaluatedType::Invalid:
         case EvaluatedType::Wildcard:
+        case EvaluatedType::NormalForm:
         case EvaluatedType::GraphPath:
         case EvaluatedType::Tuple:
         case EvaluatedType::ValueType:

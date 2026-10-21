@@ -91,15 +91,27 @@ void describeColumnType(mlir::Type chunkType, std::string& out) {
 using NLUnaryFunctionEmitter = mlir::Value (*)(mlir::OpBuilder& builder,
                                                mlir::Location loc,
                                                nl::ChunkType resultType,
-                                               mlir::Value input);
+                                               mlir::Value input,
+                                               mlir::Operation* source);
 using UnaryFunctionElement = mlir::Type (*)(mlir::OpBuilder& builder, mlir::Type inputElement);
 
 template <typename NLOp>
 mlir::Value emitNLUnaryFunction(mlir::OpBuilder& builder,
                                 mlir::Location loc,
                                 nl::ChunkType resultType,
-                                mlir::Value input) {
+                                mlir::Value input,
+                                mlir::Operation* source) {
     return builder.create<NLOp>(loc, resultType, input).getResult();
+}
+
+mlir::Value emitNLNormalize(mlir::OpBuilder& builder,
+                            mlir::Location loc,
+                            nl::ChunkType resultType,
+                            mlir::Value input,
+                            mlir::Operation* source) {
+    mlir::db::Normalize normalize = mlir::cast<mlir::db::Normalize>(source);
+
+    return builder.create<nl::Normalize>(loc, resultType, input, normalize.getForm()).getResult();
 }
 
 mlir::Type stringFunctionElement(mlir::OpBuilder& builder, mlir::Type inputElement) {
@@ -319,7 +331,8 @@ const std::unordered_map<std::string_view, UnaryFunctionLowering> unaryFunctionL
     {"db.trim",     {&emitNLUnaryFunction<nl::Trim>,     &stringFunctionElement,  ResultNullability::FollowsInput}},
     {"db.ltrim",    {&emitNLUnaryFunction<nl::LTrim>,    &stringFunctionElement,  ResultNullability::FollowsInput}},
     {"db.rtrim",    {&emitNLUnaryFunction<nl::RTrim>,    &stringFunctionElement,  ResultNullability::FollowsInput}},
-    {"db.reverse",  {&emitNLUnaryFunction<nl::Reverse>,  &reverseFunctionElement, ResultNullability::FollowsInput}}
+    {"db.reverse",  {&emitNLUnaryFunction<nl::Reverse>,  &reverseFunctionElement, ResultNullability::FollowsInput}},
+    {"db.normalize", {&emitNLNormalize,                  &stringFunctionElement,  ResultNullability::FollowsInput}}
 };
 
 const UnaryFunctionLowering* lookupUnaryFunctionLowering(mlir::Operation& operation) {
@@ -6357,7 +6370,7 @@ void DBLowering::lowerUnaryFunction(mlir::Operation* op) {
 
     setInsertionForUnaryOp(inputChunk);
 
-    _valueMap[op->getResult(0)] = spec->emit(_builder, _builder.getUnknownLoc(), resultType, inputChunk);
+    _valueMap[op->getResult(0)] = spec->emit(_builder, _builder.getUnknownLoc(), resultType, inputChunk, op);
 }
 
 void DBLowering::lowerHeadOrLast(mlir::Operation& operation) {

@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "HybridString.h"
+#include "UnicodeNormalForm.h"
 
 #include "decl/EvaluatedType.h"
 
@@ -32,6 +33,7 @@ public:
         MAP,
         EMBEDDING,
         WILDCARD,
+        NORMAL_FORM,
     };
 
     virtual Kind getKind() const = 0;
@@ -259,6 +261,23 @@ public:
 private:
     WildcardLiteral();
     ~WildcardLiteral() override;
+};
+
+class NormalFormLiteral : public Literal {
+public:
+    static NormalFormLiteral* create(CypherAST* ast, UnicodeNormalForm form);
+
+    constexpr Kind getKind() const override { return Kind::NORMAL_FORM; }
+
+    constexpr EvaluatedType getType() const override { return EvaluatedType::NormalForm; }
+
+    UnicodeNormalForm getForm() const { return _form; }
+
+private:
+    UnicodeNormalForm _form {UnicodeNormalForm::NFC};
+
+    explicit NormalFormLiteral(UnicodeNormalForm form);
+    ~NormalFormLiteral() override;
 };
 
 }

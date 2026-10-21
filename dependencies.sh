@@ -127,6 +127,34 @@ rm -f $DEPENDENCIES_DIR/lib/libz.so $DEPENDENCIES_DIR/lib/libz.so.*
 git -C $SOURCE_DIR/external/zlib checkout -- zconf.h 2>/dev/null || true
 
 # ============================================================
+# Build utf8proc from source
+# ============================================================
+echo "Building utf8proc..."
+mkdir -p $BUILD_DIR/utf8proc
+cd $BUILD_DIR/utf8proc
+
+UTF8PROC_CMAKE_ARGS=(
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_INSTALL_PREFIX=$DEPENDENCIES_DIR
+    -DCMAKE_INSTALL_LIBDIR=lib
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    -DBUILD_SHARED_LIBS=OFF
+    -DUTF8PROC_ENABLE_TESTING=OFF
+)
+
+if [[ $USE_CLANG -eq 1 ]]; then
+    UTF8PROC_CMAKE_ARGS+=("${CLANG_COMPILER_ARGS[@]}")
+fi
+
+if [[ "$(uname)" == "Linux" ]]; then
+    UTF8PROC_CMAKE_ARGS+=("${LINUX_ARCH_ARGS[@]}")
+fi
+
+cmake "${UTF8PROC_CMAKE_ARGS[@]}" $SOURCE_DIR/external/utf8proc
+cmake --build $BUILD_DIR/utf8proc -j $NUM_JOBS
+cmake --install $BUILD_DIR/utf8proc
+
+# ============================================================
 # Build OpenSSL from source
 # ============================================================
 OPENSSL_VERSION="3.5.5"

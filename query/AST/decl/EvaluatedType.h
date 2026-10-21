@@ -38,6 +38,7 @@ enum class EvaluatedType : uint8_t {
     EdgeType,
     DateTime,
     Duration,
+    NormalForm,
 
     _SIZE,
 };
@@ -89,7 +90,8 @@ using EvaluatedTypeName = EnumToString<EvaluatedType>::Create<
     EnumStringPair<EvaluatedType::PropertyType, "PropertyType">,
     EnumStringPair<EvaluatedType::EdgeType, "EdgeType">,
     EnumStringPair<EvaluatedType::DateTime, "DateTime">,
-    EnumStringPair<EvaluatedType::Duration, "Duration">>;
+    EnumStringPair<EvaluatedType::Duration, "Duration">,
+    EnumStringPair<EvaluatedType::NormalForm, "NormalForm">>;
 
 // Evaluated Type to ValueType conversion
 static constexpr size_t VALUE_TYPE_COUNT = std::to_underlying(ValueType::_SIZE);

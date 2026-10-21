@@ -2773,6 +2773,14 @@ def LTrim : TextFunctionOp<"ltrim">;
 def RTrim : TextFunctionOp<"rtrim">;
 def Reverse : TypedUnaryFunctionOp<"reverse", "::mlir::storage::StringType, ::mlir::storage::ListType">;
 
+def Normalize : TextFunctionOp<"normalize"> {
+  let arguments = (ins Column:$input, UnicodeNormalForm:$form);
+
+  let assemblyFormat = [{
+    `(` $input `,` $form `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
 def Substring : TuringOp<"substring", [NoMemoryEffect, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Take the run of each row's string its start and length span";
 

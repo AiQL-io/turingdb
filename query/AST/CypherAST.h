@@ -25,6 +25,7 @@ class CharLiteral;
 class ListLiteral;
 class MapLiteral;
 class WildcardLiteral;
+class NormalFormLiteral;
 class EmbeddingLiteral;
 class Expr;
 class ExprChain;
@@ -137,6 +138,7 @@ public:
     friend ListLiteral;
     friend MapLiteral;
     friend WildcardLiteral;
+    friend NormalFormLiteral;
     friend EmbeddingLiteral;
     friend ExprChain;
     friend BinaryExpr;

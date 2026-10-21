@@ -281,6 +281,9 @@ find_package(ZLIB REQUIRED)
 # openssl
 find_package(OpenSSL REQUIRED)
 
+# utf8proc
+find_package(utf8proc REQUIRED)
+
 # Resolve the Python used for the nanobind modules before any find_package(Python).
 # The first one runs inside add_subdirectory(external) via nanobind, so this must
 # come before it. Priority: explicit -DPython_EXECUTABLE, then the active
