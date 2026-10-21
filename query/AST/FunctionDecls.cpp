@@ -623,7 +623,7 @@ void FunctionDecls::initDefault() {
         std::string_view _orNullName;
         EvaluatedType _result {EvaluatedType::Invalid};
         std::vector<EvaluatedType> _converted;
-        std::vector<EvaluatedType> _unconvertible;
+        std::vector<FunctionArgumentType> _unconvertible;
     };
 
     const std::vector<Conversion> conversions = {
@@ -632,7 +632,7 @@ void FunctionDecls::initDefault() {
             "toIntegerOrNull",
             EvaluatedType::Integer,
             {EvaluatedType::String, EvaluatedType::Integer, EvaluatedType::Double, EvaluatedType::Bool},
-            {EvaluatedType::List, EvaluatedType::Map, EvaluatedType::NodePattern, EvaluatedType::EdgePattern,
+            {EvaluatedType::List, EvaluatedType::Map, nodeOrGroup, edgeOrPath,
              EvaluatedType::GraphPath, EvaluatedType::DateTime, EvaluatedType::Duration, EvaluatedType::Embedding},
         },
         {
@@ -640,7 +640,7 @@ void FunctionDecls::initDefault() {
             "toFloatOrNull",
             EvaluatedType::Double,
             {EvaluatedType::String, EvaluatedType::Integer, EvaluatedType::Double},
-            {EvaluatedType::Bool, EvaluatedType::List, EvaluatedType::Map, EvaluatedType::NodePattern, EvaluatedType::EdgePattern,
+            {EvaluatedType::Bool, EvaluatedType::List, EvaluatedType::Map, nodeOrGroup, edgeOrPath,
              EvaluatedType::GraphPath, EvaluatedType::DateTime, EvaluatedType::Duration, EvaluatedType::Embedding},
         },
         {
@@ -648,7 +648,7 @@ void FunctionDecls::initDefault() {
             "toBooleanOrNull",
             EvaluatedType::Bool,
             {EvaluatedType::String, EvaluatedType::Integer, EvaluatedType::Bool},
-            {EvaluatedType::Double, EvaluatedType::List, EvaluatedType::Map, EvaluatedType::NodePattern, EvaluatedType::EdgePattern,
+            {EvaluatedType::Double, EvaluatedType::List, EvaluatedType::Map, nodeOrGroup, edgeOrPath,
              EvaluatedType::GraphPath, EvaluatedType::DateTime, EvaluatedType::Duration, EvaluatedType::Embedding},
         },
         {
@@ -657,7 +657,7 @@ void FunctionDecls::initDefault() {
             EvaluatedType::String,
             {EvaluatedType::String, EvaluatedType::Integer, EvaluatedType::Double, EvaluatedType::Bool,
              EvaluatedType::DateTime, EvaluatedType::Duration},
-            {EvaluatedType::List, EvaluatedType::Map, EvaluatedType::NodePattern, EvaluatedType::EdgePattern,
+            {EvaluatedType::List, EvaluatedType::Map, nodeOrGroup, edgeOrPath,
              EvaluatedType::GraphPath, EvaluatedType::Embedding},
         },
     };
@@ -679,7 +679,7 @@ void FunctionDecls::initDefault() {
             ofACell->setReturnTypes({{conversion._result}});
         }
 
-        for (const EvaluatedType unconvertible : conversion._unconvertible) {
+        for (const FunctionArgumentType& unconvertible : conversion._unconvertible) {
             FunctionSignature* unconverted = createFunction(conversion._orNullName);
             unconverted->setArguments({unconvertible});
             unconverted->setReturnTypes({{EvaluatedType::Null}});
