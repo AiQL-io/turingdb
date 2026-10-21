@@ -119,3 +119,6 @@ add_turing_test(test_query_ir_or_null_of_a_variable_length_path OrNullOfAVariabl
 
 add_turing_test(test_query_ir_computed_once_over_constants ComputedOnceOverConstantsTest.cpp)
 target_include_directories(test_query_ir_computed_once_over_constants PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_integer_against_double IntegerAgainstDoubleTest.cpp)
+target_include_directories(test_query_ir_integer_against_double PRIVATE ${IR_TEST_DIR})
