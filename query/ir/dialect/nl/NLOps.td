@@ -2957,6 +2957,7 @@ def Last : NLUnaryFunctionOp<"last", [ConstantThroughOperands]>;
 def Tail : NLUnaryFunctionOp<"tail", [ConstantThroughOperands]>;
 
 def Abs : NLUnaryFunctionOp<"abs", [ConstantThroughOperands]>;
+def Negate : NLUnaryFunctionOp<"negate", [ConstantThroughOperands]>;
 def Sign : NLUnaryFunctionOp<"sign", [ConstantThroughOperands]>;
 def Ceil : NLUnaryFunctionOp<"ceil", [ConstantThroughOperands]>;
 def Floor : NLUnaryFunctionOp<"floor", [ConstantThroughOperands]>;
