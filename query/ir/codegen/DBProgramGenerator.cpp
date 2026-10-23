@@ -3882,7 +3882,7 @@ void DBProgramGenerator::generateCall(const CallStmt* callStmt) {
     const ExprChain* arguments = invocation->getArguments();
     if (arguments) {
         for (const Expr* argument : *arguments) {
-            translateExpr(argument);
+            translateExprOverRows(argument);
             inputs.push_back(_part._exprMap.at(argument));
         }
     }
@@ -4205,7 +4205,7 @@ void DBProgramGenerator::generateYieldFilter(const YieldItems* yieldItems) {
     // column in flight goes through the filter, the yields among them, so they stay
     // row-aligned with each other.
     const Expr* predicateExpr = where->getExpr();
-    translateExpr(predicateExpr);
+    translateExprOverRows(predicateExpr);
 
     const auto findIt = _part._exprMap.find(predicateExpr);
     bioassert(findIt != end(_part._exprMap), "Failed to get value for YIELD WHERE expr");
@@ -4635,7 +4635,7 @@ void DBProgramGenerator::collectMergeHop(const EdgePattern* edgePattern, MergePa
 
 void DBProgramGenerator::collectMergeProperties(const PatternData* data, MergeEntity& entity) {
     for (const EntityPropertyConstraint& constraint : data->exprConstraints()) {
-        translateExpr(constraint._expr);
+        translateExprOverRows(constraint._expr);
 
         const std::string_view propName = constraint._propTypeName;
         entity._propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
@@ -4855,7 +4855,7 @@ void DBProgramGenerator::generateCreateStmt(const CreateStmt* createStmt) {
         llvm::SmallVector<mlir::Value> propValues;
         if (data) {
             for (const EntityPropertyConstraint& constraint : data->exprConstraints()) {
-                translateExpr(constraint._expr);
+                translateExprOverRows(constraint._expr);
                 const std::string_view propName = constraint._propTypeName;
                 propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
                 propValues.push_back(_part._exprMap.at(constraint._expr));
@@ -4904,7 +4904,7 @@ void DBProgramGenerator::generateCreateStmt(const CreateStmt* createStmt) {
             const EdgePatternData* edgeData = edge->getData();
             if (edgeData) {
                 for (const EntityPropertyConstraint& constraint : edgeData->exprConstraints()) {
-                    translateExpr(constraint._expr);
+                    translateExprOverRows(constraint._expr);
                     const std::string_view propName = constraint._propTypeName;
                     propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
                     propValues.push_back(_part._exprMap.at(constraint._expr));
@@ -5093,7 +5093,7 @@ mlir::Value DBProgramGenerator::resolveColumnInScope(ColumnPredicate accept) con
         }
 
         const mlir::Value column = findIt->second.back();
-        if (!isRowAlignedHere(column) || !accept(column)) {
+        if (!holdsTheRowsInFlight(column) || !accept(column)) {
             continue;
         }
 
@@ -5101,7 +5101,7 @@ mlir::Value DBProgramGenerator::resolveColumnInScope(ColumnPredicate accept) con
     }
 
     for (const YieldedColumn& yielded : _part._yieldedColumns) {
-        if (isRowAlignedHere(yielded._column)) {
+        if (holdsTheRowsInFlight(yielded._column) && accept(yielded._column)) {
             return yielded._column;
         }
     }
@@ -5138,14 +5138,7 @@ mlir::Value DBProgramGenerator::translateAggregateInput(const Expr* argExpr,
 
         return getOrTranslateBoundColumn(argExpr);
     } else if (argType != EvaluatedType::Wildcard) {
-        mlir::Block* const block = _opBuilder.getInsertionBlock();
-        const mlir::Block::iterator insertionPoint = _opBuilder.getInsertionPoint();
-        mlir::Operation* const lastOpBefore = insertionPoint == block->begin() ? nullptr : &*std::prev(insertionPoint);
-
-        translateExpr(argExpr);
-
-        const mlir::Block::iterator firstTranslated = lastOpBefore ? std::next(lastOpBefore->getIterator()) : block->begin();
-        alignConstantOperandsToDriver(firstTranslated, _opBuilder.getInsertionPoint());
+        translateExprOverRows(argExpr);
 
         return alignConstantToDriver(_part._exprMap.at(argExpr));
     }
@@ -5167,7 +5160,13 @@ mlir::Value DBProgramGenerator::translateAggregateInput(const Expr* argExpr,
 }
 
 mlir::Value DBProgramGenerator::resolveRowCarryingColumn() {
-    return resolveColumnInScope([this](mlir::Value column) { return !yieldsConstantColumn(column, _constantColumns); });
+    const mlir::Value column = resolveColumnInScope([this](mlir::Value column) { return !yieldsConstantColumn(column, _constantColumns); });
+    if (column || !_part._aggregateOp) {
+        return column;
+    }
+
+    // Under a grouping key no variable names, the groups are held by the aggregate's results alone
+    return _part._aggregateOp->getResult(0);
 }
 
 mlir::Value DBProgramGenerator::alignConstantToDriver(mlir::Value column) {
@@ -5209,6 +5208,17 @@ void DBProgramGenerator::alignConstantOperandsToDriver(mlir::Block::iterator fir
             operand.set(_opBuilder.create<mlir::db::BroadcastConstant>(loc, noneType, operand.get(), driver).getResult());
         }
     }
+}
+
+void DBProgramGenerator::translateExprOverRows(const Expr* expr) {
+    mlir::Block* const block = _opBuilder.getInsertionBlock();
+    const mlir::Block::iterator insertionPoint = _opBuilder.getInsertionPoint();
+    mlir::Operation* const lastOpBefore = insertionPoint == block->begin() ? nullptr : &*std::prev(insertionPoint);
+
+    translateExpr(expr);
+
+    const mlir::Block::iterator firstTranslated = lastOpBefore ? std::next(lastOpBefore->getIterator()) : block->begin();
+    alignConstantOperandsToDriver(firstTranslated, _opBuilder.getInsertionPoint());
 }
 
 mlir::Value DBProgramGenerator::resolveWildcardColumn() {
@@ -5274,7 +5284,7 @@ void DBProgramGenerator::generateSetItems(const SetStmt* setStmt, mlir::Value ro
             std::get_if<SetItem::PropertyExprAssign>(&item->item());
         bioassert(assign, "Only property-assignment SET items are supported");
 
-        translateExpr(assign->_propValueExpr);
+        translateExprOverRows(assign->_propValueExpr);
 
         generatePropertyWrite(assign->_propTypeExpr,
                               _part._exprMap.at(assign->_propValueExpr),
@@ -7401,7 +7411,7 @@ mlir::Value DBProgramGenerator::getOrTranslateBoundColumn(const VariableColumnMa
         }
     }
 
-    translateExpr(expr);
+    translateExprOverRows(expr);
     return _part._exprMap.at(expr);
 }
 
@@ -7430,7 +7440,7 @@ mlir::Value DBProgramGenerator::getOrTranslateBoundColumn(const Expr* expr) {
 
 void DBProgramGenerator::applyPredicateFilters(std::span<const Expr* const> predicates) {
     for (const Expr* predicate : predicates) {
-        translateExpr(predicate);
+        translateExprOverRows(predicate);
         filterAllColumns(_part._exprMap.at(predicate));
     }
 }

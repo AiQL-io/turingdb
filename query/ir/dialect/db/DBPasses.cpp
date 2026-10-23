@@ -8,6 +8,7 @@
 
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Dominance.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
@@ -6163,7 +6164,7 @@ bool isRowWiseOp(Operation* op) {
     return isMaskComputeOp(op)
         || isa<GetNodeLabelSet, CheckLabelConstraint, CheckEdgeTypeConstraint,
                Labels, EdgeType, ToInteger, ToFloat, ToBoolean,
-               CosineSimilarity, EuclideanDistance>(op);
+               CosineSimilarity, EuclideanDistance, BroadcastConstant>(op);
 }
 
 bool aggregatesDistinctly(llvm::ArrayRef<int64_t> kinds) {
@@ -8004,7 +8005,83 @@ struct FetchNodesChain {
     Operation* _scan {nullptr};
     ArrayAttr _labels;
     llvm::SmallVector<OpResult> _links;
+    llvm::SmallVector<std::pair<BroadcastConstant, Value>> _redrivenBroadcasts;
 };
+
+// A db.broadcast_constant reads no value of its driver, only how many rows it holds
+bool readsTheRowsAlone(OpOperand& use) {
+    BroadcastConstant broadcast = dyn_cast<BroadcastConstant>(use.getOwner());
+
+    return broadcast && &use != &broadcast.getValueMutable();
+}
+
+// The one op reading the values of @param column, or null when there is not exactly one use
+// reading them
+Operation* soleValueReader(Value column) {
+    Operation* reader = nullptr;
+    for (OpOperand& use : column.getUses()) {
+        if (readsTheRowsAlone(use)) {
+            continue;
+        } else if (reader) {
+            return nullptr;
+        }
+
+        reader = use.getOwner();
+    }
+
+    return reader;
+}
+
+// A column @param reader hands on beside @param column, so one holding the same rows, or
+// null when it hands on no other
+Value siblingColumnOf(Value column, Operation* reader) {
+    OperandRange candidates = reader->getOperands();
+
+    CarrySetLayout layout;
+    if (matchCarrySetLayout(reader, layout)) {
+        candidates = candidates.slice(layout._operandOffset, carriedCount(reader, layout));
+    } else if (!isa<Yield>(reader)) {
+        return {};
+    }
+
+    for (const Value candidate : candidates) {
+        if (candidate != column) {
+            return candidate;
+        }
+    }
+
+    return {};
+}
+
+// The broadcasts counting the rows of @param column, which the fetch removes, each paired
+// with the column it counts instead: one @param reader hands on beside it, else
+// @param fallback, else none when the column was the only one holding those rows. False
+// when that column is not bound ahead of a broadcast reading it.
+bool collectRedrivenBroadcasts(Value column, Operation* reader, Value fallback, FetchNodesChain& chain) {
+    const Value sibling = siblingColumnOf(column, reader);
+    mlir::DominanceInfo dominance;
+
+    for (OpOperand& use : column.getUses()) {
+        if (!readsTheRowsAlone(use)) {
+            continue;
+        }
+
+        BroadcastConstant broadcast = cast<BroadcastConstant>(use.getOwner());
+
+        Value driver;
+        if (sibling && dominance.properlyDominates(sibling, broadcast)) {
+            driver = sibling;
+        } else if (fallback && dominance.properlyDominates(fallback, broadcast)) {
+            driver = fallback;
+        } else if (sibling || fallback) {
+            return false;
+        }
+
+        chain._redrivenBroadcasts.emplace_back(broadcast, driver);
+    }
+
+    return true;
+}
 
 // The column a result is, as handed on by its op: a column carried through a filter, an
 // unwind or a node fetch, or one a product's factor yields. Null for any other result.
@@ -8061,12 +8138,17 @@ bool matchFetchNodesChain(Value nodes, Value ids, FetchNodesChain& chain) {
         const bool readByTheEquality = user == chain._equality.getOperation();
         const bool carriedByTheFilter = user == chain._filter.getOperation() && use.getOperandNumber() > 0;
 
-        if (!readByTheEquality && !carriedByTheFilter) {
+        if (!readByTheEquality && !carriedByTheFilter && !readsTheRowsAlone(use)) {
             return false;
         }
     }
 
     chain._links.clear();
+    chain._redrivenBroadcasts.clear();
+
+    if (!collectRedrivenBroadcasts(nodes, chain._filter, ids, chain)) {
+        return false;
+    }
 
     Value column = nodes;
     while (!isa_and_nonnull<ScanNodes, ScanNodesByLabel>(column.getDefiningOp())) {
@@ -8080,8 +8162,12 @@ bool matchFetchNodesChain(Value nodes, Value ids, FetchNodesChain& chain) {
             return false;
         }
 
-        const bool readByTheLinkAlone = handedOn.hasOneUse();
-        if (!readByTheLinkAlone || !keepsAColumnOnceDropped(link, handedOn)) {
+        Operation* const reader = soleValueReader(handedOn);
+        if (!reader || !keepsAColumnOnceDropped(link, handedOn)) {
+            return false;
+        }
+
+        if (!collectRedrivenBroadcasts(handedOn, reader, Value(), chain)) {
             return false;
         }
 
@@ -8200,6 +8286,20 @@ void inlineTheFactorLeft(CrossProduct product, mlir::RewriterBase& rewriter) {
 }
 
 void fuseFetchNodes(FetchNodesChain& chain, mlir::RewriterBase& rewriter) {
+    for (const std::pair<BroadcastConstant, Value>& redriven : chain._redrivenBroadcasts) {
+        BroadcastConstant broadcast = redriven.first;
+        const Value driver = redriven.second;
+
+        rewriter.modifyOpInPlace(broadcast, [&broadcast, driver] {
+            mlir::MutableOperandRange driverOperand = broadcast.getDriverMutable();
+            if (driver) {
+                driverOperand.assign(driver);
+            } else {
+                driverOperand.clear();
+            }
+        });
+    }
+
     FilterOp filter = chain._filter;
     const Location loc = filter.getLoc();
 

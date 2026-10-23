@@ -1109,6 +1109,10 @@ private:
     // op in [@param first, @param last) to the driver instead.
     void alignConstantOperandsToDriver(mlir::Block::iterator first, mlir::Block::iterator last);
 
+    // Translates @param expr for a clause over the rows in flight, with the ops it emits
+    // aligned to the driver as alignConstantOperandsToDriver does
+    void translateExprOverRows(const Expr* expr);
+
     // The column count(*) counts: the first variable bound to a column holding the rows
     // flowing past the insertion point. A scope of constants alone is the single row those
     // constants are, which is what count(*) counts there
