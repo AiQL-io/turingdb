@@ -756,6 +756,10 @@ private:
     void foldTruncatesIntoOutputs(mlir::func::FuncOp nlFunction);
     void foldSkipTruncatesIntoOutputs(mlir::func::FuncOp nlFunction);
 
+    // Peephole: an nl.output reading only constants laid out over one relation, for it
+    // alone, emits the constants against that relation's chunk instead of the copies
+    void foldBroadcastsIntoOutputs(mlir::func::FuncOp nlFunction);
+
     // The procedure registered under this full name, or a clear error when there is
     // no registry to resolve it against or no procedure of that name
     const Procedure* procedureFor(llvm::StringRef name) const;

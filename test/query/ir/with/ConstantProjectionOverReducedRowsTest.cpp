@@ -89,6 +89,26 @@ TEST_F(ConstantProjectionOverReducedRowsTest, returnsOneConstantRowForAKeylessAg
     expectRows("UNWIND [1, 2] AS x WITH count(*) AS c RETURN 1", {{"1"}});
 }
 
+TEST_F(ConstantProjectionOverReducedRowsTest, returnsNoConstantRowPastASkipOfTheOnlyRow) {
+    expectRows("WITH 1 AS a SKIP 1 RETURN 1", {});
+}
+
+TEST_F(ConstantProjectionOverReducedRowsTest, returnsNoConstantRowPastASortedLimitOfZero) {
+    expectRows("WITH 1 AS a ORDER BY a LIMIT 0 RETURN 1", {});
+}
+
+TEST_F(ConstantProjectionOverReducedRowsTest, returnsEveryConstantOncePerDistinctValue) {
+    expectRows("UNWIND [1, 1, 2] AS x WITH DISTINCT x RETURN 1, 'a'", {{"1", "a"}, {"1", "a"}});
+}
+
+TEST_F(ConstantProjectionOverReducedRowsTest, cutsTheDistinctRowsUnderTheConstant) {
+    expectRows("UNWIND [1, 1, 2] AS x WITH DISTINCT x RETURN 1 LIMIT 5", {{"1"}, {"1"}});
+}
+
+TEST_F(ConstantProjectionOverReducedRowsTest, returnsOneConstantRowPerRowOfAConstantWith) {
+    expectRows("UNWIND [1, 1, 2] AS x WITH DISTINCT x WITH 1 AS y RETURN 1", {{"1"}, {"1"}});
+}
+
 int main(int argc, char** argv) {
     return turing::test::turingTestMain(argc, argv);
 }

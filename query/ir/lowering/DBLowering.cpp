@@ -1162,6 +1162,8 @@ mlir::func::FuncOp DBLowering::lower(mlir::func::FuncOp dbFunction, mlir::Module
     // offset) instead of copying it to the front - the copy-free post-skip tail.
     foldSkipTruncatesIntoOutputs(nlFunction);
 
+    foldBroadcastsIntoOutputs(nlFunction);
+
     // Run MLIR verifier on the nlFunction
     if (mlir::failed(mlir::verify(nlFunction))) {
         throw IRException("DBLowering produced an invalid nl function");
@@ -5580,6 +5582,59 @@ void DBLowering::foldSkipTruncatesIntoOutputs(mlir::func::FuncOp nlFunction) {
     }
 }
 
+void DBLowering::foldBroadcastsIntoOutputs(mlir::func::FuncOp nlFunction) {
+    llvm::SmallVector<nl::Output, 4> foldable;
+
+    nlFunction.walk([&foldable](nl::Output output) {
+        const mlir::OperandRange columns = output.getColumns();
+        if (output.getCardinality() || columns.empty()) {
+            return;
+        }
+
+        mlir::Value sharedCardinality;
+        for (const mlir::Value column : columns) {
+            nl::BroadcastConstant broadcast = column.getDefiningOp<nl::BroadcastConstant>();
+            if (!broadcast || !column.hasOneUse()) {
+                return;
+            }
+
+            const mlir::Value cardinality = broadcast.getCardinality();
+            if (!cardinality) {
+                return;
+            } else if (!sharedCardinality) {
+                sharedCardinality = cardinality;
+            } else if (cardinality != sharedCardinality) {
+                return;
+            }
+        }
+
+        foldable.push_back(output);
+    });
+
+    for (nl::Output output : foldable) {
+        llvm::SmallVector<mlir::Value, 4> constants;
+        llvm::SmallVector<nl::BroadcastConstant, 4> broadcasts;
+        for (const mlir::Value column : output.getColumns()) {
+            nl::BroadcastConstant broadcast = column.getDefiningOp<nl::BroadcastConstant>();
+            constants.push_back(broadcast.getValue());
+            broadcasts.push_back(broadcast);
+        }
+
+        _builder.setInsertionPoint(output);
+        _builder.create<nl::Output>(output.getLoc(),
+                                    constants,
+                                    output.getLimit(),
+                                    output.getSkip(),
+                                    broadcasts.front().getCardinality(),
+                                    output.getColumnNamesAttr());
+
+        output.erase();
+        for (nl::BroadcastConstant broadcast : broadcasts) {
+            broadcast.erase();
+        }
+    }
+}
+
 mlir::Value DBLowering::propertyWriteChunk(llvm::StringRef propertyName, mlir::Value chunk) {
     if (!_view || !_view->isValid()) {
         return chunk;
@@ -6708,9 +6763,8 @@ nl::Output DBLowering::lowerOutput(mlir::db::Output output) {
     // dropping the copy.
 
     // If there is a column which is produced by a block which is not the entry block
-    // (e.g. a loop block), then set the anchor to be that block. Otherwise, we have no
-    // loops, i.e. we are in a MATCH (n) RETURN 5 case, where the output can just be in
-    // the entry block since it is independent of any loop (over n in this case).
+    // (e.g. a loop block), then set the anchor to be that block. Otherwise no relation
+    // drives the projection, as in RETURN 1, and the output is the single row it holds.
     // Getting the owner block of the returned column is sufficient because in nested
     // loops, each Cypher variable is redefined each op due to the carry set implictly
     // filtering. Otherwise we would need to check for the *deepest* block of all
@@ -6724,29 +6778,13 @@ nl::Output DBLowering::lowerOutput(mlir::db::Output output) {
         }
     }
 
-    // Custom cardinality calculation for e.g. MATCH (n) RETURN 5
-    mlir::Value cardinality;
-    // Output would not normally be in a loop body, but toplevel
-    const bool returningNonLooped = anchorBlock == _entryBlock;
-    if (returningNonLooped && _innermostLoopBody) {
-        // but if we have all constants, then it need be moved to the inner most loop to
-        // match cardinality. An expression over constants alone is one of them: it is
-        // bound where its operands are, above the loop whose rows it is projected over
-        const bool allConstants = llvm::all_of(columns, [this](mlir::Value column) { return yieldsConstantColumn(column, _constantColumns); });
-
-        if (allConstants) {
-            anchorBlock = _innermostLoopBody;
-            cardinality = _innermostCardinality;
-        }
-    }
-
     setInsertionInto(anchorBlock);
 
     return _builder.create<nl::Output>(_builder.getUnknownLoc(),
                                        columns,
                                        mlir::Value(),
                                        mlir::Value(),
-                                       cardinality,
+                                       mlir::Value(),
                                        output.getColumnNamesAttr());
 }
 

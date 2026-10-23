@@ -1084,15 +1084,16 @@ func.func @main() {
 )mlir";
 
 // CALL db.labels() YIELD label RETURN 5: a projection of only constants over a drive
-// loop. The constant has no per-row column to size the emission, so the output nests
-// in the drive loop and takes its row count from a loop variable - here a label-ID
+// loop. The constant is laid out over the yielded column, so the output nests in the
+// drive loop and takes its row count from that column - here a label-ID
 // chunk, not the node-ID chunk a scan would bind, which is why nl.output's cardinality
 // driver accepts a chunk of any element type.
 constexpr const char* labelsConstantProgram = R"mlir(
 func.func @main() {
   %label = db.call_procedure("db.labels", {}, {}) yields ["label"] : () -> !db.column<none>
   %c = db.constant(5 : i64)
-  db.output(%c) : !db.column<i64>
+  %rows = db.broadcast_constant(%c, %label) : (!db.column<i64>, !db.column<none>) -> !db.column<none>
+  db.output(%rows) : !db.column<none>
   return
 }
 )mlir";

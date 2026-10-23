@@ -5392,6 +5392,8 @@ void DBProgramGenerator::generateOutput(const Projection* projection, const Unio
     llvm::SmallVector<llvm::StringRef> outputNames;
     translateProjection(projection, variableColumns, outputted, outputNames);
 
+    broadcastConstantProjection(outputted);
+
     buildNamedPathItems(projection, outputted);
     expandPathItems(projection, outputted);
 
@@ -7140,10 +7142,15 @@ void DBProgramGenerator::translateDistinct(const Projection* projection,
     llvm::SmallVector<size_t> dedupedCarriedColumns;
     collectCarriedRowColumns(carriedColumns, dedupedCarriedColumns, dedupedColumns);
 
-    // Every column is constant, so the projection is one row repeated as many times as
-    // the query matched: no column tells two of those rows apart, and the one the dedup
-    // keeps is the first of them - the projection capped at a single row
-    if (dedupedColumns.empty()) {
+    // Every column is constant, or one laid out over the rows, so the projection is one row
+    // repeated as many times as the query matched: no column tells two of those rows apart,
+    // and the one the dedup keeps is the first of them - the projection capped at a single row
+    const bool repeatsOneRow = dedupedCarriedColumns.empty()
+                            && llvm::all_of(dedupedColumns, [](mlir::Value column) {
+                                   return mlir::isa_and_nonnull<mlir::db::BroadcastConstant>(column.getDefiningOp());
+                               });
+
+    if (repeatsOneRow) {
         translateDistinctOverConstants(projection, projected);
     } else {
         llvm::SmallVector<mlir::Value> deduped;
