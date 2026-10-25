@@ -163,23 +163,12 @@ ListShape selectedListShape(const Expr* value) {
     return namesNoShape ? ListShape(EvaluatedType::Invalid, 1) : shape;
 }
 
-// A type-erased cell concatenates as the text it holds, which is how the element of a list
-// joins a string.
-bool concatenatesAny(TypePairBitset pair) {
-    return pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::String);
-}
-
-// Two cells join as the texts they hold under '||', which concatenates whatever it is
-// given. '+' computes over them instead, as the other arithmetic operators do.
-bool concatenatesTwoAnyValues(TypePairBitset pair) {
-    return pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Any);
-}
-
-// A number joins a string as the text Cypher writes it with: 1 + ' apples' is '1 apples'.
-// A boolean does not: true + 'x' has no meaning in Cypher.
+// A number or a boolean joins a string as the text Cypher writes it with: 1 + ' apples' is
+// '1 apples' and true + 'x' is 'truex'.
 bool concatenatesAsText(TypePairBitset pair) {
     return pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::String)
-        || pair == TypePairBitset(EvaluatedType::Double, EvaluatedType::String);
+        || pair == TypePairBitset(EvaluatedType::Double, EvaluatedType::String)
+        || pair == TypePairBitset(EvaluatedType::Bool, EvaluatedType::String);
 }
 
 // Whether an arithmetic operator's operands are a type-erased cell and a number, or two
@@ -583,11 +572,12 @@ void ExprAnalyzer::analyzeBinaryExpr(BinaryExpr* expr) {
                 break;
             }
 
-            // A cell meets a string row by row: holding text or a number it joins it as
-            // text, holding a list it takes it as an element
+            // A cell meets a string or a boolean row by row: holding text or a number it
+            // joins it as text, holding a list it takes it as an element
             const bool addsATextToAny = pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::String)
                                      || pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Char);
-            if (addsATextToAny) {
+            const bool addsABooleanToAny = pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Bool);
+            if (addsATextToAny || addsABooleanToAny) {
                 type = EvaluatedType::Any;
                 break;
             }
@@ -638,8 +628,17 @@ void ExprAnalyzer::analyzeBinaryExpr(BinaryExpr* expr) {
                 break;
             }
 
-            if (concatenatesAny(pair) || concatenatesTwoAnyValues(pair)) {
+            // A type-erased cell joins a string where its row holds a string, a list where
+            // it holds a list, and is a type error where it holds anything else
+            if (pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::String)) {
                 type = EvaluatedType::String;
+                break;
+            } else if (pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::List)) {
+                type = EvaluatedType::List;
+                expr->setListShape(ListShape(EvaluatedType::Invalid, 1));
+                break;
+            } else if (pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Any)) {
+                type = EvaluatedType::Any;
                 break;
             }
 

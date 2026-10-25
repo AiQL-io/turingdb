@@ -3206,7 +3206,7 @@ def AddOp : BinaryOp<"add", [NoMemoryEffect, DeclareOpInterfaceMethods<Condition
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def ConcatOp : BinaryOp<"concat", [Pure]> {
+def ConcatOp : BinaryOp<"concat", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Row-wise concatenation of two string or two list columns";
 
   let arguments = (ins Column:$lhs, Column:$rhs);

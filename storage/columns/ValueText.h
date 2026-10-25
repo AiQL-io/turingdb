@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <span>
+#include <string>
 #include <string_view>
 #include <type_traits>
 
@@ -14,8 +15,8 @@
 
 namespace db {
 
-// Longer than the text of any number Cypher writes: an int64 spends 20 characters, and the
-// shortest round trip of a double spends fewer than this.
+// Longer than the text of any number, instant or duration Cypher writes: an int64 spends 20
+// characters, an instant 30, a duration 29, and the shortest round trip of a double fewer.
 constexpr size_t valueTextCapacity = 32;
 
 using ValueTextScratch = std::array<char, valueTextCapacity>;
@@ -28,6 +29,15 @@ template <typename Value>
 std::string_view valueTextInto(const Value value, std::span<char> scratch) {
     if constexpr (std::is_same_v<Value, types::Bool::Primitive>) {
         return value ? "true" : "false";
+    } else if constexpr (std::is_same_v<Value, types::DateTime::Primitive>
+                      || std::is_same_v<Value, types::Duration::Primitive>) {
+        std::string text;
+        Value::format(text, value);
+
+        const size_t size = std::min(text.size(), scratch.size());
+        std::copy_n(text.begin(), size, scratch.begin());
+
+        return {scratch.data(), size};
     } else {
         const auto written = fmt::format_to_n(scratch.data(), scratch.size(), "{}", value);
         size_t size = std::min(written.size, scratch.size());

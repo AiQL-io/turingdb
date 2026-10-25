@@ -449,7 +449,8 @@ struct TemporalArithmeticKindPairs<Op> {
     >::Type;
 };
 
-// A cell meets a string under '+' alone, which joins it as text or as a list element
+// A cell meets a string or a boolean under '+' alone, which joins it as text or as a list
+// element
 template <ColumnOperator Op>
 struct CellTextKindPairs {
     using Pairs = std::tuple<>;
@@ -459,8 +460,21 @@ template <>
 struct CellTextKindPairs<OP_ADD> {
     using Pairs = TupleFlatten<
         ListElementKindPairs<types::String::Primitive>::Pairs,
-        ListElementKindPairs<types::String::OwningPrimitive>::Pairs
+        ListElementKindPairs<types::String::OwningPrimitive>::Pairs,
+        ListElementKindPairs<types::Bool::Primitive>::Pairs
     >::Type;
+};
+
+// A cell meets a list under '+' alone, which joins the list the cell holds or takes the
+// cell as one element
+template <ColumnOperator Op>
+struct CellListKindPairs {
+    using Pairs = std::tuple<>;
+};
+
+template <>
+struct CellListKindPairs<OP_ADD> {
+    using Pairs = ListElementKindPairs<ListView>::Pairs;
 };
 
 // A cell meets the null literal under '+' alone, which appends it to the list the cell holds
@@ -504,6 +518,7 @@ struct PairRestrictions<Op> {
         typename TemporalArithmeticKindPairs<Op>::Pairs,
 
         typename CellTextKindPairs<Op>::Pairs,
+        typename CellListKindPairs<Op>::Pairs,
         typename CellNullKindPairs<Op>::Pairs
     >;
 
@@ -522,25 +537,24 @@ struct PairRestrictions<Op> {
         OptionalKindPairs<types::String::Primitive, types::String::Primitive>::Pairs,
         OptionalKindPairs<ListView, ListView>::Pairs,
 
-        // A cell joins a list as the list it holds, or as one element
-        OptionalKindPairs<ListView, ListElementView>::Pairs,
-
         // A string a function produced owns its characters - what type() and a CSV field
         // answer - and concatenates with one the graph lends, either way round
         OptionalKindPairs<types::String::Primitive, types::String::OwningPrimitive>::Pairs,
         OptionalKindPairs<types::String::OwningPrimitive, types::String::Primitive>::Pairs,
         OptionalKindPairs<types::String::OwningPrimitive, types::String::OwningPrimitive>::Pairs,
 
-        // A type-erased cell concatenates as the text it holds, which is how the element
-        // of a list joins a string: [x IN xs | x + ' expert']
+        // A type-erased cell joins a string or a list where its row holds one
         ListElementKindPairs<types::String::Primitive>::Pairs,
         ListElementKindPairs<types::String::OwningPrimitive>::Pairs,
+        ListElementKindPairs<ListView>::Pairs,
         OptionalKindPairs<ListElementView, ListElementView>::Pairs,
 
-        // A number joins a string as the text Cypher writes it with: 1 + ' apples'
+        // A number or a boolean joins a string as the text Cypher writes it with:
+        // 1 + ' apples', true + 'x'
         TextKindPairs<types::Int64::Primitive>::Pairs,
         TextKindPairs<types::UInt64::Primitive>::Pairs,
-        TextKindPairs<types::Double::Primitive>::Pairs
+        TextKindPairs<types::Double::Primitive>::Pairs,
+        TextKindPairs<types::Bool::Primitive>::Pairs
     >;
 
     using AllowedMixed = AllowedMixedList<>;

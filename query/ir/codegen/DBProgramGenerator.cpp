@@ -8782,20 +8782,21 @@ void DBProgramGenerator::translateBinaryExpr(const Expr* expr, const BinaryExpr*
         break;
         case BinaryOperator::Add: {
             const EvaluatedType resultType = binExpr->getType();
-            const bool isConcatenation = resultType == EvaluatedType::String || resultType == EvaluatedType::List;
+
+            // A type-erased cell joins a list as the list it holds or as one element of it,
+            // which only its row says, so an add over one is decided row by row
+            const bool addsACell = lhsExpr->getType() == EvaluatedType::Any
+                                || rhsExpr->getType() == EvaluatedType::Any;
+            const bool joinsAsText = resultType == EvaluatedType::String;
+            const bool joinsAsList = resultType == EvaluatedType::List;
+            const bool isConcatenation = !addsACell && (joinsAsText || joinsAsList);
 
             if (isConcatenation) {
                 // A scalar concatenated with a list joins it as the one-element list it
-                // stands for, so both sides of the concatenation are lists. A cell may hold
-                // a list itself, so the concatenation reads it row by row instead.
+                // stands for, so both sides of the concatenation are lists
                 const bool concatenatesLists = resultType == EvaluatedType::List;
-                const auto joinsAsAList = [](const Expr* operand) {
-                    const EvaluatedType operandType = operand->getType();
-                    return operandType != EvaluatedType::List && operandType != EvaluatedType::Any;
-                };
-
-                const bool lhsJoinsAList = concatenatesLists && joinsAsAList(lhsExpr);
-                const bool rhsJoinsAList = concatenatesLists && joinsAsAList(rhsExpr);
+                const bool lhsJoinsAList = concatenatesLists && lhsExpr->getType() != EvaluatedType::List;
+                const bool rhsJoinsAList = concatenatesLists && rhsExpr->getType() != EvaluatedType::List;
 
                 const mlir::Value lhsColumn = lhsJoinsAList ? singletonList(lhs) : lhs;
                 const mlir::Value rhsColumn = rhsJoinsAList ? singletonList(rhs) : rhs;

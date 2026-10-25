@@ -27,3 +27,7 @@ add_call_v3_test(test_query_ir_any_reduce_null_body AnyReduceNullBodyTest.cpp)
 add_call_v3_test(test_query_ir_any_map_value_collected AnyMapValueCollectedTest.cpp)
 
 add_call_v3_test(test_query_ir_any_cell_plus_null AnyCellPlusNullTest.cpp)
+
+add_call_v3_test(test_query_ir_any_concatenation_over_no_row AnyConcatenationOverNoRowTest.cpp)
+
+add_call_v3_test(test_query_ir_any_cell_addition_type_error AnyCellAdditionTypeErrorTest.cpp)

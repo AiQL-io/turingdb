@@ -48,18 +48,19 @@ Speculation::Speculatability speculatableOverNumbers(Operation* op) {
     return speculatableWhen(llvm::all_of(op->getOperands(), isNumberColumn));
 }
 
-// A tagged cell, or a column whose type lowering resolves, may hold a value that is no
-// boolean, which a logical operator raises on. The null literal is a nullable none.
+// A tagged cell, or a column whose type lowering resolves, may hold a value of any type. The
+// null literal is a nullable none.
+bool mayHoldAnyType(Value operand) {
+    const ColumnType column = cast<ColumnType>(operand.getType());
+    const Type element = columnElement(operand);
+    const bool unresolved = isa<NoneType>(column.getType()) && isa<NoneType>(element);
+
+    return unresolved || isa<storage::AnyType, storage::MapElementType>(element);
+}
+
+// A logical operator raises on a value that is no boolean
 Speculation::Speculatability speculatableOverTruthValues(Operation* op) {
-    const bool mayReadANonBoolean = llvm::any_of(op->getOperands(), [](Value operand) {
-        const ColumnType column = cast<ColumnType>(operand.getType());
-        const Type element = columnElement(operand);
-        const bool unresolved = isa<NoneType>(column.getType()) && isa<NoneType>(element);
-
-        return unresolved || isa<storage::AnyType, storage::MapElementType>(element);
-    });
-
-    return speculatableWhen(!mayReadANonBoolean);
+    return speculatableWhen(llvm::none_of(op->getOperands(), mayHoldAnyType));
 }
 
 template <typename... ElementTypes>
@@ -2483,6 +2484,11 @@ Speculation::Speculatability NotOp::getSpeculatability() {
 
 Speculation::Speculatability AddOp::getSpeculatability() {
     return speculatableOverNumbers(getOperation());
+}
+
+// '||' raises on a value that is neither a string nor a list
+Speculation::Speculatability ConcatOp::getSpeculatability() {
+    return speculatableWhen(llvm::none_of(getOperation()->getOperands(), mayHoldAnyType));
 }
 
 Speculation::Speculatability SubOp::getSpeculatability() {
