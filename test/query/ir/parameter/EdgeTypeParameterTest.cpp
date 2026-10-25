@@ -71,6 +71,15 @@ TEST_F(EdgeTypeParameterTest, aTypeTestReadsTheParameter) {
     expectCount("MATCH ()-[e]->() WHERE e:$type RETURN count(e)", parameters, "3");
 }
 
+TEST_F(EdgeTypeParameterTest, aParameterIsOneTypeOfATypeExpression) {
+    ParameterMap parameters;
+    setString(parameters, "type", "KNOWS_WELL");
+
+    expectCount("MATCH ()-[e:!$type]->() RETURN count(e)", parameters, "15");
+    expectCount("MATCH ()-[e:(INTERESTED_IN|$type)&!INTERESTED_IN]->() RETURN count(e)", parameters, "3");
+    expectCount("MATCH ()-[:!$type*1..2]->() RETURN count(*)", parameters, "15");
+}
+
 TEST_F(EdgeTypeParameterTest, aParameterTypeOnAHopFromALabelledNode) {
     ParameterMap parameters;
     setString(parameters, "type", "KNOWS_WELL");
@@ -178,7 +187,7 @@ TEST_F(EdgeTypeParameterTest, twoTypesOnACreatedEdgeAreRejected) {
     ParameterMap parameters;
     setString(parameters, "type", "MENTORS");
 
-    runWriteExpectingError("CREATE (a:Mentor)-[:$type|ADVISES]->(b:Mentee)", parameters, "An edge cannot have more than one edge type");
+    runWriteExpectingError("CREATE (a:Mentor)-[:$type|ADVISES]->(b:Mentee)", parameters, "An edge in a write pattern takes exactly one edge type");
 }
 
 TEST_F(EdgeTypeParameterTest, anUndefinedParameterIsRejected) {

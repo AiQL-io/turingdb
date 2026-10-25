@@ -225,6 +225,7 @@ void VariableDependencyGraph::registerPatternElement(const PatternElement* ptn) 
         const EdgePatternData* edgeData = edge->getData();
         if (edgeData) {
             edgeVar->setEdgeTypeConstraint(edgeData->edgeTypeConstraints());
+            edgeVar->addEdgeTypeExprConstraints(edgeData->edgeTypeExprConstraints());
         }
 
         // The quantifier rides the edge-producing dependency: the node it lands on is
@@ -311,6 +312,7 @@ VariableDependency* VariableDependencyGraph::getOrCreateVariable(const EntityPat
         const NodePatternData* data = node->getData();
         if (data) {
             var->addLabelConstraints(data->labelConstraints());
+            var->addLabelExprConstraints(data->labelExprConstraints());
         }
     }
 

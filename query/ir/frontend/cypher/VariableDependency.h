@@ -17,6 +17,7 @@ namespace db {
 namespace rg = ranges;
 namespace rv = rg::views;
 
+class LabelExpr;
 class VarDecl;
 class VariableDependencyGraph;
 
@@ -52,6 +53,8 @@ public:
     const VarDecl* getDecl() const { return _decl; }
 
     const std::optional<Constraint>& constraints() const { return _constraints; }
+    std::span<const LabelExpr* const> labelExprConstraints() const { return _labelExprConstraints; }
+    std::span<const LabelExpr* const> edgeTypeExprConstraints() const { return _edgeTypeExprConstraints; }
 
     bool isIsolated() const { return edges().empty(); }
 
@@ -64,7 +67,9 @@ public:
     void addOutgoing(DependencyEdge* newEdge);
 
     void addLabelConstraints(std::span<const LabelRef> labels);
+    void addLabelExprConstraints(std::span<const LabelExpr* const> labelExprs);
     void setEdgeTypeConstraint(std::span<const EdgeTypeRef> types);
+    void addEdgeTypeExprConstraints(std::span<const LabelExpr* const> typeExprs);
 
 private:
     friend VariableDependencyGraph;
@@ -73,6 +78,8 @@ private:
     Edges _outgoing;
 
     std::optional<Constraint> _constraints;
+    std::vector<const LabelExpr*> _labelExprConstraints;
+    std::vector<const LabelExpr*> _edgeTypeExprConstraints;
 
     std::string _name;
     const VarDecl* _decl {nullptr};

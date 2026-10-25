@@ -5,7 +5,6 @@
 #include "AnalyzeException.h"
 #include "ExprAnalyzer.h"
 #include "FunctionInvocation.h"
-#include "SymbolChain.h"
 #include "YieldClause.h"
 #include "YieldItems.h"
 #include "decl/EvaluatedType.h"
@@ -414,9 +413,8 @@ void ReadStmtAnalyzer::analyze(NodePattern* nodePattern) {
     NodePatternData* data = NodePatternData::create(_ast);
     nodePattern->setData(data);
 
-    const auto& labels = nodePattern->labels();
-    if (labels && !labels->empty()) {
-        data->addLabelConstraints(labels);
+    if (const LabelExpr* labelExpr = nodePattern->getLabelExpr()) {
+        data->addLabelExpr(labelExpr);
     }
 
     const MapLiteral* properties = nodePattern->getProperties();
@@ -481,9 +479,8 @@ void ReadStmtAnalyzer::analyze(EdgePattern* edgePattern) {
     EdgePatternData* data = EdgePatternData::create(_ast);
     edgePattern->setData(data);
 
-    const auto& types = edgePattern->types();
-    if (types && !types->empty()) {
-        data->addEdgeTypeConstraints(types);
+    if (const LabelExpr* typeExpr = edgePattern->getLabelExpr()) {
+        data->addEdgeTypeExpr(typeExpr);
     }
 
     const QuantifiedPath* qp = edgePattern->getQuantifiedPath();
@@ -597,8 +594,8 @@ void ReadStmtAnalyzer::analyzeHops(EdgePattern* walk) {
         EdgePatternData* hopData = EdgePatternData::create(_ast);
         hop->setData(hopData);
 
-        if (const SymbolChain* types = hop->types()) {
-            hopData->addEdgeTypeConstraints(types);
+        if (const LabelExpr* typeExpr = hop->getLabelExpr()) {
+            hopData->addEdgeTypeExpr(typeExpr);
         }
 
         wheres.push_back(hop->getWhere());

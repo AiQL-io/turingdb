@@ -10,11 +10,11 @@
 #include "Literal.h"
 #include "EdgePattern.h"
 #include "ExprAnalyzer.h"
+#include "LabelExpr.h"
 #include "NodePattern.h"
 #include "Pattern.h"
 #include "PatternElement.h"
 #include "Symbol.h"
-#include "SymbolChain.h"
 #include "decl/DeclContext.h"
 #include "decl/EvaluatedType.h"
 #include "decl/PatternData.h"
@@ -220,10 +220,8 @@ void WriteStmtAnalyzer::analyze(NodePattern* nodePattern) {
                            nodePattern);
             }
 
-            const auto& labels = nodePattern->labels();
-
             // Already existing vars cannot have constraints
-            if (nodePattern->getData() != nullptr || labels != nullptr) {
+            if (nodePattern->getData() != nullptr || nodePattern->getLabelExpr() != nullptr) {
                 throwError("Variable already defined", nodePattern);
             }
 
@@ -242,12 +240,16 @@ void WriteStmtAnalyzer::analyze(NodePattern* nodePattern) {
     nodePattern->setDecl(decl);
     nodePattern->setData(data);
 
-    const auto& labels = nodePattern->labels();
-    if (labels == nullptr) {
+    const LabelExpr* labelExpr = nodePattern->getLabelExpr();
+    if (labelExpr == nullptr) {
         throwError("Node pattern must have at least one label", nodePattern);
     }
 
-    data->addLabelConstraints(labels);
+    if (labelExpr->getKind() != LabelExpr::Kind::LABELS) {
+        throwError("Labels in a write pattern can only be joined by ':' or '&'", nodePattern);
+    }
+
+    data->addLabelConstraints(labelExpr->getLabels());
 
     const MapLiteral* properties = nodePattern->getProperties();
     if (properties) {
@@ -316,18 +318,16 @@ void WriteStmtAnalyzer::analyze(EdgePattern* edgePattern) {
         throwError("Variable length relationships cannot be used in a write pattern", edgePattern);
     }
 
-    if (edgePattern->types() == nullptr) {
+    const LabelExpr* typeExpr = edgePattern->getLabelExpr();
+    if (typeExpr == nullptr) {
         throwError("Edge pattern must have at least one edge type", edgePattern);
     }
 
-    const auto& types = edgePattern->types();
-    const SymbolChain::ParameterVector& typeParameters = types->getParameters();
-
-    if (types->size() + typeParameters.size() > 1) {
-        throwError("An edge cannot have more than one edge type", edgePattern);
+    if (!typeExpr->namesOneLabel()) {
+        throwError("An edge in a write pattern takes exactly one edge type, with no '|', '&', ':' or '!'", edgePattern);
     }
 
-    data->addEdgeTypeConstraints(types);
+    data->addEdgeTypeConstraints(typeExpr->getLabels());
 
     const MapLiteral* properties = edgePattern->getProperties();
     if (properties) {

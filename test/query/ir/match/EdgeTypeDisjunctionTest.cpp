@@ -80,7 +80,7 @@ protected:
         const QueryStatus status = runQuery(query, &sink);
 
         EXPECT_FALSE(status.isOk()) << "query: " << query;
-        EXPECT_NE(status.getError().find("An edge cannot have more than one edge type"), std::string::npos)
+        EXPECT_NE(status.getError().find("An edge in a write pattern takes exactly one edge type"), std::string::npos)
             << "query: " << query << "\nerror: " << status.getError();
     }
 
@@ -199,6 +199,6 @@ TEST_F(EdgeTypeDisjunctionTest, MergePatternWithOneTypeClearsTheTypeGuard) {
     NullSink sink;
     const QueryStatus status = runQuery("MERGE (a:Person)-[:KNOWS_WELL]->(b:Person)", &sink);
 
-    EXPECT_EQ(status.getError().find("An edge cannot have more than one edge type"), std::string::npos)
+    EXPECT_EQ(status.getError().find("An edge in a write pattern takes exactly one edge type"), std::string::npos)
         << "error: " << status.getError();
 }

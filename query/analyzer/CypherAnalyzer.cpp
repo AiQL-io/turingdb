@@ -18,7 +18,6 @@
 #include "ReadStmtAnalyzer.h"
 #include "Symbol.h"
 #include "SourceManager.h"
-#include "SymbolChain.h"
 #include "WriteStmtAnalyzer.h"
 #include "ExprAnalyzer.h"
 #include "QueryCommand.h"
@@ -2050,9 +2049,8 @@ void CypherAnalyzer::analyze(const CreateNodePropertyIndexQuery* query) {
     const NodePattern* node = query->nodePattern();
     bioassert(node, "Failed to get node pattern.");
 
-    const SymbolChain* labels = node->labels();
     const MapLiteral* properties = node->getProperties();
-    const bool haveLabelConstraints = labels && !labels->empty();
+    const bool haveLabelConstraints = node->getLabelExpr() != nullptr;
     const bool havePropertyConstraints = properties && !properties->empty();
     const bool havePredicate = node->getWhere() != nullptr;
     if (haveLabelConstraints || havePropertyConstraints || havePredicate) {
@@ -2088,9 +2086,8 @@ void CypherAnalyzer::analyze(const CreateEdgePropertyIndexQuery* query) {
     const EdgePattern* edge = query->edgePattern();
     bioassert(edge, "Failed to get edge pattern.");
 
-    const SymbolChain* types = edge->types();
     const MapLiteral* properties = edge->getProperties();
-    const bool haveTypeConstraints = types && !types->empty();
+    const bool haveTypeConstraints = edge->getLabelExpr() != nullptr;
     const bool havePropertyConstraints = properties && !properties->empty();
     const bool havePredicate = edge->getWhere() != nullptr;
     if (haveTypeConstraints || havePropertyConstraints || havePredicate) {

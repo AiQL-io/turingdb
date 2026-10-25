@@ -53,6 +53,7 @@ class EntityTypeExpr;
 class Expr;
 class ExprChain;
 class IndexExpr;
+class LabelExpr;
 class Literal;
 class ListLiteral;
 class ListComprehensionExpr;
@@ -86,6 +87,7 @@ class SinglePartQuery;
 class UnionQuery;
 class ConditionalQuery;
 class Stmt;
+class SymbolChain;
 class WhereClause;
 class WithStmt;
 class NextSegmentStmt;
@@ -104,6 +106,7 @@ public:
     using ColumnPredicate = llvm::function_ref<bool(mlir::Value)>;
     using VariableColumnBinding = llvm::function_ref<void(const VarDecl*, std::string_view, mlir::Value)>;
     using CaseRegionGenerator = llvm::function_ref<mlir::Value(mlir::Value)>;
+    using LabelSetCheck = llvm::function_ref<mlir::Value(const SymbolChain*)>;
 
     // Maps a Cypher variable to the last column defined for it, the one the projection
     // and its ORDER BY read
@@ -551,9 +554,9 @@ private:
 
     const PartScope::WrittenEntity* findWrittenEntity(const VarDecl* decl) const;
 
-    static bool writtenEntityHasTypes(const PartScope::WrittenEntity& written,
-                                      std::span<const std::string_view> typeNames,
-                                      bool isNode);
+    static bool writtenEntityPasses(const PartScope::WrittenEntity& written,
+                                    const LabelExpr* labelExpr,
+                                    bool isNode);
 
     using CarriedEntities = llvm::SmallVector<std::pair<const VarDecl*, PartScope::WrittenEntity>>;
 
@@ -1067,6 +1070,12 @@ private:
     mlir::Value checkNodeLabels(mlir::Value nodeColumn, std::span<const LabelRef> labels, bool nullable);
     mlir::Value checkEdgeType(mlir::Value edgeTypeColumn, std::span<const EdgeTypeRef> edgeTypes, bool nullable);
 
+    // One check per set of names in the expression, joined by db.and, db.or and db.not. A
+    // set is a conjunction for an edge too: e:A:B is two type checks joined by db.and.
+    mlir::Value checkNodeLabelExpr(mlir::Value nodeColumn, const LabelExpr* labelExpr, bool nullable);
+    mlir::Value checkEdgeTypeExpr(mlir::Value edgeTypeColumn, const LabelExpr* labelExpr, bool nullable);
+    mlir::Value combineLabelSetChecks(const LabelExpr* labelExpr, LabelSetCheck checkLabelSet);
+
     // A named edge variable has one occurrence per time the pattern walks it, all equated
     // by the identity filter, so the first one's type column answers for the variable. Null
     // where no traversal published one, as below a barrier that republished only the edge.
@@ -1408,9 +1417,10 @@ private:
                            llvm::SmallVectorImpl<const VarDecl*>& imports,
                            llvm::SmallVectorImpl<mlir::Value>& columns);
 
-    // Appends the mask of one inner node's label constraint, read over the hop column that
-    // node is bound to
+    // Appends the masks of one inner node's label constraints, or of one hop's type
+    // constraints, read over the hop column that node or edge is bound to
     void collectHopLabelMask(const NodePattern* node, mlir::Value column, llvm::SmallVectorImpl<mlir::Value>& masks);
+    void collectHopTypeMask(const EdgePattern* hop, mlir::Value column, llvm::SmallVectorImpl<mlir::Value>& masks);
 
     // The column a consumer reading a list is handed for @param column: the column itself,
     // or - when it holds paths - the list each path expands to for the variable of

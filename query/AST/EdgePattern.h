@@ -8,9 +8,9 @@ namespace db {
 
 class CypherAST;
 class Expr;
+class LabelExpr;
 class NodePattern;
 class Symbol;
-class SymbolChain;
 class EdgePatternData;
 class QuantifiedPath;
 class VarDecl;
@@ -28,7 +28,7 @@ public:
 
     Direction getDirection() const { return _direction; }
 
-    const SymbolChain* types() const { return _types; }
+    LabelExpr* getLabelExpr() const { return _labelExpr; }
 
     EdgePatternData* getData() const { return _data; }
 
@@ -59,7 +59,7 @@ public:
 
     void setDirection(Direction direction) { _direction = direction; }
 
-    void setTypes(SymbolChain* types) { _types = types; }
+    void setLabelExpr(LabelExpr* labelExpr) { _labelExpr = labelExpr; }
 
     void setData(EdgePatternData* data) { _data = data; }
 
@@ -76,7 +76,7 @@ public:
 
 private:
     Direction _direction {Direction::Undirected};
-    SymbolChain* _types {nullptr};
+    LabelExpr* _labelExpr {nullptr};
     EdgePatternData* _data {nullptr};
     QuantifiedPath* _quantifiedPath {nullptr};
     std::vector<EdgePattern*> _hops;
