@@ -484,8 +484,8 @@ ChangeResult<Change*> GraphManager::getChange(const Graph* graph, ChangeID chang
     return _changes.getChange(graph, changeID);
 }
 
-ChangeResult<void> GraphManager::submitChange(ChangeAccessor& accessor, JobSystem& jobSystem) {
-    return _changes.submitChange(accessor, jobSystem);
+ChangeResult<void> GraphManager::submitChange(ChangeAccessor& accessor, JobSystem& jobSystem, SubmitMode mode) {
+    return _changes.submitChange(accessor, jobSystem, mode);
 }
 
 ChangeResult<void> GraphManager::deleteChange(ChangeAccessor& accessor, ChangeID changeID) {

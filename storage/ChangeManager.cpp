@@ -44,7 +44,7 @@ ChangeResult<Change*> ChangeManager::getChange(const Graph* graph, ChangeID chan
     return it->second.get();
 }
 
-ChangeResult<void> ChangeManager::submitChange(ChangeAccessor& access, JobSystem& jobsystem) {
+ChangeResult<void> ChangeManager::submitChange(ChangeAccessor& access, JobSystem& jobsystem, SubmitMode mode) {
     std::unique_lock guard(_changesLock);
     const Graph* graph = access.getGraph();
 
@@ -54,7 +54,20 @@ ChangeResult<void> ChangeManager::submitChange(ChangeAccessor& access, JobSystem
     }
 
     auto& change = findIt->second;
-    if (auto res = change->submit(jobsystem); !res) {
+
+    if (mode == SubmitMode::SQUASH) {
+        for (const auto& [pair, other] : _changes) {
+            const bool isOtherChange = other.get() != change.get();
+            const bool sameGraph = pair._graph == graph;
+
+            if (isOtherChange && sameGraph && change->hasCommit(other->baseHash())) {
+                return ChangeError::result(ChangeErrorType::COULD_NOT_ACCEPT_CHANGE,
+                                           CommitError(CommitErrorType::SQUASH_BLOCKED_BY_DEPENDENT_CHANGE));
+            }
+        }
+    }
+
+    if (auto res = change->submit(jobsystem, mode); !res) {
         return ChangeError::result(ChangeErrorType::COULD_NOT_ACCEPT_CHANGE, res.error());
     }
 

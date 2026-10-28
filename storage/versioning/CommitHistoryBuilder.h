@@ -24,6 +24,8 @@ public:
 
     void setCommitDatapartCount(size_t count);
 
+    void absorbJournal(const CommitHistory& other);
+
 private:
     CommitHistory& _history;
 };

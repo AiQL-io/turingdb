@@ -70,6 +70,12 @@ module {
     return
   }
 
+  func.func @change_submit_squash() {
+    %0 = nl.change submit_squash : !nl.chunk<!storage.change_id>
+    nl.output(%0) names ["changeID"] : !nl.chunk<!storage.change_id>
+    return
+  }
+
   func.func @change_delete() {
     %0 = nl.change delete : !nl.chunk<!storage.change_id>
     nl.output(%0) names ["changeID"] : !nl.chunk<!storage.change_id>

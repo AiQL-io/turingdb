@@ -188,6 +188,7 @@
 %token<std::string_view> COLLECT
 %token<std::string_view> CONNECT
 %token<std::string_view> SUBMIT
+%token<std::string_view> SQUASH
 %token<std::string_view> CHANGE
 %token<std::string_view> COMMIT
 %token<std::string_view> STARTS
@@ -1044,6 +1045,7 @@ changeQuery
 changeOp
     : NEW { $$ = ChangeOp::NEW; }
     | SUBMIT { $$ = ChangeOp::SUBMIT; }
+    | SUBMIT SQUASH { $$ = ChangeOp::SUBMIT_SQUASH; }
     | DELETE { $$ = ChangeOp::DELETE; }
     | LIST { $$ = ChangeOp::LIST; }
     ;
@@ -2308,6 +2310,7 @@ reservedWord
     | INDEXES { $$ = Symbol::create(ast, $1); }
     | PARQUET { $$ = Symbol::create(ast, $1); }
     | SUBMIT { $$ = Symbol::create(ast, $1); }
+    | SQUASH { $$ = Symbol::create(ast, $1); }
     | CHANGE { $$ = Symbol::create(ast, $1); }
     | STARTS { $$ = Symbol::create(ast, $1); }
     | UNIQUE { $$ = Symbol::create(ast, $1); }

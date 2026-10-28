@@ -56,6 +56,10 @@ NLChangeOperation toRuntimeChangeOperation(storage::ChangeOperation operation) {
         case storage::ChangeOperation::List:
             return NLChangeOperation::List;
         break;
+
+        case storage::ChangeOperation::SubmitSquash:
+            return NLChangeOperation::SubmitSquash;
+        break;
     }
 
     throw IRException("Unhandled change operation");

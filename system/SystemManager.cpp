@@ -226,8 +226,8 @@ ChangeResult<Change*> SystemManager::getChange(const Graph* graph, ChangeID chan
     return _graphManager.getChange(graph, changeID);
 }
 
-ChangeResult<void> SystemManager::submitChange(ChangeAccessor& accessor) {
-    return _graphManager.submitChange(accessor, _jobSystem);
+ChangeResult<void> SystemManager::submitChange(ChangeAccessor& accessor, SubmitMode mode) {
+    return _graphManager.submitChange(accessor, _jobSystem, mode);
 }
 
 CommitResult<void> SystemManager::commitChange(ChangeAccessor& accessor) {

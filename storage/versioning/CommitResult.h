@@ -17,6 +17,7 @@ enum class CommitErrorType : uint8_t {
     BAD_PATCH_NODE_LABELSET,
     COULD_NOT_CREATE_NODE_CONTAINER,
     NO_PENDING_COMMIT,
+    SQUASH_BLOCKED_BY_DEPENDENT_CHANGE,
 
     _SIZE,
 };
@@ -30,7 +31,8 @@ using CommitErrorTypeDescription = EnumToString<CommitErrorType>::Create<
     EnumStringPair<CommitErrorType::BUILD_DATAPART_FAILED, "Could not build datapart">,
     EnumStringPair<CommitErrorType::BAD_PATCH_NODE_LABELSET, "Patch node had invalid labelset">,
     EnumStringPair<CommitErrorType::COULD_NOT_CREATE_NODE_CONTAINER, "Failed to create NodeContainer">,
-    EnumStringPair<CommitErrorType::NO_PENDING_COMMIT, "No pending commit">
+    EnumStringPair<CommitErrorType::NO_PENDING_COMMIT, "No pending commit">,
+    EnumStringPair<CommitErrorType::SQUASH_BLOCKED_BY_DEPENDENT_CHANGE, "Cannot squash: another open change is based on an intermediate commit of this change">
 >;
 
 class CommitError {

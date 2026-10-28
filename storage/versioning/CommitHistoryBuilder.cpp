@@ -12,6 +12,10 @@ void CommitHistoryBuilder::addValidIndex(const WeakArc<Index>& index) {
     _history._validIndexes.push_back(index);
 }
 
+void CommitHistoryBuilder::absorbJournal(const CommitHistory& other) {
+    _history._journal->absorb(other.journal());
+}
+
 void CommitHistoryBuilder::setCommitDatapartCount(size_t count) {
     WeakArc<DataPart>* begin = _history._allDataparts.data();
     const size_t totalCount = _history._allDataparts.size();

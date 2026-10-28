@@ -146,9 +146,11 @@ def ListAvailableGraphs : SystemOp<"list_available_graphs"> {
 def ChangeCommand : SystemOp<"change"> {
   let summary = "Create, submit, delete or list the changes of a graph";
   let description = [{
-    `CHANGE NEW` / `SUBMIT` / `DELETE` / `LIST`, selected by `change_operation`. All four
-    report change IDs, so all four share one op: new/submit/delete each act on a
-    single change and report its ID; list reports one row per open change.
+    `CHANGE NEW` / `SUBMIT` / `SUBMIT SQUASH` / `DELETE` / `LIST`, selected by
+    `change_operation`. All of them report change IDs, so all share one op:
+    new/submit/submit_squash/delete each act on a single change and report its
+    ID; list reports one row per open change. `submit` publishes every commit of
+    the change, `submit_squash` publishes its tip as one commit.
 
       %ids = db.change new : !db.column<!storage.change_id>
 

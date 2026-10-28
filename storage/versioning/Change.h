@@ -9,6 +9,7 @@
 #include "versioning/CommitResult.h"
 #include "versioning/ChangeID.h"
 #include "versioning/ChangeAccessor.h"
+#include "versioning/SubmitMode.h"
 #include "views/GraphView.h"
 
 namespace db {
@@ -41,6 +42,7 @@ public:
 
     [[nodiscard]] ChangeAccessor access() { return ChangeAccessor {this}; }
     [[nodiscard]] CommitHash baseHash() const;
+    [[nodiscard]] bool hasCommit(CommitHash hash) const { return _commitOffsets.contains(hash); }
     [[nodiscard]] ChangeID id() const { return _id; }
 
 private:
@@ -67,7 +69,7 @@ private:
 
     [[nodiscard]] CommitResult<void> commit(JobSystem& jobsystem);
     [[nodiscard]] CommitResult<void> rebase(JobSystem& jobsystem);
-    [[nodiscard]] CommitResult<void> submit(JobSystem& jobsystem);
+    [[nodiscard]] CommitResult<void> submit(JobSystem& jobsystem, SubmitMode mode);
 
     [[nodiscard]] GraphView viewGraph(CommitHash commitHash) const;
 };

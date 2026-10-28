@@ -11,6 +11,7 @@
 #include "indexes/IndexManager.h"
 #include "metadata/SupportedType.h"
 #include "versioning/Change.h"
+#include "versioning/SubmitMode.h"
 #include "versioning/CommitResult.h"
 #include "mergers/DataPartMergeResult.h"
 #include "dump/DumpResult.h"
@@ -110,8 +111,11 @@ private:
 
     void addCommit(std::unique_ptr<Commit> commit);
 
-    [[nodiscard]] CommitResult<void> submitChange(Change* change, JobSystem&);
+    [[nodiscard]] CommitResult<void> submitChange(Change* change, JobSystem&, SubmitMode mode);
 
     [[nodiscard]] Commit::CommitSpan getCommitsSinceCommitHash(CommitHash from) const;
+
+    [[nodiscard]] static std::unique_ptr<Commit> squashCommits(std::vector<std::unique_ptr<Commit>>& commits,
+                                                               const Commit* mainHead);
 };
 }

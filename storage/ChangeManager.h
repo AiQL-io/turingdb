@@ -6,6 +6,7 @@
 #include "versioning/ChangeResult.h"
 #include "versioning/ChangeID.h"
 #include "versioning/Change.h"
+#include "versioning/SubmitMode.h"
 
 #include "RWSpinLock.h"
 
@@ -46,7 +47,7 @@ public:
 
     Change* createChange(Graph* graph, CommitHash baseHash);
     ChangeResult<Change*> getChange(const Graph* graph, ChangeID changeID);
-    ChangeResult<void> submitChange(ChangeAccessor& access, JobSystem&);
+    ChangeResult<void> submitChange(ChangeAccessor& access, JobSystem&, SubmitMode mode = SubmitMode::MERGE);
     ChangeResult<void> deleteChange(ChangeAccessor& access, ChangeID changeID);
 
     DataPartMergeResult<void> mergeDataParts(Graph* grapph, JobSystem& jobSystem);

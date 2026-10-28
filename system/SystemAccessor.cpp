@@ -88,8 +88,8 @@ ChangeResult<Change*> SystemAccessor::getChange(const Graph* graph, ChangeID cha
     return _sysMan->getChange(graph, changeID);
 }
 
-ChangeResult<void> SystemAccessor::submitChange(ChangeAccessor& accessor) {
-    return _sysMan->submitChange(accessor);
+ChangeResult<void> SystemAccessor::submitChange(ChangeAccessor& accessor, SubmitMode mode) {
+    return _sysMan->submitChange(accessor, mode);
 }
 
 CommitResult<void> SystemAccessor::commitChange(ChangeAccessor& accessor) {

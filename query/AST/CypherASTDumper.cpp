@@ -470,6 +470,9 @@ void CypherASTDumper::dump(std::ostream& out, const ChangeQuery* query) {
         case ChangeOp::SUBMIT:
             out << "    _" << std::hex << query << " ||--o{ SUBMIT : \"\"\n";
             break;
+        case ChangeOp::SUBMIT_SQUASH:
+            out << "    _" << std::hex << query << " ||--o{ SUBMIT_SQUASH : \"\"\n";
+            break;
     }
 }
 

@@ -29,6 +29,7 @@ enum class NLChangeOperation : uint8_t {
     Submit,
     Delete,
     List,
+    SubmitSquash,
 };
 
 // Which way a transfer moves its files. The runtime mirror of

@@ -79,6 +79,13 @@ module {
     return
   }
 
+  // CHANGE SUBMIT SQUASH
+  func.func @change_submit_squash() {
+    %ids = db.change submit_squash : !db.column<!storage.change_id>
+    db.output(%ids) names ["changeID"] : !db.column<!storage.change_id>
+    return
+  }
+
   // CHANGE DELETE
   func.func @change_delete() {
     %ids = db.change delete : !db.column<!storage.change_id>

@@ -9,6 +9,7 @@
 #include "versioning/ChangeID.h"
 #include "versioning/CommitHash.h"
 #include "versioning/ChangeResult.h"
+#include "versioning/SubmitMode.h"
 #include "dump/DumpResult.h"
 #include "dump/LoadGraphResult.h"
 #include "mergers/DataPartMergeResult.h"
@@ -84,7 +85,7 @@ public:
     // Change management
     ChangeResult<Change*> newChange(std::string_view name, CommitHash baseHash = CommitHash::head());
     ChangeResult<Change*> getChange(const Graph* graph, ChangeID changeID);
-    ChangeResult<void> submitChange(ChangeAccessor& accessor);
+    ChangeResult<void> submitChange(ChangeAccessor& accessor, SubmitMode mode = SubmitMode::MERGE);
     CommitResult<void> commitChange(ChangeAccessor& accessor);
     ChangeResult<void> deleteChange(ChangeAccessor& accessor, ChangeID changeID);
     void listChanges(std::vector<const Change*>& changes, const Graph* graph) const;

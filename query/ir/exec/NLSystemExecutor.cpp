@@ -255,11 +255,15 @@ void NLSystemExecutor::runChangeCommand(NLExecutionContext* context, NLFunctionD
         }
         break;
 
-        case NLChangeOperation::Submit: {
+        case NLChangeOperation::Submit:
+        case NLChangeOperation::SubmitSquash: {
             ChangeAccessor& changeAccessor = requireWriteTransaction(context).changeAccessor();
             const ChangeID changeID = changeAccessor.getID();
+            const SubmitMode mode = command->getOperation() == NLChangeOperation::SubmitSquash
+                                      ? SubmitMode::SQUASH
+                                      : SubmitMode::MERGE;
 
-            if (const auto result = accessor.submitChange(changeAccessor); !result) {
+            if (const auto result = accessor.submitChange(changeAccessor, mode); !result) {
                 throw IRException(fmt::format("Failed to submit change: {}",
                                               result.error().fmtMessage()));
             }

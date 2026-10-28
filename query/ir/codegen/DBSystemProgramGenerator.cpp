@@ -74,6 +74,10 @@ mlir::storage::ChangeOperation toChangeOperation(ChangeOp op) {
         case ChangeOp::LIST:
             return mlir::storage::ChangeOperation::List;
         break;
+
+        case ChangeOp::SUBMIT_SQUASH:
+            return mlir::storage::ChangeOperation::SubmitSquash;
+        break;
     }
 
     bioassert(false, "Unhandled change operation");

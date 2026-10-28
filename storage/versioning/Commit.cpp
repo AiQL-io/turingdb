@@ -44,6 +44,12 @@ CommitView Commit::view() const {
     return CommitView(this);
 }
 
+void Commit::setCounts(size_t numNodes, size_t numEdges, size_t numDataParts) {
+    _numNodes = numNodes;
+    _numEdges = numEdges;
+    _numDataParts = numDataParts;
+}
+
 std::unique_ptr<Commit> Commit::createNextCommit(VersionController* controller,
                                                  const WeakArc<CommitData>& data,
                                                  const Commit* prevCommit) {

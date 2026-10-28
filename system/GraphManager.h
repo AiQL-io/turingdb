@@ -63,7 +63,7 @@ public:
     // Change management
     ChangeResult<Change*> newChange(std::string_view graphName, CommitHash baseHash);
     ChangeResult<Change*> getChange(const Graph* graph, ChangeID changeID);
-    ChangeResult<void> submitChange(ChangeAccessor& accessor, JobSystem& jobSystem);
+    ChangeResult<void> submitChange(ChangeAccessor& accessor, JobSystem& jobSystem, SubmitMode mode = SubmitMode::MERGE);
     ChangeResult<void> deleteChange(ChangeAccessor& accessor, ChangeID changeID);
     void listChanges(std::vector<const Change*>& changes, const Graph* graph) const;
     bool hasChanges() const;

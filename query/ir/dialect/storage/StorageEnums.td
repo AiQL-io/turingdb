@@ -89,6 +89,7 @@ def ChangeOperation : I64EnumAttr<"ChangeOperation", "A change-management operat
     I64EnumAttrCase<"Submit", 1, "submit">,
     I64EnumAttrCase<"Delete", 2, "delete">,
     I64EnumAttrCase<"List", 3, "list">,
+    I64EnumAttrCase<"SubmitSquash", 4, "submit_squash">,
 ]> {
     let cppNamespace = "::mlir::storage";
 }

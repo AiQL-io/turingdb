@@ -21,8 +21,8 @@ CommitResult<void> ChangeAccessor::commit(JobSystem& jobsystem) {
     return _change->commit(jobsystem);
 }
 
-CommitResult<void> ChangeAccessor::submit(JobSystem& jobsystem) {
-    return _change->submit(jobsystem);
+CommitResult<void> ChangeAccessor::submit(JobSystem& jobsystem, SubmitMode mode) {
+    return _change->submit(jobsystem, mode);
 }
 
 ChangeID ChangeAccessor::getID() const {
