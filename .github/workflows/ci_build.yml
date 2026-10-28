@@ -47,7 +47,7 @@ jobs:
         # matrix and has not caught a Linux-clean regression. macOS is still a
         # shipped platform, built by the release matrix in ci_release.yml and by
         # ci_full_matrix_build.yml, the pre-tag check to run before a release.
-        os: ${{ fromJson(inputs.os_list || '["ubuntu-24.04-turing"]') }}
+        os: ${{ fromJson(inputs.os_list || '["ubuntu-24.04"]') }}
         python_version: ${{ fromJson(inputs.python_version_list || '["3.14"]') }}
 
     # Each matrix.os value is the literal runner label it dispatches to: the ubuntu-*-turing
@@ -64,6 +64,8 @@ jobs:
       BUILD_JOBS: 4
       CMAKE_BUILD_PARALLEL_LEVEL: 4
       CTEST_PARALLEL_LEVEL: 4
+      # The AiQL fork has no AWS secrets: the steps that need them are skipped without
+      HAS_AWS_CREDENTIALS: ${{ secrets.AWS_ACCESS_KEY_ID != '' }}
 
     steps:
     # A runner with a host to itself sets HOST_BUILD_JOBS in its container
@@ -279,6 +281,7 @@ jobs:
         python3 scripts/with_host_lock.py /tmp/turingdb-regress.lock .venv-test/bin/turingdb --help
 
     - name: Configure AWS Credentials
+      if: env.HAS_AWS_CREDENTIALS == 'true'
       uses: aws-actions/configure-aws-credentials@v4
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -315,11 +318,19 @@ jobs:
 
     # The GitHub-hosted ARM runners are ephemeral and have no local cache base.
     - name: Cache reactome dataset (GitHub-hosted Linux)
+      id: cache-reactome-github-hosted
       if: runner.os == 'Linux' && !contains(matrix.os, 'turing')
       uses: actions/cache@v4
       with:
         path: external/datasets/reactome
         key: dataset-reactome-v1
+
+    # The bucket is public, so a runner without AWS credentials fetches the file directly.
+    - name: Download reactome dataset (GitHub-hosted Linux)
+      if: steps.cache-reactome-github-hosted.outputs.cache-hit == 'false'
+      run: |
+        mkdir -p external/datasets/reactome
+        curl -fsSL -o external/datasets/reactome/reactome.jsonl https://turingdb-public.s3.eu-west-2.amazonaws.com/data/reactome.jsonl
 
     - name: Disk usage (before regress)
       run: df -h
