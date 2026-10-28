@@ -108,6 +108,7 @@ set(ast_sources
     CreateEdgePropertyIndexQuery.cpp
     DropIndexQuery.cpp
     MergeDataPartsQuery.cpp
+    SquashCommitsQuery.cpp
 
     ExprUtils.cpp
   )

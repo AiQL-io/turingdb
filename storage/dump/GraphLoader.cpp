@@ -1,6 +1,7 @@
 #include "GraphLoader.h"
 
 #include "CommitLoader.h"
+#include "HistorySquashDumper.h"
 #include "GraphInfoLoader.h"
 #include "Graph.h"
 #include "versioning/Commit.h"
@@ -23,6 +24,10 @@ DumpResult<void> GraphLoader::load(Graph* graph, const fs::Path& graphDir) {
 
     if (dirInfo->_type != fs::FileType::Directory) {
         return DumpError::result(DumpErrorType::NOT_DIRECTORY);
+    }
+
+    if (auto res = HistorySquashDumper::recover(graphDir); !res) {
+        return res;
     }
 
     // Loading info

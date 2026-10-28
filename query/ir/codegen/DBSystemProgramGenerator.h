@@ -24,6 +24,7 @@ class DeleteVectorIndexQuery;
 class DropIndexQuery;
 class InstallExtensionQuery;
 class LoadCommitQuery;
+class SquashCommitsQuery;
 class LoadEmbeddingQuery;
 class LoadGMLQuery;
 class LoadGraphQuery;
@@ -69,6 +70,7 @@ private:
     void generateCommit();
     void generateLoadCommit(const LoadCommitQuery* query);
     void generateMergeDataParts();
+    void generateSquashCommits(const SquashCommitsQuery* query);
 
     void generateS3Connect(const S3ConnectQuery* query);
     void generateS3Transfer(const S3TransferQuery* query);

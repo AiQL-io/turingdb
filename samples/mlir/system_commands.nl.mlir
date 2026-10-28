@@ -87,6 +87,16 @@ module {
     return
   }
 
+  func.func @squash_commits() {
+    nl.squash_commits after "a1b2c3" through "d4e5f6"
+    return
+  }
+
+  func.func @squash_all_commits() {
+    nl.squash_commits
+    return
+  }
+
   func.func @load_commit() {
     nl.load_commit("a1b2c3")
     return

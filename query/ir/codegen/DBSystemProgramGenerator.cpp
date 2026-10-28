@@ -19,6 +19,7 @@
 #include "DropIndexQuery.h"
 #include "InstallExtensionQuery.h"
 #include "LoadCommitQuery.h"
+#include "SquashCommitsQuery.h"
 #include "LoadEmbeddingQuery.h"
 #include "LoadGMLQuery.h"
 #include "LoadGraphQuery.h"
@@ -206,6 +207,11 @@ bool DBSystemProgramGenerator::generate(const QueryCommand* query) {
             return true;
         break;
 
+        case QueryCommand::Kind::SQUASH_COMMITS_QUERY:
+            generateSquashCommits(static_cast<const SquashCommitsQuery*>(query));
+            return true;
+        break;
+
         case QueryCommand::Kind::S3_CONNECT_QUERY:
             generateS3Connect(static_cast<const S3ConnectQuery*>(query));
             return true;
@@ -380,6 +386,24 @@ void DBSystemProgramGenerator::generateCommit() {
 void DBSystemProgramGenerator::generateLoadCommit(const LoadCommitQuery* query) {
     _opBuilder->create<mlir::db::LoadCommit>(_opBuilder->getUnknownLoc(),
                                              toStringRef(query->getHashStr()));
+}
+
+void DBSystemProgramGenerator::generateSquashCommits(const SquashCommitsQuery* query) {
+    const std::optional<std::string_view> baseHashStr = query->getBaseHashStr();
+    const std::optional<std::string_view> tipHashStr = query->getTipHashStr();
+
+    mlir::StringAttr baseAttr;
+    mlir::StringAttr tipAttr;
+
+    if (baseHashStr.has_value()) {
+        baseAttr = _opBuilder->getStringAttr(toStringRef(*baseHashStr));
+    }
+
+    if (tipHashStr.has_value()) {
+        tipAttr = _opBuilder->getStringAttr(toStringRef(*tipHashStr));
+    }
+
+    _opBuilder->create<mlir::db::SquashCommits>(_opBuilder->getUnknownLoc(), baseAttr, tipAttr);
 }
 
 void DBSystemProgramGenerator::generateMergeDataParts() {

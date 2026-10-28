@@ -2,6 +2,9 @@
 
 #include <unordered_map>
 #include <memory>
+#include <optional>
+#include <span>
+#include <vector>
 #include <shared_mutex>
 #include <atomic>
 
@@ -13,6 +16,7 @@
 #include "versioning/Change.h"
 #include "versioning/SubmitMode.h"
 #include "versioning/CommitResult.h"
+#include "versioning/SquashHistoryResult.h"
 #include "mergers/DataPartMergeResult.h"
 #include "dump/DumpResult.h"
 #include "versioning/Commit.h"
@@ -48,6 +52,22 @@ public:
     void createFirstCommit();
     [[nodiscard]] DataPartMergeResult<void> mergeDataParts(JobSystem& jobSystem);
     [[nodiscard]] std::unique_ptr<Change> newChange(CommitHash base = CommitHash::head());
+
+    /// Collects the hashes of the commits after @param base (from the very first commit when
+    /// it is empty) up to and including @param tip, oldest first. The commit @param base
+    /// stands for comes before them, since squashing needs it loaded as well.
+    [[nodiscard]] SquashHistoryResult<void> getSquashRange(std::optional<CommitHash> base,
+                                                           CommitHash tip,
+                                                           std::vector<CommitHash>& range) const;
+
+    /// Replaces the commits after @param base up to and including @param tip with @param tip,
+    /// which keeps its hash and holds the data parts and writes of the whole range.
+    /// @param openChangeBases are the base commits of the open changes of the graph.
+    /// @param squashed receives the hashes of the commits that are gone.
+    [[nodiscard]] SquashHistoryResult<void> squashHistory(std::optional<CommitHash> base,
+                                                          CommitHash tip,
+                                                          std::span<const CommitHash> openChangeBases,
+                                                          std::vector<CommitHash>& squashed);
 
     [[nodiscard]] FrozenCommitTx openTransaction(CommitHash hash = CommitHash::head()) const;
     [[nodiscard]] CommitHash getHeadHash() const;
@@ -98,6 +118,10 @@ private:
     mutable std::shared_mutex _mutex;
     Commit::CommitVector _commits;
     CommitMap _offsets;
+
+    /// Commits a history squash removed from @ref _commits. A reader that looked a commit up
+    /// before the squash may still hold its pointer, so they live as long as the controller.
+    Commit::CommitVector _retiredCommits;
     std::unique_ptr<ArcManager<CommitData>> _dataManager;
     std::unique_ptr<ArcManager<DataPart>> _partManager;
     IndexManager _indexManager;
@@ -114,6 +138,11 @@ private:
     [[nodiscard]] CommitResult<void> submitChange(Change* change, JobSystem&, SubmitMode mode);
 
     [[nodiscard]] Commit::CommitSpan getCommitsSinceCommitHash(CommitHash from) const;
+
+    [[nodiscard]] SquashHistoryResult<void> resolveSquashRange(std::optional<CommitHash> base,
+                                                               CommitHash tip,
+                                                               size_t& firstIndex,
+                                                               size_t& tipIndex) const;
 
     [[nodiscard]] static std::unique_ptr<Commit> squashCommits(std::vector<std::unique_ptr<Commit>>& commits,
                                                                const Commit* mainHead);

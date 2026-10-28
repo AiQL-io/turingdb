@@ -78,6 +78,7 @@
     #include "LoadParquetQuery.h"
     #include "LoadJsonlQuery.h"
     #include "LoadCommitQuery.h"
+    #include "SquashCommitsQuery.h"
     #include "ShowProceduresQuery.h"
     #include "ShowExtensionsQuery.h"
     #include "stmt/LoadCSVStmt.h"
@@ -189,6 +190,9 @@
 %token<std::string_view> CONNECT
 %token<std::string_view> SUBMIT
 %token<std::string_view> SQUASH
+%token<std::string_view> COMMITS
+%token<std::string_view> AFTER
+%token<std::string_view> THROUGH
 %token<std::string_view> CHANGE
 %token<std::string_view> COMMIT
 %token<std::string_view> STARTS
@@ -405,6 +409,7 @@
 %type<db::ChangeQuery*> changeQuery
 %type<db::CommitQuery*> commitQuery
 %type<db::MergeDataPartsQuery*> mergeDataPartsQuery
+%type<db::SquashCommitsQuery*> squashCommitsQuery
 %type<db::ListGraphQuery*> listGraphQuery
 %type<db::ListAvailableGraphsQuery*> listAvailableGraphsQuery
 %type<db::CreateGraphQuery*> createGraphQuery
@@ -645,6 +650,7 @@ singleQuery
     | loadParquet { $$ = $1; }
     | loadJsonl { $$ = $1; }
     | loadCommitQuery { $$ = $1; }
+    | squashCommitsQuery { $$ = $1; }
     | s3ConnectQuery { $$ = $1; }
     | s3TransferQuery { $$ = $1; }
     | showProceduresQuery { $$ = $1; }
@@ -878,6 +884,13 @@ vectorSearchSt
 
 loadCommitQuery
     : LOAD COMMIT STRING_LITERAL { $$ = LoadCommitQuery::create(ast, $3); LOC($$, @$);}
+    ;
+
+squashCommitsQuery
+    : SQUASH COMMITS { $$ = SquashCommitsQuery::create(ast, std::nullopt, std::nullopt); LOC($$, @$); }
+    | SQUASH COMMITS AFTER STRING_LITERAL { $$ = SquashCommitsQuery::create(ast, $4, std::nullopt); LOC($$, @$); }
+    | SQUASH COMMITS THROUGH STRING_LITERAL { $$ = SquashCommitsQuery::create(ast, std::nullopt, $4); LOC($$, @$); }
+    | SQUASH COMMITS AFTER STRING_LITERAL THROUGH STRING_LITERAL { $$ = SquashCommitsQuery::create(ast, $4, $6); LOC($$, @$); }
     ;
 
 createGraphQuery
@@ -2311,6 +2324,9 @@ reservedWord
     | PARQUET { $$ = Symbol::create(ast, $1); }
     | SUBMIT { $$ = Symbol::create(ast, $1); }
     | SQUASH { $$ = Symbol::create(ast, $1); }
+    | COMMITS { $$ = Symbol::create(ast, $1); }
+    | AFTER { $$ = Symbol::create(ast, $1); }
+    | THROUGH { $$ = Symbol::create(ast, $1); }
     | CHANGE { $$ = Symbol::create(ast, $1); }
     | STARTS { $$ = Symbol::create(ast, $1); }
     | UNIQUE { $$ = Symbol::create(ast, $1); }

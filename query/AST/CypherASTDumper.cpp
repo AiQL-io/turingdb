@@ -10,6 +10,7 @@
 #include "ChangeQuery.h"
 #include "CommitQuery.h"
 #include "MergeDataPartsQuery.h"
+#include "SquashCommitsQuery.h"
 #include "Parameter.h"
 #include "SymbolChain.h"
 #include "LabelExpr.h"
@@ -234,6 +235,10 @@ void CypherASTDumper::dump(std::ostream& out) {
 
             case QueryCommand::Kind::MERGE_DATAPARTS_QUERY:
                 dump(out, static_cast<const MergeDataPartsQuery*>(query));
+            break;
+
+            case QueryCommand::Kind::SQUASH_COMMITS_QUERY:
+                dump(out, static_cast<const SquashCommitsQuery*>(query));
             break;
 
             case QueryCommand::Kind::UNION_QUERY:
@@ -487,6 +492,13 @@ void CypherASTDumper::dump(std::ostream& out, const MergeDataPartsQuery* query) 
     out << "    script ||--o{ _" << std::hex << query << " : \"\"\n";
     out << "    _" << std::hex << query << " {\n";
     out << "        ASTType MergeDataPartsQuery\n";
+    out << "    }\n";
+}
+
+void CypherASTDumper::dump(std::ostream& out, const SquashCommitsQuery* query) {
+    out << "    script ||--o{ _" << std::hex << query << " : \"\"\n";
+    out << "    _" << std::hex << query << " {\n";
+    out << "        ASTType SquashCommitsQuery\n";
     out << "    }\n";
 }
 

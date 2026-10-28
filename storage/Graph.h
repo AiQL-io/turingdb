@@ -1,13 +1,17 @@
 #pragma once
 
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
+#include <vector>
 
 #include "datapart/DataPart.h"
 #include "Path.h"
 #include "versioning/CommitHash.h"
 #include "versioning/GraphID.h"
 #include "mergers/DataPartMergeResult.h"
+#include "versioning/SquashHistoryResult.h"
 #include "dump/DumpResult.h"
 
 namespace db {
@@ -44,6 +48,13 @@ public:
     [[nodiscard]] FrozenCommitTx openTransaction(CommitHash hash = CommitHash::head()) const;
     [[nodiscard]] DataPartMergeResult<void> mergeDataParts(JobSystem& jobSystem);
     [[nodiscard]] DumpResult<void> loadCommit(CommitHash hash);
+    [[nodiscard]] SquashHistoryResult<void> getSquashRange(std::optional<CommitHash> base,
+                                                           CommitHash tip,
+                                                           std::vector<CommitHash>& range) const;
+    [[nodiscard]] SquashHistoryResult<void> squashHistory(std::optional<CommitHash> base,
+                                                          CommitHash tip,
+                                                          std::span<const CommitHash> openChangeBases,
+                                                          std::vector<CommitHash>& squashed);
 
     [[nodiscard]] GraphID getID() const { return _graphID; }
     [[nodiscard]] CommitHash getHeadHash() const;

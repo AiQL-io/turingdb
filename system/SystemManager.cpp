@@ -17,6 +17,7 @@
 #include "versioning/ChangeAccessor.h"
 
 #include "dump/GraphDumper.h"
+#include "dump/HistorySquashDumper.h"
 
 #include "SystemEventHandler.h"
 
@@ -248,6 +249,51 @@ bool SystemManager::hasChanges() const {
 
 DataPartMergeResult<void> SystemManager::mergeDataParts(Graph* graph) {
     return _graphManager.mergeDataParts(graph, _jobSystem);
+}
+
+SquashHistoryResult<void> SystemManager::squashCommits(std::string_view graphName,
+                                                       std::optional<CommitHash> base,
+                                                       CommitHash tip) {
+    Graph* graph = graphName.empty() ? getDefaultGraph()
+                                     : getGraph(graphName);
+    if (!graph) {
+        return SquashHistoryError::result(SquashHistoryErrorType::GRAPH_NOT_FOUND);
+    }
+
+    const bool isSyncedOnDisk = _config->isSyncedOnDisk();
+
+    // Only the head commit is in memory after a restart, and a squash needs the writes of
+    // every commit of the range
+    if (isSyncedOnDisk) {
+        std::vector<CommitHash> range;
+        if (auto res = graph->getSquashRange(base, tip, range); !res) {
+            return res;
+        }
+
+        for (const CommitHash hash : range) {
+            if (const auto res = graph->loadCommit(hash); !res) {
+                spdlog::error("Could not load commit {} to squash: {}", hash, res.error().fmtMessage());
+                return SquashHistoryError::result(SquashHistoryErrorType::COULD_NOT_LOAD_COMMITS);
+            }
+        }
+    }
+
+    std::vector<CommitHash> squashed;
+    if (auto res = _graphManager.squashHistory(graph, base, tip, squashed); !res) {
+        return res;
+    }
+
+    if (squashed.empty() || !isSyncedOnDisk) {
+        return {};
+    }
+
+    const Commit* tipCommit = graph->getVersionController().getCommitSafe(tip);
+    if (const auto res = HistorySquashDumper::dump(*tipCommit, graph->getPath(), squashed); !res) {
+        spdlog::error("Could not write the squashed history of graph {}: {}", graph->getName(), res.error().fmtMessage());
+        return SquashHistoryError::result(SquashHistoryErrorType::COULD_NOT_PERSIST);
+    }
+
+    return {};
 }
 
 ChangeResult<Transaction> SystemManager::openTransaction(std::string_view graphName,

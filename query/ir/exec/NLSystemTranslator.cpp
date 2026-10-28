@@ -262,6 +262,20 @@ bool NLSystemTranslator::translate(mlir::Operation& operation, NLStmtContainer* 
         NLLoadCommitData* data =
             _program->allocFunctionData<NLLoadCommitData>(toStringView(loadCommit.getCommitHash()));
         body->emplaceStmt(&NLSystemExecutor::runLoadCommit, data);
+    } else if (nl::SquashCommits squashCommits = mlir::dyn_cast<nl::SquashCommits>(operation)) {
+        std::optional<std::string_view> baseCommit;
+        std::optional<std::string_view> tipCommit;
+
+        if (squashCommits.getBaseCommit().has_value()) {
+            baseCommit = toStringView(*squashCommits.getBaseCommit());
+        }
+
+        if (squashCommits.getTipCommit().has_value()) {
+            tipCommit = toStringView(*squashCommits.getTipCommit());
+        }
+
+        NLSquashCommitsData* data = _program->allocFunctionData<NLSquashCommitsData>(baseCommit, tipCommit);
+        body->emplaceStmt(&NLSystemExecutor::runSquashCommits, data);
     } else if (mlir::isa<nl::MergeDataParts>(operation)) {
         body->emplaceStmt(&NLSystemExecutor::runMergeDataParts, nullptr);
     } else if (nl::S3Connect s3Connect = mlir::dyn_cast<nl::S3Connect>(operation)) {

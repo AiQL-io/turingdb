@@ -44,6 +44,7 @@ class LoadGraphQuery;
 class ListGraphQuery;
 class ListAvailableGraphsQuery;
 class MergeDataPartsQuery;
+class SquashCommitsQuery;
 class MergeStmt;
 class CreateGraphQuery;
 class LoadGMLQuery;
@@ -89,6 +90,7 @@ private:
     void dump(std::ostream& out, const ChangeQuery* query);
     void dump(std::ostream& out, const CommitQuery* query);
     void dump(std::ostream& out, const MergeDataPartsQuery* query);
+    void dump(std::ostream& out, const SquashCommitsQuery* query);
     void dump(std::ostream& out, const ListGraphQuery* query);
     void dump(std::ostream& out, const ListAvailableGraphsQuery* query);
     void dump(std::ostream& out, const CreateGraphQuery* query);

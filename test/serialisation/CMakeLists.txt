@@ -5,3 +5,6 @@ add_turing_test(test_tombstone_serial TombstoneSerialisationTest.cpp)
 
 add_turing_test(test_squash_submit SquashSubmitTest.cpp)
 target_link_libraries(test_squash_submit PRIVATE turing_ir_test_rows_s)
+
+add_turing_test(test_squash_commits SquashCommitsTest.cpp)
+target_link_libraries(test_squash_commits PRIVATE turing_ir_test_rows_s)

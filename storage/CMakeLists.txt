@@ -123,6 +123,7 @@ set(storage_sources
         mergers/DataPartMergeResult.cpp
 
         versioning/CommitResult.cpp
+        versioning/SquashHistoryResult.cpp
         versioning/ChangeResult.cpp
         versioning/VersionController.cpp
         versioning/Change.cpp
@@ -159,6 +160,7 @@ set(storage_sources
 
         dump/GraphLoader.cpp
         dump/GraphDumper.cpp
+        dump/HistorySquashDumper.cpp
         dump/DataPartLoader.cpp
         dump/CommitDumper.cpp
         dump/CommitLoader.cpp

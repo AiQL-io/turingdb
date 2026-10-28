@@ -27,6 +27,30 @@
 
 using namespace db;
 
+namespace {
+
+/*
+ * Merging data parts renumbers the entities of the graph, so a commit that did it cannot be
+ * folded into the commits around it. It is recognised by the data parts it holds: a commit
+ * adds its own on top of those of the commit before, while a merge commit holds the merged
+ * ones alone, and that is all of its data parts.
+ */
+bool replacesEarlierDataParts(const Commit& commit, const Commit* previous) {
+    if (commit.isMergeCommit()) {
+        return true;
+    } else if (!previous) {
+        return false;
+    }
+
+    const size_t allDataParts = commit.data().allDataparts().size();
+    const size_t ownDataParts = commit.data().commitDataparts().size();
+    const size_t earlierDataParts = previous->data().allDataparts().size();
+
+    return allDataParts == ownDataParts && earlierDataParts > 0;
+}
+
+}
+
 VersionController::VersionController(Graph* graph)
     : _graph(graph),
     _dataManager(std::make_unique<ArcManager<CommitData>>()),
@@ -188,6 +212,159 @@ std::unique_ptr<Commit> VersionController::squashCommits(std::vector<std::unique
     tip->setPreviousCommit(mainHead);
 
     return tip;
+}
+
+SquashHistoryResult<void> VersionController::resolveSquashRange(std::optional<CommitHash> base,
+                                                                CommitHash tip,
+                                                                size_t& firstIndex,
+                                                                size_t& tipIndex) const {
+    const CommitHash tipHash = tip == CommitHash::head() ? _head.load()->hash() : tip;
+    const std::optional<size_t> tipOffset = getCommitIndex(tipHash);
+
+    if (!tipOffset.has_value()) {
+        return SquashHistoryError::result(SquashHistoryErrorType::COMMIT_NOT_FOUND);
+    }
+
+    firstIndex = 0;
+    tipIndex = *tipOffset;
+
+    if (base.has_value()) {
+        const CommitHash baseHash = *base == CommitHash::head() ? _head.load()->hash() : *base;
+        const std::optional<size_t> baseOffset = getCommitIndex(baseHash);
+
+        if (!baseOffset.has_value()) {
+            return SquashHistoryError::result(SquashHistoryErrorType::COMMIT_NOT_FOUND);
+        } else if (*baseOffset >= *tipOffset) {
+            return SquashHistoryError::result(SquashHistoryErrorType::RANGE_NOT_ORDERED);
+        }
+
+        firstIndex = *baseOffset + 1;
+    }
+
+    return {};
+}
+
+SquashHistoryResult<void> VersionController::getSquashRange(std::optional<CommitHash> base,
+                                                            CommitHash tip,
+                                                            std::vector<CommitHash>& range) const {
+    std::shared_lock<std::shared_mutex> sharedLock(_mutex);
+
+    size_t firstIndex = 0;
+    size_t tipIndex = 0;
+    if (auto res = resolveSquashRange(base, tip, firstIndex, tipIndex); !res) {
+        return res;
+    }
+
+    // The commit before the range is part of what has to be loaded: it tells whether the first
+    // commit of the range merged data parts
+    range.clear();
+    if (firstIndex > 0) {
+        range.emplace_back(_commits[firstIndex - 1]->hash());
+    }
+
+    for (size_t index = firstIndex; index <= tipIndex; index++) {
+        range.emplace_back(_commits[index]->hash());
+    }
+
+    return {};
+}
+
+/*
+ * The squashed commit is the last commit of the range: it already holds the cumulative
+ * metadata, tombstones, indexes and data parts of the whole range, so entity IDs are
+ * untouched. It only needs to be re-parented onto the commit before the range and to report
+ * the writes and data parts of every commit it replaces.
+ */
+SquashHistoryResult<void> VersionController::squashHistory(std::optional<CommitHash> base,
+                                                           CommitHash tip,
+                                                           std::span<const CommitHash> openChangeBases,
+                                                           std::vector<CommitHash>& squashed) {
+    Profile profile("VersionController::squashHistory");
+
+    std::unique_lock<std::shared_mutex> uniqueLock(_mutex);
+
+    size_t firstIndex = 0;
+    size_t tipIndex = 0;
+    if (auto res = resolveSquashRange(base, tip, firstIndex, tipIndex); !res) {
+        return res;
+    }
+
+    squashed.clear();
+
+    // A single commit has nothing to be folded into
+    if (firstIndex == tipIndex) {
+        return {};
+    }
+
+    const Commit* baseCommit = firstIndex > 0 ? _commits[firstIndex - 1].get() : nullptr;
+    if (baseCommit && !baseCommit->hasData()) {
+        return SquashHistoryError::result(SquashHistoryErrorType::COMMIT_NOT_LOADED);
+    }
+
+    for (size_t index = firstIndex; index <= tipIndex; index++) {
+        const Commit& commit = *_commits[index];
+        const Commit* previous = index > 0 ? _commits[index - 1].get() : nullptr;
+
+        if (!commit.hasData()) {
+            return SquashHistoryError::result(SquashHistoryErrorType::COMMIT_NOT_LOADED);
+        } else if (replacesEarlierDataParts(commit, previous)) {
+            return SquashHistoryError::result(SquashHistoryErrorType::RANGE_HAS_MERGE_COMMIT);
+        }
+    }
+
+    // A change based on the last commit of the range, or on any commit after it, is rebased onto
+    // the squashed commit as it was on the original. One based on a commit that goes away has
+    // nothing to be rebased from.
+    for (const CommitHash changeBase : openChangeBases) {
+        const std::optional<size_t> baseOffset = getCommitIndex(changeBase);
+
+        if (baseOffset.has_value() && *baseOffset >= firstIndex && *baseOffset < tipIndex) {
+            return SquashHistoryError::result(SquashHistoryErrorType::BLOCKED_BY_OPEN_CHANGE);
+        }
+    }
+
+    Commit* tipCommit = _commits[tipIndex].get();
+    CommitHistory& tipHistory = tipCommit->history();
+    CommitHistoryBuilder historyBuilder {tipHistory};
+
+    size_t numNodes = tipCommit->getNumNodes();
+    size_t numEdges = tipCommit->getNumEdges();
+    size_t numDataParts = tipCommit->data().commitDataparts().size();
+
+    for (size_t index = firstIndex; index < tipIndex; index++) {
+        const Commit& commit = *_commits[index];
+
+        historyBuilder.absorbJournal(commit.history());
+
+        numNodes += commit.getNumNodes();
+        numEdges += commit.getNumEdges();
+        numDataParts += commit.data().commitDataparts().size();
+    }
+
+    // The data parts of the range are the tail of the cumulative list of the last commit
+    const size_t baseDataPartCount = baseCommit ? baseCommit->data().allDataparts().size() : 0;
+    const size_t totalDataPartCount = tipHistory.allDataparts().size();
+    bioassert(totalDataPartCount - baseDataPartCount == numDataParts,
+              "squashed data part count mismatch");
+
+    historyBuilder.setCommitDatapartCount(numDataParts);
+
+    tipCommit->setCounts(numNodes, numEdges, numDataParts);
+    tipCommit->setPreviousCommit(baseCommit);
+
+    for (size_t index = firstIndex; index < tipIndex; index++) {
+        squashed.emplace_back(_commits[index]->hash());
+        _offsets.erase(_commits[index]->hash());
+        _retiredCommits.emplace_back(std::move(_commits[index]));
+    }
+
+    _commits.erase(_commits.begin() + firstIndex, _commits.begin() + tipIndex);
+
+    for (size_t index = firstIndex; index < _commits.size(); index++) {
+        _offsets[_commits[index]->hash()] = index;
+    }
+
+    return {};
 }
 
 std::unique_ptr<Change> VersionController::newChange(CommitHash base) {
