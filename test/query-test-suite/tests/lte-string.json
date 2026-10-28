@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "MATCH (n) WHERE n.name <= \"\" RETURN n",
+  "expect": {
+    "result": "n",
+    "resultJson": "{\"header\":{\"column_names\":[\"n\"],\"column_types\":[\"UInt64\"]},\"data\":[[[]]]}"
+  },
+  "tags": [
+    "where",
+    "string"
+  ],
+  "write-required": false
+}

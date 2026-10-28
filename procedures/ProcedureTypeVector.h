@@ -4,6 +4,9 @@
 #include <vector>
 #include <stdint.h>
 
+#include "ID.h"
+#include "metadata/PropertyType.h"
+
 #include "EnumToString.h"
 
 namespace db {
@@ -21,10 +24,26 @@ enum class ProcedureType : uint8_t {
     DOUBLE,
     BOOL,
     STRING_VIEW,
-    STRING,
     LIST,
+    MAP,
     _SIZE,
 };
+
+template <typename T>
+struct ProcedureTypeOf;
+
+template <> struct ProcedureTypeOf<NodeID> { static constexpr ProcedureType value = ProcedureType::NODE; };
+template <> struct ProcedureTypeOf<EdgeID> { static constexpr ProcedureType value = ProcedureType::EDGE; };
+template <> struct ProcedureTypeOf<LabelID> { static constexpr ProcedureType value = ProcedureType::LABEL_ID; };
+template <> struct ProcedureTypeOf<EdgeTypeID> { static constexpr ProcedureType value = ProcedureType::EDGE_TYPE_ID; };
+template <> struct ProcedureTypeOf<PropertyTypeID> { static constexpr ProcedureType value = ProcedureType::PROPERTY_TYPE_ID; };
+template <> struct ProcedureTypeOf<ValueType> { static constexpr ProcedureType value = ProcedureType::VALUE_TYPE; };
+template <> struct ProcedureTypeOf<types::UInt64::Primitive> { static constexpr ProcedureType value = ProcedureType::UINT_64; };
+template <> struct ProcedureTypeOf<types::Int64::Primitive> { static constexpr ProcedureType value = ProcedureType::INT64; };
+template <> struct ProcedureTypeOf<types::Double::Primitive> { static constexpr ProcedureType value = ProcedureType::DOUBLE; };
+template <> struct ProcedureTypeOf<types::Bool::Primitive> { static constexpr ProcedureType value = ProcedureType::BOOL; };
+template <> struct ProcedureTypeOf<types::String::Primitive> { static constexpr ProcedureType value = ProcedureType::STRING_VIEW; };
+template <> struct ProcedureTypeOf<ListView> { static constexpr ProcedureType value = ProcedureType::LIST; };
 
 using ProcedureTypeName = EnumToString<ProcedureType>::Create<
     EnumStringPair<ProcedureType::INVALID, "INVALID">,
@@ -39,13 +58,15 @@ using ProcedureTypeName = EnumToString<ProcedureType>::Create<
     EnumStringPair<ProcedureType::DOUBLE, "FLOAT">,
     EnumStringPair<ProcedureType::BOOL, "BOOLEAN">,
     EnumStringPair<ProcedureType::STRING_VIEW, "STRING">,
-    EnumStringPair<ProcedureType::STRING, "STRING">,
-    EnumStringPair<ProcedureType::LIST, "LIST">>;
+    EnumStringPair<ProcedureType::LIST, "LIST">,
+    EnumStringPair<ProcedureType::MAP, "MAP">>;
 
 struct NamedProcedureType {
     std::string_view _name;
     ProcedureType _type {ProcedureType::INVALID};
     bool _optional {false};
+    bool _constant {false};
+    bool _nullable {false};
 };
 
 class ProcedureTypeVector {
@@ -65,13 +86,36 @@ public:
 
     void add(std::string_view name, ProcedureType type) {
         constexpr bool optional = false;
-        _values.emplace_back(name, type, optional);
+        constexpr bool constant = false;
+        _values.emplace_back(name, type, optional, constant);
+        _requiredCount++;
+    }
+
+    void addNullable(std::string_view name, ProcedureType type) {
+        constexpr bool optional = false;
+        constexpr bool constant = false;
+        constexpr bool nullable = true;
+        _values.emplace_back(name, type, optional, constant, nullable);
+        _requiredCount++;
+    }
+
+    void addConstant(std::string_view name, ProcedureType type) {
+        constexpr bool optional = false;
+        constexpr bool constant = true;
+        _values.emplace_back(name, type, optional, constant);
         _requiredCount++;
     }
 
     void addOptional(std::string_view name, ProcedureType type) {
         constexpr bool optional = true;
-        _values.emplace_back(name, type, optional);
+        constexpr bool constant = false;
+        _values.emplace_back(name, type, optional, constant);
+    }
+
+    void addOptionalConstant(std::string_view name, ProcedureType type) {
+        constexpr bool optional = true;
+        constexpr bool constant = true;
+        _values.emplace_back(name, type, optional, constant);
     }
 
     size_t requiredCount() const { return _requiredCount; }

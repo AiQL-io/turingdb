@@ -1,0 +1,62 @@
+#pragma once
+
+#include <memory>
+#include <string>
+#include <string_view>
+
+#include "QueryConfig.h"
+#include "versioning/ChangeID.h"
+
+#include "TuringTest.h"
+
+namespace db {
+class NLOutputSink;
+class ParameterMap;
+class QueryInterpreterV3;
+}
+
+namespace turing::test {
+
+class TuringTestEnv;
+
+// Drives the whole engine through QueryInterpreterV3 on the simpledb fixture: reads run on
+// the head, writes run in a change of their own that is then submitted, so a read that
+// follows sees what they wrote.
+class CallV3Test : public TuringTest {
+public:
+    CallV3Test();
+    ~CallV3Test() override;
+
+    void initialize() override;
+
+protected:
+    void runQuery(std::string_view query, db::NLOutputSink& sink);
+    void runQuery(std::string_view query, const db::ParameterMap& parameters, db::NLOutputSink& sink);
+    void runQueryExpectingError(std::string_view query, std::string_view reason);
+    void runQueryExpectingError(std::string_view query, const db::ParameterMap& parameters, std::string_view reason);
+    void runWrite(std::string_view query);
+    void runWrite(std::string_view query, const db::ParameterMap& parameters);
+    void runWrite(std::string_view query, const db::ParameterMap& parameters, db::NLOutputSink& sink);
+
+    // The rows a write reports, for a query whose WITH or RETURN projects what it wrote
+    void runWrite(std::string_view query, db::NLOutputSink& sink);
+    void runWriteExpectingError(std::string_view query, std::string_view reason);
+    void runWriteExpectingError(std::string_view query, const db::ParameterMap& parameters, std::string_view reason);
+
+    // Two writing queries in one change, with no commit between them: what @param first
+    // wrote is staged, and @param second reads the change's committed tip - so the rows it
+    // reports are the ones the staged write is invisible to
+    void runWritesInOneChange(std::string_view first, std::string_view second, db::NLOutputSink& sink);
+    void runLegacyWrite(std::string_view query);
+
+private:
+    const std::string _graphName {"simpledb"};
+    std::unique_ptr<TuringTestEnv> _env;
+    std::unique_ptr<db::QueryInterpreterV3> _interpreter;
+    db::QueryConfig _queryConfig;
+
+    void newChange(db::ChangeID& changeID);
+    void submitChange(db::ChangeID changeID);
+};
+
+}

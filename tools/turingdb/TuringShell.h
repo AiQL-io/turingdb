@@ -11,7 +11,11 @@
 #include "versioning/CommitHash.h"
 #include "versioning/ChangeID.h"
 
+#include "CompilerContext.h"
+#include "ParameterMap.h"
 #include "TuringClient.h"
+
+#include "ShellCompletion.h"
 
 namespace db {
 
@@ -51,6 +55,7 @@ private:
     TuringDB& _turingDB;
     net::proto::TuringClient _client;
     LocalMemory* _mem {nullptr};
+    CompilerContext _compilerContext;
     std::string _graphName {"default"};
     CommitHash _hash {CommitHash::head()};
     ChangeID _changeID {ChangeID::head()};
@@ -58,13 +63,18 @@ private:
     std::string _remotePort;
     bool _remoteConnected {false};
     bool _quiet {false};
-    pthread_t _threadID {};
+    int _stopPipe[2] {-1, -1};
     std::atomic<bool> _running {true};
     LineNoiseHandle* _lineNoiseHandle {nullptr};
     std::unordered_map<std::string_view, Command> _localCommands;
+    ShellCompletion _completion;
+    ParameterMap _parameters;
 
+    bool waitForInput();
     void processLine(std::string& line);
-    void runMLIRQuery(std::string_view query);
+    bool processParameterCommand(const std::string& line);
+    void setParameter(std::string_view arguments);
+    void printParameters() const;
     void formatMessage(std::string& msg);
     std::string composePrompt();
     void checkShellContext();

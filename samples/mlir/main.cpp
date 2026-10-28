@@ -29,6 +29,8 @@
 #include "CypherAnalyzer.h"
 #include "CypherParser.h"
 #include "Graph.h"
+#include "ProcedureContext.h"
+#include "ProcedureManager.h"
 #include "SimpleGraph.h"
 #include "SystemManager.h"
 #include "TuringConfig.h"
@@ -40,6 +42,8 @@
 #include "columns/ColumnEdgeTypes.h"
 #include "columns/ColumnConst.h"
 #include "columns/ColumnOptVector.h"
+
+#include "GraphPath.h"
 
 #include "list/ListView.h"
 #include "list/ListElementView.h"
@@ -227,10 +231,7 @@ void helloModule(mlir::OpBuilder& builder, mlir::ModuleOp& module) {
     addNestedLoopFunction(builder, module);
 }
 
-void progGen(std::string_view query,
-             mlir::MLIRContext* ctxt,
-             mlir::OpBuilder* bld,
-             mlir::ModuleOp* module) {
+void progGen(std::string_view query, Graph& graph, mlir::ModuleOp* module) {
     TuringConfig config;
     config.setSyncedOnDisk(false);
 
@@ -239,10 +240,7 @@ void progGen(std::string_view query,
 
     SystemAccessor acc = sysman.accessUnique();
 
-    Graph* graph = acc.createGraph("simpledb");
-    SimpleGraph::createSimpleGraph(graph);
-
-    const FrozenCommitTx transaction = graph->openTransaction();
+    const FrozenCommitTx transaction = graph.openTransaction();
     const GraphView view = transaction.viewGraph();
 
     CypherAST ast(acc.getProcedures(), query);
@@ -321,19 +319,35 @@ private:
             std::cout << (*edgeTypes)[row].getValue();
         } else if (const auto* counts = dynamic_cast<const ColumnVector<uint64_t>*>(column)) {
             std::cout << (*counts)[row];
-        } else if (printValueCell<int64_t>(column, row)
+        } else if (printPlainValueCell<int64_t>(column, row)
+                   || printPlainValueCell<double>(column, row)
+                   || printValueCell<int64_t>(column, row)
                    || printValueCell<uint64_t>(column, row)
                    || printValueCell<double>(column, row)
                    || printValueCell<std::string_view>(column, row)
+                   || printValueCell<std::string>(column, row)
                    || printEmbeddingCell(column, row)) {
             // Printed by the helper for whichever nullable value type matched
+        } else if (dynamic_cast<const ColumnConst<PropertyNull>*>(column)) {
+            std::cout << "null";
         } else if (printConstValueCell<int64_t>(column, row)
                    || printConstValueCell<uint64_t>(column, row)
                    || printConstValueCell<double>(column, row)
+                   || printConstValueCell<std::string_view>(column, row)
+                   || printConstValueCell<std::string>(column, row)
                    || printConstValueCell<CustomBool>(column, row)) {
             // ColumnConst
+        } else if (printPlainValueCell<std::string>(column, row)
+                   || printPlainValueCell<std::string_view>(column, row)) {
+            // A non-nullable value column
         } else if (printListCell(column, row)) {
             // A per-group list cell from an nl.collect drain
+        } else if (printConstListCell(column, row)) {
+            // The one list a list-valued nl.constant holds for every row
+        } else if (printListElementCell(column, row)) {
+            // A tagged scalar from a heterogeneous unwind
+        } else if (printPathCell(column, row)) {
+            // The alternating node and edge IDs a db.shortest_path emits
         } else {
             std::cout << "?";
         }
@@ -373,6 +387,17 @@ private:
         return true;
     }
 
+    template <typename T>
+    static bool printPlainValueCell(const Column* column, size_t row) {
+        const auto* values = dynamic_cast<const ColumnVector<T>*>(column);
+        if (!values) {
+            return false;
+        }
+
+        std::cout << (*values)[row];
+        return true;
+    }
+
     // An embedding cell needs its own printer: the value is a span of floats,
     // which has no operator<<, so render it as [a, b, c]
     static bool printEmbeddingCell(const Column* column, size_t row) {
@@ -399,9 +424,9 @@ private:
         return true;
     }
 
-    // Print one element of a collected list, dispatching on its type tag. collect
-    // produces homogeneous scalar lists, so Int/UInt/Double/Bool/String are the tags
-    // that occur; the rest are rendered as placeholders for completeness.
+    // Print one element of a list, dispatching on its type tag. A collect produces
+    // homogeneous scalar lists, so Int/UInt/Double/Bool/String are the tags that occur
+    // there; a list literal may also hold a list, which is printed as one.
     static void printListElement(const ListElementView& element) {
         switch (element.getTag()) {
             case ListBufferTypeTag::Int:
@@ -429,13 +454,70 @@ private:
             break;
 
             case ListBufferTypeTag::ListView:
-                std::cout << "<list>";
+                printList(element.getAs<ListView>());
             break;
 
+            case ListBufferTypeTag::Null:
+                std::cout << "null";
+            break;
+
+            case ListBufferTypeTag::NodeID:
+                std::cout << element.getAs<NodeID>().getValue();
+            break;
+
+            case ListBufferTypeTag::EdgeID:
+                std::cout << element.getAs<EdgeID>().getValue();
+            break;
+
+            case ListBufferTypeTag::DateTime: {
+                std::string formatted;
+                DateTime::format(formatted, element.getAs<types::DateTime::Primitive>());
+
+                std::cout << formatted;
+            }
+            break;
+
+            case ListBufferTypeTag::Duration: {
+                std::string formatted;
+                Duration::format(formatted, element.getAs<types::Duration::Primitive>());
+
+                std::cout << formatted;
+            }
+            break;
+
+            case ListBufferTypeTag::MapView:
             case ListBufferTypeTag::INVALID:
                 std::cout << "?";
             break;
         }
+    }
+
+    // Print a list as [a, b, c].
+    static void printList(const ListView list) {
+        std::cout << "[";
+        for (size_t index = 0; const ListElementView& element : list) {
+            if (index > 0) {
+                std::cout << ", ";
+            }
+
+            printListElement(element);
+            index++;
+        }
+        std::cout << "]";
+    }
+
+    // Print one cell of a type-tagged scalar column (a ColumnVector<ListElementView>
+    // from a heterogeneous nl.unwind_const, whose cells need not share a type) as the
+    // value alone; returns whether the column matched.
+    static bool printListElementCell(const Column* column, size_t row) {
+        const auto* elements = dynamic_cast<const ColumnVector<ListElementView>*>(column);
+        if (!elements) {
+            return false;
+        }
+
+        printListElement((*elements)[row]);
+
+        return true;
     }
 
     // Print one cell of a list column (a ColumnVector<ListView> from an nl.collect
@@ -446,14 +528,41 @@ private:
             return false;
         }
 
-        const ListView list = (*lists)[row];
+        printList((*lists)[row]);
+
+        return true;
+    }
+
+    // Print one cell of a constant list column (a ColumnConst<ListView> from an
+    // list-valued nl.constant, which answers the same list at every row); returns whether the
+    // column matched.
+    static bool printConstListCell(const Column* column, size_t row) {
+        const auto* lists = dynamic_cast<const ColumnConst<ListView>*>(column);
+        if (!lists) {
+            return false;
+        }
+
+        printList((*lists)[row]);
+
+        return true;
+    }
+
+    // Print one cell of a path column (a ColumnVector<Path> from an nl.shortest_path)
+    // as the alternating node and edge IDs it holds, target first; returns whether the
+    // column matched.
+    static bool printPathCell(const Column* column, size_t row) {
+        const auto* paths = dynamic_cast<const ColumnVector<Path>*>(column);
+        if (!paths) {
+            return false;
+        }
+
         std::cout << "[";
-        for (size_t index = 0; const ListElementView& element : list) {
+        for (size_t index = 0; const EntityID entity : (*paths)[row]) {
             if (index > 0) {
                 std::cout << ", ";
             }
 
-            printListElement(element);
+            std::cout << entity.getValue();
             index++;
         }
         std::cout << "]";
@@ -535,6 +644,20 @@ bool moduleHasCreateOps(mlir::ModuleOp& module) {
     return found;
 }
 
+// Fills the context a CALL needs - the registry its name is resolved against, and
+// the graph view, chunk size and list buffer its callbacks read - so a module
+// containing a db.call_procedure runs here the way it would in the server.
+void setupProcedureContext(const GraphView& view,
+                           LocalMemory& memory,
+                           const ProcedureManager& procedures,
+                           ProcedureContext& context) {
+    context.setGraphView(&view);
+    context.setProcedures(&procedures);
+    context.setChunkSize(ChunkConfig::CHUNK_SIZE);
+    context.setListBuffer(&memory.listBuffer());
+    context.setStringBuffer(&memory.stringBuffer());
+}
+
 // Runs the module's main function against the view, pushing output into sink.
 // A db-dialect "main" runs through DBDialectInterpreter, which lowers it to the
 // nl dialect first; an nl-dialect "main" runs straight through NLInterpreter.
@@ -550,53 +673,52 @@ void runModuleMain(mlir::ModuleOp& module,
         throw std::runtime_error("-exec requires a 'main' function in the module");
     }
 
+    ProcedureManager procedures;
+    procedures.init();
+
+    ProcedureContext procedureContext;
+    setupProcedureContext(view, memory, procedures, procedureContext);
+
     if (classifyDialect(mainFunction) == QueryDialect::DB) {
         DBDialectInterpreter interpreter(module, &view, &sink, &memory,
                                         ChunkConfig::CHUNK_SIZE,
                                         writeBuffer,
-                                        metadataBuilder);
+                                        metadataBuilder,
+                                        &procedureContext);
         const DBDialectInterpreter::Status status = interpreter.run();
         std::cout << "[DBDialectInterpreter] lowering: " << status.getLowerMilliseconds() << " ms, "
                   << "translation: " << status.getTranslateMilliseconds() << " ms, "
                   << "execution: " << status.getExecuteMilliseconds() << " ms\n";
     } else {
-        NLInterpreter interpreter(module, &view, &sink, &memory);
+        NLInterpreter interpreter(module,
+                                  &view,
+                                  &sink,
+                                  &memory,
+                                  ChunkConfig::CHUNK_SIZE,
+                                  /*writeBuffer=*/nullptr,
+                                  /*metadataBuilder=*/nullptr,
+                                  &procedureContext);
         const NLInterpreter::Status status = interpreter.run();
         std::cout << "[NLInterpreter] translation: " << status.getTranslateMilliseconds() << " ms, "
                   << "execution: " << status.getExecuteMilliseconds() << " ms\n";
     }
 }
 
-// Loads the graph at graphDir and runs the module's main function against it.
-// With quiet set, output rows are only counted, not printed - the mode for
-// benchmarking, where per-row formatting would dominate the timing.
-void executeModule(mlir::ModuleOp& module, const std::string& graphDir, bool quiet) {
-    if (graphDir.empty()) {
-        throw std::runtime_error("-exec requires a graph directory given with -graph");
-    }
-
-    auto graph = Graph::create();
-    const auto loadResult = GraphLoader::load(graph.get(), fs::Path(graphDir));
-    if (!loadResult) {
-        throw std::runtime_error(loadResult.error().fmtMessage());
-    }
-
+void executeModule(mlir::ModuleOp& module, Graph& graph, bool quiet) {
     const bool isWrite = moduleHasCreateOps(module);
 
-    // Write queries open a change and grab the write buffer and metadata builder
-    // from the tip commit. Read queries use a read-only snapshot.
     std::unique_ptr<Change> change;
     CommitWriteBuffer* writeBuffer = nullptr;
     MetadataBuilder* metadataBuilder = nullptr;
     JobSystem jobSystem;
 
-    const FrozenCommitTx transaction = graph->openTransaction();
+    const FrozenCommitTx transaction = graph.openTransaction();
     const GraphReader reader = transaction.readGraph();
     const GraphView& view = reader.getView();
 
     if (isWrite) {
         jobSystem.init();
-        change = graph->newChange();
+        change = graph.newChange();
         CommitBuilder* commitBuilder = change->access().getTip();
         writeBuffer = &commitBuilder->writeBuffer();
         metadataBuilder = &commitBuilder->metadata();
@@ -666,7 +788,12 @@ void dumpLoweredModule(mlir::ModuleOp& module, const std::string& graphDir) {
     mlir::MLIRContext* context = module.getContext();
     mlir::OwningOpRef<mlir::ModuleOp> nlModule = mlir::ModuleOp::create(mlir::UnknownLoc::get(context));
 
-    DBLowering lowering(context, view);
+    // A db.call_procedure resolves its name and its return types against the registry
+    // during lowering, the way a property fetch resolves against the schema.
+    ProcedureManager procedures;
+    procedures.init();
+
+    DBLowering lowering(context, view, &procedures);
     lowering.lower(mainFunction, *nlModule);
 
     mlir::ModuleOp loweredModule = nlModule.get();
@@ -738,8 +865,26 @@ int main(int argc, char** argv) {
         mlir::OpBuilder builder(&ctxt);
         auto mainMod = mlir::ModuleOp::create(builder.getUnknownLoc());
 
+        std::unique_ptr<Graph> graph;
+
+        const bool needGraph = !query.empty() || execute;
+        if (needGraph) {
+            graph = Graph::create();
+
+            if (!graphDir.empty()) {
+                const auto loadResult = GraphLoader::load(graph.get(), fs::Path(graphDir));
+                if (!loadResult) {
+                    throw std::runtime_error(loadResult.error().fmtMessage());
+                }
+            } else if (execute) {
+                throw std::runtime_error("-exec requires a graph directory given with -graph");
+            } else {
+                SimpleGraph::createSimpleGraph(graph.get());
+            }
+        }
+
         if (!query.empty()) {
-            progGen(query, &ctxt, &builder, &mainMod);
+            progGen(query, *graph, &mainMod);
         } else if (files.empty()) {
             helloModule(builder, mainMod);
         } else {
@@ -758,7 +903,7 @@ int main(int argc, char** argv) {
         }
 
         if (execute) {
-            executeModule(mainMod, graphDir, quiet);
+            executeModule(mainMod, *graph, quiet);
         }
     } catch (const std::exception& e) {
         std::cerr << e.what() << "\n";

@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "RETURN {}",
+  "expect": {
+    "result": "{}\n{}",
+    "resultJson": "{\"header\":{\"column_names\":[\"{}\"],\"column_types\":[\"Map\"]},\"data\":[[[{}]]]}"
+  },
+  "tags": [
+    "fuzz",
+    "crash",
+    "map",
+    "literal"
+  ],
+  "write-required": false
+}

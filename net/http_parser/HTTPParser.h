@@ -1,5 +1,7 @@
 #pragma once
 
+#include <limits>
+
 #include "HTTPParsingInfo.h"
 #include "AbstractTCPParser.h"
 #include "UriParser.h"
@@ -33,46 +35,12 @@ public:
     }
 
     void handleAnalyzeError(AnalyzeError error, AbstractTCPWriter& writer) override {
-        handleAnalyzeError(error, static_cast<HTTPWriter&>(writer));
+        writer.writeAnalyzeError(error);
     }
 
-    void handleAnalyzeError(AnalyzeError error, HTTPWriter& httpWriter) {
-        switch (static_cast<HTTP::Error>(error)) {
-            case net::HTTP::Error::REQUEST_TOO_BIG:
-                httpWriter.setFirstLine(net::HTTP::Status::CONTENT_TOO_LARGE);
-            break;
-
-            case net::HTTP::Error::INVALID_CONTENT_LENGTH:
-            case net::HTTP::Error::HEADER_INCOMPLETE:
-                httpWriter.setFirstLine(net::HTTP::Status::BAD_REQUEST);
-            break;
-
-            case net::HTTP::Error::TOO_MANY_PARAMS:
-                httpWriter.setFirstLine(net::HTTP::Status::CONTENT_TOO_LARGE);
-            break;
-
-            case net::HTTP::Error::UNKNOWN_ENDPOINT:
-                httpWriter.setFirstLine(net::HTTP::Status::NOT_FOUND);
-            break;
-
-            case net::HTTP::Error::INVALID_METHOD:
-                httpWriter.setFirstLine(net::HTTP::Status::METHOD_NOT_ALLOWED);
-            break;
-
-            case net::HTTP::Error::NO_METHOD:
-            case net::HTTP::Error::NO_URI:
-            case net::HTTP::Error::UNKNOWN:
-            case net::HTTP::Error::INVALID_URI:
-            case net::HTTP::Error::_SIZE:
-                httpWriter.setFirstLine(net::HTTP::Status::BAD_REQUEST);
-            break;
-        }
-
-        httpWriter.addConnection(net::getConnectionHeader(true));
-        httpWriter.addChunkedTransferEncoding();
-        httpWriter.addContentType(net::ContentType::JSON);
-        httpWriter.flushHeader();
-        httpWriter.flush();
+    [[nodiscard]] size_t getUnreceivedRequestBytes() const override {
+        const size_t receivedBytes = _reader.getSize();
+        return _requestSize > receivedBytes ? _requestSize - receivedBytes : 0;
     }
 
     [[nodiscard]] const HTTP::Info& getHttpInfo() const { return _info; }
@@ -81,6 +49,7 @@ public:
         _info.reset();
         _currentPtr = _reader.getData();
         _payloadSize = 0;
+        _requestSize = 0;
         _payloadBegin = nullptr;
         _parsedHeader = false;
         _contentLengthSeen = false;
@@ -92,6 +61,7 @@ private:
     char* _currentPtr {nullptr};
     char* _payloadBegin {nullptr};
     uint64_t _payloadSize {0};
+    uint64_t _requestSize {0};
     bool _parsedHeader {false};
     bool _contentLengthSeen {false};
 
@@ -111,6 +81,13 @@ private:
 
             if (auto res = parseHeaders(); !res) {
                 return res.get_unexpected();
+            }
+
+            const size_t headerSize = _currentPtr - _reader.getData();
+            _requestSize = headerSize + _payloadSize;
+
+            if (_requestSize > NetBuffer::BUFFER_SIZE) {
+                return BadResult(HTTP::Error::REQUEST_TOO_BIG);
             }
 
             _parsedHeader = true;
@@ -320,15 +297,14 @@ private:
 
             // Parse digits with bounds checking (no strtoull — buffer is not
             // null-terminated). Horner's rule; the overflow guard keeps
-            // _payloadSize * 10 well below the size_t bound because BUFFER_SIZE
-            // is far smaller.
+            // _payloadSize * 10 + 9 inside uint64_t.
             _payloadSize = 0;
             for (const char c : value) {
                 if (!isdigit(static_cast<unsigned char>(c))) {
                     return BadResult(HTTP::Error::INVALID_CONTENT_LENGTH);
                 }
 
-                if (_payloadSize > NetBuffer::BUFFER_SIZE / 10) {
+                if (_payloadSize > (std::numeric_limits<uint64_t>::max() - 9) / 10) {
                     return BadResult(HTTP::Error::REQUEST_TOO_BIG);
                 }
 

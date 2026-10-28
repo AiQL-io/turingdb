@@ -17,6 +17,7 @@
 #include "versioning/Change.h"
 #include "versioning/CommitBuilder.h"
 #include "versioning/CommitHash.h"
+#include "versioning/CommitHistoryBuilder.h"
 #include "versioning/DataPartRebaser.h"
 #include "versioning/Transaction.h"
 #include "CommitJournal.h"
@@ -100,7 +101,7 @@ CommitHash VersionController::getHeadHash() const {
     return head->hash();
 }
 
-CommitResult<void> VersionController::submitChange(Change* change, JobSystem& jobSystem) {
+CommitResult<void> VersionController::submitChange(Change* change, JobSystem& jobSystem, SubmitMode mode) {
     Profile profile("VersionController::submitChange");
 
     std::unique_lock<std::shared_mutex> uniqueLock(_mutex);
@@ -114,6 +115,8 @@ CommitResult<void> VersionController::submitChange(Change* change, JobSystem& jo
             return res;
         }
     }
+
+    std::vector<std::unique_ptr<Commit>> builtCommits;
 
     for (auto& commitBuilder : change->_commits) {
         // If this Change has modifications which were not applied by a "COMMIT" command,
@@ -129,10 +132,62 @@ CommitResult<void> VersionController::submitChange(Change* change, JobSystem& jo
 
         auto& newCommit = buildRes.value();
 
-        addCommit(std::move(newCommit));
+        if (mode == SubmitMode::MERGE) {
+            addCommit(std::move(newCommit));
+        } else {
+            builtCommits.emplace_back(std::move(newCommit));
+        }
+    }
+
+    // Nothing has been published to main until every commit of the change is built,
+    // so a failure above leaves main untouched
+    if (mode == SubmitMode::SQUASH) {
+        addCommit(squashCommits(builtCommits, headCommit));
     }
 
     return {};
+}
+
+/*
+ * The squashed commit is the tip of the change: it already holds the cumulative metadata,
+ * tombstones, indexes and data parts of the whole change, so entity IDs are untouched.
+ * It only needs to be re-parented onto main and to report the writes and data parts of
+ * every commit it replaces.
+ */
+std::unique_ptr<Commit> VersionController::squashCommits(std::vector<std::unique_ptr<Commit>>& commits,
+                                                         const Commit* mainHead) {
+    bioassert(!commits.empty(), "a change always has at least one commit");
+
+    std::unique_ptr<Commit> tip = std::move(commits.back());
+    commits.pop_back();
+
+    CommitHistory& tipHistory = tip->history();
+    CommitHistoryBuilder historyBuilder {tipHistory};
+
+    size_t numNodes = tip->getNumNodes();
+    size_t numEdges = tip->getNumEdges();
+    size_t numDataParts = tip->getNumDataParts();
+
+    for (const auto& commit : commits) {
+        historyBuilder.absorbJournal(commit->history());
+
+        numNodes += commit->getNumNodes();
+        numEdges += commit->getNumEdges();
+        numDataParts += commit->getNumDataParts();
+    }
+
+    // The data parts of the change are the tail of the cumulative list of the tip
+    const size_t mainDataPartCount = mainHead->data().allDataparts().size();
+    const size_t totalDataPartCount = tipHistory.allDataparts().size();
+    bioassert(totalDataPartCount - mainDataPartCount == numDataParts,
+              "squashed data part count mismatch");
+
+    historyBuilder.setCommitDatapartCount(numDataParts);
+
+    tip->setCounts(numNodes, numEdges, numDataParts);
+    tip->setPreviousCommit(mainHead);
+
+    return tip;
 }
 
 std::unique_ptr<Change> VersionController::newChange(CommitHash base) {
@@ -252,6 +307,10 @@ template WeakArc<Index> VersionController::createNodePropertyIndex<types::Double
 template WeakArc<Index> VersionController::createNodePropertyIndex<types::String>(std::string_view indexName, PropertyTypeID ptID);
 template WeakArc<Index> VersionController::createNodePropertyIndex<types::Bool>(std::string_view indexName, PropertyTypeID ptID);
 template WeakArc<Index> VersionController::createNodePropertyIndex<types::Embedding>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> VersionController::createNodePropertyIndex<types::List>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> VersionController::createNodePropertyIndex<types::DateTime>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> VersionController::createNodePropertyIndex<types::Duration>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> VersionController::createNodePropertyIndex<types::Map>(std::string_view indexName, PropertyTypeID ptID);
 
 template WeakArc<Index> VersionController::createEdgePropertyIndex<types::Int64>(std::string_view indexName, PropertyTypeID ptID);
 template WeakArc<Index> VersionController::createEdgePropertyIndex<types::UInt64>(std::string_view indexName, PropertyTypeID ptID);
@@ -259,4 +318,8 @@ template WeakArc<Index> VersionController::createEdgePropertyIndex<types::Double
 template WeakArc<Index> VersionController::createEdgePropertyIndex<types::String>(std::string_view indexName, PropertyTypeID ptID);
 template WeakArc<Index> VersionController::createEdgePropertyIndex<types::Bool>(std::string_view indexName, PropertyTypeID ptID);
 template WeakArc<Index> VersionController::createEdgePropertyIndex<types::Embedding>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> VersionController::createEdgePropertyIndex<types::List>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> VersionController::createEdgePropertyIndex<types::DateTime>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> VersionController::createEdgePropertyIndex<types::Duration>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> VersionController::createEdgePropertyIndex<types::Map>(std::string_view indexName, PropertyTypeID ptID);
 }

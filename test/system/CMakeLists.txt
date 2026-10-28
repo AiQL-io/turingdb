@@ -1,10 +1,7 @@
-function(add_db_system_tests exe_name cpp_file)
-    add_turing_test(${exe_name} ${cpp_file})
-    target_link_libraries(${exe_name}
-        PRIVATE turing_db_storage_s
-                turing_db_system_s
-                turing_testenv_s
-                turing_testutils_s)
-endfunction()
+add_turing_test(test_system SystemTest.cpp)
 
-add_db_system_tests(test_system SystemTest.cpp)
+add_turing_test(test_system_version_not_found VersionNotFoundTest.cpp)
+
+add_turing_test(test_system_list_available_graphs_during_import ListAvailableGraphsDuringImportTest.cpp)
+
+add_turing_test(test_system_failed_import_clears_loading FailedImportClearsLoadingTest.cpp)

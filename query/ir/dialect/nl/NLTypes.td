@@ -47,6 +47,21 @@ def NLSortState : NLType<"SortState", "sort_state"> {
     }];
 }
 
+def NLHashJoinState : NLType<"HashJoinState", "hash_join_state"> {
+    let summary = "A hash join build side handle";
+    let description = [{
+        Stands for one equi-join's built side: the rows of the build factor,
+        materialized column by column, and the index from a row's serialized key
+        to the rows carrying it. Produced by nl.hash_join_buffer, filled by
+        nl.hash_join_collect once per build-loop step, and read by
+        nl.hash_join_probe once per probe-loop step. It is a handle, not a chunk:
+        it owns the growing per-column buffers and the key index, not a single
+        chunk of values. The joining sibling of !nl.sort_state - it indexes the
+        rows it accumulates rather than ordering them, and the rows come back out
+        through the probe rather than through an nl.for of its own.
+    }];
+}
+
 def NLDistinctState : NLType<"DistinctState", "distinct_state"> {
     let summary = "A DISTINCT seen-set handle";
     let description = [{
@@ -108,6 +123,74 @@ def NLGroupAggregateState : NLType<"GroupAggregateState", "group_aggregate_state
     }];
 }
 
+def NLOptionalState : NLType<"OptionalState", "optional_state"> {
+    let summary = "An OPTIONAL MATCH accumulator handle";
+    let description = [{
+        Stands for one OPTIONAL MATCH's state over the current step of the rows it
+        joins onto: the input chunks themselves, a matched flag per input row, and
+        the row buffers the matched rows are collected into. Produced by
+        nl.optional_buffer at the top of the block whose step it covers - so it is
+        reset once per step of the rows in flight - appended to by
+        nl.optional_collect, and drained by the nl.for over nl.optional_drain, which
+        emits the collected rows and then one null-padded row per input row nothing
+        matched. The pattern sibling of !nl.sort_state: it accumulates rows to
+        re-emit them, but keeps the input chunks beside them so the rows it missed
+        can be rebuilt.
+    }];
+}
+
+def NLExistsState : NLType<"ExistsState", "exists_state"> {
+    let summary = "An EXISTS accumulator handle";
+    let description = [{
+        Stands for one EXISTS subquery's state over the current step of the rows it
+        answers for: the input chunks and a matched flag per input row. Produced by
+        nl.exists_buffer at the top of the block whose step it covers - so it is
+        reset once per step - marked by nl.exists_mark as the body walks, and read
+        by nl.exists_result, which lays the flags out as the boolean chunk the op
+        produces. The lighter sibling of !nl.optional_state: EXISTS answers for the
+        input rows rather than re-emitting rows, so it buffers none of them.
+    }];
+}
+
+def NLCountSubqueryState : NLType<"CountSubqueryState", "count_subquery_state"> {
+    let summary = "A COUNT subquery accumulator handle";
+    let description = [{
+        Stands for one COUNT subquery's state over the current step of the rows it
+        answers for: the input chunks and a count per input row. Produced by
+        nl.count_subquery_buffer, which zeroes the counts once per step, added to by
+        nl.count_subquery_tally as the body walks, and read by
+        nl.count_subquery_result. The counting sibling of !nl.exists_state.
+    }];
+}
+
+def NLRowListsState : NLType<"RowListsState", "row_lists_state"> {
+    let summary = "A one-list-per-row accumulator handle";
+    let description = [{
+        Stands for the state of one pattern comprehension or COLLECT subquery over the
+        current step of the rows it is read on: how many rows that step has, and the
+        values its body's rows contributed, each under the row it belongs to. Produced by
+        nl.row_lists_buffer at the top of the block whose step it covers - so it is reset
+        once per step - staged into by nl.row_lists_collect once per step of the body's
+        own nest, and read by nl.row_lists_result, which builds one list per row of the
+        step. The list-valued sibling of !nl.optional_state: both cover one step of the
+        rows in flight, but this one reduces what the body found to one cell per row
+        rather than re-emitting it as rows.
+    }];
+}
+
+def NLRowState : NLType<"RowState", "row_state"> {
+    let summary = "A row accumulator handle";
+    let description = [{
+        Stands for rows held over the current step: the ones the branches of a UNION
+        inside a CALL body produce, or the table a db.materialize holds for the
+        branches of a NEXT segment. Produced by nl.row_buffer at the top of the block
+        whose step it covers - so it is reset once per step - appended to by one
+        nl.row_collect per producer, and drained by each nl.for over an nl.row_drain,
+        which emits the rows in the order they were collected. The unordered sibling of
+        !nl.sort_state.
+    }];
+}
+
 def NLCollectState : NLType<"CollectState", "collect_state"> {
     let summary = "A per-group value-list accumulator handle for one collect";
     let description = [{
@@ -123,7 +206,44 @@ def NLCollectState : NLType<"CollectState", "collect_state"> {
     }];
 }
 
-def NLChunk : NLType<"Chunk", "chunk"> {
+def NLShortestPathState : NLType<"ShortestPathState", "shortest_path_state"> {
+    let summary = "A shortest-path search accumulator handle";
+    let description = [{
+        One SHORTESTPATH's fully buffered source and target node sets. Produced by
+        nl.shortest_path_buffer, appended to by nl.shortest_path_update, and drained by the
+        nl.for over nl.shortest_path, which runs the search once both sets are complete.
+    }];
+}
+
+def NLNodeSetState : NLType<"NodeSetState", "node_set_state"> {
+    let summary = "A node set handle";
+    let description = [{
+        Stands for the set of nodes a whole column holds, sorted and without duplicates.
+        Produced by nl.node_set_buffer, appended to by nl.node_set_collect once per
+        producing-loop step, and read by the nl.explore_paths that binds its ends to the set.
+        It is a handle, not a chunk: it owns the accumulated nodes, which the walk reads once
+        the producing loop has run to its end.
+    }];
+}
+
+def NLProcedureState : NLType<"ProcedureState", "procedure_state"> {
+    let summary = "A live procedure call handle";
+    let description = [{
+        Stands for one CALL's procedure state: the procedure's own data (what its
+        alloc callback produced), the input columns its arguments are bound to and
+        the result columns its yielded return values are bound to. Produced by
+        nl.procedure, which prepares it once above the loops, then read by the
+        nl.for over nl.procedure_init, which drives the procedure until it
+        finishes.
+        It is a handle, not a chunk: it owns the call, not a chunk of values - the
+        sibling of !nl.sort_state, except the state lives inside the procedure
+        rather than in the engine.
+    }];
+}
+
+def CarriesRows : NativeTypeTrait<"CarriesRows">;
+
+def NLChunk : NLType<"Chunk", "chunk", [CarriesRows]> {
     let summary = "A bounded batch of values";
     let description = "One column chunk filled by a single database iterator step";
     let parameters = (ins "::mlir::Type":$elementType);
@@ -148,15 +268,16 @@ def NLPropertyType : NLType<"PropertyType", "property_type"> {
     }];
 }
 
-def NLEdgeType : NLType<"EdgeType", "edge_type"> {
-    let summary = "A resolved edge type handle";
+def NLEdgeTypeSet : NLType<"EdgeTypeSet", "edge_type_set"> {
+    let summary = "A resolved set of edge types";
     let description = [{
-        The edge sibling of !nl.property_type. Stands for one relationship type of
-        the graph - storage's EdgeTypeID - once its name has been resolved.
-        Produced by nl.get_edge_type ahead of the loops and consumed by the by-type
-        edge hops, so the name is looked up once rather than per step when a hop is
-        nested in a loop. It is not a chunk element type: it names an edge type, it
-        does not hold values.
+        The edge sibling of !nl.property_type. Stands for the relationship types a
+        pattern named - storage's EdgeTypeIDs - once their names have been resolved.
+        A pattern may name several, as `-[:KNOWS|LIKES]->` does, and an edge matches
+        when it carries any one of them. Produced by nl.get_edge_type_set ahead of the
+        loops and consumed by the by-type edge hops, so the names are looked up once
+        rather than per step when a hop is nested in a loop. It is not a chunk
+        element type: it names edge types, it does not hold values.
     }];
 }
 
@@ -196,6 +317,16 @@ def NLEdgeIDChunk : Type<
     BuildableType<"::mlir::nl::ChunkType::get($_builder.getContext(), "
                   "::mlir::storage::EdgeIDType::get($_builder.getContext()))">;
 
+// The mask sibling of NLNodeIDChunk: constrains an operand to
+// !nl.chunk<!storage.bool> - a row-by-row flag beside another chunk, as nl.merge's
+// pending masks are - and carries the recipe that lets a format omit its type.
+def NLBoolChunk : Type<
+        CPred<"::llvm::isa<::mlir::nl::ChunkType>($_self) && "
+              "::llvm::isa<::mlir::storage::BoolType>(::llvm::cast<::mlir::nl::ChunkType>($_self).getElementType())">,
+        "chunk of booleans", "::mlir::nl::ChunkType">,
+    BuildableType<"::mlir::nl::ChunkType::get($_builder.getContext(), "
+                  "::mlir::storage::BoolType::get($_builder.getContext()))">;
+
 def NLLabelSetIDChunk : Type<
         CPred<"::llvm::isa<::mlir::nl::ChunkType>($_self) && "
               "::llvm::isa<::mlir::storage::LabelSetIDType>(::llvm::cast<::mlir::nl::ChunkType>($_self).getElementType())">,
@@ -210,6 +341,20 @@ def NLEdgeTypeIDChunk : Type<
     BuildableType<"::mlir::nl::ChunkType::get($_builder.getContext(), "
                   "::mlir::storage::EdgeTypeIDType::get($_builder.getContext()))">;
 
+def NLMapChunk : Type<
+        CPred<"::llvm::isa<::mlir::nl::ChunkType>($_self) && "
+              "::llvm::isa<::mlir::storage::MapType>(::llvm::cast<::mlir::nl::ChunkType>($_self).getElementType())">,
+        "chunk of maps", "::mlir::nl::ChunkType">,
+    BuildableType<"::mlir::nl::ChunkType::get($_builder.getContext(), "
+                  "::mlir::storage::MapType::get($_builder.getContext()))">;
+
+def NLMapElementChunk : Type<
+        CPred<"::llvm::isa<::mlir::nl::ChunkType>($_self) && "
+              "::llvm::isa<::mlir::storage::MapElementType>(::llvm::cast<::mlir::nl::ChunkType>($_self).getElementType())">,
+        "chunk of map entries", "::mlir::nl::ChunkType">,
+    BuildableType<"::mlir::nl::ChunkType::get($_builder.getContext(), "
+                  "::mlir::storage::MapElementType::get($_builder.getContext()))">;
+
 // Constrains an operand to a resolved !nl.property_type handle, the same way
 // NLNodeIDChunk constrains a chunk operand. The single concrete type - there is
 // only ever !nl.property_type - is what lets the property fetches omit the
@@ -219,14 +364,14 @@ def NLPropertyTypeHandle : Type<
         "property type handle", "::mlir::nl::PropertyTypeType">,
     BuildableType<"::mlir::nl::PropertyTypeType::get($_builder.getContext())">;
 
-// Constrains an operand to a resolved !nl.edge_type handle, the edge sibling of
+// Constrains an operand to a resolved !nl.edge_type_set handle, the edge sibling of
 // NLPropertyTypeHandle. The single concrete type - there is only ever
-// !nl.edge_type - lets the by-type edge hops omit the handle's type in their
+// !nl.edge_type_set - lets the by-type edge hops omit the handle's type in their
 // assembly format, building it from this recipe instead.
 def NLEdgeTypeHandle : Type<
-        CPred<"::llvm::isa<::mlir::nl::EdgeTypeType>($_self)">,
-        "edge type handle", "::mlir::nl::EdgeTypeType">,
-    BuildableType<"::mlir::nl::EdgeTypeType::get($_builder.getContext())">;
+        CPred<"::llvm::isa<::mlir::nl::EdgeTypeSetType>($_self)">,
+        "edge type set handle", "::mlir::nl::EdgeTypeSetType">,
+    BuildableType<"::mlir::nl::EdgeTypeSetType::get($_builder.getContext())">;
 
 // Constrains an operand to an !nl.limit_state handle, the same way
 // NLPropertyTypeHandle constrains the property handle. The single concrete type
@@ -256,6 +401,16 @@ def NLSortStateHandle : Type<
         CPred<"::llvm::isa<::mlir::nl::SortStateType>($_self)">,
         "sort state handle", "::mlir::nl::SortStateType">,
     BuildableType<"::mlir::nl::SortStateType::get($_builder.getContext())">;
+
+// Constrains an operand to an !nl.hash_join_state handle, the same way
+// NLSortStateHandle constrains the sort handle. The single concrete type - there
+// is only ever !nl.hash_join_state - is what lets nl.hash_join_collect and
+// nl.hash_join_probe omit the handle's type in their assembly, building it from
+// this recipe instead.
+def NLHashJoinStateHandle : Type<
+        CPred<"::llvm::isa<::mlir::nl::HashJoinStateType>($_self)">,
+        "hash join state handle", "::mlir::nl::HashJoinStateType">,
+    BuildableType<"::mlir::nl::HashJoinStateType::get($_builder.getContext())">;
 
 // Constrains an operand to an !nl.distinct_state handle, the same way
 // NLSortStateHandle constrains the sort handle. The single concrete type - there
@@ -294,5 +449,77 @@ def NLCollectStateHandle : Type<
         CPred<"::llvm::isa<::mlir::nl::CollectStateType>($_self)">,
         "collect state handle", "::mlir::nl::CollectStateType">,
     BuildableType<"::mlir::nl::CollectStateType::get($_builder.getContext())">;
+
+// Constrains an operand to an !nl.shortest_path_state handle
+def NLShortestPathStateHandle : Type<
+        CPred<"::llvm::isa<::mlir::nl::ShortestPathStateType>($_self)">,
+        "shortest path state handle", "::mlir::nl::ShortestPathStateType">,
+    BuildableType<"::mlir::nl::ShortestPathStateType::get($_builder.getContext())">;
+
+// Constrains an operand to an !nl.node_set_state handle
+def NLNodeSetStateHandle : Type<
+        CPred<"::llvm::isa<::mlir::nl::NodeSetStateType>($_self)">,
+        "node set state handle", "::mlir::nl::NodeSetStateType">,
+    BuildableType<"::mlir::nl::NodeSetStateType::get($_builder.getContext())">;
+
+// Constrains an operand to an !nl.procedure_state handle, the same way
+// NLSortStateHandle constrains the sort handle. The single concrete type - there
+// is only ever !nl.procedure_state - is what lets nl.procedure_init omit the
+// handle's type in its assembly, building it from this recipe instead.
+def NLProcedureStateHandle : Type<
+        CPred<"::llvm::isa<::mlir::nl::ProcedureStateType>($_self)">,
+        "procedure state handle", "::mlir::nl::ProcedureStateType">,
+    BuildableType<"::mlir::nl::ProcedureStateType::get($_builder.getContext())">;
+
+// Constrains an operand to an !nl.row_lists_state handle, the same way NLSortStateHandle
+// constrains the sort handle. The single concrete type - there is only ever
+// !nl.row_lists_state - is what lets nl.row_lists_collect and nl.row_lists_result omit the
+// handle's type in their assembly, building it from this recipe instead.
+def NLRowListsStateHandle : Type<
+        CPred<"::llvm::isa<::mlir::nl::RowListsStateType>($_self)">,
+        "row lists state handle", "::mlir::nl::RowListsStateType">,
+    BuildableType<"::mlir::nl::RowListsStateType::get($_builder.getContext())">;
+
+// Constrains an operand to an !nl.optional_state handle, the same way
+// NLSortStateHandle constrains the sort handle. The single concrete type - there
+// is only ever !nl.optional_state - is what lets nl.optional_collect and
+// nl.optional_drain omit the handle's type in their assembly, building it from
+// this recipe instead.
+def NLOptionalStateHandle : Type<
+        CPred<"::llvm::isa<::mlir::nl::OptionalStateType>($_self)">,
+        "optional state handle", "::mlir::nl::OptionalStateType">,
+    BuildableType<"::mlir::nl::OptionalStateType::get($_builder.getContext())">;
+
+// Constrains an operand to an !nl.row_state handle, as NLSortStateHandle constrains
+// the sort one, and carries the recipe that lets nl.row_collect and nl.row_drain
+// omit the handle's type.
+def NLRowStateHandle : Type<
+        CPred<"::llvm::isa<::mlir::nl::RowStateType>($_self)">,
+        "row state handle", "::mlir::nl::RowStateType">,
+    BuildableType<"::mlir::nl::RowStateType::get($_builder.getContext())">;
+
+// Constrains an operand to an !nl.exists_state handle, as NLOptionalStateHandle
+// constrains the optional one, and carries the recipe that lets nl.exists_mark and
+// nl.exists_result omit the handle's type.
+def NLExistsStateHandle : Type<
+        CPred<"::llvm::isa<::mlir::nl::ExistsStateType>($_self)">,
+        "exists state handle", "::mlir::nl::ExistsStateType">,
+    BuildableType<"::mlir::nl::ExistsStateType::get($_builder.getContext())">;
+
+def NLCountSubqueryStateHandle : Type<
+        CPred<"::llvm::isa<::mlir::nl::CountSubqueryStateType>($_self)">,
+        "count subquery state handle", "::mlir::nl::CountSubqueryStateType">,
+    BuildableType<"::mlir::nl::CountSubqueryStateType::get($_builder.getContext())">;
+
+// Constrains an operand to a chunk of unsigned 64-bit counts, the way
+// NLNodeIDChunk constrains an ID chunk. It is what an OPTIONAL MATCH's row tag
+// rides on - the position of the input row each matched row descends from - and
+// the BuildableType recipe lets the ops naming it omit the type.
+def NLUInt64Chunk : Type<
+        CPred<"::llvm::isa<::mlir::nl::ChunkType>($_self) && "
+              "::llvm::cast<::mlir::nl::ChunkType>($_self).getElementType().isUnsignedInteger(64)">,
+        "chunk of unsigned 64-bit counts", "::mlir::nl::ChunkType">,
+    BuildableType<"::mlir::nl::ChunkType::get($_builder.getContext(), "
+                  "$_builder.getIntegerType(64, false))">;
 
 #endif // TURINGDB_NL_TYPES

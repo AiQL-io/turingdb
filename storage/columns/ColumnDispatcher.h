@@ -37,12 +37,16 @@ using AllValueTypes = TypeList<
     types::String::Primitive,
     types::Bool::Primitive,
     types::Embedding::Primitive,
+    types::DateTime::Primitive,
+    types::Duration::Primitive,
     std::optional<types::Int64::Primitive>,
     std::optional<types::UInt64::Primitive>,
     std::optional<types::Double::Primitive>,
     std::optional<types::String::Primitive>,
     std::optional<types::Bool::Primitive>,
     std::optional<types::Embedding::Primitive>,
+    std::optional<types::DateTime::Primitive>,
+    std::optional<types::Duration::Primitive>,
     std::optional<NodeID>,
     std::optional<EdgeID>,
     std::string,
@@ -51,6 +55,7 @@ using AllValueTypes = TypeList<
     const Change*,
     EntityList,
     ListView,
+    std::optional<ListView>,
     ListElementView
 >;
 template <ColumnKind::Code K, typename... TypeList>

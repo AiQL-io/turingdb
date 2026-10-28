@@ -66,8 +66,7 @@ protected:
     }
 
     QueryStatus query(std::string_view q, std::string_view graphName, ChangeID changeID) {
-        QueryCallbacks callbacks;
-        const QueryState state(graphName, &_env->getMem(), &_queryConfig, &callbacks, CommitHash::head(), changeID);
+        const QueryState state(graphName, &_env->getMem(), &_env->getCompilerContext(), &_queryConfig, nullptr, CommitHash::head(), changeID);
         return _env->getDB().query(q, state);
     }
 };
@@ -225,5 +224,5 @@ TEST_F(CommitJournalSerialisationTest, createNodesAndEdgesThenLoad) {
 }
 
 int main(int argc, char** argv) {
-    return turingTestMain(argc, argv, [] { testing::GTEST_FLAG(repeat) = 1; });
+    return turingTestMain(argc, argv);
 }

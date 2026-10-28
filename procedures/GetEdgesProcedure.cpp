@@ -8,6 +8,7 @@
 #include "ProcedureState.h"
 #include "Procedure.h"
 #include "ProcedureNamespace.h"
+#include "TypedProcedure.h"
 #include "ProcUtils.h"
 #include "ProcedureException.h"
 #include "columns/ColumnVector.h"
@@ -18,6 +19,7 @@
 #include "metadata/GraphMetadata.h"
 #include "metadata/PropertyTypeMap.h"
 #include "versioning/Tombstones.h"
+#include "buffers/StringBuffer.h"
 #include "list/ListView.h"
 #include "ID.h"
 
@@ -25,14 +27,9 @@ using namespace db;
 
 namespace {
 
-using EdgeIDCol = ColumnVector<EdgeID>;
-using NodeIDCol = ColumnVector<NodeID>;
-using EdgeTypeIDCol = ColumnVector<EdgeTypeID>;
-using StringColumn = ColumnVector<std::string>;
-
 constexpr std::string_view edgeIDsErr = "getEdges: edgeIDs must be a constant list";
 
-struct Data : public ProcedureData {};
+struct Data : public TypedProcedureData<GetEdgesProcedure> {};
 
 void executeImpl(ProcedureState* proc) {
     Data& data = proc->data<Data>();
@@ -40,41 +37,24 @@ void executeImpl(ProcedureState* proc) {
 
     const Column* inputEdgeIDs = data.getInputColumn(0);
 
-    auto* idCol = static_cast<EdgeIDCol*>(data.getReturnColumn(0));
-    auto* srcCol = static_cast<NodeIDCol*>(data.getReturnColumn(1));
-    auto* tgtCol = static_cast<NodeIDCol*>(data.getReturnColumn(2));
-    auto* typeCol = static_cast<EdgeTypeIDCol*>(data.getReturnColumn(3));
-    auto* propsCol = static_cast<StringColumn*>(data.getReturnColumn(4));
+    auto* idCol = data.getReturnColumn<0>();
+    auto* srcCol = data.getReturnColumn<1>();
+    auto* tgtCol = data.getReturnColumn<2>();
+    auto* typeCol = data.getReturnColumn<3>();
+    auto* propsCol = data.getReturnColumn<4>();
 
     const GraphView& view = *ctxt->getGraphView();
     const GraphReader reader(view);
     const PropertyTypeMap& propTypes = reader.getMetadata().propTypes();
+    StringBuffer* stringBuffer = ctxt->getStringBuffer();
 
-    const bool hasEdgeTombstones = view.tombstones().hasEdges();
+    const bool hasEdgeTombstones = view.hasDeletedEdges();
 
     std::vector<int64_t> edgeIDs;
     const auto& edgeIDsList = ProcUtils::constArg<ListView>(inputEdgeIDs, edgeIDsErr);
     ProcUtils::readIntList(&edgeIDsList, edgeIDs);
 
-    if (idCol) {
-        idCol->clear();
-    }
-
-    if (srcCol) {
-        srcCol->clear();
-    }
-
-    if (tgtCol) {
-        tgtCol->clear();
-    }
-
-    if (typeCol) {
-        typeCol->clear();
-    }
-
-    if (propsCol) {
-        propsCol->clear();
-    }
+    data.clearReturnColumns();
 
     std::string propsJson;
 
@@ -105,7 +85,7 @@ void executeImpl(ProcedureState* proc) {
 
         if (propsCol) {
             ProcUtils::encodeProperties(edge.properties(), propTypes, propsJson);
-            propsCol->push_back(propsJson);
+            propsCol->push_back(stringBuffer->insert(propsJson));
         }
     }
 
@@ -114,25 +94,9 @@ void executeImpl(ProcedureState* proc) {
 
 }
 
-ProcedureData* GetEdgesProcedure::allocData() {
-    return new Data();
-}
-
-void GetEdgesProcedure::deallocData(ProcedureData* data) {
-    delete data;
-}
-
 void GetEdgesProcedure::registerProcedure(ProcedureNamespace* ns) {
-    Procedure* proc = new Procedure("getEdges");
-    proc->setExecuteCallback(&execute);
-    proc->setAllocCallback(&allocData);
-    proc->setDeallocCallback(&deallocData);
-    proc->addArgument("edgeIDs", ProcedureType::LIST);
-    proc->addReturnValue("id", ProcedureType::EDGE);
-    proc->addReturnValue("src", ProcedureType::NODE);
-    proc->addReturnValue("tgt", ProcedureType::NODE);
-    proc->addReturnValue("edgeTypeID", ProcedureType::EDGE_TYPE_ID);
-    proc->addReturnValue("properties", ProcedureType::STRING);
+    Procedure* proc = createTypedProcedure<Data>("getEdges");
+    proc->addConstantArgument("edgeIDs", ProcedureType::LIST);
     ns->addProcedure(proc);
 }
 

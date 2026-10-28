@@ -3,45 +3,55 @@
 #include <string_view>
 
 #include "QueryConfig.h"
-#include "QueryCallbacks.h"
 #include "versioning/CommitHash.h"
 #include "versioning/ChangeID.h"
 
 namespace db {
 
 class LocalMemory;
+class NLOutputSink;
+class CompilerContext;
+class ParameterMap;
 
 class QueryState {
 public:
     QueryState(std::string_view graphName,
                LocalMemory* mem,
+               CompilerContext* compilerContext,
                const QueryConfig* queryConfig,
-               const QueryCallbacks* callbacks,
+               NLOutputSink* sink,
                CommitHash hash = CommitHash::head(),
-               ChangeID change = ChangeID::head())
+               ChangeID change = ChangeID::head(),
+               const ParameterMap* parameters = nullptr)
         : _graphName(graphName),
         _mem(mem),
+        _compilerContext(compilerContext),
         _queryConfig(queryConfig),
-        _callbacks(callbacks),
+        _sink(sink),
         _hash(hash),
-        _change(change)
+        _change(change),
+        _parameters(parameters)
     {
     }
 
     std::string_view getGraphName() const { return _graphName; }
     LocalMemory* getMemory() const { return _mem; }
+    CompilerContext* getCompilerContext() const { return _compilerContext; }
     const QueryConfig* getQueryConfig() const { return _queryConfig; }
-    const QueryCallbacks* getCallbacks() const { return _callbacks; }
+    NLOutputSink* getSink() const { return _sink; }
     CommitHash getCommitHash() const { return _hash; }
     ChangeID getChangeID() const { return _change; }
+    const ParameterMap* getParameters() const { return _parameters; }
 
 private:
     std::string_view _graphName;
     LocalMemory* _mem {nullptr};
+    CompilerContext* _compilerContext {nullptr};
     const QueryConfig* _queryConfig {nullptr};
-    const QueryCallbacks* _callbacks {nullptr};
+    NLOutputSink* _sink {nullptr};
     CommitHash _hash {CommitHash::head()};
     ChangeID _change {ChangeID::head()};
+    const ParameterMap* _parameters {nullptr};
 };
 
 }

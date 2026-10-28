@@ -17,19 +17,21 @@ public:
 
     Kind getKind() const override { return Kind::SINGLE_PART_QUERY; }
 
-    const StmtContainer* getReadStmts() const { return _readStmts; }
-    const StmtContainer* getUpdateStmts() const { return _updateStmts; }
+    const StmtContainer* getStmts() const { return _stmts; }
     const ReturnStmt* getReturnStmt() const { return _returnStmt; }
+    ReturnStmt* getReturnStmt() { return _returnStmt; }
 
-    void setReadStmts(StmtContainer* stmts) { _readStmts = stmts; }
-    void addReadStmt(Stmt* stmt);
+    // A CALL subquery counts when its own body does
+    bool writesToTheGraph() const;
+    bool readsTheGraph() const;
 
-    void setUpdateStmts(StmtContainer* stmts) { _updateStmts = stmts; }
+    void setStmts(StmtContainer* stmts) { _stmts = stmts; }
+    void addStmt(Stmt* stmt);
+
     void setReturnStmt(ReturnStmt* stmt) { _returnStmt = stmt; }
 
 private:
-    StmtContainer* _readStmts {nullptr};
-    StmtContainer* _updateStmts {nullptr};
+    StmtContainer* _stmts {nullptr};
     ReturnStmt* _returnStmt {nullptr};
 
     SinglePartQuery(DeclContext* declContext);

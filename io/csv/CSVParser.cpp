@@ -6,8 +6,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <algorithm>
+#include <span>
+#include <string>
+#include <vector>
+
 #include <spdlog/spdlog.h>
 
+#include "buffers/StringBuffer.h"
 #include "columns/ColumnStringTable.h"
 
 #include "TuringException.h"
@@ -372,7 +378,39 @@ bool CSVParser::readLine() {
     }
 }
 
-size_t CSVParser::readChunk(size_t maxRows, ColumnStringTable* output) {
+CSVParser::RecordStatus CSVParser::readRecord() {
+    if (!readLine()) {
+        return RecordStatus::Finished;
+    }
+
+    _linesRead++;
+
+    if (!parseCSVLine(_lineBuffer, _fields)) {
+        if (_errorMode == CSVErrorMode::Skip) {
+            _linesSkipped++;
+            spdlog::warn("CSV line {}: unterminated quote, skipping", _linesRead);
+            return RecordStatus::Skipped;
+        }
+
+        throw TuringException(fmt::format("CSV line {}: unterminated quote", _linesRead));
+    }
+
+    if (_fields.size() != _expectedFieldCount) {
+        if (_errorMode == CSVErrorMode::Skip) {
+            _linesSkipped++;
+            spdlog::warn("CSV line {}: expected {} fields, got {}, skipping",
+                         _linesRead, _expectedFieldCount, _fields.size());
+            return RecordStatus::Skipped;
+        }
+
+        throw TuringException(fmt::format("CSV line {}: expected {} fields, got {}",
+                                          _linesRead, _expectedFieldCount, _fields.size()));
+    }
+
+    return RecordStatus::Read;
+}
+
+size_t CSVParser::readChunk(size_t maxRows, ColumnStringTable* output, StringBuffer* stringBuffer) {
     if (!_opened) {
         openFile();
     }
@@ -385,33 +423,47 @@ size_t CSVParser::readChunk(size_t maxRows, ColumnStringTable* output) {
     size_t rowsRead = 0;
 
     while (rowsRead < maxRows) {
-        if (!readLine()) {
+        const RecordStatus status = readRecord();
+        if (status == RecordStatus::Finished) {
             break;
-        }
-        _linesRead++;
-
-        if (!parseCSVLine(_lineBuffer, _fields)) {
-            if (_errorMode == CSVErrorMode::Skip) {
-                _linesSkipped++;
-                spdlog::warn("CSV line {}: unterminated quote, skipping", _linesRead);
-                continue;
-            }
-            throw TuringException(fmt::format("CSV line {}: unterminated quote", _linesRead));
-        }
-
-        if (_fields.size() != _expectedFieldCount) {
-            if (_errorMode == CSVErrorMode::Skip) {
-                _linesSkipped++;
-                spdlog::warn("CSV line {}: expected {} fields, got {}, skipping",
-                             _linesRead, _expectedFieldCount, _fields.size());
-                continue;
-            }
-            throw TuringException(fmt::format("CSV line {}: expected {} fields, got {}",
-                                              _linesRead, _expectedFieldCount, _fields.size()));
+        } else if (status == RecordStatus::Skipped) {
+            continue;
         }
 
         for (size_t i = 0; i < _fields.size(); i++) {
-            output->getFieldColumn(i)->push_back(std::move(_fields[i]));
+            output->getFieldColumn(i)->push_back(stringBuffer->insert(_fields[i]));
+        }
+        rowsRead++;
+    }
+
+    return rowsRead;
+}
+
+size_t CSVParser::readChunk(size_t maxRows,
+                            std::span<const size_t> fieldIndices,
+                            ColumnStringTable* output,
+                            StringBuffer* stringBuffer) {
+    if (!_opened) {
+        openFile();
+    }
+    if (_finished) {
+        return 0;
+    }
+
+    output->clear();
+
+    size_t rowsRead = 0;
+
+    while (rowsRead < maxRows) {
+        const RecordStatus status = readRecord();
+        if (status == RecordStatus::Finished) {
+            break;
+        } else if (status == RecordStatus::Skipped) {
+            continue;
+        }
+
+        for (size_t i = 0; i < fieldIndices.size(); i++) {
+            output->getFieldColumn(i)->push_back(stringBuffer->insert(_fields[fieldIndices[i]]));
         }
         rowsRead++;
     }

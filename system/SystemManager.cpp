@@ -21,7 +21,6 @@
 #include "SystemEventHandler.h"
 
 #include "Panic.h"
-#include "TuringException.h"
 
 using namespace db;
 
@@ -142,7 +141,7 @@ void SystemManager::initLockFile() {
 void SystemManager::initVectorDatabase() {
     const auto& vectorDir = _config->getVectorDir();
 
-    if (auto res = _vectorDatabase.init(vectorDir); !res) {
+    if (auto res = _vectorDatabase.init(vectorDir, _config->mmappingVectorIndexes()); !res) {
         panic("Could not create vector database: {}", res.error().fmtMessage());
     }
 }
@@ -187,8 +186,10 @@ void SystemManager::listGraphs(std::vector<std::string_view>& names) const {
 
 Graph* SystemManager::importGraph(const fs::Path& path,
                                   std::string_view graphName,
-                                  const EmbeddingsSpec& embeddingSpecs) {
-    return _graphManager.importGraph(graphName, path, &_jobSystem, embeddingSpecs);
+                                  const EmbeddingsSpec& embeddingSpecs,
+                                  const DateTimeSpec& dateTimeSpecs,
+                                  const DurationSpec& durationSpecs) {
+    return _graphManager.importGraph(graphName, path, &_jobSystem, embeddingSpecs, dateTimeSpecs, durationSpecs);
 }
 
 DumpResult<void> SystemManager::dumpGraph(std::string_view graphName) {
@@ -214,14 +215,7 @@ bool SystemManager::isGraphLoading(std::string_view graphName) const {
 }
 
 void SystemManager::listAvailableGraphs(std::vector<std::string>& names) const {
-    const auto list = _config->getGraphsDir().listDir();
-    if (!list) {
-        throw TuringException("Can not list graphs in turing directory");
-    }
-
-    for (const auto& path : list.value()) {
-        names.emplace_back(path.filename());
-    }
+    _graphManager.listAvailableGraphs(names);
 }
 
 ChangeResult<Change*> SystemManager::newChange(std::string_view graphName, CommitHash baseHash) {
@@ -232,8 +226,8 @@ ChangeResult<Change*> SystemManager::getChange(const Graph* graph, ChangeID chan
     return _graphManager.getChange(graph, changeID);
 }
 
-ChangeResult<void> SystemManager::submitChange(ChangeAccessor& accessor) {
-    return _graphManager.submitChange(accessor, _jobSystem);
+ChangeResult<void> SystemManager::submitChange(ChangeAccessor& accessor, SubmitMode mode) {
+    return _graphManager.submitChange(accessor, _jobSystem, mode);
 }
 
 CommitResult<void> SystemManager::commitChange(ChangeAccessor& accessor) {
@@ -248,6 +242,10 @@ void SystemManager::listChanges(std::vector<const Change*>& changes, const Graph
     _graphManager.listChanges(changes, graph);
 }
 
+bool SystemManager::hasChanges() const {
+    return _graphManager.hasChanges();
+}
+
 DataPartMergeResult<void> SystemManager::mergeDataParts(Graph* graph) {
     return _graphManager.mergeDataParts(graph, _jobSystem);
 }
@@ -255,10 +253,18 @@ DataPartMergeResult<void> SystemManager::mergeDataParts(Graph* graph) {
 ChangeResult<Transaction> SystemManager::openTransaction(std::string_view graphName,
                                                          CommitHash commitHash,
                                                          ChangeID changeID) {
-    Graph* graph = graphName.empty() ? this->getDefaultGraph()
-                                     : this->getGraph(graphName);
+    Graph* graph = this->getDefaultGraph();
+    if (!graphName.empty()) {
+        const ChangeResult<Graph*> foundGraph = _graphManager.findGraph(graphName);
+        if (!foundGraph) {
+            return BadResult<ChangeError>(foundGraph.error());
+        }
+
+        graph = foundGraph.value();
+    }
+
     if (!graph) {
-        return ChangeError::result(ChangeErrorType::GRAPH_NOT_FOUND);
+        return ChangeError::graphResult(ChangeErrorType::GRAPH_NOT_FOUND, graphName);
     }
 
     if (changeID == ChangeID::head()) {
@@ -270,14 +276,14 @@ ChangeResult<Transaction> SystemManager::openTransaction(std::string_view graphN
         // Determine why it failed
         const Commit* commit = graph->getVersionController().getCommitSafe(commitHash);
         if (commit != nullptr && !commit->hasData()) {
-            return ChangeError::result(ChangeErrorType::COMMIT_NOT_LOADED);
+            return ChangeError::result(ChangeErrorType::COMMIT_NOT_LOADED, commitHash);
         }
-        return ChangeError::result(ChangeErrorType::COMMIT_NOT_FOUND);
+        return ChangeError::result(ChangeErrorType::COMMIT_NOT_FOUND, commitHash);
     }
 
     const auto changeRes = _graphManager.getChange(graph, changeID);
     if (!changeRes) {
-        return ChangeError::result(ChangeErrorType::CHANGE_NOT_FOUND);
+        return BadResult<ChangeError>(changeRes.error());
     }
 
     // In a valid change
@@ -289,7 +295,7 @@ ChangeResult<Transaction> SystemManager::openTransaction(std::string_view graphN
             return tx;
         }
 
-        return ChangeError::result(ChangeErrorType::CHANGE_NOT_FOUND);
+        return ChangeError::result(ChangeErrorType::CHANGE_NOT_FOUND, changeID);
     }
 
     // if hash != head: Requesting a read on a specific commit (either pending or frozen)
@@ -305,10 +311,10 @@ ChangeResult<Transaction> SystemManager::openTransaction(std::string_view graphN
     {
         const Commit* commit = graph->getVersionController().getCommitSafe(commitHash);
         if (commit != nullptr && !commit->hasData()) {
-            return ChangeError::result(ChangeErrorType::COMMIT_NOT_LOADED);
+            return ChangeError::result(ChangeErrorType::COMMIT_NOT_LOADED, commitHash);
         }
     }
-    return ChangeError::result(ChangeErrorType::COMMIT_NOT_FOUND);
+    return ChangeError::result(ChangeErrorType::COMMIT_NOT_FOUND, commitHash);
 }
 
 DumpResult<void> SystemManager::loadCommit(std::string_view graphName, CommitHash hash) {

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -12,10 +13,14 @@
 
 #include "ParquetReader.h"
 
+#include "DurationSpec.h"
 #include "ID.h"
+#include "list/ListContainer.h"
+#include "list/ListView.h"
 #include "metadata/PropertyType.h"
 
 namespace parquet {
+class ColumnDescriptor;
 class FileMetaData;
 }
 
@@ -31,9 +36,10 @@ public:
     using NodeIDs = std::span<const int64_t>;
     using IDMap = std::unordered_map<int64_t, NodeID>;
 
-    ParquetImportVisitor(CommitBuilder* builder, IDMap& nodeIDs)
+    ParquetImportVisitor(CommitBuilder* builder, IDMap& nodeIDs, const DurationSpec& durationSpecs)
         : _builder(builder),
-        _nodeIDs(nodeIDs)
+        _nodeIDs(nodeIDs),
+        _durationSpecs(durationSpecs)
     {
     }
 
@@ -48,14 +54,32 @@ protected:
         std::string name;
         ValueType valueType {ValueType::Invalid};
         PropertyTypeID propertyTypeID;
+        parquet::Type::type physicalType {parquet::Type::UNDEFINED};
         int16_t maxDefLevel {0};
+        int16_t maxRepLevel {0};
+
+        // What a TIMESTAMP column counts in, UNKNOWN for a column holding anything else.
+        // A list of timestamps is a List column whose elements still carry it.
+        parquet::LogicalType::TimeUnit::unit timeUnit {parquet::LogicalType::TimeUnit::UNKNOWN};
+
+        bool holdsDurations {false};
+
+        // Indexed by repetition depth: the definition level a value must reach for the
+        // list at that depth to hold an element. Index 0 is unused.
+        std::vector<int16_t> listDefLevels;
     };
+
+    // The instant a TIMESTAMP column's raw value stands for, scaled from the unit the
+    // column counts in to the microseconds a DateTime holds
+    static types::DateTime::Primitive toDateTime(const PropertyColumn& prop, int64_t value);
 
     CommitBuilder* _builder {nullptr};
 
     // Maps node IDs as defined by the parquet file to TuringDB NodeIDs defined by the
     // @ref DataPartBuilder used when importing
     IDMap& _nodeIDs;
+
+    const DurationSpec& _durationSpecs;
 
     std::unordered_map<size_t, PropertyColumn> _propertyColumns;
 
@@ -69,6 +93,22 @@ protected:
     // Maps a property column index => definition levels of that column.
     // Used to encode null/nans for simple types.
     std::unordered_map<size_t, std::vector<int16_t>> _propDefLevels;
+
+    // A repeated column is drained sub-batch by sub-batch, each delivery invalidating the
+    // last, so a list column's levels and values are accumulated over the whole row group
+    // rather than viewed.
+    std::unordered_map<size_t, std::vector<int16_t>> _propRepLevels;
+    std::unordered_map<size_t, std::vector<int64_t>> _propListInt64Vals;
+    std::unordered_map<size_t, std::vector<double>> _propListDoubleVals;
+    std::unordered_map<size_t, std::vector<uint8_t>> _propListBoolVals;
+
+    // Owns the elements of the lists built for one chunk; each list is deep-copied into
+    // the datapart as it is added, so the scratch is cleared with the chunk.
+    ListContainer _listScratch;
+
+    // One entry per row of the chunk, filled by @ref buildListProperties, empty where the
+    // row has no value for the column being built
+    std::vector<std::optional<ListView>> _chunkLists;
 
     static constexpr size_t INVALID_COL_IDX = std::numeric_limits<size_t>::max();
 
@@ -85,14 +125,23 @@ protected:
     // Infers a property column value type and registers property type
     void discoverPropertyColumn(size_t columnIndex,
                                 const std::string& path,
-                                parquet::Type::type physicalType,
-                                int16_t maxDefLevel);
+                                const parquet::ColumnDescriptor& descriptor);
 
     // Capture helpers for property columns, called by the derived value callbacks
     // once they have handled their entity-specific columns.
-    void capturePropertyLevels(size_t columnIndex, std::span<const int16_t> defLevels);
+    void capturePropertyLevels(size_t columnIndex,
+                               std::span<const int16_t> repLevels,
+                               std::span<const int16_t> defLevels);
     void capturePropertyInt64(size_t columnIndex, std::span<const int64_t> values);
     void capturePropertyByteArray(size_t columnIndex, std::span<const parquet::ByteArray> values);
+
+    // Groups a list column's captured levels and values into one list per row, storing the
+    // elements in @ref _listScratch and the per-row views in @ref _chunkLists.
+    void buildListProperties(size_t columnIndex, const PropertyColumn& prop, size_t numRows);
+
+    ListContainer::ListItemVariant listElement(const PropertyColumn& prop,
+                                               size_t columnIndex,
+                                               size_t valueIndex);
 
     void resetPropertyChunk();
 };

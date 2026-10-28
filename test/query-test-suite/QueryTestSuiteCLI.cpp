@@ -5,7 +5,7 @@
 #include <spdlog/spdlog.h>
 
 #include "QueryTestRunner.h"
-#include "RemoteQueryTestRunner.h"
+#include "V3QueryTestRunner.h"
 
 using namespace turing::test;
 
@@ -61,12 +61,9 @@ std::string argParserUsage(const argparse::ArgumentParser& parser) {
 std::string serializeTest(const QueryTestSpec& test) {
     std::string out = fmt::format(
         "{{\"name\":\"{}\",\"query\":\"{}\",\"writeRequired\":{},"
-        "\"disabledReason\":\"{}\","
-        "\"remoteEnabled\":{},\"remoteDisabledReason\":\"{}\",\"tags\":[",
+        "\"disabledReason\":\"{}\",\"tags\":[",
         escapeJson(test._name), escapeJson(test._query),
-        test._writeRequired ? "true" : "false", escapeJson(test._disabledReason),
-        test._remoteEnabled ? "true" : "false",
-        escapeJson(test._remoteDisabledReason));
+        test._writeRequired ? "true" : "false", escapeJson(test._disabledReason));
     for (size_t i = 0; i < test._tags.size(); ++i) {
         if (i > 0) {
             out += ",";
@@ -77,40 +74,19 @@ std::string serializeTest(const QueryTestSpec& test) {
     return out;
 }
 
-// Remote mode keeps the output transport-focused; local runs include the
-// additional JSON expectation fields used by the in-process suite.
-std::string serializeResult(const QueryTestResult& result, bool includeJsonFields = true) {
-    if (!includeJsonFields) {
-        return fmt::format(
-            "{{\"name\":\"{}\",\"planOutput\":\"{}\","
-            "\"resultOutput\":\"{}\","
-            "\"planMatched\":{},\"resultMatched\":{},"
-            "\"timeUs\":{}}}",
-            escapeJson(result._name),
-            escapeJson(result._planOutput),
-            escapeJson(result._resultOutput),
-            result._planMatched ? "true" : "false",
-            result._resultMatched ? "true" : "false",
-            result._timeUs);
-    }
-
+std::string serializeResult(const V3QueryTestResult& result) {
     return fmt::format(
-        "{{\"name\":\"{}\",\"planOutput\":\"{}\","
-        "\"resultOutput\":\"{}\",\"resultJsonOutput\":\"{}\","
-        "\"resultJsonError\":\"{}\","
-        "\"planMatched\":{},\"resultMatched\":{},"
-        "\"resultJsonMatched\":{},\"resultJsonValid\":{},"
+        "{{\"name\":\"{}\",\"resultOutput\":\"{}\","
+        "\"mlirProgram\":\"{}\","
+        "\"resultMatched\":{},\"mlirMatched\":{},"
         "\"timeUs\":{}}}",
-        escapeJson(result._name), escapeJson(result._planOutput),
-        escapeJson(result._resultOutput), escapeJson(result._resultJsonOutput),
-        escapeJson(result._resultJsonError),
-        result._planMatched ? "true" : "false",
+        escapeJson(result._name), escapeJson(result._resultOutput),
+        escapeJson(result._mlirOutput),
         result._resultMatched ? "true" : "false",
-        result._resultJsonMatched ? "true" : "false",
-        result._resultJsonValid ? "true" : "false", result._timeUs);
+        result._mlirMatched ? "true" : "false", result._timeUs);
 }
 
-} // namespace
+}
 
 int main(int argc, char** argv) {
     spdlog::set_level(spdlog::level::off);
@@ -124,16 +100,8 @@ int main(int argc, char** argv) {
         .help("Run a single test by name")
         .metavar("name")
         .nargs(1);
-    program.add_argument("--run-remote")
-        .help("Run a single test by name through the remote protocol")
-        .metavar("name")
-        .nargs(1);
     program.add_argument("--run-all")
         .help("Run all enabled tests")
-        .default_value(false)
-        .implicit_value(true);
-    program.add_argument("--run-all-remote")
-        .help("Run all enabled tests through the remote protocol")
         .default_value(false)
         .implicit_value(true);
 
@@ -147,11 +115,10 @@ int main(int argc, char** argv) {
 
     const bool doList = program.get<bool>("--list");
     const bool doRunAll = program.get<bool>("--run-all");
-    const bool doRunAllRemote = program.get<bool>("--run-all-remote");
     const bool doRun = program.is_used("--run");
-    const bool doRunRemote = program.is_used("--run-remote");
 
-    if ((doList ? 1 : 0) + (doRun ? 1 : 0) + (doRunRemote ? 1 : 0) + (doRunAll ? 1 : 0) + (doRunAllRemote ? 1 : 0) != 1) {
+    const int selectedModes = (doList ? 1 : 0) + (doRun ? 1 : 0) + (doRunAll ? 1 : 0);
+    if (selectedModes != 1) {
         fmt::println("{}", argParserUsage(program));
         return 1;
     }
@@ -179,8 +146,7 @@ int main(int argc, char** argv) {
         return 0;
     }
 
-    QueryTestRunner runner;
-    RemoteQueryTestRunner remoteRunner;
+    V3QueryTestRunner runner;
 
     if (doRun) {
         const std::string name = program.get<std::string>("--run");
@@ -189,29 +155,8 @@ int main(int argc, char** argv) {
                 continue;
             }
             const fs::Path outDir = fs::Path {"query_test_suite_cli"} / test._name;
-            const QueryTestResult result = runner.runTest(test, outDir);
+            const V3QueryTestResult result = runner.runTest(test, outDir);
             fmt::println("{}", serializeResult(result));
-            return 0;
-        }
-        fmt::println("{}", "{\"error\":\"Unknown test name\"}");
-        return 1;
-    }
-
-    if (doRunRemote) {
-        const std::string name = program.get<std::string>("--run-remote");
-        for (const auto& test : tests) {
-            if (test._name != name) {
-                continue;
-            }
-            if (!test._remoteEnabled) {
-                fmt::println(stderr, "Remote test disabled for '{}': {}", name,
-                             test._remoteDisabledReason);
-                return 1;
-            }
-            const fs::Path outDir =
-                fs::Path {"query_test_suite_cli_remote"} / test._name;
-            const QueryTestResult result = remoteRunner.runTest(test, outDir);
-            fmt::println("{}", serializeResult(result, false));
             return 0;
         }
         fmt::println("{}", "{\"error\":\"Unknown test name\"}");
@@ -221,20 +166,15 @@ int main(int argc, char** argv) {
     fmt::print("[");
     bool first = true;
     for (const auto& test : tests) {
-        if (!test._enabled || (doRunAllRemote && !test._remoteEnabled)) {
+        if (!test._enabled) {
             continue;
         }
-        QueryTestResult result;
+
+        V3QueryTestResult result;
         try {
-            result =
-                doRunAllRemote
-                    ? remoteRunner.runTest(
-                          test, fs::Path {"query_test_suite_cli_remote"} / test._name)
-                    : runner.runTest(test,
-                                     fs::Path {"query_test_suite_cli"} / test._name);
+            result = runner.runTest(test, fs::Path {"query_test_suite_cli"} / test._name);
         } catch (const std::exception& e) {
-            // A single failing test — e.g. an unsupported column type over the
-            // remote protocol — must not abort the whole run. Record it as a
+            // A single failing test must not abort the whole run. Record it as a
             // failed result and keep going with the remaining tests.
             result._name = test._name;
             result._resultOutput = fmt::format("ERROR: {}", e.what());
@@ -244,7 +184,7 @@ int main(int argc, char** argv) {
             fmt::print(",");
         }
         first = false;
-        fmt::print("{}", serializeResult(result, !doRunAllRemote));
+        fmt::print("{}", serializeResult(result));
     }
     fmt::println("]");
     return 0;

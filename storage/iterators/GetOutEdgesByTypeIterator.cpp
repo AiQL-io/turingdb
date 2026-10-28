@@ -3,16 +3,17 @@
 #include <iterator>
 
 #include "columns/ColumnIDs.h"
+#include "EdgeTypeMatch.h"
 #include "IteratorUtils.h"
 
 using namespace db;
 
 GetOutEdgesByTypeChunkWriter::GetOutEdgesByTypeChunkWriter(const GraphView& view,
                                                            const ColumnNodeIDs* inputNodeIDs,
-                                                           EdgeTypeID edgeType)
+                                                           std::span<const EdgeTypeID> edgeTypes)
     : GetOutEdgesIterator(view, inputNodeIDs),
-    _edgeType(edgeType),
-    _filter(view.tombstones())
+    _edgeTypes(edgeTypes),
+    _filter(view)
 {
 }
 
@@ -60,21 +61,23 @@ void GetOutEdgesByTypeChunkWriter::fill(size_t maxCount) {
     }
 
     // Filtering by edge type breaks the contiguous-range fill the unfiltered
-    // GetOutEdgesChunkWriter uses: a node's edges of the requested type are
+    // GetOutEdgesChunkWriter uses: a node's edges of the requested types are
     // scattered through its edge span, not a sub-range of it, so there is no run
     // to std::generate over. We walk the span edge by edge and push only the
     // matches - directly into the output columns, with no intermediate unfiltered
     // chunk. The bitmask dispatch (as in GetOutEdgesChunkWriter::fill) lifts the
     // "is this column wired up?" test out of the per-edge loop: one template
     // instantiation per column combination, selected once by the switch below.
+    const std::span<const EdgeTypeID> edgeTypes = _edgeTypes;
+
     const auto fill = [&]<std::array<bool, NColumns> conditions>() {
         while (isValid() && remainingToMax > 0) {
             const size_t index = std::distance(_inputNodeIDs->cbegin(), _nodeIt);
 
-            // Append this node's remaining edges of the requested type until the
+            // Append this node's remaining edges of a requested type until the
             // span is exhausted or the row budget runs out.
             while (_edgeIt != _edges.end() && remainingToMax > 0) {
-                if (_edgeIt->_edgeTypeID == _edgeType) {
+                if (edgeTypeMatches(edgeTypes, _edgeIt->_edgeTypeID)) {
                     _indices->push_back(index);
 
                     if constexpr (conditions[0]) {
@@ -114,7 +117,7 @@ void GetOutEdgesByTypeChunkWriter::fill(size_t maxCount) {
     }
 
     // Base column is _edgeIDs: only need to check if there are edge tombstones
-    if (_view.tombstones().hasEdges()) {
+    if (_view.hasDeletedEdges()) {
         filterTombstones();
     }
 }

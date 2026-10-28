@@ -1,24 +1,27 @@
-
 #include <errno.h>
 #include <fcntl.h>
 #include <string.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <charconv>
-#include <limits>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <spdlog/fmt/fmt.h>
 
 #include "HTTPUtils.h"
 #include "TuringProtoDecoder.h"
 #include "TuringProtoHeaders.h"
 #include "TuringException.h"
+#include "TuringSink.h"
+#include "TuringSinkColumnContainer.h"
 #include "dataframe/Dataframe.h"
 #include "dataframe/DataframeManager.h"
 
@@ -77,15 +80,6 @@ size_t parseHexU32(std::string_view hexDigits) {
     return value;
 }
 
-// Server-side ChangeID/CommitHash::fromString() parses with std::from_chars(..., 16),
-// so the wire encoding must be hex. std::to_string() would silently emit decimal,
-// which matches hex only for values 0-9 and then misroutes everything from 10 on.
-static std::string toHexString(uint64_t value) {
-    std::array<char, 17> buffer;
-    const auto res = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, 16);
-    return std::string(buffer.data(), res.ptr);
-}
-
 // Classifies the result of a recv/recvmsg/send syscall. Throws on a fatal error or a peer
 // close; otherwise tells the caller whether to reissue the call, yield to the event loop,
 // or proceed with the transferred bytes.
@@ -138,9 +132,11 @@ TuringAsyncClient::TuringAsyncClient(const std::string& remoteAddress,
     _remotePort(remotePort),
     _localMem(localMem),
     _inBuf(bufferCapacity),
+    _sink(_localMem, &_embeddingBuffer, &_listBuffer, &_mapBuffer),
     _dfMan(std::make_unique<db::DataframeManager>()),
     _df(std::make_unique<db::Dataframe>()),
-    _decoder(std::make_unique<TuringProtoDecoder>(_localMem, _dfMan.get(), &_inBuf, &_embeddingBuffer, &_stringBuffer, &_listBuffer, _colSchemas))
+    _dataframeContainer(std::make_unique<TuringSinkColumnContainer>(_df.get(), _dfMan.get())),
+    _decoder(&_inBuf, &_sink, _columnSchemas)
 {
     _sendBuffer.reserve(256);
 }
@@ -185,8 +181,8 @@ void TuringAsyncClient::connect() {
         }
 
         // A non-blocking connect() typically returns -1/EINPROGRESS: the handshake is
-        // still in flight and completes later, surfaced as the socket becoming writable.
-        // Treat that as success and let the event loop finish it; any other errno is fatal.
+        // still in flight, and send() finishes it once the socket is writable. Any other
+        // errno is fatal.
         const int connectResult = ::connect(sock, addr->ai_addr, addr->ai_addrlen);
         if (connectResult != 0 && errno != EINPROGRESS) {
             lastErrno = errno;
@@ -195,14 +191,42 @@ void TuringAsyncClient::connect() {
         }
 
         _socket = sock;
+        _connecting = connectResult != 0;
         ::freeaddrinfo(result);
         return;
     }
 
     ::freeaddrinfo(result);
+    throwConnectError(lastErrno);
+}
+
+TuringAsyncClient::AsyncIOProgress TuringAsyncClient::finishConnect() {
+    pollfd writable {.fd = _socket, .events = POLLOUT, .revents = 0};
+
+    const int ready = ::poll(&writable, 1, 0);
+    if (ready < 0) {
+        throwConnectError(errno);
+    } else if (ready == 0) {
+        return AsyncIOProgress::WouldBlock;
+    }
+
+    int error = 0;
+    socklen_t errorSize = sizeof(error);
+    if (::getsockopt(_socket, SOL_SOCKET, SO_ERROR, &error, &errorSize) < 0) {
+        throwConnectError(errno);
+    } else if (error != 0) {
+        throwConnectError(error);
+    }
+
+    _connecting = false;
+
+    return AsyncIOProgress::Ok;
+}
+
+void TuringAsyncClient::throwConnectError(int error) const {
     throw TuringException(std::string("Failed to connect to ")
                           + _remoteAddress + ":" + _remotePort + ": "
-                          + strerror(lastErrno));
+                          + strerror(error));
 }
 
 void TuringAsyncClient::disconnect() {
@@ -213,6 +237,7 @@ void TuringAsyncClient::disconnect() {
         ::close(_socket);
         _socket = -1;
     }
+    _connecting = false;
 }
 /**-------------------------------------------------------------**/
 
@@ -376,25 +401,27 @@ void TuringAsyncClient::processProtoPacket() {
 
     switch (responseHeader._type) {
         case MessageTypes::CHUNK_HEADER:
-            _decoder->decodeIncomingChunkHeader(_df.get());
+            _decoder.decodeIncomingChunkHeader(_dataframeContainer.get());
         break;
 
         case MessageTypes::CHUNK:
-            _decoder->decodeIncomingChunk(_df.get());
+            _decoder.decodeIncomingChunk(_dataframeContainer.get());
         break;
 
         case MessageTypes::END_CHUNK:
+            _decoder.decodeChunkFooter(_dataframeContainer.get());
             _callbackFired = true;
             _callback(_df.get());
             _df->clear();
-            for (auto& schema : _colSchemas) {
-                schema.getColState().reset();
+            for (auto& schema : _columnSchemas) {
+                schema.getColumnState().reset();
             }
-            _decoder->reset();
+            _decoder.reset();
         break;
 
         case MessageTypes::END: {
             if (!_callbackFired) {
+                _df->setDeclaredRowCount(0);
                 _callback(_df.get());
             }
 
@@ -462,26 +489,24 @@ void TuringAsyncClient::drainScratchIntoIovecs(std::array<iovec, 2>& iovecs, siz
 /**-------- --------------------------------------**/
 
 /**-------- Send Functions --------**/
-void TuringAsyncClient::buildRequest(const std::string& query) {
+void TuringAsyncClient::buildRequest(const std::string& query, const db::ParameterMap* parameters) {
+    _requestBody.build(query, parameters);
+    const std::span<char> prefix = _requestBody.getPrefix();
+    const std::span<char> suffix = _requestBody.getSuffix();
+    const size_t bodySize = prefix.size() + query.size() + suffix.size();
+
     // Serialize the whole request (headers + body) into the owned send buffer; send()
     // pumps it from _sendOffset and resumes across EAGAIN. Keep-Alive means the buffer is
     // reused across requests, so clear it first and size it for this request's body.
     _sendBuffer.clear();
-    _sendBuffer.reserve(query.size() + 256);
-
-    const std::string commitParam = (_commitHash.get() == db::CommitHash::head().get())
-                                      ? std::string("head")
-                                      : toHexString(_commitHash.get());
-    const std::string changeParam = (_changeID.get() == db::ChangeID::head().get())
-                                      ? std::string("head")
-                                      : toHexString(_changeID.get());
+    _sendBuffer.reserve(bodySize + 256);
 
     _sendBuffer += "POST /query?graph=";
     _sendBuffer += _graphName;
     _sendBuffer += "&commit=";
-    _sendBuffer += commitParam;
+    _commitHash.appendString(_sendBuffer);
     _sendBuffer += "&change=";
-    _sendBuffer += changeParam;
+    _changeID.appendString(_sendBuffer);
     _sendBuffer += " HTTP/1.1\r\n";
 
     _sendBuffer += "Host: ";
@@ -492,14 +517,16 @@ void TuringAsyncClient::buildRequest(const std::string& query) {
 
     _sendBuffer += "Content-type: application/turing-proto\r\n";
     _sendBuffer += "Content-Length: ";
-    _sendBuffer += std::to_string(query.size());
+    _sendBuffer += std::to_string(bodySize);
     _sendBuffer += "\r\n";
     _sendBuffer += "Connection: Keep-Alive\r\n";
     _sendBuffer += "\r\n";
 
     // The body follows the header block in the same buffer — no separate copy, no second
     // iovec, and send() only reads the bytes so no const_cast is needed.
+    _sendBuffer.append(prefix.data(), prefix.size());
     _sendBuffer += query;
+    _sendBuffer.append(suffix.data(), suffix.size());
 
     _sendOffset = 0;
     _sending = true;
@@ -508,6 +535,13 @@ void TuringAsyncClient::buildRequest(const std::string& query) {
 void TuringAsyncClient::send() {
     if (!_sending) {
         return;
+    }
+
+    if (_connecting) {
+        const AsyncIOProgress progress = finishConnect();
+        if (progress == AsyncIOProgress::WouldBlock) {
+            return;
+        }
     }
 
     while (_sendOffset < _sendBuffer.size()) {
@@ -529,9 +563,13 @@ void TuringAsyncClient::send() {
 }
 
 db::QueryStatus TuringAsyncClient::sendQuery(const std::string& query,
-                                             const db::QueryCallbacks::OnOutputData& callback) {
-    bioassert(query.length() <= std::numeric_limits<uint32_t>::max(), "Query length exceeds uint32 maximum");
-    bioassert(_graphName.length() <= std::numeric_limits<uint32_t>::max(), "Graph name length exceeds uint32 maximum");
+                                             const db::QueryCallbacks::OnOutputData& callback,
+                                             const db::ParameterMap* parameters) {
+    if (_graphName.length() > MAX_WIRE_SIZE) {
+        throw TuringException(fmt::format("The graph name is {} bytes, more than the {} bytes the binary protocol allows",
+                                          _graphName.length(),
+                                          MAX_WIRE_SIZE));
+    }
 
     // Prime the per-query state and stage the request, then make the first send/recv
     // attempt. On a blocking socket this runs the whole exchange; on a non-blocking
@@ -541,7 +579,7 @@ db::QueryStatus TuringAsyncClient::sendQuery(const std::string& query,
     reset();
     _callback = callback;
 
-    buildRequest(query);
+    buildRequest(query, parameters);
 
     send();
     if (isSendComplete()) {
@@ -626,21 +664,18 @@ void TuringAsyncClient::reset() {
 
     // Proto payload and decoded-response state. _df/_dfMan are rebuilt from scratch so each
     // query starts with an empty dataframe; recreating _dfMan frees the columns it owned for
-    // the previous query. _decoder is rebound to the fresh _dfMan.
+    // the previous query. The decoder references _inBuf, _sink and _columnSchemas, which all
+    // live for the client's lifetime, so it is reset in place (which also resets the sink).
     _inBuf.reset();
     _embeddingBuffer.clear();
     _stringBuffer.clear();
     _listBuffer.clear();
-    _colSchemas.clear();
+    _mapBuffer.clear();
+    _columnSchemas.clear();
+    _decoder.reset();
     _dfMan = std::make_unique<db::DataframeManager>();
     _df = std::make_unique<db::Dataframe>();
-    _decoder = std::make_unique<TuringProtoDecoder>(_localMem,
-                                                    _dfMan.get(),
-                                                    &_inBuf,
-                                                    &_embeddingBuffer,
-                                                    &_stringBuffer,
-                                                    &_listBuffer,
-                                                    _colSchemas);
+    _dataframeContainer = std::make_unique<TuringSinkColumnContainer>(_df.get(), _dfMan.get());
 
     // Per-query callback and accumulated result.
     _callback = db::QueryCallbacks::OnOutputData();

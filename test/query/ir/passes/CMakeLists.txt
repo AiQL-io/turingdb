@@ -1,0 +1,135 @@
+add_ir_tests(test_query_ir_push_down_filter PushDownFilterTest.cpp)
+
+add_ir_tests(test_query_ir_raising_op_speculatability RaisingOpSpeculatabilityTest.cpp)
+
+add_ir_tests(test_query_ir_chained_function_speculatability ChainedFunctionSpeculatabilityTest.cpp)
+
+add_ir_tests(test_query_ir_negation_speculatability NegationSpeculatabilityTest.cpp)
+
+add_ir_tests(test_query_ir_push_down_through_unwind PushDownThroughUnwindTest.cpp)
+
+add_ir_tests(test_query_ir_fuse_scan_by_node_ids FuseScanByNodeIDsTest.cpp)
+
+add_ir_tests(test_query_ir_fuse_scan_by_property_value FuseScanByPropertyValueTest.cpp)
+
+add_ir_tests(test_query_ir_trim_unread_columns TrimUnreadColumnsTest.cpp)
+
+add_ir_tests(test_query_ir_trim_call_carry_set TrimCallCarrySetTest.cpp)
+
+add_ir_tests(test_query_ir_reuse_property_reads ReusePropertyReadsTest.cpp)
+
+# The edge-scan fusion tests check the rewritten db program, then lower and run it
+# against the shared SimpleGraph fixture to compare its rows with the unfused hop's.
+add_ir_tests(test_query_ir_fuse_scan_edges FuseScanEdgesTest.cpp)
+
+# The codegen-level cases compile Cypher through the parser, analyzer and DBProgramGenerator
+# against the shared SimpleGraph fixture and read the db program the pass pipeline leaves.
+add_turing_test(test_query_ir_fuse_scan_edges_codegen FuseScanEdgesCodegenTest.cpp)
+target_include_directories(test_query_ir_fuse_scan_edges_codegen PRIVATE ${IR_TEST_DIR})
+
+# The by-type fusion tests check the rewritten db program, then lower and run it against
+# the shared SimpleGraph fixture to compare its rows with the plain hop and filter's.
+add_ir_tests(test_query_ir_fuse_edges_by_type FuseEdgesByTypeTest.cpp)
+
+add_ir_tests(test_query_ir_fuse_scan_edges_by_type FuseScanEdgesByTypeTest.cpp)
+
+# The by-label out-edge fusion tests check the rewritten db program, then lower and run it
+# against the shared SimpleGraph fixture to compare its rows with the label scan and hop's.
+add_ir_tests(test_query_ir_fuse_scan_out_edges_by_label FuseScanOutEdgesByLabelTest.cpp)
+
+add_turing_test(test_query_ir_fuse_scan_out_edges_by_label_codegen FuseScanOutEdgesByLabelCodegenTest.cpp)
+target_include_directories(test_query_ir_fuse_scan_out_edges_by_label_codegen PRIVATE ${IR_TEST_DIR})
+
+add_ir_tests(test_query_ir_fuse_scan_in_edges_by_label FuseScanInEdgesByLabelTest.cpp)
+
+add_turing_test(test_query_ir_fuse_scan_in_edges_by_label_codegen FuseScanInEdgesByLabelCodegenTest.cpp)
+target_include_directories(test_query_ir_fuse_scan_in_edges_by_label_codegen PRIVATE ${IR_TEST_DIR})
+
+# The endpoint-label fusion tests: the same two checks for the scans read off the label set
+# of the endpoint the hop arrives at or leaves, rather than the one it starts from.
+add_ir_tests(test_query_ir_fuse_scan_edges_by_endpoint_label FuseScanEdgesByEndpointLabelTest.cpp)
+
+add_turing_test(test_query_ir_fuse_scan_edges_by_endpoint_label_codegen FuseScanEdgesByEndpointLabelCodegenTest.cpp)
+target_include_directories(test_query_ir_fuse_scan_edges_by_endpoint_label_codegen PRIVATE ${IR_TEST_DIR})
+
+add_ir_tests(test_query_ir_edge_scan_index_cost EdgeScanIndexCostTest.cpp)
+
+# The by-label hop fusion tests: the same two checks for the hops that walk the edges the
+# endpoint they reach carries a set of labels on.
+add_ir_tests(test_query_ir_fuse_edges_by_endpoint_label FuseEdgesByEndpointLabelTest.cpp)
+
+add_ir_tests(test_query_ir_fuse_edges_by_type_and_label FuseEdgesByTypeAndLabelTest.cpp)
+
+add_ir_tests(test_query_ir_remove_redundant_label_checks RemoveRedundantLabelChecksTest.cpp)
+
+add_turing_test(test_query_ir_remove_redundant_label_checks_codegen RemoveRedundantLabelChecksCodegenTest.cpp)
+target_include_directories(test_query_ir_remove_redundant_label_checks_codegen PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_fuse_edges_by_endpoint_label_codegen FuseEdgesByEndpointLabelCodegenTest.cpp)
+target_include_directories(test_query_ir_fuse_edges_by_endpoint_label_codegen PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_fuse_edges_by_type_codegen FuseEdgesByTypeCodegenTest.cpp)
+target_include_directories(test_query_ir_fuse_edges_by_type_codegen PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_fuse_scan_by_node_ids_codegen FuseScanByNodeIDsCodegenTest.cpp)
+target_include_directories(test_query_ir_fuse_scan_by_node_ids_codegen PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_fuse_scan_by_property_value_codegen FuseScanByPropertyValueCodegenTest.cpp)
+target_include_directories(test_query_ir_fuse_scan_by_property_value_codegen PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_trim_unread_columns_cypher TrimUnreadColumnsCypherTest.cpp)
+target_sources(test_query_ir_trim_unread_columns_cypher PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_trim_unread_columns_cypher PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_reuse_property_reads_cypher ReusePropertyReadsCypherTest.cpp)
+target_sources(test_query_ir_reuse_property_reads_cypher PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_reuse_property_reads_cypher PRIVATE ${IR_TEST_DIR})
+
+add_ir_tests(test_query_ir_narrow_edge_type_reads NarrowEdgeTypeReadsTest.cpp)
+
+add_ir_tests(test_query_ir_fuse_edge_type_predicates FuseEdgeTypePredicatesTest.cpp)
+
+add_ir_tests(test_query_ir_fuse_label_predicates FuseLabelPredicatesTest.cpp)
+
+add_turing_test(test_query_ir_fuse_edge_type_predicates_codegen FuseEdgeTypePredicatesCodegenTest.cpp)
+target_include_directories(test_query_ir_fuse_edge_type_predicates_codegen PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_narrow_edge_type_reads_codegen NarrowEdgeTypeReadsCodegenTest.cpp)
+target_include_directories(test_query_ir_narrow_edge_type_reads_codegen PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_narrow_edge_type_reads_query NarrowEdgeTypeReadsQueryTest.cpp)
+target_include_directories(test_query_ir_narrow_edge_type_reads_query PRIVATE ${IR_TEST_DIR})
+
+add_ir_tests(test_query_ir_shared_edge_type_check SharedEdgeTypeCheckTest.cpp)
+
+add_ir_tests(test_query_ir_two_filters_over_one_read TwoFiltersOverOneReadTest.cpp)
+
+add_ir_tests(test_query_ir_trim_lazy_case TrimLazyCaseTest.cpp)
+
+add_ir_tests(test_query_ir_trim_list_comprehension TrimListComprehensionTest.cpp)
+
+add_call_v3_test(test_query_ir_fetch_nodes FetchNodesTest.cpp)
+
+add_call_v3_test(test_query_ir_fetch_nodes_over_an_empty_product FetchNodesOverAnEmptyProductTest.cpp)
+
+add_ir_tests(test_query_ir_deep_chain_passes DeepChainPassesTest.cpp)
+
+add_ir_tests(test_query_ir_constant_column_deep_chain ConstantColumnDeepChainTest.cpp)
+
+add_call_v3_test(test_query_ir_deep_chain_query DeepChainQueryTest.cpp)
+
+add_call_v3_test(test_query_ir_reroot_id_operand_read_twice RerootIDOperandReadTwiceTest.cpp)
+
+add_call_v3_test(test_query_ir_seed_ids_below_a_filter SeedIDsBelowAFilterTest.cpp)
+
+add_call_v3_test(test_query_ir_reroot_at_scanned_nodes RerootAtScannedNodesTest.cpp)
+
+add_turing_test(test_query_ir_reroot_pattern_at_seed RerootPatternAtSeedTest.cpp)
+target_sources(test_query_ir_reroot_pattern_at_seed PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_reroot_pattern_at_seed PRIVATE ${IR_TEST_DIR})
+
+add_call_v3_test(test_query_ir_push_down_filters_past_writes PushDownFiltersPastWritesTest.cpp)
+
+add_call_v3_test(test_query_ir_constant_rows_passes ConstantRowsPassesTest.cpp)
+
+add_call_v3_test(test_query_ir_reuse_label_and_type_reads ReuseLabelAndTypeReadsTest.cpp)

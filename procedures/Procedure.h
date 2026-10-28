@@ -46,8 +46,17 @@ public:
     void setAllocCallback(AllocCallback cb);
     void setDeallocCallback(DeallocCallback cb);
     void addReturnValue(std::string_view name, ProcedureType type);
+
+    void addNullableReturnValue(std::string_view name, ProcedureType type);
+
     void addArgument(std::string_view name, ProcedureType type);
     void addOptionalArgument(std::string_view name, ProcedureType type);
+
+    // A constant argument is read once per call rather than per row - the procedure
+    // takes nothing but a ColumnConst for it. A row-aligned argument makes the
+    // procedure per-row, which obliges it to report the input row of the rows it emits.
+    void addConstantArgument(std::string_view name, ProcedureType type);
+    void addOptionalConstantArgument(std::string_view name, ProcedureType type);
 
     // Arguments and return values
     const ProcedureTypeVector& returnValues() const { return _returnValues; }
@@ -61,11 +70,24 @@ public:
         return _returnValues[index]._type;
     }
 
+    bool isReturnValueNullable(size_t index) const {
+        return _returnValues[index]._nullable;
+    }
+
     ProcedureType getArgumentType(size_t index) const {
         return _argumentTypes[index]._type;
     }
 
     void returnAll(std::vector<YieldItem>& yieldItems) const;
+
+    bool hasRowAlignedArgument() const;
+
+    // Renders the procedure as `name(arg :: TYPE, opt :: TYPE = null) :: (ret :: TYPE)`,
+    // the form SHOW PROCEDURES lists it in
+    void buildSignature(std::string& result) const;
+
+    bool hasIndices() const { return _hasIndices; }
+    void setHasIndices(bool value) { _hasIndices = value; }
 
 private:
     friend class ProcedureNamespace;
@@ -77,6 +99,9 @@ private:
     DeallocCallback _deallocCallback {nullptr};
     ProcedureTypeVector _returnValues;
     ProcedureTypeVector _argumentTypes;
+    bool _hasIndices {false};
+
+    void throwIfOptionalArgumentDeclared() const;
 };
 
 }

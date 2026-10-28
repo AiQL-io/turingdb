@@ -1,8 +1,23 @@
 #include "PatternData.h"
 
+#include <algorithm>
+
 #include "CypherAST.h"
+#include "LabelExpr.h"
 
 using namespace db;
+
+namespace {
+
+bool isTypeList(const LabelExpr* typeExpr) {
+    if (typeExpr->getKind() == LabelExpr::Kind::OR) {
+        return std::ranges::all_of(typeExpr->getOperands(), &LabelExpr::namesOneLabel);
+    }
+
+    return typeExpr->namesOneLabel();
+}
+
+}
 
 // PatternData
 PatternData::PatternData()
@@ -30,8 +45,22 @@ NodePatternData* NodePatternData::create(CypherAST* ast) {
     return data;
 }
 
-void NodePatternData::addLabelConstraint(std::string_view label) {
-    _labelConstraints.push_back(label);
+void NodePatternData::addLabelConstraints(const SymbolChain* labels) {
+    collectSchemaNames(labels, _labelConstraints);
+}
+
+void NodePatternData::addLabelExpr(const LabelExpr* labelExpr) {
+    const LabelExpr::Kind kind = labelExpr->getKind();
+
+    if (kind == LabelExpr::Kind::LABELS) {
+        addLabelConstraints(labelExpr->getLabels());
+    } else if (kind == LabelExpr::Kind::AND) {
+        for (const LabelExpr* conjunct : labelExpr->getOperands()) {
+            addLabelExpr(conjunct);
+        }
+    } else {
+        _labelExprConstraints.push_back(labelExpr);
+    }
 }
 
 // EdgePatternData
@@ -48,6 +77,25 @@ EdgePatternData* EdgePatternData::create(CypherAST* ast) {
     return data;
 }
 
-void EdgePatternData::addEdgeTypeConstraint(std::string_view edgeType) {
-    _edgeTypeConstraints.push_back(edgeType);
+void EdgePatternData::addEdgeTypeConstraints(const SymbolChain* edgeTypes) {
+    collectSchemaNames(edgeTypes, _edgeTypeConstraints);
+}
+
+void EdgePatternData::addEdgeTypeExpr(const LabelExpr* typeExpr) {
+    const LabelExpr::Kind kind = typeExpr->getKind();
+    const bool listsTheTypes = _edgeTypeConstraints.empty() && isTypeList(typeExpr);
+
+    if (kind == LabelExpr::Kind::AND) {
+        for (const LabelExpr* conjunct : typeExpr->getOperands()) {
+            addEdgeTypeExpr(conjunct);
+        }
+    } else if (listsTheTypes && kind == LabelExpr::Kind::OR) {
+        for (const LabelExpr* alternative : typeExpr->getOperands()) {
+            addEdgeTypeConstraints(alternative->getLabels());
+        }
+    } else if (listsTheTypes) {
+        addEdgeTypeConstraints(typeExpr->getLabels());
+    } else {
+        _edgeTypeExprConstraints.push_back(typeExpr);
+    }
 }

@@ -1,0 +1,120 @@
+#include <gtest/gtest.h>
+
+#include <memory>
+#include <string>
+#include <string_view>
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
+
+#include "DBDialect.h"
+#include "DBProgramGenerator.h"
+#include "NLDialect.h"
+#include "StorageDialect.h"
+
+#include "CypherAST.h"
+#include "CypherAnalyzer.h"
+#include "CypherParser.h"
+
+#include "Graph.h"
+#include "SimpleGraph.h"
+#include "SystemAccessor.h"
+#include "SystemManager.h"
+#include "versioning/Transaction.h"
+#include "views/GraphView.h"
+
+#include "TuringException.h"
+#include "TuringTest.h"
+#include "TuringTestEnv.h"
+
+using namespace db;
+using namespace turing::test;
+
+// An item carrying an aggregate is not itself the aggregate function: {total: count(n)}
+// and count(n) + 1 are both flagged aggregate without being a function invocation
+class NestedAggregateProjectionTest : public TuringTest {
+protected:
+    void initialize() override {
+        _env = TuringTestEnv::create(fs::Path {_outDir} / "turing");
+
+        SystemAccessor system = _env->getSystemManager().accessUnique();
+        _graph = system.createGraph(_graphName);
+        SimpleGraph::createSimpleGraph(_graph);
+    }
+
+    // Parses, analyzes and generates the db dialect program of a query, without running it
+    void generateProgram(std::string_view query) {
+        SystemAccessor system = _env->getSystemManager().accessUnique();
+        const ProcedureManager* procedures = system.getProcedures();
+
+        const FrozenCommitTx transaction = _graph->openTransaction();
+        const GraphView view = transaction.viewGraph();
+
+        CypherAST ast(procedures, query);
+
+        CypherParser parser(&ast);
+        parser.parse(query);
+
+        CypherAnalyzer analyzer(&ast, view);
+        analyzer.analyze();
+
+        mlir::MLIRContext context;
+        context.getOrLoadDialect<mlir::func::FuncDialect>();
+        context.getOrLoadDialect<mlir::storage::Storage>();
+        context.getOrLoadDialect<mlir::db::DB>();
+        context.getOrLoadDialect<mlir::nl::NL>();
+
+        mlir::OpBuilder builder(&context);
+        mlir::OwningOpRef<mlir::ModuleOp> owningModule =
+            mlir::ModuleOp::create(builder.getUnknownLoc());
+        mlir::ModuleOp module = owningModule.get();
+
+        DBProgramGenerator generator(&module);
+        generator.generate(&ast);
+    }
+
+    const std::string _graphName = "simpledb";
+    std::unique_ptr<TuringTestEnv> _env;
+    Graph* _graph {nullptr};
+};
+
+// The same count over the same group, written where codegen can build it: one grouping
+// key and one aggregate is a grouped aggregate, and it must keep generating - what the
+// tests below reject is where the aggregate sits, not the grouping
+TEST_F(NestedAggregateProjectionTest, generatesTheSameAggregateOutsideAMap) {
+    EXPECT_NO_THROW(generateProgram("MATCH (n:Person) RETURN n.name, count(n)"));
+}
+
+// A map holding a constant next to the same grouping key: every value is a literal, so the
+// map builds as a constant and generates.
+TEST_F(NestedAggregateProjectionTest, generatesAMapHoldingAConstant) {
+    EXPECT_NO_THROW(generateProgram("MATCH (n:Person) RETURN n.name, {total: 1}"));
+}
+
+TEST_F(NestedAggregateProjectionTest, generatesAMapHoldingAnAggregateAlone) {
+    EXPECT_NO_THROW(generateProgram("MATCH (n:Person) RETURN {total: count(n)}"));
+}
+
+// The aggregate the map holds is registered with the grouped aggregate and the map is
+// built over the result, as a list holding one is
+TEST_F(NestedAggregateProjectionTest, generatesAMapHoldingAnAggregateBesideAGroupingKey) {
+    EXPECT_NO_THROW(generateProgram("MATCH (n:Person) RETURN n.name, {total: count(n)}"));
+}
+
+// An aggregate wrapped in arithmetic is valid openCypher - count(n) + 1 is the group's
+// count read through one more computation, the grouped analogue of the scalar count(n) + 1.
+// The grouped aggregate registers the count and leaves the arithmetic to the projection.
+TEST_F(NestedAggregateProjectionTest, generatesAnAggregateInsideAnExpression) {
+    EXPECT_NO_THROW(generateProgram("MATCH (n:Person) RETURN n.name, count(n) + 1"));
+    EXPECT_NO_THROW(generateProgram("MATCH (n:Person) RETURN n.name, 2 * count(n) + 20"));
+}
+
+// The aggregate a list holds is registered with the grouped aggregate and the list is
+// built over the result - the same route an aggregate inside arithmetic takes.
+TEST_F(NestedAggregateProjectionTest, generatesAListHoldingAnAggregateBesideAGroupingKey) {
+    EXPECT_NO_THROW(generateProgram("MATCH (n) RETURN DISTINCT n, [count(n.age)]"));
+    EXPECT_NO_THROW(generateProgram("MATCH (n) RETURN n.age, [count(n.name)]"));
+}

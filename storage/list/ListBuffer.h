@@ -12,6 +12,11 @@
 #include "ListView.h"
 #include "ListWriteCursor.h"
 
+#include "map/MapView.h"
+
+#include "ID.h"
+
+#include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
 
 #include "TypeUtils.h"
@@ -20,7 +25,9 @@ namespace {
 using ListableTypesImpl =
     std::tuple<db::types::Int64::Primitive, db::types::UInt64::Primitive,
                db::types::Double::Primitive, db::types::String::Primitive,
-               db::types::Bool::Primitive, db::types::Embedding::Primitive, db::ListView>;
+               db::types::Bool::Primitive, db::types::Embedding::Primitive, db::ListView,
+               db::PropertyNull, db::NodeID, db::EdgeID, db::types::DateTime::Primitive, db::MapView,
+               db::types::Duration::Primitive>;
 }
 
 namespace db {
@@ -60,6 +67,34 @@ public:
      */
     ListWriteCursor reserveList(size_t numElements, size_t valueBytes);
 
+    /**
+     * @brief Stores the elements of @param a followed by those of @param b as one new list
+     * in contiguous storage and returns a @ref ListView over it.
+     */
+    ListView concatenate(ListView a, ListView b);
+
+    /**
+     * @brief Stores the elements of @param list in reverse order as one new list in
+     * contiguous storage and returns a @ref ListView over it.
+     */
+    ListView reverse(ListView list);
+
+    /**
+     * @brief Stores the elements of @param list - the elements of a nested list among them
+     * - as one new list in this buffer and returns a @ref ListView over the copy.
+     *
+     * For a value that has to outlive the buffer it was built in. A string or embedding
+     * element keeps only a view of its payload, which is copied no more than the source
+     * list is: the copy stands as long as those payloads do.
+     */
+    ListView copy(ListView list);
+
+    /**
+     * @brief Stores @param element - the elements of a nested list among them - in this
+     * buffer and returns a view of the copy, which stands as long as @ref copy(ListView)'s.
+     */
+    ListElementView copy(ListElementView element);
+
     void clear();
 
 private:
@@ -67,7 +102,13 @@ private:
     ListByteBuffer<N> _elements;
     /// Container of @ref ListElementView, for each element in @ref _elements
     ListElementViewBuffer<N> _views;
+
+    /// Returns the value @param element holds, a nested list copied into this buffer
+    ListItemVariant ownedItem(ListElementView element);
 };
+
+// Default size; alias to avoid ugly empty template
+using QueryListBuffer = ListBuffer<>;
 
 template <typename T>
 concept Listable = TypeConcepts::InTuple<T, ListableTypesImpl>;

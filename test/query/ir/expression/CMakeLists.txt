@@ -1,0 +1,157 @@
+add_turing_test(test_query_ir_function_input_column FunctionInputColumnTest.cpp)
+target_include_directories(test_query_ir_function_input_column PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_arithmetic_ext ArithmeticExtTest.cpp)
+target_include_directories(test_query_ir_arithmetic_ext PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_string_concat StringConcatTest.cpp)
+target_include_directories(test_query_ir_string_concat PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_absent_property_name AbsentPropertyNameTest.cpp)
+target_include_directories(test_query_ir_absent_property_name PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_absent_schema_name AbsentSchemaNameTest.cpp)
+target_include_directories(test_query_ir_absent_schema_name PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_string_size StringSizeTest.cpp)
+target_include_directories(test_query_ir_string_size PRIVATE ${IR_TEST_DIR})
+
+# The crossed-source constant tests run a query whose constant is in flight when a search
+# or a CALL opens a product, and read their rows as text.
+add_turing_test(test_query_ir_crossed_source_constant CrossedSourceConstantTest.cpp)
+target_include_directories(test_query_ir_crossed_source_constant PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_string_predicates StringPredicateTest.cpp)
+target_sources(test_query_ir_string_predicates PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_string_predicates PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_numeric_conversion NumericConversionTest.cpp)
+target_sources(test_query_ir_numeric_conversion PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_numeric_conversion PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_mask_comparison MaskComparisonTest.cpp)
+target_include_directories(test_query_ir_mask_comparison PRIVATE ${IR_TEST_DIR})
+
+# type() over an edge, run end to end against simpledb.
+add_call_v3_test(test_query_ir_edge_type_function EdgeTypeFunctionTest.cpp)
+
+# id() over the nodes and edges of simpledb, run end to end.
+add_turing_test(test_query_ir_id_function IdFunctionTest.cpp)
+target_include_directories(test_query_ir_id_function PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_cross_type_comparison CrossTypeComparisonTest.cpp)
+target_include_directories(test_query_ir_cross_type_comparison PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_to_string_function ToStringFunctionTest.cpp)
+target_include_directories(test_query_ir_to_string_function PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_number_concatenation NumberConcatenationTest.cpp)
+target_include_directories(test_query_ir_number_concatenation PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_tagged_cell_operator TaggedCellOperatorTest.cpp)
+target_include_directories(test_query_ir_tagged_cell_operator PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_tagged_cell_function TaggedCellFunctionTest.cpp)
+target_include_directories(test_query_ir_tagged_cell_function PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_concat_operator ConcatOperatorTest.cpp)
+target_include_directories(test_query_ir_concat_operator PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_tagged_cell_comparison TaggedCellComparisonTest.cpp)
+target_sources(test_query_ir_tagged_cell_comparison PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp ${IR_TEST_DIR}/CallV3Test.cpp)
+target_include_directories(test_query_ir_tagged_cell_comparison PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_parenthesised_property ParenthesisedPropertyTest.cpp)
+
+add_turing_test(test_query_ir_function_call_property FunctionCallPropertyTest.cpp)
+
+add_turing_test(test_query_ir_numeric_function NumericFunctionTest.cpp)
+
+add_turing_test(test_query_ir_string_function StringFunctionTest.cpp)
+
+add_turing_test(test_query_ir_string_argument_function StringArgumentFunctionTest.cpp)
+
+add_turing_test(test_query_ir_untyped_element_function UntypedElementFunctionTest.cpp)
+
+add_turing_test(test_query_ir_function_argument_source FunctionArgumentSourceTest.cpp)
+
+# A comparison chain's middle operand is one expression both of its sides point at, read
+# off the codegen dump.
+add_ir_tests(test_query_ir_comparison_chain_codegen ComparisonChainCodegenTest.cpp)
+target_sources(test_query_ir_comparison_chain_codegen PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_comparison_chain_codegen PRIVATE ${IR_TEST_DIR})
+
+add_ir_tests(test_query_ir_foreign_filter_column ForeignFilterColumnTest.cpp)
+
+add_turing_test(test_query_ir_double_cell_equality DoubleCellEqualityTest.cpp)
+
+add_turing_test(test_query_ir_const_conversion_property ConstConversionPropertyTest.cpp)
+target_include_directories(test_query_ir_const_conversion_property PRIVATE ${IR_TEST_DIR})
+
+# Equality over the double a type-erased list cell computes its arithmetic in, which the
+# analyzer types as the integer the list's null element leaves it.
+add_turing_test(test_query_ir_tagged_cell_arithmetic_equality TaggedCellArithmeticEqualityTest.cpp)
+
+add_call_v3_test(test_query_ir_tagged_cell_string_addition TaggedCellStringAdditionTest.cpp)
+
+add_turing_test(test_query_ir_integer_division_overflow IntegerDivisionOverflowTest.cpp)
+
+add_turing_test(test_query_ir_keys_and_properties KeysAndPropertiesTest.cpp)
+
+add_turing_test(test_query_ir_keys_after_write_in_query KeysAfterWriteInQueryTest.cpp)
+
+add_call_v3_test(test_query_ir_function_name_case FunctionNameCaseTest.cpp)
+
+add_turing_test(test_query_ir_entity_negative_integer EntityNegativeIntegerTest.cpp)
+target_link_libraries(test_query_ir_entity_negative_integer PRIVATE turing_ir_test_hash_join_s)
+
+add_turing_test(test_query_ir_opencypher_string_function OpenCypherStringFunctionTest.cpp)
+
+add_turing_test(test_query_ir_conversion_argument_types ConversionArgumentTypesTest.cpp)
+
+add_turing_test(test_query_ir_integer_conversion_of_decimal_text IntegerConversionOfDecimalTextTest.cpp)
+
+add_turing_test(test_query_ir_char_length_of_a_cell CharLengthOfACellTest.cpp)
+
+add_turing_test(test_query_ir_strict_conversion_of_a_cell StrictConversionOfACellTest.cpp)
+
+add_turing_test(test_query_ir_or_null_of_a_variable_length_path OrNullOfAVariableLengthPathTest.cpp)
+
+add_turing_test(test_query_ir_computed_once_over_constants ComputedOnceOverConstantsTest.cpp)
+target_include_directories(test_query_ir_computed_once_over_constants PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_integer_against_double IntegerAgainstDoubleTest.cpp)
+target_include_directories(test_query_ir_integer_against_double PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_integer_double_equality IntegerDoubleEqualityTest.cpp)
+
+add_turing_test(test_query_ir_normalize_function NormalizeFunctionTest.cpp)
+
+add_turing_test(test_query_ir_is_normalized_predicate IsNormalizedPredicateTest.cpp)
+
+add_turing_test(test_query_ir_cross_type_ordering CrossTypeOrderingTest.cpp)
+
+add_turing_test(test_query_ir_null_comparison_operand NullComparisonOperandTest.cpp)
+
+add_turing_test(test_query_ir_case_ordering_across_types CaseOrderingAcrossTypesTest.cpp)
+
+add_turing_test(test_query_ir_null_logical_operand NullLogicalOperandTest.cpp)
+
+add_turing_test(test_query_ir_create_null_property CreateNullPropertyTest.cpp)
+
+add_turing_test(test_query_ir_owned_string_cell_ordering OwnedStringCellOrderingTest.cpp)
+
+add_turing_test(test_query_ir_null_entity_against_id NullEntityAgainstIDTest.cpp)
+
+add_turing_test(test_query_ir_match_null_property MatchNullPropertyTest.cpp)
+
+add_turing_test(test_query_ir_map_value_against_a_mask MapValueAgainstAMaskTest.cpp)
+
+add_ir_tests(test_query_ir_entity_comparison_lowering EntityComparisonLoweringTest.cpp)
+target_sources(test_query_ir_entity_comparison_lowering PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_entity_comparison_lowering PRIVATE ${IR_TEST_DIR})
+
+add_call_v3_test(test_query_ir_unary_minus UnaryMinusTest.cpp)
+
+add_turing_test(test_query_ir_list_element_concatenation ListElementConcatenationTest.cpp)
+target_include_directories(test_query_ir_list_element_concatenation PRIVATE ${IR_TEST_DIR})

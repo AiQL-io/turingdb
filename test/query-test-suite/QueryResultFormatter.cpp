@@ -14,9 +14,14 @@
 #include "list/ListElementView.h"
 #include "list/ListUtils.h"
 #include "list/ListView.h"
+
+#include "map/MapEntryView.h"
+#include "map/MapUtils.h"
+#include "map/MapView.h"
 #include "QueryStatus.h"
 #include "columns/AllowedKinds.h"
 #include "columns/ColumnConst.h"
+#include "columns/ColumnMask.h"
 #include "columns/ColumnOperatorDispatcher.h"
 #include "columns/ColumnVector.h"
 #include "dataframe/Dataframe.h"
@@ -73,13 +78,27 @@ template <db::IntegralType T, int tag>
     return std::to_string(value.getValue());
 }
 
-template <int I>
-[[maybe_unused]] std::string valueToString(const db::TemplateCommitHash<I>& value) {
+template <int I, int Radix>
+[[maybe_unused]] std::string valueToString(const db::TemplateCommitHash<I, Radix>& value) {
     return std::to_string(value.get());
 }
 
 [[maybe_unused]] std::string valueToString(const db::CustomBool& value) {
     return value ? "true" : "false";
+}
+
+[[maybe_unused]] std::string valueToString(const db::DateTime& value) {
+    std::string result;
+    db::DateTime::format(result, value);
+
+    return result;
+}
+
+[[maybe_unused]] std::string valueToString(const db::Duration& value) {
+    std::string result;
+    db::Duration::format(result, value);
+
+    return result;
 }
 
 [[maybe_unused]] std::string valueToString(const db::CommitBuilder* value) {
@@ -89,6 +108,8 @@ template <int I>
 [[maybe_unused]] std::string valueToString(const db::Change* value) {
     return value ? "change_ptr" : "null";
 }
+
+[[maybe_unused]] std::string valueToString(db::ListView view);
 
 template <typename T>
 [[maybe_unused]] std::string valueToString(const T& value) {
@@ -111,6 +132,10 @@ template <typename T>
     result += "]";
     return result;
 }
+
+[[maybe_unused]] std::string valueToString(const db::ListElementView element);
+[[maybe_unused]] std::string valueToString(db::ListView view);
+[[maybe_unused]] std::string valueToString(db::MapView view);
 
 template <typename T>
 [[maybe_unused]] std::string valueToString(const std::optional<T>& value) {
@@ -140,8 +165,6 @@ template <typename T>
     result += "]";
     return result;
 }
-
-[[maybe_unused]] std::string valueToString(db::ListView view);
 
 [[maybe_unused]] std::string valueToString(const db::ListElementView element) {
     const auto writeTyped = []<typename T>(const db::ListElementView element) -> std::string {
@@ -173,6 +196,42 @@ template <typename T>
     return out;
 }
 
+// The value of one entry, which is what a cell of a map value column is. The key is added
+// by entryToString, for an entry read as a member of its map rather than alone.
+[[maybe_unused]] std::string valueToString(const db::MapEntryView entry) {
+    const auto writeTyped = []<typename T>(const db::MapEntryView entry) -> std::string {
+        return valueToString(entry.getValueAs<T>());
+    };
+
+    return db::dispatchMapEntry(writeTyped, entry);
+}
+
+[[maybe_unused]] std::string entryToString(const db::MapEntryView entry) {
+    std::string out {entry.getKey()};
+    out += ": ";
+    out += valueToString(entry);
+    return out;
+}
+
+[[maybe_unused]] std::string valueToString(const db::MapView view) {
+    if (view.empty()) {
+        return "{}";
+    }
+
+    std::string out = "{";
+    size_t i = 0;
+
+    for (const db::MapEntryView entry : view.entries()) {
+        if (i++ > 0) {
+            out += ", ";
+        }
+        out += entryToString(entry);
+    }
+
+    out += "}";
+    return out;
+}
+
 struct Stringify {
     std::string& _string;
     size_t _row {0};
@@ -184,6 +243,10 @@ struct Stringify {
 
     template <typename T>
     void operator()(const db::ColumnConst<T>* typed) {
+        _string = valueToString(typed->at(_row));
+    }
+
+    void operator()(const db::ColumnMask* typed) {
         _string = valueToString(typed->at(_row));
     }
 };
@@ -266,6 +329,23 @@ void QueryResultFormatter::appendRows(std::vector<std::vector<std::string>>& row
 
         for (auto* col : df->cols()) {
             values.push_back(columnValueToString(col->getColumn(), row));
+        }
+
+        rows.push_back(values);
+    }
+}
+
+void QueryResultFormatter::appendChunkRows(std::vector<std::vector<std::string>>& rows,
+                                           std::vector<std::string>& values,
+                                           std::span<const db::Column* const> chunks,
+                                           size_t offset,
+                                           size_t rowCount) {
+    for (size_t row = offset; row < offset + rowCount; ++row) {
+        values.clear();
+        values.reserve(chunks.size());
+
+        for (const db::Column* col : chunks) {
+            values.push_back(columnValueToString(col, row));
         }
 
         rows.push_back(values);

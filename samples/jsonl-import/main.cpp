@@ -1,7 +1,10 @@
 #include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <memory>
+#include <span>
 #include <string>
+#include <vector>
 
 #include <argparse.hpp>
 #include <spdlog/spdlog.h>
@@ -10,17 +13,54 @@
 #include "JobSystem.h"
 #include "JsonlParser.h"
 #include "LocalMemory.h"
-#include "QueryCallbacks.h"
+#include "CompilerContext.h"
+#include "NLOutputSink.h"
 #include "SystemManager.h"
 #include "TuringConfig.h"
 #include "TuringDB.h"
-#include "dataframe/Dataframe.h"
+#include "columns/Column.h"
 #include "reader/GraphReader.h"
 #include "versioning/Change.h"
 #include "versioning/ChangeAccessor.h"
 #include "versioning/Transaction.h"
 
 using namespace db;
+
+namespace {
+
+class DumpingNLSink : public NLOutputSink {
+public:
+    explicit DumpingNLSink(LocalMemory* memory)
+        : _memory(memory)
+    {
+    }
+
+    void declareOutput(std::span<const std::string_view> names,
+                       std::span<const Column* const> chunks) override {
+        _emitted.reserve(chunks.size());
+
+        for (const Column* chunk : chunks) {
+            _emitted.push_back(_memory->allocSame(chunk));
+        }
+    }
+
+    // Only [offset, offset + rowCount) of each chunk is part of the result, so the rows
+    // are taken into a column of their own and that one is dumped
+    void appendChunks(std::span<const Column* const> chunks, size_t offset, size_t rowCount) override {
+        for (size_t columnIndex = 0; columnIndex < chunks.size(); columnIndex++) {
+            Column* const emitted = _emitted[columnIndex];
+
+            emitted->assignFromLine(chunks[columnIndex], offset, rowCount);
+            emitted->dump(std::cout);
+        }
+    }
+
+private:
+    LocalMemory* _memory {nullptr};
+    std::vector<Column*> _emitted;
+};
+
+}
 
 int main(int argc, char** argv) {
     argparse::ArgumentParser parser("jsonl-import", "1.0", argparse::default_arguments::help);
@@ -102,10 +142,9 @@ int main(int argc, char** argv) {
 
     if (!query.empty()) {
         LocalMemory mem;
-        QueryCallbacks cbs;
-        const auto dump = [](const Dataframe* d) { d->dump(std::cout); };
-        cbs.setOnOutputData(dump);
-        QueryState state(graphName, &mem, &db.getDefaultQueryConfig(), &cbs);
+        CompilerContext compilerContext;
+        DumpingNLSink sink(&mem);
+        QueryState state(graphName, &mem, &compilerContext, &db.getDefaultQueryConfig(), &sink);
         const auto res = db.query(query, state);
         if (!res) {
             spdlog::error(res.getError());

@@ -3,9 +3,11 @@
 #include <stdint.h>
 #include <sys/socket.h>
 #include <unistd.h>
+#include <algorithm>
 
 #include "ServerContext.h"
 #include "TCPConnection.h"
+#include "NetException.h"
 
 using namespace net;
 
@@ -26,7 +28,21 @@ void TCPConnectionManager::process(AbstractThreadContext* threadContext,
         return;
     }
 
-    if (eventType & utils::EVENT_IN) {
+    const size_t bytesToDiscard = connection.getBytesToDiscard();
+
+    if ((eventType & utils::EVENT_IN) && bytesToDiscard != 0) {
+        auto inputWriter = connection.getInputBuffer().getWriter();
+        const size_t readSize = std::min(bytesToDiscard, inputWriter.getBufferSize());
+        const ssize_t bytesRead = ::recv(s, inputWriter.getBuffer(), readSize, 0);
+
+        const bool discardedAll = bytesRead == static_cast<ssize_t>(bytesToDiscard);
+        if (bytesRead <= 0 || discardedAll) {
+            connection.close();
+            return;
+        }
+
+        connection.setBytesToDiscard(bytesToDiscard - bytesRead);
+    } else if (eventType & utils::EVENT_IN) {
         auto inputWriter = connection.getInputBuffer().getWriter();
         const ssize_t bytesRead = ::recv(s, inputWriter.getBuffer(), inputWriter.getBufferSize(), 0);
         if (bytesRead <= 0) {
@@ -41,21 +57,32 @@ void TCPConnectionManager::process(AbstractThreadContext* threadContext,
 
         if (!analyzeRes) {
             parser.handleAnalyzeError(analyzeRes.error(), writer);
+
+            const size_t unreceivedBytes = parser.getUnreceivedRequestBytes();
+            const bool responseSent = !writer.errorOccured();
+
             writer.reset();
             parser.reset();
             inputWriter.reset();
-            connection.close();
-            return;
-        }
 
-        const bool finished = analyzeRes.value();
+            if (unreceivedBytes == 0 || !responseSent) {
+                connection.close();
+                return;
+            }
 
-        if (finished) {
+            connection.setBytesToDiscard(unreceivedBytes);
+        } else if (analyzeRes.value()) {
             // Process with stored callback
             _ctxt._process(threadContext, connection);
 
-            if (writer.getBytesWritten() != 0) {
-                writer.flush(); // Make sure we sent everything
+            // A gone-away peer makes send() fail: the writer records that through
+            // netErrorOccurred() and also throws, and the throw would escape to the
+            // thread entry and terminate the server. errorOccured() below handles it.
+            try {
+                if (writer.getBytesWritten() != 0) {
+                    writer.flush(); // Make sure we sent everything
+                }
+            } catch (const NetException&) {
             }
 
             if (writer.errorOccured()) {
@@ -67,7 +94,10 @@ void TCPConnectionManager::process(AbstractThreadContext* threadContext,
             }
 
             if (writer.wroteNonEmptyChunk()) {
-                writer.flush();
+                try {
+                    writer.flush();
+                } catch (const NetException&) {
+                }
                 writer.reset();
             }
 

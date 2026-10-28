@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "MATCH (a)-->(b)-->(a) RETURN a, b\nORDER BY a, b;",
+  "expect": {
+    "result": "a,b\n0,1\n0,6\n1,0\n6,0",
+    "resultJson": "{\"header\":{\"column_names\":[\"a\",\"b\"],\"column_types\":[\"UInt64\",\"UInt64\"]},\"data\":[[[0,0,1,6],[1,6,0,0]]]}"
+  },
+  "tags": [
+    "success",
+    "reads",
+    "loop"
+  ],
+  "write-required": false
+}

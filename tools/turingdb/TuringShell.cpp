@@ -1,40 +1,58 @@
 #include "TuringShell.h"
 
-#include <signal.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <stdio.h>
 #include <regex>
 #include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <termios.h>
 #include <iostream>
+#include <variant>
 
 #include <argparse.hpp>
 #include <linenoise.h>
+#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
-#include <tabulate/table.hpp>
 #include <termcolor/termcolor.hpp>
 #include <range/v3/view/drop.hpp>
+
+#ifdef CALLGRIND_PROFILE
+#include <valgrind/callgrind.h>
+#endif
 
 #include "TuringDB.h"
 #include "Graph.h"
 #include "SystemManager.h"
 #include "LineNoiseHandle.h"
+#include "ShellCompletion.h"
+#include "ShellTable.h"
 #include "LocalMemory.h"
+#include "ParameterJson.h"
+#include "ParameterValue.h"
 
 #include "NLOutputSink.h"
-#include "QueryInterpreterV3.h"
 
 #include "columns/Block.h"
 #include "columns/Column.h"
 #include "columns/ColumnVector.h"
 #include "columns/ColumnConst.h"
+#include "columns/ColumnMask.h"
 #include "columns/ColumnOptVector.h"
+#include "columns/AllowedKinds.h"
+#include "columns/ColumnOperatorDispatcher.h"
 #include "dataframe/Dataframe.h"
 #include "dataframe/NamedColumn.h"
 #include "GraphPath.h"
 
+#include "map/MapBufferTypeTag.h"
+#include "map/MapEntryView.h"
+#include "map/MapUtils.h"
 #include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
 #include "list/ListBufferTypeTag.h"
@@ -97,6 +115,30 @@ void extractWords(std::vector<std::string>& words, const std::string& line) {
         words.emplace_back(std::string(line.c_str() + pos, newPos - pos));
         pos = newPos;
     }
+}
+
+bool isParameterName(std::string_view name) {
+    if (name.empty()) {
+        return false;
+    }
+
+    return std::all_of(name.begin(), name.end(), [](char ch) { return isalnum(ch) || ch == '_'; });
+}
+
+bool isShowParametersCommand(const std::string& line) {
+    std::vector<std::string> words;
+    extractWords(words, line);
+
+    if (words.size() != 2) {
+        return false;
+    }
+
+    std::string& lastWord = words.back();
+    if (lastWord.ends_with(';')) {
+        lastWord.pop_back();
+    }
+
+    return strcasecmp(words[0].c_str(), "SHOW") == 0 && strcasecmp(lastWord.c_str(), "PARAMETERS") == 0;
 }
 
 // Commands
@@ -216,6 +258,25 @@ void unquietCommand(const TuringShell::Command::Words& args, TuringShell& shell,
 
     shell.setQuiet(false);
 }
+
+#ifdef CALLGRIND_PROFILE
+void profilerCommand(const TuringShell::Command::Words& args, TuringShell& shell, std::string& line) {
+    if (args.size() != 2) {
+        spdlog::error("The profiler command takes start or stop");
+        return;
+    }
+
+    if (args[1] == "start") {
+        CALLGRIND_ZERO_STATS;
+        CALLGRIND_START_INSTRUMENTATION;
+    } else if (args[1] == "stop") {
+        CALLGRIND_STOP_INSTRUMENTATION;
+        CALLGRIND_DUMP_STATS;
+    } else {
+        spdlog::error("The profiler command takes start or stop");
+    }
+}
+#endif
 
 void readCommand(const TuringShell::Command::Words& args, TuringShell& shell, std::string& line) {
     std::string fileName;
@@ -344,6 +405,14 @@ TuringShell::TuringShell(TuringDB& turingDB,
     _mem(mem),
     _lineNoiseHandle(lineNoiseHandle)
 {
+    if (::pipe(_stopPipe) != 0) {
+        panic("Could not create the shell stop pipe: {}", strerror(errno));
+    }
+
+    ::fcntl(_stopPipe[0], F_SETFD, FD_CLOEXEC);
+    ::fcntl(_stopPipe[1], F_SETFD, FD_CLOEXEC);
+    ::fcntl(_stopPipe[1], F_SETFL, O_NONBLOCK);
+
     _localCommands.emplace("q", Command {quitCommand});
     _localCommands.emplace("quit", Command {quitCommand});
     _localCommands.emplace("exit", Command {quitCommand});
@@ -353,26 +422,30 @@ TuringShell::TuringShell(TuringDB& turingDB,
     _localCommands.emplace("quiet", Command {quietCommand});
     _localCommands.emplace("unquiet", Command {unquietCommand});
     _localCommands.emplace("read", Command {readCommand});
+#ifdef CALLGRIND_PROFILE
+    _localCommands.emplace("profiler", Command {profilerCommand});
+#endif
     _localCommands.emplace("sh", Command {shCommand});
     _localCommands.emplace("shell", Command {shCommand});
     _localCommands.emplace("connect", Command {connectCommand});
     _localCommands.emplace("disconnect", Command {disconnectCommand});
+
+    for (const auto& [name, command] : _localCommands) {
+        _completion.addCommand(name);
+    }
+
+    _completion.install();
 }
 
 TuringShell::~TuringShell() {
+    ::close(_stopPipe[0]);
+    ::close(_stopPipe[1]);
 }
 
 void TuringShell::startLoop() {
-    _threadID = ::pthread_self();
-
-    // Setup SIGUSR1 signal
-    // Doesn't do anything by default, it only
-    // interrupts ::read() (default unix behaviour)
-    struct sigaction sa {};
-    sa.sa_handler = [](int) {};
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(SIGUSR1, &sa, nullptr);
+    // Without a terminal linenoise reads lines through stdio, and poll() on stdin
+    // cannot see the lines stdio has already buffered
+    setvbuf(stdin, nullptr, _IONBF, 0);
 
     // Prepare prompt
     char* line = nullptr;
@@ -395,22 +468,20 @@ void TuringShell::startLoop() {
     }
 
     while (_running.load()) {
-        errno = 0;
-
         // Async Lineoise API
-        linenoiseEditStart(_lineNoiseHandle->getState(), -1, -1,
-                           _lineNoiseHandle->getBuffer(),
-                           LineNoiseHandle::BUFSIZE,
-                           shellPrompt.c_str());
-        _lineNoiseHandle->setActive();
+        _lineNoiseHandle->startEditing(shellPrompt.c_str());
 
         line = linenoiseEditMore;
-        while ((line = linenoiseEditFeed(_lineNoiseHandle->getState())) == linenoiseEditMore) { }
+        while (line == linenoiseEditMore && waitForInput()) {
+            errno = 0;
+            line = linenoiseEditFeed(_lineNoiseHandle->getState());
+        }
 
-        _lineNoiseHandle->setInactive();
-        linenoiseEditStop(_lineNoiseHandle->getState());
+        _lineNoiseHandle->stopEditing();
 
-        if (line == nullptr) {
+        if (line == linenoiseEditMore) {
+            break;
+        } else if (line == nullptr) {
             if (errno == EAGAIN) {
                 // Ctrl+C -> Just redisplay the prompt
                 fmt::println("If you meant to exit the shell, use 'Ctrl+D' instead.");
@@ -446,19 +517,19 @@ std::string TuringShell::composePrompt() {
         const auto remoteGraph = _client.getGraphName();
         return remoteCommit == CommitHash::head()
                  ? fmt::format("{}:{}> ", _remoteAddress, remoteGraph)
-                 : fmt::format("{}:{}(detached {:x})> ", _remoteAddress, remoteGraph, remoteCommit.get());
+                 : fmt::format("{}:{}(detached {})> ", _remoteAddress, remoteGraph, remoteCommit);
     }
 
     const std::string basePrompt = "turing";
     if (_changeID == ChangeID::head()) {
         return _hash == CommitHash::head()
                  ? fmt::format("{}:{}> ", basePrompt, _graphName)
-                 : fmt::format("{}:{}(detached {:x})> ", basePrompt, _graphName, _hash.get());
+                 : fmt::format("{}:{}(detached {})> ", basePrompt, _graphName, _hash);
     }
 
     return _hash == CommitHash::head()
-             ? fmt::format("{}:{}@{:x}> ", basePrompt, _graphName, _changeID.get())
-             : fmt::format("{}:{}@{:x}(detached {:x})> ", basePrompt, _graphName, _changeID.get(), _hash.get());
+             ? fmt::format("{}:{}@{}> ", basePrompt, _graphName, _changeID)
+             : fmt::format("{}:{}@{}(detached {})> ", basePrompt, _graphName, _changeID, _hash);
 }
 
 void asString(std::string& out, const db::Path& path) {
@@ -482,6 +553,7 @@ void asString(std::string& out, const db::Path& path) {
 
 void asString(std::string& out, const db::EntityList& list) {
     if (list.empty()) {
+        out += "null";
         return;
     }
 
@@ -505,20 +577,32 @@ void asString(std::string& out, db::ValueType v) {
     out += ValueTypeName::value(v);
 }
 
-void asString(std::string& out, ChangeID changeID) {
-    out += fmt::format("{:x}", changeID.get());
+void asString(std::string& out, const db::DateTime v) {
+    db::DateTime::format(out, v);
 }
 
-void asString(std::string& out, const CommitBuilder* commit) {
-    out += fmt::format("{:x}", commit->hash().get());
+void asString(std::string& out, const db::Duration v) {
+    db::Duration::format(out, v);
 }
 
-void asString(std::string& out, const Change* change) {
-    out += fmt::format("{:x}", change->id().get());
+template <int I, int Radix>
+void asString(std::string& out, const TemplateCommitHash<I, Radix>& hash) {
+    hash.appendString(out);
 }
 
 void asString(std::string& out, const PropertyNull) {
     out += "null";
+}
+
+// An entity an OPTIONAL MATCH did not match is an invalid ID, which reads as null
+template <db::IntegralType T, int Tag>
+void asString(std::string& out, const db::ID<T, Tag>& id) {
+    if (!id.isValid()) {
+        out += "null";
+        return;
+    }
+
+    out += fmt::format("{}", id.getValue());
 }
 
 void asString(std::string& out, std::span<const float> embedding) {
@@ -535,6 +619,13 @@ void asString(std::string& out, std::span<const float> embedding) {
 
     out += "]";
 }
+
+void asString(std::string& out, const ListElementView v);
+
+// Forward declared so the generic and optional overloads below resolve a list or a map to
+// this one, and so the ListElementView overload sees them: an element may be either
+void asString(std::string& out, ListView lv);
+void asString(std::string& out, MapView mv);
 
 template <typename T>
 void asString(std::string& out, const T& value) {
@@ -562,9 +653,6 @@ void asString(std::string& out, const std::optional<T>& value) {
         out += "null";
     }
 }
-
-// Forward declare so ListElementView overload sees this: an element may be a ListView itself
-void asString(std::string& out, ListView lv);
 
 void asString(std::string& out, const ListElementView v) {
     const auto writeTyped = [&out]<typename T>(const ListElementView ele) {
@@ -596,91 +684,173 @@ void asString(std::string& out, const ListView lv) {
     out += ']';
 }
 
-template <typename T>
-void tabulateWrite(tabulate::RowStream& rs, const T& value) {
-    std::string out;
-    asString(out, value);
-    rs << out;
+// The value of one entry, which is what a map value column's cell is. The key is added by
+// entryAsString, for an entry read as a member of its map rather than alone.
+void asString(std::string& out, MapEntryView v) {
+    const auto writeTyped = [&out]<typename T>(const MapEntryView ele) {
+        const T typed = ele.getValueAs<T>();
+        asString(out, typed);
+    };
+
+    dispatchMapEntry(writeTyped, v);
 }
 
-#define TABULATE_COL_CASE(Type, i)                        \
-    case Type::staticKind(): {                            \
-        const Type& src = *static_cast<const Type*>(col); \
-        tabulateWrite(rs, src[i]);                        \
-    } break;
+void entryAsString(std::string& out, MapEntryView v) {
+    out += v.getKey();
+    out += " : ";
 
-void queryCallback(size_t execCount, const Dataframe* df, tabulate::Table& table) {
+    asString(out, v);
+}
+
+void asString(std::string& out, const MapView mv) {
+    if (mv.empty()) {
+        out += "{}";
+        return;
+    }
+
+    out += '{';
+
+    const MapEntryView fst = mv.front();
+    entryAsString(out, fst);
+
+    for (const MapEntryView ele : mv.entries() | rv::drop(1)) {
+        out += ", ";
+        entryAsString(out, ele);
+    }
+
+    out += '}';
+}
+
+void asString(std::string& out, const ParameterValue& root) {
+    using Item = std::variant<const ParameterValue*, std::string_view>;
+
+    std::vector<Item> worklist;
+    worklist.emplace_back(&root);
+
+    while (!worklist.empty()) {
+        const Item item = worklist.back();
+        worklist.pop_back();
+
+        if (const std::string_view* text = std::get_if<std::string_view>(&item)) {
+            out += *text;
+            continue;
+        }
+
+        const ParameterValue& value = *std::get<const ParameterValue*>(item);
+        if (value.isNull()) {
+            out += "null";
+            continue;
+        }
+
+        switch (value.getType()) {
+            case ValueType::Int64:
+                asString(out, value.getInt64());
+            break;
+            case ValueType::Double:
+                asString(out, value.getDouble());
+            break;
+            case ValueType::Bool:
+                out += value.getBool() ? "true" : "false";
+            break;
+            case ValueType::String:
+                out += value.getString();
+            break;
+            case ValueType::List: {
+                const ParameterValue::List& list = value.getList();
+
+                out += '[';
+                worklist.emplace_back(std::string_view {"]"});
+
+                for (size_t index = list.size(); index > 0; index--) {
+                    worklist.emplace_back(&list[index - 1]);
+                    if (index > 1) {
+                        worklist.emplace_back(std::string_view {", "});
+                    }
+                }
+            }
+            break;
+            case ValueType::Map: {
+                const ParameterValue::Map& map = value.getMap();
+
+                out += '{';
+                worklist.emplace_back(std::string_view {"}"});
+
+                for (auto entry = map.rbegin(); entry != map.rend(); entry++) {
+                    worklist.emplace_back(&entry->second);
+                    worklist.emplace_back(std::string_view {" : "});
+                    worklist.emplace_back(std::string_view {entry->first});
+                    if (std::next(entry) != map.rend()) {
+                        worklist.emplace_back(std::string_view {", "});
+                    }
+                }
+            }
+            break;
+            default:
+                throw TuringException(fmt::format("Unsupported parameter type {}", ValueTypeName::value(value.getType())));
+            break;
+        }
+    }
+}
+
+template <typename T>
+void writeValue(ShellTable& table, const T& value) {
+    std::string out;
+    asString(out, value);
+    table.addCell(out);
+}
+
+struct CellWriter {
+    ShellTable& _table;
+    size_t _row {0};
+
+    template <typename T>
+    void operator()(const ColumnVector<T>* column) {
+        writeValue(_table, column->at(_row));
+    }
+
+    template <typename T>
+    void operator()(const ColumnConst<T>* column) {
+        writeValue(_table, column->at(_row));
+    }
+
+    void operator()(const ColumnMask* column) {
+        writeValue(_table, column->at(_row));
+    }
+};
+
+void writeColumnCell(ShellTable& table, const Column* column, size_t row) {
+    CellWriter cell(table, row);
+
+    using Dispatcher = ColumnSingleDispatcher<OutputtedTypes::Allowed,
+                                              CellWriter,
+                                              OutputtedTypes::Excluded>;
+
+    Dispatcher::dispatch(column, cell);
+}
+
+void queryCallback(size_t execCount, const Dataframe* df, ShellTable& table) {
     const size_t rowCount = df->getLogicalRowCount();
 
     if (execCount == 0) {
         // Write header row
-        tabulate::RowStream headerRow;
+        table.startRow();
         for (const NamedColumn* namedCol : df->cols()) {
             const std::string_view name = namedCol->getName();
             if (name.empty()) {
                 const ColumnTag tag = namedCol->getTag();
-                headerRow << "$" + std::to_string(tag.getValue());
+                table.addCell("$" + std::to_string(tag.getValue()));
             } else {
-                headerRow << name;
+                table.addCell(name);
             }
         }
-
-        table.add_row(std::move(headerRow));
     }
 
     // Write data rows
     for (size_t i = 0; i < rowCount; ++i) {
-        tabulate::RowStream rs;
+        table.startRow();
         for (const NamedColumn* namedCol : df->cols()) {
-            const Column* col = namedCol->getColumn();
-            switch (col->getKind()) {
-                TABULATE_COL_CASE(ColumnVector<EntityID>, i)
-                TABULATE_COL_CASE(ColumnVector<NodeID>, i)
-                TABULATE_COL_CASE(ColumnVector<EdgeID>, i)
-                TABULATE_COL_CASE(ColumnVector<Path>, i)
-                TABULATE_COL_CASE(ColumnVector<EntityList>, i)
-                TABULATE_COL_CASE(ColumnVector<PropertyTypeID>, i)
-                TABULATE_COL_CASE(ColumnVector<LabelID>, i)
-                TABULATE_COL_CASE(ColumnVector<EdgeTypeID>, i)
-                TABULATE_COL_CASE(ColumnVector<LabelSetID>, i)
-                TABULATE_COL_CASE(ColumnVector<types::UInt64::Primitive>, i)
-                TABULATE_COL_CASE(ColumnVector<types::Int64::Primitive>, i)
-                TABULATE_COL_CASE(ColumnVector<types::Double::Primitive>, i)
-                TABULATE_COL_CASE(ColumnVector<types::String::Primitive>, i)
-                TABULATE_COL_CASE(ColumnVector<types::Bool::Primitive>, i)
-                TABULATE_COL_CASE(ColumnVector<ValueType>, i)
-                TABULATE_COL_CASE(ColumnVector<ChangeID>, i)
-                TABULATE_COL_CASE(ColumnOptVector<types::UInt64::Primitive>, i)
-                TABULATE_COL_CASE(ColumnOptVector<types::Int64::Primitive>, i)
-                TABULATE_COL_CASE(ColumnOptVector<types::Double::Primitive>, i)
-                TABULATE_COL_CASE(ColumnOptVector<types::String::Primitive>, i)
-                TABULATE_COL_CASE(ColumnOptVector<types::Bool::Primitive>, i)
-                TABULATE_COL_CASE(ColumnOptVector<types::Embedding::Primitive>, i)
-                TABULATE_COL_CASE(ColumnVector<std::string>, i)
-                TABULATE_COL_CASE(ColumnOptVector<std::string>, i)
-                TABULATE_COL_CASE(ColumnVector<const CommitBuilder*>, i)
-                TABULATE_COL_CASE(ColumnVector<const Change*>, i)
-                TABULATE_COL_CASE(ColumnConst<EntityID>, i)
-                TABULATE_COL_CASE(ColumnConst<NodeID>, i)
-                TABULATE_COL_CASE(ColumnConst<EdgeID>, i)
-                TABULATE_COL_CASE(ColumnConst<types::UInt64::Primitive>, i)
-                TABULATE_COL_CASE(ColumnConst<types::Int64::Primitive>, i)
-                TABULATE_COL_CASE(ColumnConst<types::Double::Primitive>, i)
-                TABULATE_COL_CASE(ColumnConst<types::String::Primitive>, i)
-                TABULATE_COL_CASE(ColumnConst<types::Bool::Primitive>, i)
-                TABULATE_COL_CASE(ColumnConst<types::Embedding::Primitive>, i)
-                TABULATE_COL_CASE(ColumnConst<PropertyNull>, i)
-
-                TABULATE_COL_CASE(ColumnConst<ListView>, i)
-                TABULATE_COL_CASE(ColumnVector<ListElementView>, i)
-
-                default: {
-                    panic("can not print columns of kind {}", col->getKind());
-                }
-            }
+            writeColumnCell(table, namedCol->getColumn(), i);
         }
-
-        table.add_row(std::move(rs));
     }
 }
 
@@ -688,82 +858,51 @@ namespace {
 
 class TuringShellNLSink : public NLOutputSink {
 public:
-    void appendChunks(std::span<const Column* const> chunks, size_t offset, size_t rowCount) override {
-        if (_execCount == 0) {
-            tabulate::RowStream headerRow;
-            for (size_t columnIndex = 0; columnIndex < chunks.size(); columnIndex++) {
-                headerRow << ("$" + std::to_string(columnIndex));
+    TuringShellNLSink(ShellTable& table, size_t& rowCount, bool quiet)
+        : _table(table),
+        _rowCount(rowCount),
+        _quiet(quiet)
+    {
+    }
+
+    void declareOutput(std::span<const std::string_view> names,
+                       std::span<const Column* const> chunks) override {
+        if (_quiet || chunks.empty()) {
+            return;
+        }
+
+        _table.startRow();
+        for (size_t columnIndex = 0; columnIndex < chunks.size(); columnIndex++) {
+            const bool isNamed = columnIndex < names.size() && !names[columnIndex].empty();
+            if (isNamed) {
+                _table.addCell(names[columnIndex]);
+            } else {
+                _table.addCell("$" + std::to_string(columnIndex));
             }
-            _table.add_row(std::move(headerRow));
+        }
+    }
+
+    void appendChunks(std::span<const Column* const> chunks, size_t offset, size_t rowCount) override {
+        _rowCount += rowCount;
+
+        if (_quiet) {
+            return;
         }
 
         for (size_t rowIndex = offset; rowIndex < offset + rowCount; rowIndex++) {
-            tabulate::RowStream rs;
-            for (const Column* col : chunks) {
-                switch (col->getKind()) {
-                    TABULATE_COL_CASE(ColumnVector<NodeID>, rowIndex)
-                    TABULATE_COL_CASE(ColumnVector<EdgeID>, rowIndex)
-                    TABULATE_COL_CASE(ColumnVector<EdgeTypeID>, rowIndex)
-                    TABULATE_COL_CASE(ColumnVector<types::UInt64::Primitive>, rowIndex)
-                    TABULATE_COL_CASE(ColumnOptVector<types::Int64::Primitive>, rowIndex)
-                    TABULATE_COL_CASE(ColumnOptVector<types::Double::Primitive>, rowIndex)
-                    TABULATE_COL_CASE(ColumnOptVector<types::Bool::Primitive>, rowIndex)
-                    TABULATE_COL_CASE(ColumnOptVector<types::String::Primitive>, rowIndex)
-                    default: {
-                        rs << "?";
-                    } break;
-                }
+            _table.startRow();
+            for (const Column* column : chunks) {
+                writeColumnCell(_table, column, rowIndex);
             }
-            _table.add_row(std::move(rs));
-            _rowCount++;
         }
-
-        _execCount++;
     }
-
-    tabulate::Table& getTable() { return _table; }
-    size_t getRowCount() const { return _rowCount; }
 
 private:
-    tabulate::Table _table;
-    size_t _execCount {0};
-    size_t _rowCount {0};
+    ShellTable& _table;
+    size_t& _rowCount;
+    bool _quiet {false};
 };
 
-}
-
-void TuringShell::runMLIRQuery(std::string_view query) {
-    if (_remoteConnected) {
-        spdlog::error("#v3 is only available in local mode");
-        return;
-    }
-
-    TuringShellNLSink sink;
-    QueryStatus status;
-    QueryInterpreterV3 interp(&_turingDB.getSystemManager());
-    interp.execute(status, query, _graphName, _hash, _changeID, _mem, &sink);
-
-    if (_mem) {
-        _mem->clear();
-    }
-
-    if (!status.isOk()) {
-        if (status.hasErrorMessage()) {
-            std::string errorMsg = status.getError();
-            formatMessage(errorMsg);
-            spdlog::error("{}: {}", QueryStatusDescription::value(status.getStatus()), errorMsg);
-        } else {
-            spdlog::error("{}", QueryStatusDescription::value(status.getStatus()));
-        }
-        return;
-    }
-
-    if (!_quiet) {
-        std::cout << sink.getTable() << "\n";
-    }
-
-    std::cout << "Query returned " << sink.getRowCount() << " rows.\n";
-    std::cout << "Query executed in " << status.getTotalTime().count() << " ms.\n";
 }
 
 // Cleans double-escaped characters to single-escaped characters
@@ -792,6 +931,10 @@ void TuringShell::processLine(std::string& line) {
     // Remove leading whitespace
     trim(line);
 
+    if (processParameterCommand(line)) {
+        return;
+    }
+
     // Check if it is a local command
     const auto cmdName = getFirstWord(line);
     const auto localCmdIt = _localCommands.find(cmdName);
@@ -807,23 +950,13 @@ void TuringShell::processLine(std::string& line) {
         }
     }
 
-    // Check for #v3 prefix to route through the MLIR executor
-    constexpr std::string_view v3Prefix = "#v3 ";
-    const bool useMLIR = line.size() >= v3Prefix.size() && line.substr(0, v3Prefix.size()) == v3Prefix;
-    if (useMLIR) {
-        line = line.substr(v3Prefix.size());
-        trim(line);
-        runMLIRQuery(line);
-        return;
-    }
-
     // Execute query
-    tabulate::Table table;
+    ShellTable table;
     size_t rowCount = 0;
 
     QueryStatus res;
     Milliseconds remoteQueryTime {0};
-    {
+    if (_remoteConnected) {
         size_t execCount = 0;
 
         auto shellOutPutCallBack = [&table, &execCount, &rowCount, this](const Dataframe* df) -> void {
@@ -836,26 +969,22 @@ void TuringShell::processLine(std::string& line) {
             queryCallback(execCount++, df, table);
         };
 
-        QueryCallbacks callbacks;
-        callbacks.setOnOutputData(shellOutPutCallBack);
+        try {
+            const TimePoint start = Clock::now();
+            res = _client.sendQuery(line, shellOutPutCallBack, &_parameters);
+            const TimePoint end = Clock::now();
 
-        if (_remoteConnected) {
-            try {
-                const TimePoint start = Clock::now();
-                res = _client.sendQuery(line, shellOutPutCallBack);
-                const TimePoint end = Clock::now();
+            remoteQueryTime = end - start;
 
-                remoteQueryTime = end - start;
-
-            } catch (const TuringException& e) {
-                spdlog::error("Remote query failed: {}", e.what());
-                disconnectRemote();
-            }
-
-        } else {
-            const QueryState state(_graphName, _mem, &_turingDB.getDefaultQueryConfig(), &callbacks, _hash, _changeID);
-            res = _turingDB.query(line, state);
+        } catch (const TuringException& e) {
+            spdlog::error("Remote query failed: {}", e.what());
+            disconnectRemote();
         }
+
+    } else {
+        TuringShellNLSink sink(table, rowCount, _quiet);
+        const QueryState state(_graphName, _mem, &_compilerContext, &_turingDB.getDefaultQueryConfig(), &sink, _hash, _changeID, &_parameters);
+        res = _turingDB.query(line, state);
     }
 
     checkShellContext();
@@ -877,7 +1006,8 @@ void TuringShell::processLine(std::string& line) {
     }
 
     if (!_quiet) {
-        std::cout << table << "\n";
+        table.print(std::cout);
+        std::cout << "\n";
     }
 
     {
@@ -894,6 +1024,96 @@ void TuringShell::processLine(std::string& line) {
     if (_remoteConnected) {
         std::cout << "Remote query executed in " << remoteQueryTime.count() << " ms.\n";
     }
+}
+
+bool TuringShell::processParameterCommand(const std::string& line) {
+    constexpr std::string_view PARAM_COMMAND = ":param";
+
+    if (getFirstWord(line) == PARAM_COMMAND) {
+        setParameter(std::string_view(line).substr(PARAM_COMMAND.size()));
+        return true;
+    } else if (isShowParametersCommand(line)) {
+        printParameters();
+        return true;
+    }
+
+    return false;
+}
+
+void TuringShell::setParameter(std::string_view arguments) {
+    constexpr std::string_view ARROW = "=>";
+    constexpr std::string_view USAGE = "Usage: :param <name> => <json value>, or :param clear";
+
+    std::string trimmed(arguments);
+    trim(trimmed);
+
+    if (trimmed == "clear") {
+        _parameters.clear();
+        return;
+    }
+
+    const size_t arrowPos = trimmed.find(ARROW);
+    if (arrowPos == std::string::npos) {
+        spdlog::error("{}", USAGE);
+        return;
+    }
+
+    std::string name = trimmed.substr(0, arrowPos);
+    name.erase(name.find_last_not_of(whiteChars) + 1);
+
+    if (!isParameterName(name)) {
+        spdlog::error("Invalid parameter name '{}'. {}", name, USAGE);
+        return;
+    }
+
+    ParameterValue value;
+    try {
+        const nlohmann::json json = nlohmann::json::parse(trimmed.substr(arrowPos + ARROW.size()));
+        readJsonParameter(json, value);
+    } catch (const nlohmann::json::exception& e) {
+        spdlog::error("Invalid value for parameter {}: {}", name, e.what());
+        return;
+    } catch (const TuringException& e) {
+        spdlog::error("Invalid value for parameter {}: {}", name, e.what());
+        return;
+    }
+
+    _parameters.set(name, value);
+}
+
+void TuringShell::printParameters() const {
+    using Entry = ParameterMap::Values::value_type;
+
+    const ParameterMap::Values& values = _parameters.getValues();
+
+    std::vector<const Entry*> entries;
+    entries.reserve(values.size());
+    for (const Entry& entry : values) {
+        entries.push_back(&entry);
+    }
+
+    std::sort(entries.begin(), entries.end(), [](const Entry* lhs, const Entry* rhs) { return lhs->first < rhs->first; });
+
+    ShellTable table;
+    table.startRow();
+    table.addCell("name");
+    table.addCell("type");
+    table.addCell("value");
+
+    for (const Entry* entry : entries) {
+        const ParameterValue& value = entry->second;
+
+        table.startRow();
+        table.addCell(entry->first);
+        table.addCell(value.getTypeName());
+
+        std::string valueText;
+        asString(valueText, value);
+        table.addCell(valueText);
+    }
+
+    table.print(std::cout);
+    std::cout << "\n";
 }
 
 bool TuringShell::setGraphName(const std::string& graphName) {
@@ -950,7 +1170,7 @@ bool TuringShell::setCommitHash(CommitHash hash) {
     if (!tx) {
         if (tx.error().getType() == ChangeErrorType::COMMIT_NOT_LOADED) {
             // Commit exists but isn't hydrated — load it now
-            spdlog::info("Loading commit {:x}...", hash.get());
+            spdlog::info("Loading commit {}...", hash);
             auto loadRes = system.loadCommit(_graphName, hash);
             if (!loadRes) {
                 spdlog::error("Failed to load commit: {}", loadRes.error().fmtMessage());
@@ -985,7 +1205,24 @@ void TuringShell::printHelp() const {
 
 void TuringShell::stop() {
     _running.store(false);
-    ::pthread_kill(_threadID, SIGUSR1);
+
+    const char byte = 0;
+    [[maybe_unused]] const ssize_t written = ::write(_stopPipe[1], &byte, 1);
+}
+
+bool TuringShell::waitForInput() {
+    pollfd fds[2] {
+        {STDIN_FILENO, POLLIN, 0},
+        {_stopPipe[0], POLLIN, 0},
+    };
+
+    int ready = ::poll(fds, 2, -1);
+    while (ready < 0 && errno == EINTR) {
+        ready = ::poll(fds, 2, -1);
+    }
+
+    const bool stopRequested = (fds[1].revents & POLLIN) != 0;
+    return !stopRequested;
 }
 
 void TuringShell::connectRemote(const std::string& address, const std::string& port) {
@@ -1039,7 +1276,7 @@ void TuringShell::checkShellContext() {
     }
 
     if (change == nullptr) {
-        fmt::print("Change '{:x}' does not exist anymore, switching back to head\n", _changeID.get());
+        fmt::print("Change '{}' does not exist anymore, switching back to head\n", _changeID);
         setChangeID(ChangeID::head());
         return;
     }
@@ -1048,6 +1285,6 @@ void TuringShell::checkShellContext() {
         return;
     }
 
-    fmt::print("No commit matches hash {:x}, switching back to head\n", _hash.get());
+    fmt::print("No commit matches hash {}, switching back to head\n", _hash);
     setCommitHash(CommitHash::head());
 }

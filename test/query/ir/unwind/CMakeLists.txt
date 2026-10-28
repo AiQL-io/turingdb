@@ -1,0 +1,64 @@
+add_call_v3_test(test_query_ir_unwind_node_seed_v3 UnwindNodeSeedV3Test.cpp)
+
+# The db program an UNWIND seeding a pattern node compiles to, read against the shared
+# SimpleGraph fixture the same way.
+add_turing_test(test_query_ir_unwind_node_seed_codegen UnwindNodeSeedCodegenTest.cpp)
+target_include_directories(test_query_ir_unwind_node_seed_codegen PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_cypher_unwind CypherUnwindTest.cpp)
+target_include_directories(test_query_ir_cypher_unwind PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_unwind_collect_seed UnwindCollectSeedTest.cpp)
+target_include_directories(test_query_ir_unwind_collect_seed PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_unwind_value_filter_codegen UnwindValueFilterCodegenTest.cpp)
+target_include_directories(test_query_ir_unwind_value_filter_codegen PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_cypher_unwind_expr CypherUnwindExprTest.cpp)
+target_include_directories(test_query_ir_cypher_unwind_expr PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_unwind_constant_projection UnwindConstantProjectionTest.cpp)
+target_include_directories(test_query_ir_unwind_constant_projection PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_unwind_heterogeneous_list UnwindHeterogeneousListTest.cpp)
+target_sources(test_query_ir_unwind_heterogeneous_list PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_unwind_heterogeneous_list PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_match_cut_unwind MatchCutUnwindTest.cpp)
+target_include_directories(test_query_ir_match_cut_unwind PRIVATE ${IR_TEST_DIR})
+
+# UNWIND of a list whose elements are read per row, run end to end against simpledb.
+add_turing_test(test_query_ir_unwind_variables UnwindVariablesTest.cpp)
+target_sources(test_query_ir_unwind_variables PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_unwind_variables PRIVATE ${IR_TEST_DIR})
+
+# A CALL subquery and an optional pattern over a column matched against an unwound value.
+add_call_v3_test(test_query_ir_unwind_matched_scope UnwindMatchedScopeTest.cpp)
+
+add_turing_test(test_query_ir_unwind_equality_hop UnwindEqualityHopTest.cpp)
+target_include_directories(test_query_ir_unwind_equality_hop PRIVATE ${IR_TEST_DIR})
+
+add_call_v3_test(test_query_ir_unwind_many_elements UnwindManyElementsTest.cpp)
+
+add_turing_test(test_query_ir_unwind_over_product UnwindOverProductTest.cpp)
+
+add_turing_test(test_query_ir_unwind_list_over_kept_rows UnwindListOverKeptRowsTest.cpp)
+
+add_call_v3_test(test_query_ir_unwind_range UnwindRangeTest.cpp)
+
+add_call_v3_test(test_query_ir_unwind_unread_element UnwindUnreadElementTest.cpp)
+
+add_turing_test(test_query_ir_unwind_range_codegen UnwindRangeCodegenTest.cpp)
+target_include_directories(test_query_ir_unwind_range_codegen PRIVATE ${IR_TEST_DIR})
+
+add_call_v3_test(test_query_ir_unwind_comprehension UnwindComprehensionTest.cpp)
+
+add_call_v3_test(test_query_ir_unwind_range_window UnwindRangeWindowTest.cpp)
+
+add_turing_test(test_query_ir_unwind_list_producer_codegen UnwindListProducerCodegenTest.cpp)
+target_include_directories(test_query_ir_unwind_list_producer_codegen PRIVATE ${IR_TEST_DIR})
+
+add_call_v3_test(test_query_ir_unwind_computed UnwindComputedTest.cpp)
+
+add_turing_test(test_query_ir_unwind_computed_codegen UnwindComputedCodegenTest.cpp)
+target_include_directories(test_query_ir_unwind_computed_codegen PRIVATE ${IR_TEST_DIR})

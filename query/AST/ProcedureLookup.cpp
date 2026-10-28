@@ -46,12 +46,15 @@ static EvaluatedType procTypeToEvaluatedType(ProcedureType type) {
         break;
 
         case ProcedureType::STRING_VIEW:
-        case ProcedureType::STRING:
             return EvaluatedType::String;
         break;
 
         case ProcedureType::LIST:
             return EvaluatedType::List;
+        break;
+
+        case ProcedureType::MAP:
+            return EvaluatedType::Map;
         break;
 
         case ProcedureType::INVALID:
@@ -71,7 +74,7 @@ ProcedureLookup::ProcedureLookup(const ProcedureManager* manager)
 ProcedureLookup::~ProcedureLookup() {
 }
 
-FunctionResolver::FunctionSignatureRange ProcedureLookup::lookup(std::string_view fullName) {
+FunctionResolver::FunctionSignatureRange ProcedureLookup::lookup(std::string_view fullName) const {
     const auto it = _cacheMap.find(fullName);
     if (it != _cacheMap.end()) {
         return FunctionSignatureRange(&it->second, &it->second + 1);
@@ -91,10 +94,13 @@ FunctionResolver::FunctionSignatureRange ProcedureLookup::lookup(std::string_vie
 
     // Convert argument types
     const ProcedureTypeVector& args = proc->argumentTypes();
-    std::vector<EvaluatedType> argTypes;
+    std::vector<FunctionArgumentType> argTypes;
     argTypes.reserve(args.size());
     for (const auto& arg : args) {
-        argTypes.push_back(procTypeToEvaluatedType(arg._type));
+        FunctionArgumentType argType = procTypeToEvaluatedType(arg._type);
+        argType.setName(arg._name);
+        argType.setConstant(arg._constant);
+        argTypes.push_back(argType);
     }
     sig->setArguments(std::move(argTypes));
     sig->setRequiredArgCount(proc->getRequiredArgumentCount());

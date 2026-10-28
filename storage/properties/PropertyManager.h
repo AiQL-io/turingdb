@@ -34,12 +34,12 @@ public:
     template <SupportedType T>
     requires (!std::same_as<T, types::Embedding>)
     void registerPropertyType(PropertyTypeID ptID) {
-        if (_map.contains(ptID)) {
+        if (_containers.contains(ptID)) {
             throw FatalException("Trying to register a type that was already registered");
         }
 
         auto* ptr = new TypedPropertyContainer<T>;
-        _map.emplace(ptID, static_cast<PropertyContainer*>(ptr));
+        _containers.emplace(ptID, static_cast<PropertyContainer*>(ptr));
 
         if constexpr (std::is_same_v<T, types::UInt64>) {
             _uint64s.emplace(ptID, static_cast<PropertyContainer*>(ptr));
@@ -51,35 +51,65 @@ public:
             _strings.emplace(ptID, static_cast<PropertyContainer*>(ptr));
         } else if constexpr (std::is_same_v<T, types::Bool>) {
             _bools.emplace(ptID, static_cast<PropertyContainer*>(ptr));
+        } else if constexpr (std::is_same_v<T, types::List>) {
+            _lists.emplace(ptID, static_cast<PropertyContainer*>(ptr));
+        } else if constexpr (std::is_same_v<T, types::DateTime>) {
+            _dateTimes.emplace(ptID, static_cast<PropertyContainer*>(ptr));
+        } else if constexpr (std::is_same_v<T, types::Duration>) {
+            _durations.emplace(ptID, static_cast<PropertyContainer*>(ptr));
+        } else if constexpr (std::is_same_v<T, types::Map>) {
+            _maps.emplace(ptID, static_cast<PropertyContainer*>(ptr));
         }
     }
 
     void registerEmbeddingPropertyType(PropertyTypeID ptID, size_t dimension) {
-        if (_map.find(ptID) != _map.end()) {
+        if (_containers.find(ptID) != _containers.end()) {
             throw FatalException("Trying to register a type that was already registered");
         }
 
         auto* ptr = new TypedPropertyContainer<types::Embedding>(dimension);
-        _map.emplace(ptID, static_cast<PropertyContainer*>(ptr));
+        _containers.emplace(ptID, static_cast<PropertyContainer*>(ptr));
         _embeddings.emplace(ptID, static_cast<PropertyContainer*>(ptr));
     }
 
-    template <SupportedType T, typename... Args>
-    void add(PropertyTypeID ptID, EntityID entityID, Args&&... args) {
+    template <SupportedType T>
+    void add(PropertyTypeID ptID, EntityID entityID, const T::Primitive& arg) {
         TypedPropertyContainer<T>& container = getMutableContainer<T>(ptID);
-        container.add(entityID, std::forward<Args>(args)...);
+        container.add(entityID, arg);
+    }
+
+    template <SupportedType T>
+    void add(PropertyTypeID ptID, EntityID entityID, const std::optional<typename T::Primitive>& arg) {
+        TypedPropertyContainer<T>& container = getMutableContainer<T>(ptID);
+        container.add(entityID, arg);
+    }
+
+    template <SupportedType T>
+    void add(PropertyTypeID ptID, EntityID entityID, const typename T::OwningPrimitive& arg) {
+        TypedPropertyContainer<T>& container = getMutableContainer<T>(ptID);
+        container.add(entityID, arg);
     }
 
     bool hasPropertyType(PropertyTypeID ptID) const {
-        return _map.contains(ptID);
+        return _containers.contains(ptID);
     }
 
     bool has(PropertyTypeID ptID, EntityID entityID) const {
-        auto containerIt = _map.find(ptID);
-        if (containerIt == _map.end()) {
+        auto containerIt = _containers.find(ptID);
+        if (containerIt == _containers.end()) {
             return false;
         }
         return containerIt->second->has(entityID);
+    }
+
+    /// @returns true if stores a value or explicit NULL for @param entityID
+    bool hasEntry(PropertyTypeID ptID, EntityID entityID) const {
+        const auto containerIt = _containers.find(ptID);
+        if (containerIt == _containers.end()) {
+            return false;
+        }
+
+        return containerIt->second->hasEntry(entityID);
     }
 
     template <SupportedType T>
@@ -100,19 +130,29 @@ public:
         return container.all();
     }
 
+    /**
+     * @brief Gets the (possibly null) value of the property with ID @param ptID
+     * associated with @param entityID.
+     * @returns
+     * - std::nullopt: if the value is explicitly null;
+     * - nullptr:      if there is no associated value;
+     * - the value:    otherwise.
+     */
     template <SupportedType T>
-    const T::Primitive* tryGet(PropertyTypeID ptID, EntityID entityID) const {
+    std::optional<const typename T::Primitive*> tryGetWithNull(PropertyTypeID ptID,
+                                                               EntityID entityID) const {
         const TypedPropertyContainer<T>* container = tryGetContainer<T>(ptID);
         if (!container) {
             return nullptr;
         }
-        return container->tryGet(entityID);
+
+        return container->tryGetWithNull(entityID);
     }
 
     template <SupportedType T>
     TypedPropertyContainer<T>& getMutableContainer(PropertyTypeID ptID) {
-        const auto it = _map.find(ptID);
-        if (it == _map.end()) {
+        const auto it = _containers.find(ptID);
+        if (it == _containers.end()) {
             throw FatalException("Trying to access a property type that was not registered");
         }
 
@@ -121,8 +161,8 @@ public:
 
     template <SupportedType T>
     const TypedPropertyContainer<T>& getContainer(PropertyTypeID ptID) const {
-        const auto it = _map.find(ptID);
-        if (it == _map.end()) {
+        const auto it = _containers.find(ptID);
+        if (it == _containers.end()) {
             throw FatalException(
                 fmt::format("Trying to access property type {} that was not registered",
                             ptID.getValue()));
@@ -133,8 +173,8 @@ public:
 
     template <SupportedType T>
     const TypedPropertyContainer<T>* tryGetContainer(PropertyTypeID ptID) const {
-        const auto it = _map.find(ptID);
-        if (it == _map.end()) {
+        const auto it = _containers.find(ptID);
+        if (it == _containers.end()) {
             return nullptr;
         }
         const auto& casted = it->second->cast<T>();
@@ -145,23 +185,23 @@ public:
                                 const LabelSetHandle& labelset,
                                 EntityPropertyView& view) const;
 
-    PropertyContainerMap::iterator begin() { return _map.begin(); }
-    PropertyContainerMap::const_iterator begin() const { return _map.begin(); }
-    PropertyContainerMap::iterator end() { return _map.end(); }
-    PropertyContainerMap::const_iterator end() const { return _map.end(); }
-    PropertyContainerMap::const_iterator find(PropertyTypeID ptID) const { return _map.find(ptID); }
-    PropertyContainerMap::iterator find(PropertyTypeID ptID) { return _map.find(ptID); }
+    PropertyContainerMap::iterator begin() { return _containers.begin(); }
+    PropertyContainerMap::const_iterator begin() const { return _containers.begin(); }
+    PropertyContainerMap::iterator end() { return _containers.end(); }
+    PropertyContainerMap::const_iterator end() const { return _containers.end(); }
+    PropertyContainerMap::const_iterator find(PropertyTypeID ptID) const { return _containers.find(ptID); }
+    PropertyContainerMap::iterator find(PropertyTypeID ptID) { return _containers.find(ptID); }
 
     size_t count(PropertyTypeID ptID) const {
-        return _map.at(ptID)->size();
+        return _containers.at(ptID)->size();
     }
 
     size_t propTypeCount() const {
-        return _map.size();
+        return _containers.size();
     }
 
     bool isEmpty() const {
-        return _map.empty();
+        return _containers.empty();
     }
 
     const PropertyIndexer& indexers() const {
@@ -169,7 +209,7 @@ public:
     }
 
     std::span<const EntityID> ids(PropertyTypeID ptID) const {
-        return _map.at(ptID)->ids();
+        return _containers.at(ptID)->ids();
     }
 
     LabelSetPropertyIndexer& addIndexer(PropertyTypeID ptID) {
@@ -190,7 +230,7 @@ private:
     friend DataPartLoader;
     friend DataPartRebaser;
 
-    PropertyContainerMap _map;
+    PropertyContainerMap _containers;
 
     PropertyContainerReferences _uint64s;
     PropertyContainerReferences _int64s;
@@ -198,6 +238,10 @@ private:
     PropertyContainerReferences _strings;
     PropertyContainerReferences _bools;
     PropertyContainerReferences _embeddings;
+    PropertyContainerReferences _lists;
+    PropertyContainerReferences _dateTimes;
+    PropertyContainerReferences _durations;
+    PropertyContainerReferences _maps;
 
     PropertyIndexer _indexers;
 };

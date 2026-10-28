@@ -18,16 +18,22 @@ def DB : Dialect {
 
 }
 
-// Base, from which all TuringDB dialects are derived
+def ConstantThroughOperands : NativeOpTrait<"ConstantThroughOperands">;
+
+// Base, from which all TuringDB dialects are derived.
+//
+// Pure on an op here says it reads the graph and writes nothing - not that it keeps the
+// row count. db.limit, db.sort, db.cross_product and db.optional_match all change the
+// number of rows and all carry Pure, so a canonicalizer added to the pass pipeline has to
+// be told to leave them alone.
 class TuringOp<string mnemonic, list<Trait> traits = []>
     : Op<DB, mnemonic, traits>;
 
 class UnaryOp<string mnemonic, list<Trait> traits = []>
     : TuringOp<mnemonic, traits>;
 
-// TODO: Not sure if this top-level, generic op is the best
-// way to do this. To revisit
+// Arithmetic over two columns: constant when both operands are.
 class BinaryOp<string mnemonic, list<Trait> traits = []>
-    : TuringOp<mnemonic, traits>;
+    : TuringOp<mnemonic, !listconcat(traits, [ConstantThroughOperands])>;
 
 #endif //TURINGDB_DIALECT

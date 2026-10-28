@@ -1,6 +1,10 @@
 #include "Projection.h"
 
+#include <iterator>
+
 #include "CypherAST.h"
+#include "expr/Expr.h"
+#include "expr/StructuralExpressionComparator.h"
 
 using namespace db;
 
@@ -55,4 +59,103 @@ std::optional<std::string_view> Projection::getName(const VarDecl* item) const {
 
 bool Projection::hasName(const std::string_view& name) const {
     return _namesSet.contains(name);
+}
+
+Projection::Items::const_iterator Projection::locateItem(const Expr* key) const {
+    const VarDecl* keyDecl = key->getExprVarDecl();
+    const Items::const_iterator itemsEnd = _items.end();
+
+    for (Items::const_iterator item = _items.begin(); item != itemsEnd; item++) {
+        if (const Expr* const* itemExpr = std::get_if<Expr*>(&*item)) {
+            const Expr* projectedExpr = *itemExpr;
+
+            // A key may also name the alias an item was given - the x of
+            // RETURN n.name AS x ORDER BY x - which is one variable declared once, so the
+            // key and the item share its declaration. Every other expression is given a
+            // declaration of its own, so only an alias is ever matched here
+            const bool namesTheItem = keyDecl && projectedExpr->getExprVarDecl() == keyDecl;
+            const bool readsTheItem = StructuralExpressionComparator::equal(projectedExpr, key);
+
+            if (namesTheItem || readsTheItem) {
+                return item;
+            }
+        } else if (const VarDecl* const* itemDecl = std::get_if<VarDecl*>(&*item)) {
+            const bool namesTheItem = keyDecl && *itemDecl == keyDecl;
+
+            if (namesTheItem) {
+                return item;
+            }
+        }
+    }
+
+    return itemsEnd;
+}
+
+size_t Projection::findItemIndex(const Expr* key) const {
+    return static_cast<size_t>(std::distance(_items.begin(), locateItem(key)));
+}
+
+const Expr* Projection::findItemExpr(const Expr* key) const {
+    const Items::const_iterator item = locateItem(key);
+    if (item == _items.end()) {
+        return nullptr;
+    }
+
+    const Expr* const* itemExpr = std::get_if<Expr*>(&*item);
+    if (!itemExpr) {
+        return nullptr;
+    }
+
+    return *itemExpr;
+}
+
+bool Projection::hasItem(const Expr* key) const {
+    return locateItem(key) != _items.end();
+}
+
+bool Projection::hasItemReadingThePropertyOfComponent(const PropertyExpr* component) const {
+    for (const ReturnItem& item : _items) {
+        const Expr* const* itemExpr = std::get_if<Expr*>(&item);
+        const bool readsTheProperty = itemExpr
+                                   && StructuralExpressionComparator::readsThePropertyOfComponent(*itemExpr, component);
+
+        if (readsTheProperty) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool Projection::hasVariableItem(const VarDecl* decl) const {
+    return hasItemDecl(decl, true);
+}
+
+bool Projection::hasItemDecl(const VarDecl* decl) const {
+    return hasItemDecl(decl, false);
+}
+
+bool Projection::hasItemDecl(const VarDecl* decl, bool bareVariablesOnly) const {
+    if (!decl) {
+        return false;
+    }
+
+    for (const ReturnItem& item : _items) {
+        if (const Expr* const* itemExpr = std::get_if<Expr*>(&item)) {
+            const Expr* projectedExpr = *itemExpr;
+
+            // Only a bare variable returns the variable itself; every other item returns
+            // a value computed from it, which leaves the variable behind
+            const bool isBareVariable = projectedExpr->getKind() == Expr::Kind::SYMBOL;
+            const bool returnsTheDecl = isBareVariable || !bareVariablesOnly;
+
+            if (returnsTheDecl && projectedExpr->getExprVarDecl() == decl) {
+                return true;
+            }
+        } else if (std::get<VarDecl*>(item) == decl) {
+            return true;
+        }
+    }
+
+    return false;
 }

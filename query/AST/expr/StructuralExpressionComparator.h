@@ -1,0 +1,30 @@
+#pragma once
+
+#include <span>
+
+namespace db {
+
+class Expr;
+class FunctionInvocation;
+class LabelExpr;
+class Literal;
+class PropertyExpr;
+class SymbolChain;
+
+class StructuralExpressionComparator {
+public:
+    StructuralExpressionComparator() = delete;
+    ~StructuralExpressionComparator() = delete;
+
+    static bool equal(const Expr* lhs, const Expr* rhs);
+    static bool readsThePropertyOfComponent(const Expr* candidate, const PropertyExpr* component);
+
+private:
+    static bool equalLiterals(const Literal* lhs, const Literal* rhs);
+    static bool equalInvocations(const FunctionInvocation* lhs, const FunctionInvocation* rhs);
+    static bool equalExprLists(std::span<Expr* const> lhs, std::span<Expr* const> rhs);
+    static bool equalSymbolChains(const SymbolChain* lhs, const SymbolChain* rhs);
+    static bool equalLabelExprs(const LabelExpr* lhs, const LabelExpr* rhs);
+};
+
+}

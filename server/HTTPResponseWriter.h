@@ -3,6 +3,12 @@
 #include "Endpoints.h"
 #include "HTTP.h"
 #include "HTTPWriter.h"
+#include "list/ListUtils.h"
+#include "list/ListView.h"
+#include "map/MapEntryView.h"
+#include "map/MapUtils.h"
+#include "map/MapView.h"
+#include "metadata/PropertyNull.h"
 #include "metadata/PropertyTypeMap.h"
 #include "views/NodeView.h"
 #include "QueryStatus.h"
@@ -286,6 +292,20 @@ public:
         write(v._boolean ? "true" : "false");
     }
 
+    void writeValue(types::DateTime::Primitive v) {
+        _formatted.clear();
+        DateTime::format(_formatted, v);
+
+        writeValue(std::string_view {_formatted});
+    }
+
+    void writeValue(types::Duration::Primitive v) {
+        _formatted.clear();
+        Duration::format(_formatted, v);
+
+        writeValue(std::string_view {_formatted});
+    }
+
     void writeValue(bool v) {
         write(v ? "true" : "false");
     }
@@ -300,6 +320,68 @@ public:
             }
         }
         write(']');
+    }
+
+    void writeValue(PropertyNull) {
+        write("null");
+    }
+
+    void writeValue(NodeID v) {
+        write(std::to_string(v.getValue()));
+    }
+
+    void writeValue(EdgeID v) {
+        write(std::to_string(v.getValue()));
+    }
+
+    void writeValue(ListElementView element) {
+        const auto writeTyped = [this]<typename T>(const ListElementView view) {
+            this->writeValue(view.getAs<T>());
+        };
+
+        const ListTagDispatcher dispatcher {element.getTag()};
+        dispatcher.execute(writeTyped, element);
+    }
+
+    void writeValue(ListView list) {
+        write('[');
+
+        bool first = true;
+        for (const ListElementView element : list) {
+            if (!first) {
+                write(',');
+            }
+            first = false;
+            writeValue(element);
+        }
+
+        write(']');
+    }
+
+    void writeValue(MapEntryView entry) {
+        writeValue(entry.getKey());
+        write(':');
+
+        const auto writeTyped = [this]<typename T>(const MapEntryView view) {
+            this->writeValue(view.getValueAs<T>());
+        };
+
+        dispatchMapEntry(writeTyped, entry);
+    }
+
+    void writeValue(MapView map) {
+        write('{');
+
+        bool first = true;
+        for (const MapEntryView entry : map) {
+            if (!first) {
+                write(',');
+            }
+            first = false;
+            writeValue(entry);
+        }
+
+        write('}');
     }
 
     void writeValue(const PropertyTypeMap& propTypes, const NodeView& nodeView) {
@@ -369,6 +451,7 @@ public:
 private:
     net::NetWriter* _writer {nullptr};
     std::string _sanitized;
+    std::string _formatted;
 };
 
 }

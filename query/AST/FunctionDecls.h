@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 #include <memory>
 #include <unordered_map>
@@ -13,8 +14,8 @@ namespace db {
 class FunctionDecls : public FunctionResolver {
 public:
     using FunctionSignatures = std::vector<FunctionSignature*>;
+    using PossibleArgTypes = std::vector<FunctionArgumentType>;
 
-    FunctionDecls();
     ~FunctionDecls() override;
 
     FunctionDecls(const FunctionDecls&) = delete;
@@ -22,15 +23,24 @@ public:
     FunctionDecls& operator=(const FunctionDecls&) = delete;
     FunctionDecls& operator=(FunctionDecls&&) = delete;
 
+    static const FunctionDecls& getBuiltins();
+
+    FunctionSignatureRange lookup(std::string_view fullName) const override;
+
+private:
+    std::vector<std::unique_ptr<FunctionSignature>> _owned;
+    std::unordered_map<std::string, FunctionSignatures> _nameMap;
+
+    FunctionDecls();
+
     void initDefault();
 
     FunctionSignature* createFunction(std::string_view fullName);
 
-    FunctionSignatureRange lookup(std::string_view fullName) override;
-
-private:
-    std::vector<std::unique_ptr<FunctionSignature>> _owned;
-    std::unordered_map<std::string_view, FunctionSignatures> _nameMap;
+    // One overload per way of typing the arguments, position i taking any of positionTypes[i]
+    void createOverloads(std::string_view fullName,
+                         const std::vector<PossibleArgTypes>& positionTypes,
+                         std::vector<FunctionSignature*>& overloads);
 };
 
 }

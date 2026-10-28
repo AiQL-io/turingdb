@@ -21,14 +21,23 @@ enum ColumnOperator : uint8_t {
 
     OP_AND,
     OP_OR,
+    OP_XOR,
 
     OP_ADD,
+    OP_CONCAT,
     OP_SUB,
     OP_MUL,
     OP_DIV,
+    OP_MOD,
+    OP_POW,
+
+    OP_STARTS_WITH,
+    OP_ENDS_WITH,
+    OP_CONTAINS,
 
     OP_PROJECT,
     OP_IN,
+    OP_INDEX,
 
     // Unary operators
     OP_MINUS,
@@ -70,14 +79,23 @@ constexpr ColumnOperatorType getOperatorType(ColumnOperator op) {
 
         case OP_AND:
         case OP_OR:
+        case OP_XOR:
 
         case OP_ADD:
+        case OP_CONCAT:
         case OP_SUB:
         case OP_MUL:
         case OP_DIV:
+        case OP_MOD:
+        case OP_POW:
+
+        case OP_STARTS_WITH:
+        case OP_ENDS_WITH:
+        case OP_CONTAINS:
 
         case OP_PROJECT:
         case OP_IN:
+        case OP_INDEX:
             return ColumnOperatorType::OPTYPE_BINARY;
         break;
 
@@ -123,14 +141,23 @@ using ColumnOperatorDescription = EnumToString<ColumnOperator>::Create<
 
     EnumStringPair<ColumnOperator::OP_AND, "AND">,
     EnumStringPair<ColumnOperator::OP_OR, "OR">,
+    EnumStringPair<ColumnOperator::OP_XOR, "XOR">,
 
     EnumStringPair<ColumnOperator::OP_ADD, "ADD">,
+    EnumStringPair<ColumnOperator::OP_CONCAT, "CONCAT">,
     EnumStringPair<ColumnOperator::OP_SUB, "SUB">,
     EnumStringPair<ColumnOperator::OP_MUL, "MUL">,
     EnumStringPair<ColumnOperator::OP_DIV, "DIV">,
+    EnumStringPair<ColumnOperator::OP_MOD, "MOD">,
+    EnumStringPair<ColumnOperator::OP_POW, "POW">,
+
+    EnumStringPair<ColumnOperator::OP_STARTS_WITH, "STARTS_WITH">,
+    EnumStringPair<ColumnOperator::OP_ENDS_WITH, "ENDS_WITH">,
+    EnumStringPair<ColumnOperator::OP_CONTAINS, "CONTAINS">,
 
     EnumStringPair<ColumnOperator::OP_PROJECT, "PROJECT">,
     EnumStringPair<ColumnOperator::OP_IN, "IN">,
+    EnumStringPair<ColumnOperator::OP_INDEX, "INDEX">,
 
     EnumStringPair<ColumnOperator::OP_MINUS, "MINUS">,
     EnumStringPair<ColumnOperator::OP_PLUS, "PLUS">,

@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <shared_mutex>
+#include <unordered_set>
 
 #include "VecLibMetadata.h"
 #include "VectorResult.h"
@@ -92,10 +93,16 @@ public:
             return *this;
         }
 
+        Loader& setMmapHNSWIndex(bool mmapHNSWIndex) {
+            _mmapHNSWIndex = mmapHNSWIndex;
+            return *this;
+        }
+
         [[nodiscard]] VectorResult<std::unique_ptr<VecLib>> load(VecLibStorage& storage);
 
     private:
         std::unique_ptr<VecLib> _vecLib;
+        bool _mmapHNSWIndex {true};
     };
 
     [[nodiscard]] VectorResult<void> addEmbeddings(const BatchVectorCreate* batch);
@@ -136,9 +143,20 @@ private:
     VecLibMetadata _metadata;
     std::unique_ptr<LSHShardRouter> _shardRouter;
     std::unique_ptr<faiss::Index> _hnswIndex;
+    bool _hnswIndexMapped {false};
 
     VecLib();
 
+    void materializeHNSWIndex();
+
+    template <typename Visitor>
+    void forEachIndex(Visitor visit);
+
+    bool containsAnyID(const std::unordered_set<int64_t>& ids);
+    void collectVectorsToKeep(const std::unordered_set<int64_t>& replacedIDs, BatchVectorCreate* batch);
+    [[nodiscard]] VectorResult<void> clearIndex();
+
+    VectorResult<void> insertEmbeddings(const BatchVectorCreate* batch);
     VectorResult<void> addEmbeddingsBruteForce(const BatchVectorCreate* batch);
     VectorResult<void> addEmbeddingsHNSW(const BatchVectorCreate* batch);
 };

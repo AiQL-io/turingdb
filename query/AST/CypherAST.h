@@ -9,8 +9,10 @@ namespace db {
 
 class SourceManager;
 class DiagnosticsManager;
+class Parameter;
 class Symbol;
 class SymbolChain;
+class LabelExpr;
 class QualifiedName;
 class QuantifiedPath;
 class FunctionInvocation;
@@ -24,21 +26,32 @@ class CharLiteral;
 class ListLiteral;
 class MapLiteral;
 class WildcardLiteral;
+class NormalFormLiteral;
 class EmbeddingLiteral;
 class Expr;
 class ExprChain;
 class BinaryExpr;
+class LogicalExpr;
 class LiteralExpr;
 class EntityTypeExpr;
+class ExistsExpr;
+class CountSubqueryExpr;
+class CollectSubqueryExpr;
 class ParameterExpr;
-class PathExpr;
 class PropertyExpr;
+class PropertyLookupExpr;
 class StringExpr;
 class SymbolExpr;
 class UnaryExpr;
 class FunctionInvocationExpr;
 class IndexExpr;
 class ListExpr;
+class ListSliceExpr;
+class ListComprehensionExpr;
+class PatternComprehensionExpr;
+class ListPredicateExpr;
+class ReduceExpr;
+class CaseExpr;
 class Pattern;
 class PatternElement;
 class EntityPattern;
@@ -56,11 +69,17 @@ class StmtContainer;
 class MatchStmt;
 class ShortestPathStmt;
 class CallStmt;
+class CallSubqueryStmt;
 class CreateStmt;
+class MergeStmt;
+class NextSegmentStmt;
 class SetStmt;
+class RemoveStmt;
 class DeleteStmt;
 class QueryCommand;
 class SinglePartQuery;
+class UnionQuery;
+class ConditionalQuery;
 class ChangeQuery;
 class ReturnStmt;
 class WhereClause;
@@ -75,7 +94,6 @@ class YCypherParser;
 class ListGraphQuery;
 class ListAvailableGraphsQuery;
 class CreateGraphQuery;
-class FunctionDecls;
 class ProcedureLookup;
 class ProcedureManager;
 class LoadGraphQuery;
@@ -101,11 +119,15 @@ class CreateEdgePropertyIndexQuery;
 class DropIndexQuery;
 class MergeDataPartsQuery;
 class UnwindStmt;
+class WithStmt;
+class ExplainRequest;
 
 class CypherAST {
 public:
+    friend Parameter;
     friend Symbol;
     friend SymbolChain;
+    friend LabelExpr;
     friend QualifiedName;
     friend QuantifiedPath;
     friend FunctionInvocation;
@@ -119,20 +141,31 @@ public:
     friend ListLiteral;
     friend MapLiteral;
     friend WildcardLiteral;
+    friend NormalFormLiteral;
     friend EmbeddingLiteral;
     friend ExprChain;
     friend BinaryExpr;
+    friend LogicalExpr;
     friend LiteralExpr;
     friend EntityTypeExpr;
+    friend ExistsExpr;
+    friend CountSubqueryExpr;
+    friend CollectSubqueryExpr;
     friend ParameterExpr;
-    friend PathExpr;
     friend PropertyExpr;
+    friend PropertyLookupExpr;
     friend StringExpr;
     friend SymbolExpr;
     friend UnaryExpr;
     friend FunctionInvocationExpr;
     friend IndexExpr;
     friend ListExpr;
+    friend ListSliceExpr;
+    friend ListComprehensionExpr;
+    friend PatternComprehensionExpr;
+    friend ListPredicateExpr;
+    friend ReduceExpr;
+    friend CaseExpr;
     friend Pattern;
     friend PatternElement;
     friend NodePattern;
@@ -147,14 +180,20 @@ public:
     friend MatchStmt;
     friend ShortestPathStmt;
     friend CallStmt;
+    friend CallSubqueryStmt;
     friend CreateStmt;
+    friend MergeStmt;
+    friend NextSegmentStmt;
     friend SetStmt;
+    friend RemoveStmt;
     friend DeleteStmt;
     friend ReturnStmt;
     friend WhereClause;
     friend YieldClause;
     friend YieldItems;
     friend SinglePartQuery;
+    friend UnionQuery;
+    friend ConditionalQuery;
     friend ChangeQuery;
     friend DeclContext;
     friend VarDecl;
@@ -187,6 +226,7 @@ public:
     friend DropIndexQuery;
     friend MergeDataPartsQuery;
     friend UnwindStmt;
+    friend WithStmt;
 
     using QueryCommands = std::vector<QueryCommand*>;
 
@@ -202,8 +242,12 @@ public:
 
     const QueryCommands& queries() const { return _queries; }
 
-    FunctionDecls& functionDecls() { return *_functionDecls; }
-    const FunctionDecls& functionDecls() const { return *_functionDecls; }
+    // Moves a command out of the top-level list and into the one a holder reads it
+    // through, once that holder is built over it
+    void nestQuery(QueryCommand* query);
+
+    const std::vector<Expr*>& getExpressions() const { return _expressions; }
+    const std::vector<EntityPattern*>& getEntityPatterns() const { return _entityPatterns; }
 
     std::string* createString();
 
@@ -213,18 +257,23 @@ public:
     DiagnosticsManager* getDiagnosticsManager() { return _diagnosticsManager; }
     const DiagnosticsManager* getDiagnosticsManager() const { return _diagnosticsManager; }
 
-    FunctionDecls* getFunctionDecls() { return _functionDecls.get(); }
-    const FunctionDecls* getFunctionDecls() const { return _functionDecls.get(); }
-
     ProcedureLookup* getProcedureLookup() { return _procedureLookup.get(); }
     const ProcedureLookup* getProcedureLookup() const { return _procedureLookup.get(); }
+
+    // What the query's EXPLAIN prefix asks the engine to report, created by the first
+    // call. Null for a query carrying no prefix, which is what tells the engine to run
+    // it rather than explain it.
+    ExplainRequest& explainRequest();
+    const ExplainRequest* getExplainRequest() const { return _explainRequest.get(); }
 
 private:
     SourceManager* _sourceManager {nullptr};
     DiagnosticsManager* _diagnosticsManager {nullptr};
 
+    std::vector<Parameter*> _parameters;
     std::vector<Symbol*> _symbols;
     std::vector<SymbolChain*> _symbolChains;
+    std::vector<LabelExpr*> _labelExprs;
     std::vector<QualifiedName*> _qualifiedNames;
     std::vector<QuantifiedPath*> _quantifiedPaths;
     std::vector<FunctionInvocation*> _functionInvocations;
@@ -245,17 +294,24 @@ private:
     std::vector<OrderByItem*> _orderByItems;
     std::vector<StmtContainer*> _stmtContainers;
     QueryCommands _queries;
+
+    // The commands a top-level one holds: the branches of a union, which the AST
+    // owns like any other command but which queries() must not report as scripts of
+    // their own
+    QueryCommands _subQueries;
     std::vector<DeclContext*> _declContexts;
     std::vector<VarDecl*> _varDecls;
     std::vector<NodePatternData*> _nodePatternDatas;
     std::vector<EdgePatternData*> _edgePatternDatas;
     std::vector<std::string*> _unnamedVarIdentifiers;
 
-    std::unique_ptr<FunctionDecls> _functionDecls;
     std::unique_ptr<ProcedureLookup> _procedureLookup;
+    std::unique_ptr<ExplainRequest> _explainRequest;
 
+    void addParameter(Parameter* parameter);
     void addSymbol(Symbol* symbol);
     void addSymbolChain(SymbolChain* symbol);
+    void addLabelExpr(LabelExpr* expr);
     void addQualifiedName(QualifiedName* name);
     void addQuantifiedPath(QuantifiedPath* path);
     void addLiteral(Literal* literal);
@@ -274,6 +330,7 @@ private:
     void addOrderByItem(OrderByItem* item);
     void addStmtContainer(StmtContainer* container);
     void addQuery(QueryCommand* query);
+
     void addDeclContext(DeclContext* ctxt);
     void addVarDecl(VarDecl* decl);
     void addNodePatternData(NodePatternData* data);

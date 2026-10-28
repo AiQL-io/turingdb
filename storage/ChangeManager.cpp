@@ -38,23 +38,36 @@ ChangeResult<Change*> ChangeManager::getChange(const Graph* graph, ChangeID chan
 
     const auto it = _changes.find(GraphChangePair {graph, changeID});
     if (it == _changes.end()) {
-        return ChangeError::result(ChangeErrorType::CHANGE_NOT_FOUND);
+        return ChangeError::result(ChangeErrorType::CHANGE_NOT_FOUND, changeID);
     }
 
     return it->second.get();
 }
 
-ChangeResult<void> ChangeManager::submitChange(ChangeAccessor& access, JobSystem& jobsystem) {
+ChangeResult<void> ChangeManager::submitChange(ChangeAccessor& access, JobSystem& jobsystem, SubmitMode mode) {
     std::unique_lock guard(_changesLock);
     const Graph* graph = access.getGraph();
 
     const auto findIt = _changes.find(GraphChangePair {graph, access.getID()});
     if (findIt == _changes.end()) {
-        return ChangeError::result(ChangeErrorType::CHANGE_NOT_FOUND);
+        return ChangeError::result(ChangeErrorType::CHANGE_NOT_FOUND, access.getID());
     }
 
     auto& change = findIt->second;
-    if (auto res = change->submit(jobsystem); !res) {
+
+    if (mode == SubmitMode::SQUASH) {
+        for (const auto& [pair, other] : _changes) {
+            const bool isOtherChange = other.get() != change.get();
+            const bool sameGraph = pair._graph == graph;
+
+            if (isOtherChange && sameGraph && change->hasCommit(other->baseHash())) {
+                return ChangeError::result(ChangeErrorType::COULD_NOT_ACCEPT_CHANGE,
+                                           CommitError(CommitErrorType::SQUASH_BLOCKED_BY_DEPENDENT_CHANGE));
+            }
+        }
+    }
+
+    if (auto res = change->submit(jobsystem, mode); !res) {
         return ChangeError::result(ChangeErrorType::COULD_NOT_ACCEPT_CHANGE, res.error());
     }
 
@@ -70,7 +83,7 @@ ChangeResult<void> ChangeManager::deleteChange(ChangeAccessor& access, ChangeID 
 
     const auto it = _changes.find(GraphChangePair {graph, changeID});
     if (it == _changes.end()) {
-        return ChangeError::result(ChangeErrorType::CHANGE_NOT_FOUND);
+        return ChangeError::result(ChangeErrorType::CHANGE_NOT_FOUND, changeID);
     }
 
     access.release();
@@ -88,4 +101,10 @@ void ChangeManager::listChanges(std::vector<const Change*>& list, const Graph* g
             list.emplace_back(change.get());
         }
     }
+}
+
+bool ChangeManager::hasChanges() const {
+    std::shared_lock guard(_changesLock);
+
+    return !_changes.empty();
 }

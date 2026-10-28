@@ -7,6 +7,8 @@ namespace db {
 
 class CypherAST;
 class SinglePartQuery;
+class UnionQuery;
+class ConditionalQuery;
 class ChangeQuery;
 class CommitQuery;
 class MatchStmt;
@@ -22,16 +24,17 @@ class Projection;
 class Pattern;
 class PatternElement;
 class WhereClause;
+class WithStmt;
 class Expr;
 class NodePattern;
 class EdgePattern;
 class MapLiteral;
 class BinaryExpr;
+class LogicalExpr;
 class UnaryExpr;
 class SymbolExpr;
 class LiteralExpr;
 class ParameterExpr;
-class PathExpr;
 class EntityTypeExpr;
 class StringExpr;
 class PropertyExpr;
@@ -41,6 +44,7 @@ class LoadGraphQuery;
 class ListGraphQuery;
 class ListAvailableGraphsQuery;
 class MergeDataPartsQuery;
+class MergeStmt;
 class CreateGraphQuery;
 class LoadGMLQuery;
 class LoadParquetQuery;
@@ -72,6 +76,14 @@ private:
     std::unordered_set<const VarDecl*> _dumpedVariables;
 
     void dump(std::ostream& out, const SinglePartQuery* query);
+
+    // The query alone, without the edge joining it to the script: a union branch hangs off
+    // the union rather than off the script, as queries() already reports it
+    void dumpQueryBody(std::ostream& out, const SinglePartQuery* query);
+
+    void dump(std::ostream& out, const UnionQuery* query);
+    void dump(std::ostream& out, const ConditionalQuery* query);
+    void dump(std::ostream& out, const WithStmt* with);
     void dump(std::ostream& out, const LoadGraphQuery* query);
     void dump(std::ostream& out, const LoadJsonlQuery* query);
     void dump(std::ostream& out, const ChangeQuery* query);
@@ -86,6 +98,7 @@ private:
     void dump(std::ostream& out, const S3TransferQuery* query);
     void dump(std::ostream& out, const MatchStmt* match);
     void dump(std::ostream& out, const CreateStmt* create);
+    void dump(std::ostream& out, const MergeStmt* merge);
     void dump(std::ostream& out, const CallStmt* call);
     void dump(std::ostream& out, const YieldClause* yield);
     void dump(std::ostream& out, const DeleteStmt* deleteStmt);
@@ -105,10 +118,10 @@ private:
     void dump(std::ostream& out, const MapLiteral* map);
     void dump(std::ostream& out, const Expr* expr);
     void dump(std::ostream& out, const BinaryExpr* expr);
+    void dump(std::ostream& out, const LogicalExpr* expr);
     void dump(std::ostream& out, const UnaryExpr* expr);
     void dump(std::ostream& out, const SymbolExpr* expr);
     void dump(std::ostream& out, const LiteralExpr* expr);
-    void dump(std::ostream& out, const PathExpr* expr);
     void dump(std::ostream& out, const EntityTypeExpr* expr);
     void dump(std::ostream& out, const StringExpr* expr);
     void dump(std::ostream& out, const PropertyExpr* expr);

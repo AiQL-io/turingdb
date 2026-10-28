@@ -12,17 +12,28 @@ mkdir -p $DEPENDENCIES_DIR
 
 # Install system packages
 if [[ "$(uname)" == "Darwin" ]]; then
-    # macOS - use Homebrew (only cmake and llvm needed)
+    # macOS - use Homebrew for llvm, and Kitware's CMake 3.x release
     if ! command -v brew &> /dev/null; then
         echo "Homebrew not found. Please install Homebrew first."
         exit 1
     fi
 
-    if ! brew list cmake &> /dev/null; then
-        echo "Installing cmake via Homebrew..."
-        brew install cmake
+    # Homebrew only ships CMake 4, which rejects OpenBLAS's ctest/CMakeLists.txt (see the Linux pin below).
+    CMAKE_PIN_VERSION=3.31.12
+    CMAKE_PIN_SHA256=799af7fd545db9bf1b9cfe72f8095880e727a2d4e0df0e3dffc3bc7b95c2d3b0
+    CMAKE_DIR=$DEPENDENCIES_DIR/cmake-${CMAKE_PIN_VERSION}
+    CMAKE_BIN_DIR=$CMAKE_DIR/CMake.app/Contents/bin
+    if [[ ! -x "$CMAKE_BIN_DIR/cmake" ]]; then
+        echo "Installing cmake ${CMAKE_PIN_VERSION} from Kitware..."
+        CMAKE_ARCHIVE=cmake-${CMAKE_PIN_VERSION}-macos-universal.tar.gz
+        curl -fsSL -o "$DEPENDENCIES_DIR/$CMAKE_ARCHIVE" \
+            "https://github.com/Kitware/CMake/releases/download/v${CMAKE_PIN_VERSION}/${CMAKE_ARCHIVE}"
+        echo "${CMAKE_PIN_SHA256}  $DEPENDENCIES_DIR/$CMAKE_ARCHIVE" | shasum -a 256 -c -
+        mkdir -p "$CMAKE_DIR"
+        tar -xzf "$DEPENDENCIES_DIR/$CMAKE_ARCHIVE" -C "$CMAKE_DIR" --strip-components 1
+        rm "$DEPENDENCIES_DIR/$CMAKE_ARCHIVE"
     else
-        echo "cmake is already installed"
+        echo "cmake ${CMAKE_PIN_VERSION} is already installed"
     fi
 else
     # Linux - detect package manager
@@ -46,12 +57,13 @@ else
         sudo apt-get purge -y cmake cmake-data 2>/dev/null || true
         sudo apt-get install -y build-essential m4 lsb-release patchelf
 
-        # Apache Arrow requires CMake >= 3.25, but Ubuntu 22.04 (jammy) ships
+        # Apache Arrow requires CMake >= 3.25 and the shared test library
+        # (test/testutils/CMakeLists.txt) >= 3.27, but Ubuntu 22.04 (jammy) ships
         # 3.22.x. When the distro's cmake is too old, pull a newer one from
         # Kitware's official APT repo (same signed-by keyring pattern as the
         # LLVM repo below). Newer distros already satisfy the requirement and
         # are left on their distro package.
-        REQUIRED_CMAKE_VERSION=3.25
+        REQUIRED_CMAKE_VERSION=3.27
         INSTALLED_CMAKE_VERSION=$(cmake --version 2>/dev/null | head -1 | awk '{print $3}')
         OLDEST_CMAKE_VERSION=$(printf '%s\n%s\n' "$REQUIRED_CMAKE_VERSION" "$INSTALLED_CMAKE_VERSION" | sort -V | head -1)
         if [ "$OLDEST_CMAKE_VERSION" != "$REQUIRED_CMAKE_VERSION" ]; then
@@ -129,7 +141,8 @@ if [[ "$(uname)" == "Darwin" ]]; then
     for arg in "${MACOS_COMPILER_ARGS[@]}"; do
         QUOTED_ARGS+=("'$arg'")
     done
-    echo "export LLVM_PREFIX=${LLVM_PREFIX}" > "$MACOS_SETENV"
+    echo "export PATH=${CMAKE_BIN_DIR}:\$PATH" > "$MACOS_SETENV"
+    echo "export LLVM_PREFIX=${LLVM_PREFIX}" >> "$MACOS_SETENV"
     echo "export CMAKE_ARGS=\"${QUOTED_ARGS[*]}\"" >> "$MACOS_SETENV"
 else
     # Linux - install LLVM 21 via apt.llvm.org

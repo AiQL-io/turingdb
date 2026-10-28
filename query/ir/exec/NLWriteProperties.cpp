@@ -1,0 +1,464 @@
+#include "NLWriteProperties.h"
+
+#include <optional>
+#include <variant>
+
+#include <spdlog/fmt/bundled/format.h>
+
+#include "columns/AllowedKinds.h"
+#include "columns/ColumnConst.h"
+#include "columns/ColumnKind.h"
+#include "columns/ColumnMask.h"
+#include "columns/ColumnOperatorDispatcher.h"
+#include "columns/ColumnOptVector.h"
+#include "columns/ColumnVector.h"
+#include "list/ListElementView.h"
+#include "list/ListUtils.h"
+#include "metadata/PropertyType.h"
+#include "reader/GraphReader.h"
+#include "views/GraphView.h"
+
+#include "IRException.h"
+
+using namespace db;
+
+namespace {
+
+class ConstPropertyExtractor {
+public:
+    ConstPropertyExtractor(CommitWriteBuffer::UntypedProperties& buf,
+                           PropertyTypeID propID,
+                           size_t rowCount)
+        : _buf(buf),
+        _propID(propID),
+        _rowCount(rowCount)
+    {
+    }
+
+    template <typename T>
+    void operator()(const ColumnConst<T>* typed) {
+        _buf.clear();
+        _buf.reserve(_rowCount);
+        for (size_t i = 0; i < _rowCount; i++) {
+            _buf.emplace_back(_propID, std::make_optional(typed->getRaw()));
+        }
+    }
+
+    void operator()(const ColumnConst<types::String::Primitive>* typed) {
+        _buf.clear();
+        _buf.reserve(_rowCount);
+        for (size_t i = 0; i < _rowCount; i++) {
+            _buf.emplace_back(_propID, std::make_optional(std::string(typed->getRaw())));
+        }
+    }
+
+    void operator()(const ColumnConst<types::Embedding::Primitive>* typed) {
+        _buf.clear();
+        _buf.reserve(_rowCount);
+        const types::Embedding::Primitive span = typed->getRaw();
+        for (size_t i = 0; i < _rowCount; i++) {
+            _buf.emplace_back(_propID, std::make_optional(types::Embedding::OwningPrimitive(span.begin(), span.end())));
+        }
+    }
+
+    void operator()(const ColumnConst<ListView>* typed) {
+        _buf.clear();
+        _buf.reserve(_rowCount);
+        const types::List::OwningPrimitive encoded(typed->getRaw());
+        for (size_t i = 0; i < _rowCount; i++) {
+            _buf.emplace_back(_propID, encoded);
+        }
+    }
+
+    // A conversion of a literal - datetime('...'), toInteger('...') - answers a cell that
+    // may hold no value, so the const it stands for is already the optional the write
+    // buffer stages and must not be wrapped in a second one.
+    template <typename T>
+    void operator()(const ColumnConst<std::optional<T>>* typed) {
+        fillRows(typed->getRaw());
+    }
+
+    void operator()(const ColumnConst<std::optional<types::String::Primitive>>* typed) {
+        const std::optional<types::String::Primitive>& value = typed->getRaw();
+
+        std::optional<types::String::OwningPrimitive> owned;
+        if (value.has_value()) {
+            owned.emplace(*value);
+        }
+
+        fillRows(owned);
+    }
+
+    void operator()(const ColumnConst<std::optional<types::Embedding::Primitive>>* typed) {
+        const std::optional<types::Embedding::Primitive>& value = typed->getRaw();
+
+        std::optional<types::Embedding::OwningPrimitive> owned;
+        if (value.has_value()) {
+            owned.emplace(value->begin(), value->end());
+        }
+
+        fillRows(owned);
+    }
+
+    void operator()(const ColumnConst<std::optional<ListView>>* typed) {
+        const std::optional<ListView>& value = typed->getRaw();
+
+        std::optional<types::List::OwningPrimitive> owned;
+        if (value.has_value()) {
+            owned.emplace(*value);
+        }
+
+        fillRows(owned);
+    }
+
+    void operator()(const ColumnConst<MapView>* typed) {
+        _buf.clear();
+        _buf.reserve(_rowCount);
+        const types::Map::OwningPrimitive encoded(typed->getRaw());
+        for (size_t i = 0; i < _rowCount; i++) {
+            _buf.emplace_back(_propID, encoded);
+        }
+    }
+
+private:
+    CommitWriteBuffer::UntypedProperties& _buf;
+    PropertyTypeID _propID;
+    size_t _rowCount;
+
+    template <typename T>
+    void fillRows(const T& value) {
+        _buf.clear();
+        _buf.reserve(_rowCount);
+
+        for (size_t i = 0; i < _rowCount; i++) {
+            _buf.emplace_back(_propID, value);
+        }
+    }
+};
+
+class VectorPropertyExtractor {
+public:
+    VectorPropertyExtractor(CommitWriteBuffer::UntypedProperties& buf,
+                            PropertyTypeID propID)
+        : _buf(buf),
+        _propID(propID)
+    {
+    }
+
+    template <typename T>
+    void operator()(const ColumnVector<T>* typed) {
+        _buf.clear();
+        _buf.reserve(typed->size());
+        for (const T& val : *typed) {
+            _buf.emplace_back(_propID, std::make_optional(val));
+        }
+    }
+
+    void operator()(const ColumnVector<types::String::Primitive>* typed) {
+        _buf.clear();
+        _buf.reserve(typed->size());
+        for (const types::String::Primitive val : *typed) {
+            _buf.emplace_back(_propID, std::make_optional(std::string(val)));
+        }
+    }
+
+    void operator()(const ColumnVector<types::Embedding::Primitive>* typed) {
+        _buf.clear();
+        _buf.reserve(typed->size());
+        for (const types::Embedding::Primitive val : *typed) {
+            _buf.emplace_back(_propID, std::make_optional(types::Embedding::OwningPrimitive(val.begin(), val.end())));
+        }
+    }
+
+    void operator()(const ColumnVector<ListView>* typed) {
+        _buf.clear();
+        _buf.reserve(typed->size());
+        for (const ListView val : *typed) {
+            _buf.emplace_back(_propID, types::List::OwningPrimitive(val));
+        }
+    }
+
+    void operator()(const ColumnVector<MapView>* typed) {
+        _buf.clear();
+        _buf.reserve(typed->size());
+        for (const MapView val : *typed) {
+            _buf.emplace_back(_propID, types::Map::OwningPrimitive(val));
+        }
+    }
+
+    template <typename T>
+    void operator()(const ColumnVector<std::optional<T>>* typed) {
+        _buf.clear();
+        _buf.reserve(typed->size());
+        for (const std::optional<T>& val : *typed) {
+            _buf.emplace_back(_propID, val);
+        }
+    }
+
+    /// Owning string as outlives query
+    void operator()(const ColumnVector<std::optional<types::String::Primitive>>* typed) {
+        _buf.clear();
+        _buf.reserve(typed->size());
+        for (const std::optional<types::String::Primitive>& val : *typed) {
+            if (!val.has_value()) {
+                using Disengaged = std::optional<types::String::OwningPrimitive>;
+                _buf.emplace_back(_propID, Disengaged {});
+                continue;
+            }
+
+            _buf.emplace_back(_propID, std::make_optional(std::string(*val)));
+        }
+    }
+
+    /// Owning vec as outlives query
+    void operator()(const ColumnVector<std::optional<types::Embedding::Primitive>>* typed) {
+        _buf.clear();
+        _buf.reserve(typed->size());
+        for (const std::optional<types::Embedding::Primitive>& val : *typed) {
+            if (!val.has_value()) {
+                using Disengaged = std::optional<types::Embedding::OwningPrimitive>;
+                _buf.emplace_back(_propID, Disengaged {});
+                continue;
+            }
+            types::Embedding::OwningPrimitive emb(val->begin(), val->end());
+            _buf.emplace_back(_propID, std::make_optional(std::move(emb)));
+        }
+    }
+
+    /// Owning encoding as outlives query
+    void operator()(const ColumnVector<std::optional<ListView>>* typed) {
+        _buf.clear();
+        _buf.reserve(typed->size());
+        for (const std::optional<ListView>& val : *typed) {
+            if (!val.has_value()) {
+                using Disengaged = std::optional<types::List::OwningPrimitive>;
+                _buf.emplace_back(_propID, Disengaged {});
+                continue;
+            }
+
+            _buf.emplace_back(_propID, types::List::OwningPrimitive(*val));
+        }
+    }
+
+    /// Owning encoding as outlives query
+    void operator()(const ColumnVector<std::optional<MapView>>* typed) {
+        _buf.clear();
+        _buf.reserve(typed->size());
+        for (const std::optional<MapView>& val : *typed) {
+            if (!val.has_value()) {
+                using Disengaged = std::optional<types::Map::OwningPrimitive>;
+                _buf.emplace_back(_propID, Disengaged {});
+                continue;
+            }
+
+            _buf.emplace_back(_propID, types::Map::OwningPrimitive(*val));
+        }
+    }
+
+private:
+    CommitWriteBuffer::UntypedProperties& _buf;
+    PropertyTypeID _propID;
+};
+
+void extractMaskProperties(const ColumnMask* mask,
+                           PropertyTypeID propID,
+                           CommitWriteBuffer::UntypedProperties& buf) {
+    buf.clear();
+    buf.reserve(mask->size());
+    for (const ColumnMask::Bool_t flag : mask->getRaw()) {
+        const std::optional<types::Bool::Primitive> val {flag._value};
+        buf.emplace_back(propID, val);
+    }
+}
+
+void disengagedValue(ValueType valueType, CommitWriteBuffer::SupportedTypeVariant& value) {
+    const auto disengage = [&]<SupportedType T>() {
+        if constexpr (TrivialSupportedType<T>) {
+            value = std::optional<typename T::Primitive> {};
+        } else {
+            value = std::optional<typename T::OwningPrimitive> {};
+        }
+    };
+
+    ValueTypeDispatcher(valueType).execute(disengage);
+}
+
+ListBufferTypeTag listBufferTag(ValueType valueType) {
+    ListBufferTypeTag tag {ListBufferTypeTag::INVALID};
+
+    const auto tagOf = [&]<SupportedType T>() {
+        tag = TypeToListBufferTag<typename T::Primitive>::Tag;
+    };
+
+    ValueTypeDispatcher(valueType).execute(tagOf);
+
+    return tag;
+}
+
+void stageListElementAsItsType(const ListElementView element,
+                               ValueType valueType,
+                               CommitWriteBuffer::SupportedTypeVariant& value) {
+    switch (valueType) {
+        case ValueType::Int64:
+            value = std::optional {element.getAs<types::Int64::Primitive>()};
+        break;
+        case ValueType::UInt64:
+            value = std::optional {element.getAs<types::UInt64::Primitive>()};
+        break;
+        case ValueType::Double:
+            value = std::optional {element.getAs<types::Double::Primitive>()};
+        break;
+        case ValueType::Bool:
+            value = std::optional {element.getAs<types::Bool::Primitive>()};
+        break;
+        case ValueType::DateTime:
+            value = std::optional {element.getAs<types::DateTime::Primitive>()};
+        break;
+        case ValueType::Duration:
+            value = std::optional {element.getAs<types::Duration::Primitive>()};
+        break;
+        case ValueType::String:
+            value = std::optional<types::String::OwningPrimitive> {std::in_place, element.getAs<types::String::Primitive>()};
+        break;
+        case ValueType::Embedding: {
+            const types::Embedding::Primitive embedding = element.getAs<types::Embedding::Primitive>();
+            value = std::optional<types::Embedding::OwningPrimitive> {std::in_place, embedding.begin(), embedding.end()};
+        }
+        break;
+        case ValueType::List:
+            value = std::optional<types::List::OwningPrimitive> {std::in_place, element.getAs<types::List::Primitive>()};
+        break;
+        case ValueType::Map:
+            value = std::optional<types::Map::OwningPrimitive> {std::in_place, element.getAs<types::Map::Primitive>()};
+        break;
+        case ValueType::Invalid:
+        case ValueType::_SIZE:
+            throw IRException("Cannot write a list element to a property of invalid type");
+        break;
+    }
+}
+
+// An integer widens to the other numeric types an integer literal can be written to
+void stageListElement(const ListElementView element,
+                      ValueType valueType,
+                      CommitWriteBuffer::SupportedTypeVariant& value) {
+    const ListBufferTypeTag tag = element.getTag();
+
+    const bool holdsAnInteger = tag == ListBufferTypeTag::Int;
+    const bool widensToDouble = holdsAnInteger && valueType == ValueType::Double;
+    const bool widensToUnsigned = holdsAnInteger && valueType == ValueType::UInt64;
+
+    if (tag == ListBufferTypeTag::Null) {
+        disengagedValue(valueType, value);
+    } else if (widensToDouble) {
+        value = std::optional {static_cast<types::Double::Primitive>(element.getAs<types::Int64::Primitive>())};
+    } else if (widensToUnsigned) {
+        value = std::optional {static_cast<types::UInt64::Primitive>(element.getAs<types::Int64::Primitive>())};
+    } else if (tag == listBufferTag(valueType)) {
+        stageListElementAsItsType(element, valueType, value);
+    } else {
+        throw IRException(fmt::format("Cannot set a property of type '{}' to a list element of another type",
+                                      ValueTypeName::value(valueType)));
+    }
+}
+
+void stageListElementRows(const ListElementView element,
+                          size_t rowCount,
+                          PropertyTypeID propID,
+                          ValueType valueType,
+                          CommitWriteBuffer::UntypedProperties& buf) {
+    CommitWriteBuffer::UntypedProperty property {propID, {}};
+    stageListElement(element, valueType, property.value);
+
+    buf.assign(rowCount, property);
+}
+
+}
+
+size_t db::committedNodeCount(const GraphView* view) {
+    if (!view || !view->isValid()) {
+        return 0;
+    }
+
+    const GraphReader reader = view->read();
+    return reader.getTotalNodesAllocated();
+}
+
+size_t db::committedEdgeCount(const GraphView* view) {
+    if (!view || !view->isValid()) {
+        return 0;
+    }
+
+    const GraphReader reader = view->read();
+    return reader.getTotalEdgesAllocated();
+}
+
+bool db::holdsValue(const CommitWriteBuffer::SupportedTypeVariant& value) {
+    return std::visit([](const auto& held) { return held.has_value(); }, value);
+}
+
+void db::fillNullProperties(size_t rowCount,
+                            PropertyTypeID propID,
+                            ValueType valueType,
+                            CommitWriteBuffer::UntypedProperties& buf) {
+    CommitWriteBuffer::UntypedProperty null {propID, {}};
+    disengagedValue(valueType, null.value);
+
+    buf.assign(rowCount, null);
+}
+
+void db::extractColumnProperties(const Column* column,
+                                 size_t rowCount,
+                                 PropertyTypeID propID,
+                                 CommitWriteBuffer::UntypedProperties& buf) {
+    using Types = WriteProcessorPropertyTypes;
+
+    const ContainerKind::Code containerKind = ColumnKind::extractContainerKind(column->getKind());
+
+    if (containerKind == ContainerKind::code<ColumnConst>()) {
+        ConstPropertyExtractor extractor(buf, propID, rowCount);
+        ColumnSingleDispatcher<Types::AllowedConst,
+                               ConstPropertyExtractor,
+                               Types::ExcludedConst>::dispatch(column, extractor);
+    } else if (containerKind == ContainerKind::code<ColumnMask>()) {
+        extractMaskProperties(static_cast<const ColumnMask*>(column), propID, buf);
+    } else {
+        VectorPropertyExtractor extractor(buf, propID);
+        ColumnSingleDispatcher<Types::AllowedVector,
+                               VectorPropertyExtractor,
+                               Types::ExcludedVector>::dispatch(column, extractor);
+    }
+}
+
+void db::extractListElementProperties(const Column* column,
+                                      size_t rowCount,
+                                      PropertyTypeID propID,
+                                      ValueType valueType,
+                                      CommitWriteBuffer::UntypedProperties& buf) {
+    const ColumnKind::Code kind = column->getKind();
+
+    if (kind == ColumnConst<ListElementView>::staticKind()) {
+        const ListElementView element = static_cast<const ColumnConst<ListElementView>*>(column)->getRaw();
+        stageListElementRows(element, rowCount, propID, valueType, buf);
+    } else if (kind == ColumnConst<std::optional<ListElementView>>::staticKind()) {
+        const std::optional<ListElementView>& element =
+            static_cast<const ColumnConst<std::optional<ListElementView>>*>(column)->getRaw();
+        stageListElementRows(element.value_or(ListElementView::nullElement()), rowCount, propID, valueType, buf);
+    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+        const auto& elements = static_cast<const ColumnVector<ListElementView>*>(column)->getRaw();
+        buf.assign(elements.size(), CommitWriteBuffer::UntypedProperty {propID, {}});
+
+        for (size_t row = 0; row < elements.size(); row++) {
+            stageListElement(elements[row], valueType, buf[row].value);
+        }
+    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+        const auto& elements = static_cast<const ColumnOptVector<ListElementView>*>(column)->getRaw();
+        buf.assign(elements.size(), CommitWriteBuffer::UntypedProperty {propID, {}});
+
+        for (size_t row = 0; row < elements.size(); row++) {
+            stageListElement(elements[row].value_or(ListElementView::nullElement()), valueType, buf[row].value);
+        }
+    } else {
+        throw IRException("A property write of list elements reads a column of list elements");
+    }
+}

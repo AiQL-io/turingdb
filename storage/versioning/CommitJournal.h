@@ -52,6 +52,11 @@ public:
     const NodePropertyWriteSet& nodePropertyWriteSet() const { return _nodePropertyWriteSet; }
     const EdgePropertyWriteSet& edgePropertyWriteSet() const { return _edgePropertyWriteSet; }
 
+    /**
+     * @brief Adds all the writes recorded in @param other to this journal and finalises it.
+     */
+    void absorb(const CommitJournal& other);
+
     void finalise();
 
 private:

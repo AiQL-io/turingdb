@@ -30,6 +30,23 @@ ListElementView ListWriteCursor::writeValue(ListBufferTypeTag tag, const T& valu
     return recordView(start);
 }
 
+template <typename T>
+ListElementView ListWriteCursor::writeValueAt(size_t index, ListBufferTypeTag tag, const T& value) {
+    constexpr size_t tagSize = sizeof(ListBufferTypeTag);
+    constexpr size_t elementSize = tagSize + sizeof(T);
+
+    std::byte* start = _elementWritePtr + index * elementSize;
+
+    std::memcpy(start, &tag, tagSize);
+    std::memcpy(start + tagSize, &value, sizeof(T));
+
+    const ListElementView view(start);
+    _viewWritePtr[index] = view;
+    ++_written;
+
+    return view;
+}
+
 ListElementView ListWriteCursor::recordView(const std::byte* elementStart) {
     const ListElementView view(elementStart);
 
@@ -46,4 +63,17 @@ namespace db {
 template ListElementView ListWriteCursor::writeValue(ListBufferTypeTag, const types::String::Primitive&);
 template ListElementView ListWriteCursor::writeValue(ListBufferTypeTag, const types::Embedding::Primitive&);
 template ListElementView ListWriteCursor::writeValue(ListBufferTypeTag, const ListView&);
+template ListElementView ListWriteCursor::writeValue(ListBufferTypeTag, const MapView&);
+
+// The fixed-width elements. A decoder reading a wire whose layout already matches the
+// stored one copies these through writeRaw instead; a caller holding the value itself,
+// with no such buffer to copy from, writes it through here.
+template ListElementView ListWriteCursor::writeValue(ListBufferTypeTag, const types::Int64::Primitive&);
+template ListElementView ListWriteCursor::writeValue(ListBufferTypeTag, const types::UInt64::Primitive&);
+template ListElementView ListWriteCursor::writeValue(ListBufferTypeTag, const types::Double::Primitive&);
+template ListElementView ListWriteCursor::writeValue(ListBufferTypeTag, const types::Bool::Primitive&);
+template ListElementView ListWriteCursor::writeValue(ListBufferTypeTag, const PropertyNull&);
+
+template ListElementView ListWriteCursor::writeValueAt(size_t, ListBufferTypeTag, const EdgeID&);
+template ListElementView ListWriteCursor::writeValueAt(size_t, ListBufferTypeTag, const NodeID&);
 }

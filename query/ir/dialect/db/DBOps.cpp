@@ -1,24 +1,247 @@
 #include "DBOps.h"
 #include "DBDialect.h"
 
+#include <optional>
+
+#include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include "columns/CharacterArgument.h"
+
+#include "DBColumnElement.h"
+#include "IRLiteralList.h"
+#include "IRRange.h"
 #include "StorageEnums.h"
+#include "ColumnIndicesFormat.h"
+#include "EdgeDirectionsFormat.h"
+#include "PathStepsFormat.h"
+#include "PathHopArguments.h"
+#include "LabelAlternativesFormat.h"
+#include "StorageAttributes.h"
+#include "MergePatternShape.h"
 #include "GroupAggregateKindsFormat.h"
+#include "PropertyScanLiteral.h"
 
 using namespace mlir;
 using namespace mlir::db;
 
 namespace storage = mlir::storage;
 
-#define GET_OP_CLASSES
-#include "DBOps.cpp.inc"
-
 namespace {
+
+Type columnElement(Value column) {
+    return ::db::inferredColumnElement(column);
+}
+
+bool isNumberColumn(Value column) {
+    return isa<IntegerType, FloatType>(columnElement(column));
+}
+
+Speculation::Speculatability speculatableWhen(bool cannotRaise) {
+    return cannotRaise ? Speculation::Speculatable : Speculation::NotSpeculatable;
+}
+
+// Over numbers alone: a duration or an instant overflows, and a column of an unresolved
+// type may hold either
+Speculation::Speculatability speculatableOverNumbers(Operation* op) {
+    return speculatableWhen(llvm::all_of(op->getOperands(), isNumberColumn));
+}
+
+// A tagged cell, or a column whose type lowering resolves, may hold a value of any type. The
+// null literal is a nullable none.
+bool mayHoldAnyType(Value operand) {
+    const ColumnType column = cast<ColumnType>(operand.getType());
+    const Type element = columnElement(operand);
+    const bool unresolved = isa<NoneType>(column.getType()) && isa<NoneType>(element);
+
+    return unresolved || isa<storage::AnyType, storage::MapElementType>(element);
+}
+
+// A logical operator raises on a value that is no boolean
+Speculation::Speculatability speculatableOverTruthValues(Operation* op) {
+    return speculatableWhen(llvm::none_of(op->getOperands(), mayHoldAnyType));
+}
+
+template <typename... ElementTypes>
+Speculation::Speculatability speculatableOverElement(Value input) {
+    return speculatableWhen(isa<ElementTypes...>(columnElement(input)));
+}
+
+bool matchIntegerLiteral(Value column, int64_t& value) {
+    ConstantOp constant = column.getDefiningOp<ConstantOp>();
+    const IntegerAttr integer = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
+    if (!integer) {
+        return false;
+    }
+
+    value = integer.getValue().getSExtValue();
+    return true;
+}
+
+bool isCharacterLiteral(Value argument) {
+    int64_t value = 0;
+
+    return matchIntegerLiteral(argument, value) && value >= 0 && value <= ::db::MAX_CHARACTER_ARGUMENT;
+}
+
+// A string function counting characters raises on a cell holding no string, and on a count
+// that is null, negative or past the largest it takes. Its first operand is the string, every
+// other one a count
+Speculation::Speculatability speculatableOverCharacters(Operation* op) {
+    const bool readsAString = isa<storage::StringType>(columnElement(op->getOperand(0)));
+    const bool countsLiterals = llvm::all_of(op->getOperands().drop_front(), isCharacterLiteral);
+
+    return speculatableWhen(readsAString && countsLiterals);
+}
+
+// A literal divisor no row raises on: not 0, and not the -1 that overflows the smallest
+// integer when @param minusOneOverflows
+bool isSafeLiteralDivisor(Value divisor, bool minusOneOverflows) {
+    ConstantOp constant = divisor.getDefiningOp<ConstantOp>();
+    if (!constant) {
+        return false;
+    }
+
+    const Attribute value = constant.getValue();
+    if (const IntegerAttr integer = dyn_cast<IntegerAttr>(value)) {
+        const llvm::APInt number = integer.getValue();
+        const bool overflows = minusOneOverflows && number.isAllOnes();
+
+        return !number.isZero() && !overflows;
+    } else if (const FloatAttr real = dyn_cast<FloatAttr>(value)) {
+        return !real.getValue().isZero();
+    }
+
+    return false;
+}
+
+// What a filter reads as a mask: a boolean column, a boolean literal, one whose values may be
+// null, a property read whose type lowering resolves, or the untyped null an expression over a
+// property no row carries evaluates to
+bool isMaskColumn(Type type) {
+    const auto column = dyn_cast<ColumnType>(type);
+    if (!column) {
+        return false;
+    }
+
+    const Type element = column.getType();
+    if (isa<storage::BoolType>(element) || isa<NoneType>(element) || element.isInteger(1)) {
+        return true;
+    }
+
+    const auto nullable = dyn_cast<storage::NullableType>(element);
+    if (!nullable) {
+        return false;
+    }
+
+    const Type value = nullable.getValueType();
+
+    return isa<storage::BoolType>(value) || isa<NoneType>(value) || value.isInteger(1);
+}
+
+bool isStringColumn(Type type) {
+    const auto column = dyn_cast<ColumnType>(type);
+    if (!column) {
+        return false;
+    }
+
+    const Type element = column.getType();
+    const auto nullable = dyn_cast<storage::NullableType>(element);
+    const Type value = nullable ? nullable.getValueType() : element;
+
+    return isa<storage::StringType, storage::AnyType, NoneType>(value);
+}
+
+bool isIntegerColumn(Value column) {
+    return isa<ColumnType>(column.getType())
+        && isa<IntegerType, storage::AnyType, NoneType>(::db::declaredColumnElement(column));
+}
+
+LogicalResult verifyStringResult(Operation* op, Value result) {
+    const ColumnType resultColumn = dyn_cast<ColumnType>(result.getType());
+    if (!resultColumn || !isa<storage::StringType>(resultColumn.getType())) {
+        return op->emitOpError("result must be a column of strings");
+    }
+
+    return success();
+}
+
+LogicalResult verifyStringEnd(Operation* op, Value string, Value length, Value result) {
+    const bool readsAStringAndALength = isStringColumn(string.getType()) && isIntegerColumn(length);
+    if (!readsAStringAndALength) {
+        return op->emitOpError("operands must be a string column and an integer column");
+    }
+
+    return verifyStringResult(op, result);
+}
+
+LogicalResult verifyEdgeTypesNotEmpty(Operation* operation, ArrayAttr edgeTypes) {
+    if (edgeTypes.empty()) {
+        return operation->emitOpError("requires at least one edge type");
+    }
+
+    return success();
+}
+
+// One list of names per step of a path exploration, an empty list leaving its step free
+LogicalResult verifyStepNames(Operation* operation, ArrayAttr names, size_t stepCount, llvm::StringRef what) {
+    if (!names) {
+        return success();
+    } else if (names.size() != stepCount) {
+        return operation->emitOpError(what) << " must hold one list per step";
+    }
+
+    bool namesAny = false;
+    for (const Attribute stepNames : names) {
+        for (const Attribute name : cast<ArrayAttr>(stepNames)) {
+            const StringAttr text = dyn_cast<StringAttr>(name);
+            if (text && text.getValue().empty()) {
+                return operation->emitOpError(what) << " must not hold an empty name";
+            }
+
+            namesAny = true;
+        }
+    }
+
+    if (!namesAny) {
+        return operation->emitOpError(what) << " must name at least one name";
+    }
+
+    return success();
+}
+
+// The names of one step of a path exploration, null when the step leaves them free
+ArrayAttr stepNamesAt(ArrayAttr names, size_t step) {
+    if (!names) {
+        return {};
+    }
+
+    const ArrayAttr stepNames = cast<ArrayAttr>(names[step]);
+
+    return stepNames.empty() ? ArrayAttr() : stepNames;
+}
 
 // The keyword that introduces each factor region in the textual form
 // `db.cross_product factor { ... } factor { ... }`.
 const char* const factorKeyword = "factor";
+
+// The keyword db.hash_join spells its two key column indices after.
+const char* const keysKeyword = "on";
+
+// The db.output a union branch ends with, or a null Output when the branch is empty or
+// ends on something else. A branch's output is what fills the union's result table.
+Output getBranchOutput(Region& branch) {
+    Operation* last = nullptr;
+    if (!branch.empty()) {
+        Block& block = branch.front();
+        if (!block.empty()) {
+            last = &block.back();
+        }
+    }
+
+    return dyn_cast_or_null<Output>(last);
+}
 
 // The db.yield that terminates a factor region, or a null Yield if the region
 // is empty or does not end with one. A factor's yield names the columns that
@@ -35,6 +258,21 @@ Yield getFactorYield(Region& factor) {
     return dyn_cast_or_null<Yield>(terminator);
 }
 
+// A branch feeding the results of the op holding it, rather than the result table, ends
+// in a db.yield naming one column per result
+LogicalResult verifyYieldingBranch(Operation* holder, Region& branch) {
+    Yield yield = getFactorYield(branch);
+    if (!yield) {
+        return holder->emitOpError("each branch must end with a db.yield");
+    }
+
+    if (yield.getColumns().size() != holder->getNumResults()) {
+        return holder->emitOpError("each branch must yield one column per result");
+    }
+
+    return success();
+}
+
 // Appends the columns yielded by a factor region to resultTypes, failing with a
 // diagnostic if the factor is not terminated by a db.yield.
 ParseResult appendFactorYieldTypes(OpAsmParser& parser,
@@ -43,11 +281,54 @@ ParseResult appendFactorYieldTypes(OpAsmParser& parser,
     Yield yield = getFactorYield(factor);
     if (!yield) {
         return parser.emitError(parser.getCurrentLocation(),
-                                "cross_product factor must end with a db.yield");
+                                "factor must end with a db.yield");
     }
 
     for (const Type columnType : yield.getColumns().getTypes()) {
         resultTypes.push_back(columnType);
+    }
+
+    return success();
+}
+
+// The body of an op over the elements of one row's list: one block taking the element,
+// the row tag and one argument per carried column, ending in a yield that names the tag
+LogicalResult verifyElementBody(Operation* op, Block& bodyBlock, OperandRange carried) {
+    auto yield = dyn_cast_or_null<ComprehensionYield>(bodyBlock.empty() ? nullptr : &bodyBlock.back());
+    if (!yield) {
+        return op->emitOpError("body region must end with a db.comprehension_yield");
+    }
+
+    const size_t expectedArguments = carried.size() + 2;
+
+    if (bodyBlock.getNumArguments() != expectedArguments) {
+        return op->emitOpError("body region takes the element and the row tag plus one argument per "
+                               "carried column, ")
+               << "expected " << expectedArguments << " but has " << bodyBlock.getNumArguments();
+    }
+
+    if (!llvm::isa<ColumnType>(bodyBlock.getArgument(0).getType())) {
+        return op->emitOpError("body argument 0 must be the column of elements");
+    }
+
+    const auto rowTagType = llvm::dyn_cast<ColumnType>(bodyBlock.getArgument(1).getType());
+
+    if (!rowTagType || !rowTagType.getType().isUnsignedInteger(64)) {
+        return op->emitOpError("body argument 1 must be the ui64 column of row tags");
+    }
+
+    if (!yield.getRowTags()) {
+        return op->emitOpError("body must yield the row tag of every surviving element");
+    }
+
+    for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
+        const mlir::Type argumentType = bodyBlock.getArgument(carriedIndex + 2).getType();
+
+        if (argumentType != carried[carriedIndex].getType()) {
+            return op->emitOpError("body argument ") << carriedIndex + 2
+                                                     << " must have the type of carried column "
+                                                     << carriedIndex;
+        }
     }
 
     return success();
@@ -63,6 +344,88 @@ ParseResult parseFactorRegion(OpAsmParser& parser, OperationState& result) {
 
     Region* factor = result.addRegion();
     return parser.parseRegion(*factor, {});
+}
+
+// The results of a two-factor op - db.cross_product, db.hash_join - must be exactly the
+// columns the two factors yield: the left factor's yielded columns followed by the right
+// factor's. The yields drive the result types during parsing, so this guards the
+// programmatic builder path and re-checks parsed IR. Shared by both verifiers.
+LogicalResult verifyFactorResults(Operation* op, Region& leftFactor, Region& rightFactor) {
+    Yield leftYield = getFactorYield(leftFactor);
+    Yield rightYield = getFactorYield(rightFactor);
+    if (!leftYield || !rightYield) {
+        return op->emitOpError("each factor region must end with a db.yield");
+    }
+
+    // Each factor must contribute at least one column. A side's row count is read
+    // from its first yielded column during lowering, so a factor that surfaces no
+    // column (an empty db.yield) cannot be sized - reject it here at the db level.
+    if (leftYield.getColumns().empty() || rightYield.getColumns().empty()) {
+        return op->emitOpError("each factor must yield at least one column");
+    }
+
+    llvm::SmallVector<Type> expectedResultTypes;
+    for (const Type columnType : leftYield.getColumns().getTypes()) {
+        expectedResultTypes.push_back(columnType);
+    }
+    for (const Type columnType : rightYield.getColumns().getTypes()) {
+        expectedResultTypes.push_back(columnType);
+    }
+
+    const Operation::result_type_range resultTypes = op->getResultTypes();
+    if (resultTypes.size() != expectedResultTypes.size()) {
+        return op->emitOpError("expects ") << expectedResultTypes.size()
+                                           << " results, the columns yielded by the two factors, but has "
+                                           << resultTypes.size();
+    }
+
+    for (size_t resultIndex = 0; resultIndex < expectedResultTypes.size(); resultIndex++) {
+        if (resultTypes[resultIndex] != expectedResultTypes[resultIndex]) {
+            return op->emitOpError("result ") << resultIndex << " must be the yielded column type "
+                                              << expectedResultTypes[resultIndex];
+        }
+    }
+
+    return success();
+}
+
+// A literal list typed as homogeneous - db.unwind_const's typed column, db.const_list's
+// typed list - must carry at least one element and every element must carry one shared
+// type, or be a null, which rides a unit attr and shares whatever type the others carry.
+// The elements are checked against each other and not against the spelled element type: a
+// hand-written "s" parses as an untyped StringAttr, so comparing it to a !storage.string
+// would reject valid IR. A homogeneous result paired with literals of another type is
+// therefore not an op-level error; the runtime fill catches that on the element's type tag.
+LogicalResult verifyHomogeneousElements(Operation* op, ArrayAttr elements) {
+    if (elements.empty()) {
+        return op->emitOpError("a homogeneous literal list must carry at least one element; "
+                               "an empty list is the !storage.any form");
+    }
+
+    mlir::Type payloadType;
+    for (const Attribute element : elements) {
+        if (llvm::isa<UnitAttr>(element)) {
+            continue;
+        }
+
+        const mlir::Type elementType = ::db::literalElementType(element);
+        if (!elementType) {
+            return op->emitOpError("literal list element is not a typed attribute");
+        }
+
+        if (!payloadType) {
+            payloadType = elementType;
+        } else if (elementType != payloadType) {
+            return op->emitOpError("a homogeneous literal list requires every element to share one type");
+        }
+    }
+
+    if (!payloadType) {
+        return op->emitOpError("a homogeneous literal list must carry an element naming its type; "
+                               "a list of nulls alone is the !storage.any form");
+    }
+
+    return success();
 }
 
 // db.limit and db.skip both pass their columns straight through, so the results
@@ -94,10 +457,165 @@ LogicalResult verifyPassThrough(Operation* op,
     return success();
 }
 
+// The hop region of one step of an explore_paths: one block over the nodes and edges of the
+// repetition up to the step's end node yielding a boolean column, reading nothing defined
+// outside it but constants
+LogicalResult verifyHopRegion(Operation* op, Region& hop, size_t step, ValueRange imports) {
+    Block& block = hop.front();
+    MLIRContext* context = op->getContext();
+
+    const Type nodeColumn = ColumnType::get(context, storage::NodeIDType::get(context));
+    const Type edgeColumn = ColumnType::get(context, storage::EdgeIDType::get(context));
+    if (failed(verifyHopArguments(op, block, step, nodeColumn, edgeColumn, imports))) {
+        return failure();
+    }
+
+    Yield yield = getFactorYield(hop);
+    if (!yield) {
+        return op->emitOpError("hop region must end with a db.yield");
+    }
+
+    const bool yieldsOneMask = yield.getColumns().size() == 1 && isMaskColumn(yield.getColumns().front().getType());
+    if (!yieldsOneMask) {
+        return op->emitOpError("hop region must yield exactly one boolean column");
+    }
+
+    for (Operation& inner : block) {
+        for (const Value operand : inner.getOperands()) {
+            if (const auto argument = dyn_cast<BlockArgument>(operand)) {
+                if (argument.getOwner() != &block) {
+                    return op->emitOpError("hop region reads a block argument of another region");
+                }
+
+                continue;
+            }
+
+            Operation* const definingOp = operand.getDefiningOp();
+            const bool definedInside = definingOp->getBlock() == &block;
+            if (!definedInside && !::db::yieldsConstantColumn(operand)) {
+                return op->emitOpError("hop region may only read constants from outside itself");
+            }
+        }
+    }
+
+    return success();
 }
+
+template <typename YieldOp, typename SubqueryOp>
+LogicalResult verifySubqueryExpression(SubqueryOp subquery) {
+    Block& bodyBlock = subquery.getBody().front();
+
+    auto yield = dyn_cast_or_null<YieldOp>(bodyBlock.empty() ? nullptr : &bodyBlock.back());
+    if (!yield) {
+        return subquery.emitOpError("body region must end with a ") << YieldOp::getOperationName();
+    }
+
+    const OperandRange inputs = subquery.getInputColumns();
+    const size_t inputCount = inputs.size();
+
+    // The body carries the row tag through its dataflow only when it carries the scope,
+    // and only over rows it has: a body run one row at a time, or over the single empty
+    // row, is answered for by the lowering instead.
+    const bool tagsRows = subquery.getCarriesScope() && inputCount > 0;
+
+    const size_t expectedArguments = tagsRows ? inputCount + 1 : inputCount;
+    const size_t argumentCount = bodyBlock.getNumArguments();
+
+    if (argumentCount != expectedArguments) {
+        return subquery.emitOpError("body region takes one argument per input column")
+               << (tagsRows ? " plus the row tag" : "") << ", expected " << expectedArguments
+               << " but has " << argumentCount;
+    }
+
+    for (size_t inputIndex = 0; inputIndex < inputCount; inputIndex++) {
+        if (bodyBlock.getArgument(inputIndex).getType() != inputs[inputIndex].getType()) {
+            return subquery.emitOpError("body argument ") << inputIndex << " must have the type of input column "
+                                                          << inputIndex;
+        }
+    }
+
+    const bool yieldsATag = yield.getTag() != nullptr;
+    if (tagsRows != yieldsATag) {
+        return subquery.emitOpError("the body yields a row tag exactly when it takes one");
+    }
+
+    // A body with no tag is answered for by the rows its columns hold, so it has to hold
+    // one; a tagged body is answered for by the tag, and holds whatever its clauses left.
+    if (!tagsRows && yield.getColumns().empty()) {
+        return subquery.emitOpError("an untagged body must yield at least one column, to answer from its rows");
+    }
+
+    return success();
+}
+
+// A carried column comes back replicated, never retyped, so the carry set and the
+// results past the element column must match one for one.
+LogicalResult verifyCarriedResults(Operation* op, OperandRange carriedColumns, ResultRange carriedResults) {
+    if (carriedColumns.size() != carriedResults.size()) {
+        return op->emitOpError("expects one carried result per carried column, but has ")
+               << carriedResults.size() << " for " << carriedColumns.size();
+    }
+
+    for (size_t carriedIndex = 0; carriedIndex < carriedColumns.size(); carriedIndex++) {
+        if (carriedColumns[carriedIndex].getType() != carriedResults[carriedIndex].getType()) {
+            return op->emitOpError("carried result ") << carriedIndex
+                                                      << " must have the same type as carried column "
+                                                      << carriedIndex;
+        }
+    }
+
+    return success();
+}
+
+}
+
+#define GET_OP_CLASSES
+#include "DBOps.cpp.inc"
 
 // Ensures each variable has a numeric name
 void ScanEdges::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void ScanEdgesByType::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void ScanOutEdgesByLabelSrc::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void ScanInEdgesByLabelTgt::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void ScanOutEdgesByLabelTgt::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void ScanInEdgesByLabelSrc::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void ScanOutEdgesByLabelSrcTgt::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void ScanInEdgesByLabelSrcTgt::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
     for (Value result : getResults()) {
         setNameFn(result, "");
     }
@@ -110,7 +628,312 @@ void GetOutEdges::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
     }
 }
 
+void ExplorePaths::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+storage::PathDirection ExplorePaths::getStepDirection(size_t step) {
+    return static_cast<storage::PathDirection>(getDirections()[step]);
+}
+
+ArrayAttr ExplorePaths::getStepEdgeTypes(size_t step) {
+    return stepNamesAt(getEdgeTypesAttr(), step);
+}
+
+ArrayAttr ExplorePaths::getStepHopLabels(size_t step) {
+    return stepNamesAt(getHopLabelsAttr(), step);
+}
+
+LogicalResult ExplorePaths::verify() {
+    const OperandRange carried = getColumnsToFilter();
+    const ResultRange filtered = getFilteredColumns();
+    if (carried.size() != filtered.size()) {
+        return emitOpError("expects one filtered column per carried column, but carries ")
+               << carried.size() << " and filters " << filtered.size();
+    }
+
+    for (size_t columnIndex = 0; columnIndex < carried.size(); columnIndex++) {
+        if (carried[columnIndex].getType() != filtered[columnIndex].getType()) {
+            return emitOpError("filtered column ") << columnIndex
+                                                   << " must have the type of carried column "
+                                                   << columnIndex;
+        }
+    }
+
+    const std::optional<uint64_t> maxHops = getMaxHops();
+    if (maxHops && *maxHops < getMinHops()) {
+        return emitOpError("max_hops must be at least min_hops");
+    }
+
+    MutableArrayRef<Region> hops = getHops();
+    if (failed(verifyPathSteps(getOperation(), getDirections(), hops.size()))) {
+        return failure();
+    }
+
+    const size_t stepCount = getStepCount();
+    const bool stepNamesFail = failed(verifyStepNames(getOperation(), getEdgeTypesAttr(), stepCount, "edge_types"))
+                            || failed(verifyStepNames(getOperation(), getHopLabelsAttr(), stepCount, "hop_labels"));
+    if (stepNamesFail) {
+        return failure();
+    }
+
+    if (const std::optional<ArrayAttr> endLabels = getEndLabels()) {
+        if (endLabels->empty()) {
+            return emitOpError("end_labels must name at least one label");
+        }
+
+        for (const Attribute label : *endLabels) {
+            const StringAttr name = dyn_cast<StringAttr>(label);
+            if (name && name.getValue().empty()) {
+                return emitOpError("end_labels must name labels");
+            }
+        }
+    }
+
+    if (const std::optional<uint64_t> endColumn = getEndColumn()) {
+        if (*endColumn >= carried.size()) {
+            return emitOpError("end_column ") << *endColumn << " is not a carried column";
+        }
+
+        const auto endType = cast<ColumnType>(carried[*endColumn].getType());
+        if (!isa<storage::NodeIDType>(endType.getType())) {
+            return emitOpError("end_column must name a node column");
+        }
+    }
+
+    if (getEndsOnSeed() && getEndColumn()) {
+        return emitOpError("ends_on_seed names the end already named by end_column");
+    }
+
+    if (getEndNodes() && (getEndColumn() || getEndsOnSeed())) {
+        return emitOpError("end_nodes names the end already named by end_column or ends_on_seed");
+    }
+
+    if (getDistinct()) {
+        if (!getPaths().use_empty()) {
+            return emitOpError("distinct emits no path, so paths must have no use");
+        }
+    }
+
+    const OperandRange imports = getHopImports();
+
+    const bool hasPredicate = hasHopPredicate(hops);
+    if (!hasPredicate) {
+        if (!imports.empty()) {
+            return emitOpError("hop imports without a hop region to read them");
+        }
+
+        return success();
+    }
+
+    if (getDistinct() && !imports.empty()) {
+        return emitOpError("a distinct search expands many seeds at one level, so it cannot "
+                           "read a column that holds one value per seed");
+    }
+
+    for (size_t step = 0; step < stepCount; step++) {
+        Region& hop = hops[step];
+        if (!hop.empty() && failed(verifyHopRegion(getOperation(), hop, step, imports))) {
+            return failure();
+        }
+    }
+
+    return success();
+}
+
+LogicalResult ExpandPath::verify() {
+    const auto column = dyn_cast<ColumnType>(getResult().getType());
+    const auto list = column ? dyn_cast<storage::ListType>(column.getType()) : storage::ListType();
+    if (!list) {
+        return emitOpError("must produce a list column");
+    }
+
+    const Type elementType = list.getElementType();
+    const storage::PathExpansionKind kind = getKind();
+
+    if (kind == storage::PathExpansionKind::Edges) {
+        if (!isa<storage::EdgeIDType>(elementType)) {
+            return emitOpError("kind edges expands to a list of edge IDs");
+        }
+    } else if (!isa<storage::NodeIDType>(elementType)) {
+        return emitOpError("kind sources, ends and nodes expand to a list of node IDs");
+    }
+
+    const std::optional<uint64_t> step = getStep();
+    const std::optional<uint64_t> steps = getSteps();
+    if (step.has_value() != steps.has_value()) {
+        return emitOpError("step and steps name a step of the body together");
+    } else if (steps && *step >= *steps) {
+        return emitOpError("step ") << *step << " is not one of the " << *steps << " steps of the body";
+    } else if (steps && kind == storage::PathExpansionKind::Nodes) {
+        return emitOpError("kind nodes lists every node of the walk and takes no step");
+    }
+
+    // Reversed, the kinds swap: the pattern's end list is the walk's source list read
+    // backwards, so that is the one holding the seed. The nodes hold it either way.
+    const bool readsTheSeed = (kind == storage::PathExpansionKind::Sources && step.value_or(0) == 0)
+                           || kind == storage::PathExpansionKind::Nodes;
+    if (readsTheSeed && !getSrcids()) {
+        return emitOpError("kind sources and nodes read the seed of each path from srcids");
+    }
+
+    return success();
+}
+
+LogicalResult PathElements::verify() {
+    const auto column = dyn_cast<ColumnType>(getResult().getType());
+    const auto nullable = column ? dyn_cast<storage::NullableType>(column.getType()) : storage::NullableType();
+    if (!nullable) {
+        return emitOpError("must produce a nullable column: the path an OPTIONAL MATCH missed reads as null");
+    }
+
+    const Type value = nullable.getValueType();
+    const auto list = dyn_cast<storage::ListType>(value);
+    const Type element = list ? list.getElementType() : Type();
+
+    switch (getKind()) {
+        case storage::PathElementsKind::Nodes:
+            if (!isa_and_nonnull<storage::NodeIDType>(element)) {
+                return emitOpError("kind nodes reads a list of node IDs");
+            }
+        break;
+
+        case storage::PathElementsKind::Relationships:
+            if (!isa_and_nonnull<storage::EdgeIDType>(element)) {
+                return emitOpError("kind relationships reads a list of edge IDs");
+            }
+        break;
+
+        case storage::PathElementsKind::Length:
+            if (!value.isUnsignedInteger(64)) {
+                return emitOpError("kind length reads a ui64 count");
+            }
+        break;
+    }
+
+    return success();
+}
+
+LogicalResult MakePath::verify() {
+    const OperandRange entities = getEntities();
+    if (entities.empty()) {
+        return emitOpError("a path runs through at least one node");
+    }
+
+    const auto elementOf = [](Value value) -> Type {
+        const auto column = dyn_cast<ColumnType>(value.getType());
+        return column ? column.getType() : Type();
+    };
+
+    llvm::SmallVector<bool> reversed(entities.size(), false);
+    if (const std::optional<ArrayAttr> reversedPaths = getReversedPaths()) {
+        for (const Attribute entry : *reversedPaths) {
+            const auto index = dyn_cast<IntegerAttr>(entry);
+            if (!index || index.getInt() < 0 || static_cast<size_t>(index.getInt()) >= entities.size()) {
+                return emitOpError("reversed_paths names no operand of this path");
+            }
+
+            const size_t operandIndex = static_cast<size_t>(index.getInt());
+            if (!isa_and_nonnull<storage::PathRefType>(elementOf(entities[operandIndex]))) {
+                return emitOpError("reversed_paths names operand ") << operandIndex << ", which is no path column";
+            }
+
+            reversed[operandIndex] = true;
+        }
+    }
+
+    // A walk taken against the pattern opens on the node it ended at, so it may open the
+    // path itself; one taken with the pattern opens on its first edge and may not
+    const Type openingElement = elementOf(entities.front());
+    const bool opensOnANode = isa_and_nonnull<storage::NodeIDType>(openingElement);
+    const bool opensOnAReversedWalk = isa_and_nonnull<storage::PathRefType>(openingElement) && reversed.front();
+    if (!opensOnANode && !opensOnAReversedWalk) {
+        return emitOpError("a path opens on a node column");
+    }
+
+    size_t entityIndex = opensOnANode ? 1 : 0;
+    while (entityIndex < entities.size()) {
+        const Type element = elementOf(entities[entityIndex]);
+
+        if (isa_and_nonnull<storage::PathRefType>(element)) {
+            // A reversed walk closes on the edge it took first, so the node it seeded from
+            // is written after it; a forward one closes on a node of its own
+            if (!reversed[entityIndex]) {
+                entityIndex++;
+                continue;
+            }
+
+            const bool closesOnANode = entityIndex + 1 < entities.size()
+                                    && isa_and_nonnull<storage::NodeIDType>(elementOf(entities[entityIndex + 1]));
+            if (!closesOnANode) {
+                return emitOpError("the reversed path at operand ") << entityIndex << " closes on no node column";
+            }
+
+            entityIndex += 2;
+            continue;
+        }
+
+        if (!isa_and_nonnull<storage::EdgeIDType>(element)) {
+            return emitOpError("a hop of a path is an edge column or a path column, at operand ") << entityIndex;
+        }
+
+        const bool landsOnANode = entityIndex + 1 < entities.size()
+                               && isa_and_nonnull<storage::NodeIDType>(elementOf(entities[entityIndex + 1]));
+        if (!landsOnANode) {
+            return emitOpError("the edge column at operand ") << entityIndex << " lands on no node column";
+        }
+
+        entityIndex += 2;
+    }
+
+    return success();
+}
+
 void GetInEdges::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void GetEdges::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void GetOutEdgesByType::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void GetInEdgesByType::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void GetOutEdgesByLabel::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void GetInEdgesByLabel::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void GetOutEdgesByTypeAndLabel::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
+    for (Value result : getResults()) {
+        setNameFn(result, "");
+    }
+}
+
+void GetInEdgesByTypeAndLabel::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
     for (Value result : getResults()) {
         setNameFn(result, "");
     }
@@ -169,44 +992,282 @@ void CrossProduct::print(OpAsmPrinter& printer) {
     printer.printOptionalAttrDict((*this)->getAttrs());
 }
 
-// The results must be exactly the columns yielded by the two factors: the left
-// factor's yielded columns followed by the right factor's. The yields drive the
-// result types during parsing, so this guards the programmatic builder path and
-// re-checks parsed IR.
 LogicalResult CrossProduct::verify() {
-    Yield leftYield = getFactorYield(getLeftFactor());
-    Yield rightYield = getFactorYield(getRightFactor());
-    if (!leftYield || !rightYield) {
-        return emitOpError("each factor region must end with a db.yield");
-    }
+    return verifyFactorResults(getOperation(), getLeftFactor(), getRightFactor());
+}
 
-    // Each factor must contribute at least one column. A side's row count is read
-    // from its first yielded column during lowering, so a factor that surfaces no
-    // column (an empty db.yield) cannot be sized - reject it here at the db level.
-    if (leftYield.getColumns().empty() || rightYield.getColumns().empty()) {
-        return emitOpError("each factor must yield at least one column");
-    }
+// Builds the op from the branch count alone and creates that many empty blocks. The
+// caller fills each region with a query body and ends it with a db.output. The insertion
+// guard keeps the block creation from leaking out of the builder, as CrossProduct's does.
+void Union::build(OpBuilder& builder, OperationState& state, size_t branchCount) {
+    build(builder, state, TypeRange {}, branchCount);
+}
 
-    llvm::SmallVector<Type> expectedResultTypes;
-    for (const Type columnType : leftYield.getColumns().getTypes()) {
-        expectedResultTypes.push_back(columnType);
-    }
-    for (const Type columnType : rightYield.getColumns().getTypes()) {
-        expectedResultTypes.push_back(columnType);
-    }
+void Union::build(OpBuilder& builder, OperationState& state, TypeRange resultTypes, size_t branchCount) {
+    const OpBuilder::InsertionGuard guard(builder);
 
-    const Operation::result_type_range resultTypes = getOperation()->getResultTypes();
-    if (resultTypes.size() != expectedResultTypes.size()) {
-        return emitOpError("expects ") << expectedResultTypes.size()
-                                       << " results, the columns yielded by the two factors, but has "
-                                       << resultTypes.size();
-    }
+    state.addTypes(resultTypes);
 
-    for (size_t resultIndex = 0; resultIndex < expectedResultTypes.size(); resultIndex++) {
-        if (resultTypes[resultIndex] != expectedResultTypes[resultIndex]) {
-            return emitOpError("result ") << resultIndex << " must be the yielded column type "
-                                          << expectedResultTypes[resultIndex];
+    for (size_t branchIndex = 0; branchIndex < branchCount; branchIndex++) {
+        Region* branch = state.addRegion();
+        builder.createBlock(branch);
+    }
+}
+
+// Custom syntax, one region per branch separated by commas:
+//
+//   db.union { ... db.output(%a) names ["name"] : ... },
+//             { ... db.output(%b) names ["name"] : ... }
+//
+// A union with results spells their types after the regions:
+//
+//   %z = db.union { ... db.yield %a : ... }, { ... db.yield %b : ... } : !db.column<none>
+ParseResult Union::parse(OpAsmParser& parser, OperationState& result) {
+    do {
+        Region* branch = result.addRegion();
+        if (parser.parseRegion(*branch, {})) {
+            return failure();
         }
+    } while (succeeded(parser.parseOptionalComma()));
+
+    if (succeeded(parser.parseOptionalColon())) {
+        SmallVector<Type> resultTypes;
+        if (parser.parseTypeList(resultTypes)) {
+            return failure();
+        }
+
+        result.addTypes(resultTypes);
+    }
+
+    return parser.parseOptionalAttrDict(result.attributes);
+}
+
+void Union::print(OpAsmPrinter& printer) {
+    llvm::interleave(getBranches(),
+                     printer,
+                     [&](Region& branch) {
+                         printer << " ";
+                         printer.printRegion(branch);
+                     },
+                     ",");
+
+    const ResultRange results = getResults();
+    if (!results.empty()) {
+        printer << " : ";
+        llvm::interleaveComma(results.getTypes(), printer);
+    }
+
+    printer.printOptionalAttrDict((*this)->getAttrs());
+}
+
+LogicalResult Materialize::verify() {
+    if (getColumns().empty()) {
+        return emitOpError("requires at least one column");
+    }
+
+    return success();
+}
+
+LogicalResult ScanMaterialized::verify() {
+    Materialize materialize = getRows().getDefiningOp<Materialize>();
+    if (!materialize) {
+        return emitOpError("requires rows a db.materialize holds");
+    }
+
+    const OperandRange heldColumns = materialize.getColumns();
+    const ResultRange columns = getColumns();
+    if (columns.size() != heldColumns.size()) {
+        return emitOpError("expects ") << heldColumns.size()
+                                       << " results, one per column the db.materialize holds, but has "
+                                       << columns.size();
+    }
+
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        if (columns[columnIndex].getType() != heldColumns[columnIndex].getType()) {
+            return emitOpError("result ") << columnIndex << " must have the type of the column it reads";
+        }
+    }
+
+    return success();
+}
+
+// A union emits one result table, so every branch has to end in a db.output and all of
+// them have to name the same columns. The names are the query's, checked by the analyzer;
+// what is re-checked here is the shape a hand-written module can still get wrong.
+LogicalResult Union::verify() {
+    const MutableArrayRef<Region> branches = getBranches();
+    if (branches.size() < 2) {
+        return emitOpError("requires at least two branches");
+    }
+
+    if (getNumResults() > 0) {
+        for (Region& branch : branches) {
+            if (failed(verifyYieldingBranch(getOperation(), branch))) {
+                return failure();
+            }
+        }
+
+        return success();
+    }
+
+    Output first;
+    for (Region& branch : branches) {
+        Output output = getBranchOutput(branch);
+        if (!output) {
+            return emitOpError("each branch must end with a db.output");
+        }
+
+        if (!first) {
+            first = output;
+            continue;
+        }
+
+        if (output.getColumns().size() != first.getColumns().size()) {
+            return emitOpError("every branch must output the same number of columns");
+        }
+
+        if (output.getColumnNamesAttr() != first.getColumnNamesAttr()) {
+            return emitOpError("every branch must output the same column names");
+        }
+    }
+
+    return success();
+}
+
+void Conditional::build(OpBuilder& builder,
+                        OperationState& state,
+                        TypeRange resultTypes,
+                        size_t regionCount) {
+    const OpBuilder::InsertionGuard guard(builder);
+
+    state.addTypes(resultTypes);
+
+    for (size_t regionIndex = 0; regionIndex < regionCount; regionIndex++) {
+        Region* region = state.addRegion();
+        builder.createBlock(region);
+    }
+}
+
+LogicalResult Conditional::verify() {
+    const MutableArrayRef<Region> regions = getBranches();
+    if (regions.size() < 2) {
+        return emitOpError("requires a condition and the branch it guards");
+    }
+
+    const size_t conditionCount = regions.size() / 2;
+    for (size_t conditionIndex = 0; conditionIndex < conditionCount; conditionIndex++) {
+        Yield condition = getFactorYield(regions[2 * conditionIndex]);
+        if (!condition || condition.getColumns().size() != 1) {
+            return emitOpError("each condition must end with a db.yield of one column");
+        }
+
+        if (failed(verifyYieldingBranch(getOperation(), regions[2 * conditionIndex + 1]))) {
+            return failure();
+        }
+    }
+
+    const bool hasDefault = regions.size() % 2 == 1;
+    if (hasDefault) {
+        return verifyYieldingBranch(getOperation(), regions.back());
+    }
+
+    return success();
+}
+
+// Builds the op from the result types - the left factor's yielded columns followed
+// by the right factor's - and the two key column indices, and creates the two empty
+// factor blocks. The cross product's sibling builder, with the join keys added.
+void HashJoin::build(OpBuilder& builder,
+                     OperationState& state,
+                     TypeRange resultTypes,
+                     uint64_t leftKey,
+                     uint64_t rightKey) {
+    const OpBuilder::InsertionGuard guard(builder);
+
+    state.addTypes(resultTypes);
+
+    const Type keyIndexType = builder.getIntegerType(64, /*isSigned=*/false);
+    state.addAttribute(getLeftKeyAttrName(state.name), builder.getIntegerAttr(keyIndexType, leftKey));
+    state.addAttribute(getRightKeyAttrName(state.name), builder.getIntegerAttr(keyIndexType, rightKey));
+
+    Region* leftFactor = state.addRegion();
+    builder.createBlock(leftFactor);
+
+    Region* rightFactor = state.addRegion();
+    builder.createBlock(rightFactor);
+}
+
+// Custom syntax, the cross product's with the join keys spelled after the regions:
+//
+//   %a, %ka, %b, %kb = db.hash_join factor { ... db.yield %x, %k : ... }
+//                                   factor { ... db.yield %y, %k : ... } on 1, 1
+//
+// The result types are recovered from the two factors' yields, exactly as
+// db.cross_product recovers them.
+ParseResult HashJoin::parse(OpAsmParser& parser, OperationState& result) {
+    if (parseFactorRegion(parser, result) || parseFactorRegion(parser, result)) {
+        return failure();
+    }
+
+    uint64_t leftKey = 0;
+    uint64_t rightKey = 0;
+    const bool keysFailed = parser.parseKeyword(keysKeyword)
+                            || parser.parseInteger(leftKey)
+                            || parser.parseComma()
+                            || parser.parseInteger(rightKey);
+    if (keysFailed) {
+        return failure();
+    }
+
+    if (parser.parseOptionalAttrDict(result.attributes)) {
+        return failure();
+    }
+
+    const Type keyIndexType = parser.getBuilder().getIntegerType(64, /*isSigned=*/false);
+    result.addAttribute(getLeftKeyAttrName(result.name), IntegerAttr::get(keyIndexType, leftKey));
+    result.addAttribute(getRightKeyAttrName(result.name), IntegerAttr::get(keyIndexType, rightKey));
+
+    Region& leftFactor = *result.regions[0];
+    Region& rightFactor = *result.regions[1];
+    if (appendFactorYieldTypes(parser, leftFactor, result.types)
+        || appendFactorYieldTypes(parser, rightFactor, result.types)) {
+        return failure();
+    }
+
+    return success();
+}
+
+void HashJoin::print(OpAsmPrinter& printer) {
+    printer << " " << factorKeyword << " ";
+    printer.printRegion(getLeftFactor());
+
+    printer << " " << factorKeyword << " ";
+    printer.printRegion(getRightFactor());
+
+    printer << " " << keysKeyword << " " << getLeftKey() << ", " << getRightKey();
+
+    printer.printOptionalAttrDict((*this)->getAttrs(), {getLeftKeyAttrName(), getRightKeyAttrName()});
+}
+
+// The results line up with the two factors' yields exactly as a cross product's do, and
+// each key index has to name a column of its own factor's yield - it is what the join
+// matches on, so a key past the end names no column to read.
+LogicalResult HashJoin::verify() {
+    if (failed(verifyFactorResults(getOperation(), getLeftFactor(), getRightFactor()))) {
+        return failure();
+    }
+
+    const size_t leftCount = getFactorYield(getLeftFactor()).getColumns().size();
+    const size_t rightCount = getFactorYield(getRightFactor()).getColumns().size();
+
+    if (getLeftKey() >= leftCount) {
+        return emitOpError("left key column ") << getLeftKey() << " is past the "
+                                               << leftCount << " columns the left factor yields";
+    }
+
+    if (getRightKey() >= rightCount) {
+        return emitOpError("right key column ") << getRightKey() << " is past the "
+                                                << rightCount << " columns the right factor yields";
     }
 
     return success();
@@ -226,13 +1287,56 @@ LogicalResult CreateNode::verify() {
 }
 
 LogicalResult CreateEdge::verify() {
-    if (getEdgeType().empty()) {
+    const StringAttr edgeType = dyn_cast<StringAttr>(getEdgeType());
+    if (edgeType && edgeType.getValue().empty()) {
         return emitOpError("requires a non-empty edge type");
     }
 
     if (getPropNames().size() != getPropValues().size()) {
         return emitOpError("prop_names and prop_values must have the same count, but has ")
                << getPropNames().size() << " names and " << getPropValues().size() << " values";
+    }
+
+    return success();
+}
+
+LogicalResult Merge::verify() {
+    const LogicalResult pattern = verifyMergePattern(getOperation(),
+                                                     getNodeLabels(),
+                                                     getNodePropNames(),
+                                                     getEdgeTypes(),
+                                                     getEdgePropNames(),
+                                                     getEdgeDirectionsAttr(),
+                                                     getPendingNodesAttr(),
+                                                     getBoundNodes().size(),
+                                                     getBoundPending().size(),
+                                                     getNodePropValues().size(),
+                                                     getEdgePropValues().size());
+    if (failed(pattern)) {
+        return pattern;
+    }
+
+    const size_t expectedResults = mergeResultCount(getNodeLabels(), getCarriedColumns().size());
+    if (getResults().size() != expectedResults) {
+        return emitOpError("must produce one column per chain entity, the created mask and one "
+                           "per carried column - ")
+               << expectedResults << " in all, but produces " << getResults().size();
+    }
+
+    return success();
+}
+
+LogicalResult SetNodeProperty::verify() {
+    if (getProperty().empty()) {
+        return emitOpError("requires a non-empty property name");
+    }
+
+    return success();
+}
+
+LogicalResult SetEdgeProperty::verify() {
+    if (getProperty().empty()) {
+        return emitOpError("requires a non-empty property name");
     }
 
     return success();
@@ -248,7 +1352,9 @@ LogicalResult ScanNodesByLabel::verify() {
     return success();
 }
 
-LogicalResult CheckLabelConstraint::verify() {
+// The edge sibling of ScanNodesByLabel::verify: a label-free scan of every edge is
+// db.scan_edges, so an empty label list is malformed IR here too.
+LogicalResult ScanOutEdgesByLabelSrc::verify() {
     if (getLabels().empty()) {
         return emitOpError("requires at least one label");
     }
@@ -256,9 +1362,209 @@ LogicalResult CheckLabelConstraint::verify() {
     return success();
 }
 
+LogicalResult ScanInEdgesByLabelTgt::verify() {
+    if (getLabels().empty()) {
+        return emitOpError("requires at least one label");
+    }
+
+    return success();
+}
+
+LogicalResult ScanOutEdgesByLabelTgt::verify() {
+    if (getLabels().empty()) {
+        return emitOpError("requires at least one label");
+    }
+
+    return success();
+}
+
+LogicalResult ScanInEdgesByLabelSrc::verify() {
+    if (getLabels().empty()) {
+        return emitOpError("requires at least one label");
+    }
+
+    return success();
+}
+
+LogicalResult ScanOutEdgesByLabelSrcTgt::verify() {
+    if (getSrcLabels().empty() || getTgtLabels().empty()) {
+        return emitOpError("requires at least one label on each end");
+    }
+
+    return success();
+}
+
+LogicalResult ScanInEdgesByLabelSrcTgt::verify() {
+    if (getSrcLabels().empty() || getTgtLabels().empty()) {
+        return emitOpError("requires at least one label on each end");
+    }
+
+    return success();
+}
+
+LogicalResult GetOutEdgesByLabel::verify() {
+    if (getLabels().empty()) {
+        return emitOpError("requires at least one label");
+    }
+
+    return success();
+}
+
+LogicalResult GetInEdgesByLabel::verify() {
+    if (getLabels().empty()) {
+        return emitOpError("requires at least one label");
+    }
+
+    return success();
+}
+
+LogicalResult GetOutEdgesByTypeAndLabel::verify() {
+    if (getLabels().empty()) {
+        return emitOpError("requires at least one label");
+    }
+
+    return success();
+}
+
+LogicalResult GetInEdgesByTypeAndLabel::verify() {
+    if (getLabels().empty()) {
+        return emitOpError("requires at least one label");
+    }
+
+    return success();
+}
+
+LogicalResult CountScanRows::verify() {
+    if (getLabels().empty()) {
+        return emitOpError("requires at least one scan to count");
+    }
+
+    const std::optional<llvm::StringRef> property = getProperty();
+    if (property && property->empty()) {
+        return emitOpError("requires a non-empty property name");
+    }
+
+    if (!property && getPropertyScan()) {
+        return emitOpError("names the scan of a property it does not read");
+    }
+
+    if (getPropertyScan().value_or(0) >= getLabels().size()) {
+        return emitOpError("reads a property from a scan it does not list");
+    }
+
+    return success();
+}
+
+LogicalResult ScanNodesByPropertyValue::verify() {
+    if (getProperty().empty()) {
+        return emitOpError("requires a non-empty property name");
+    }
+
+    const TypedAttr literal = getValue();
+    if (!storage::isPropertyScanLiteral(literal)) {
+        return emitOpError(storage::propertyScanLiteralKinds()) << literal.getType();
+    }
+
+    const std::optional<ArrayAttr> labels = getLabels();
+    if (labels && labels->empty()) {
+        return emitOpError("requires at least one label when labels are given");
+    }
+
+    return success();
+}
+
+LogicalResult CheckLabelConstraint::verify() {
+    const ArrayAttr alternatives = getAlternatives();
+    const bool hasEmptyAlternative = llvm::any_of(alternatives, [](Attribute alternative) {
+        return cast<ArrayAttr>(alternative).empty();
+    });
+
+    if (alternatives.empty() || hasEmptyAlternative) {
+        return emitOpError("requires at least one label in every alternative");
+    }
+
+    return success();
+}
+
+ArrayAttr CheckLabelConstraint::getConjunction() {
+    const ArrayAttr alternatives = getAlternatives();
+    if (alternatives.size() != 1) {
+        return nullptr;
+    }
+
+    return cast<ArrayAttr>(alternatives[0]);
+}
+
 LogicalResult CheckEdgeTypeConstraint::verify() {
-    if (getEdgeTypes().empty()) {
-        return emitOpError("requires at least one edge type");
+    return verifyEdgeTypesNotEmpty(getOperation(), getEdgeTypes());
+}
+
+void Output::build(OpBuilder& builder, OperationState& state, ValueRange columns) {
+    Output::build(builder, state, columns, ArrayAttr());
+}
+
+LogicalResult Output::verify() {
+    const ArrayAttr columnNames = getColumnNamesAttr();
+    if (columnNames && columnNames.size() != getColumns().size()) {
+        return emitOpError("names must give one name per output column, but has ")
+               << columnNames.size() << " names for " << getColumns().size() << " columns";
+    }
+
+    return success();
+}
+
+// db.case pairs each condition with the value the row takes when it holds, so the two
+// operand groups must be parallel; a CASE with no branch is not a selection at all.
+LogicalResult Case::verify() {
+    const OperandRange conditions = getConditions();
+    const OperandRange values = getValues();
+
+    if (conditions.empty()) {
+        return emitOpError("requires at least one branch");
+    } else if (conditions.size() != values.size()) {
+        return emitOpError("expects one value per condition, but has ")
+               << values.size() << " values for " << conditions.size() << " conditions";
+    }
+
+    return success();
+}
+
+LogicalResult LazyCase::verify() {
+    const MutableArrayRef<Region> branches = getBranches();
+    const OperandRange carried = getColumnsToFilter();
+
+    if (branches.size() < 2) {
+        return emitOpError("requires at least one condition and its value");
+    }
+
+    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
+        Block& block = branches[branchIndex].front();
+
+        if (!dyn_cast_or_null<CaseYield>(block.empty() ? nullptr : &block.back())) {
+            return emitOpError("region ") << branchIndex << " must end with a db.case_yield";
+        } else if (block.getNumArguments() != carried.size()) {
+            return emitOpError("region ") << branchIndex << " takes one argument per carried column, expected "
+                                          << carried.size() << " but has " << block.getNumArguments();
+        }
+
+        for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
+            if (block.getArgument(carriedIndex).getType() != carried[carriedIndex].getType()) {
+                return emitOpError("region ") << branchIndex << " argument " << carriedIndex
+                                              << " must have the type of carried column " << carriedIndex;
+            }
+        }
+    }
+
+    return success();
+}
+
+LogicalResult ToNullable::verify() {
+    const Type operandType = cast<ColumnType>(getOperand().getType()).getType();
+    const Type resultType = cast<ColumnType>(getResult().getType()).getType();
+    const auto nullable = dyn_cast<storage::NullableType>(resultType);
+
+    if (!nullable || nullable.getValueType() != operandType) {
+        return emitOpError("must produce the nullable column of its operand's values");
     }
 
     return success();
@@ -336,28 +1642,96 @@ LogicalResult RemoveDuplicates::verify() {
     return verifyPassThrough(getOperation(), getColumns(), getResults());
 }
 
+// A call produces one column per yielded return value then one per carried column, so
+// `yields`, the carry set and the results must line up. A call yielding nothing has no
+// column to produce and no row count to be read from, so it is rejected here at the db
+// level; the procedure's return values themselves are checked against the registry
+// during lowering, which is where the registry is available.
+LogicalResult CallProcedure::verify() {
+    const ArrayAttr yields = getYields();
+    const OperandRange carriedColumns = getCarriedColumns();
+
+    // A call yielding nothing produces no column, so it has no row count for a carried
+    // row to be replicated against - it is called for what it does, not for rows, and
+    // nothing can ride through it.
+    if (yields.empty() && !carriedColumns.empty()) {
+        return emitOpError("yields no return value, so it cannot carry ")
+               << carriedColumns.size() << " columns past it";
+    }
+
+    const Operation::result_range results = getResults();
+    const size_t expectedResults = yields.size() + carriedColumns.size();
+    if (results.size() != expectedResults) {
+        return emitOpError("expects ") << expectedResults
+                                       << " results, one per yielded return value and carried column, but has "
+                                       << results.size();
+    }
+
+    // A carried column is only replicated by the call, never retyped, so each trailing
+    // result keeps its carried column's type - the pass-through check db.limit shares,
+    // applied to the results after the yields.
+    for (size_t carriedIndex = 0; carriedIndex < carriedColumns.size(); carriedIndex++) {
+        const Value carried = carriedColumns[carriedIndex];
+        const Value result = results[yields.size() + carriedIndex];
+
+        if (carried.getType() != result.getType()) {
+            return emitOpError("carried result ") << carriedIndex
+                                                  << " must have the same type as carried column "
+                                                  << carriedIndex;
+        }
+    }
+
+    return success();
+}
+
 // Allows inline declaration of a constant type
 LogicalResult ConstantOp::inferReturnTypes(MLIRContext* context,
                                            std::optional<Location> location,
-                                           ValueRange operands, DictionaryAttr attributes,
+                                           ValueRange operands,
+                                           DictionaryAttr attributes,
                                            PropertyRef properties,
                                            RegionRange regions,
                                            SmallVectorImpl<Type>& inferredReturnTypes) {
     ConstantOpGenericAdaptor adaptor(operands, attributes, properties, regions);
-    const mlir::TypedAttr typedValue = mlir::cast<mlir::TypedAttr>(adaptor.getValue());
 
-    mlir::Type elementType;
-    if (const auto elements = mlir::dyn_cast<mlir::DenseElementsAttr>(typedValue)) {
-        const auto shapedType = mlir::cast<mlir::ShapedType>(elements.getType());
-        const bool isEmbedding = shapedType.getElementType().isF32()
-                                 && shapedType.hasRank()
-                                 && shapedType.getRank() == 1;
-        elementType = isEmbedding ? storage::EmbeddingType::get(context) : typedValue.getType();
-    } else {
-        elementType = typedValue.getType();
+    // An array of per-element attributes is a list literal; it carries no type of its own,
+    // so the element type is the homogeneity verdict over the elements.
+    if (const auto elements = llvm::dyn_cast<ArrayAttr>(adaptor.getValue())) {
+        const mlir::Type shared = ::db::sharedLiteralElementType(elements);
+        const mlir::Type listElement = shared ? shared : storage::AnyType::get(context);
+        const mlir::Type listType = storage::ListType::get(context, listElement);
+
+        inferredReturnTypes.emplace_back(mlir::db::ColumnType::get(context, listType));
+        return success();
     }
 
-    inferredReturnTypes.emplace_back(mlir::db::ColumnType::get(context, elementType));
+    // A dense f32 array is an embedding: a flat run of floats, which is the one attribute
+    // kind carrying no type of its own that still names its column's element type.
+    if (llvm::isa<mlir::DenseF32ArrayAttr>(adaptor.getValue())) {
+        const mlir::Type embeddingType = storage::EmbeddingType::get(context);
+
+        inferredReturnTypes.emplace_back(mlir::db::ColumnType::get(context, embeddingType));
+        return success();
+    }
+
+    if (llvm::isa<mlir::DictionaryAttr>(adaptor.getValue())) {
+        const mlir::Type mapType = storage::MapType::get(context);
+
+        inferredReturnTypes.emplace_back(mlir::db::ColumnType::get(context, mapType));
+        return success();
+    }
+
+    // Type inference runs while the op is still being parsed, ahead of the operand
+    // constraint that limits the value to those three kinds, so an attribute of any other
+    // kind has to be turned away here rather than cast blindly.
+    const mlir::TypedAttr typedValue = llvm::dyn_cast<mlir::TypedAttr>(adaptor.getValue());
+    if (!typedValue) {
+        return mlir::emitOptionalError(location,
+                                       "db.constant carries a typed value, a dense f32 array "
+                                       "or an array of literals, not ", adaptor.getValue());
+    }
+
+    inferredReturnTypes.emplace_back(mlir::db::ColumnType::get(context, typedValue.getType()));
     return mlir::success();
 }
 
@@ -413,7 +1787,8 @@ LogicalResult GroupAggregate::verify() {
     }
 
     // Each kind names one aggregate's reduction, so it must be a valid
-    // GroupAggregateKind (count / sum / min / max / avg).
+    // GroupAggregateKind (count / count_distinct / sum / sum_distinct / min / max /
+    // avg / avg_distinct).
     for (const int64_t kind : kinds) {
         if (!storage::symbolizeGroupAggregateKind(kind)) {
             return emitOpError("has an unknown aggregate kind ") << kind;
@@ -431,20 +1806,29 @@ LogicalResult Collect::verify() {
     const Operation::result_range results = getResults();
     const uint64_t keyCount = getKeyCount();
 
-    // Exactly one collected column follows the grouping keys. Bound keyCount by the
-    // real column count first: summing keyCount + 1 could wrap in unsigned 64-bit and
-    // let a pathological keyCount slip past into out-of-bounds lowering.
+    // The collected columns follow the grouping keys, and one aggregate input follows
+    // them per kind, so what is left over after the keys and the aggregates is the value
+    // columns - at least one. Bound keyCount by the real column count first: summing
+    // keyCount + aggregateCount could wrap in unsigned 64-bit and let a pathological
+    // keyCount slip past into out-of-bounds lowering.
     const size_t columnCount = columns.size();
-    if (keyCount >= columnCount || columnCount - keyCount != 1) {
+    const llvm::ArrayRef<int64_t> kinds = getKinds().value_or(llvm::ArrayRef<int64_t> {});
+    const size_t aggregateCount = kinds.size();
+    if (keyCount >= columnCount || columnCount - keyCount <= aggregateCount) {
         return emitOpError("expects ") << keyCount
-                                       << " grouping-key columns and one collected column, but has "
+                                       << " grouping-key columns, at least one collected column and "
+                                       << aggregateCount
+                                       << " aggregate columns, but has "
                                        << columnCount;
     }
 
-    // One result per grouping key then the collected list.
+    const size_t valueCount = columnCount - keyCount - aggregateCount;
+
+    // One result per grouping key, one per collected list, then one per aggregate.
     if (results.size() != columnCount) {
         return emitOpError("expects ") << columnCount
-                                       << " results, one per grouping key plus the collected list, but has "
+                                       << " results, one per grouping key plus the collected lists and the "
+                                          "aggregates, but has "
                                        << results.size();
     }
 
@@ -458,11 +1842,45 @@ LogicalResult Collect::verify() {
         }
     }
 
-    // The trailing result is the collected list: a column whose element type is a
-    // storage list.
-    const ColumnType listColumn = llvm::dyn_cast<ColumnType>(results[keyCount].getType());
-    if (!listColumn || !llvm::isa<storage::ListType>(listColumn.getType())) {
-        return emitOpError("collected result must be a list column");
+    // Each value's result is the list it collects into: a column whose element type is a
+    // storage list of that value column's type.
+    for (size_t valueIndex = 0; valueIndex < valueCount; valueIndex++) {
+        const size_t position = keyCount + valueIndex;
+
+        const ColumnType listColumn = llvm::dyn_cast<ColumnType>(results[position].getType());
+        if (!listColumn || !llvm::isa<storage::ListType>(listColumn.getType())) {
+            return emitOpError("collected result ") << valueIndex << " must be a list column";
+        }
+
+        const ColumnType valueColumn = llvm::cast<ColumnType>(columns[position].getType());
+        const storage::ListType collectedList = llvm::cast<storage::ListType>(listColumn.getType());
+        if (collectedList.getElementType() != valueColumn.getType()) {
+            return emitOpError("collected result ") << valueIndex
+                                                    << " must be a list of "
+                                                    << valueColumn.getType()
+                                                    << ", the collected column's type, but collects "
+                                                    << collectedList.getElementType();
+        }
+    }
+
+    // Each kind names one aggregate's reduction, so it must be a valid
+    // GroupAggregateKind, exactly as db.group_aggregate's kinds must.
+    for (const int64_t kind : kinds) {
+        if (!storage::symbolizeGroupAggregateKind(kind)) {
+            return emitOpError("has an unknown aggregate kind ") << kind;
+        }
+    }
+
+    // Every deduplicating value names one of the collected columns.
+    if (const std::optional<llvm::ArrayRef<int64_t>> distinctValues = getDistinctValues()) {
+        for (const int64_t valueIndex : *distinctValues) {
+            if (valueIndex < 0 || static_cast<size_t>(valueIndex) >= valueCount) {
+                return emitOpError("distinct value index ") << valueIndex
+                                                            << " is out of range for "
+                                                            << valueCount
+                                                            << " collected columns";
+            }
+        }
     }
 
     return success();
@@ -497,5 +1915,594 @@ LogicalResult UnwindCollect::verify() {
         }
     }
 
+    if (columns[keyCount].getType() != results[keyCount].getType()) {
+        return emitOpError("unwound value result must have the same type as the collected column");
+    }
+
     return success();
+}
+
+LogicalResult Unwind::verify() {
+    return verifyCarriedResults(getOperation(), getColumnsToFilter(), getCarried());
+}
+
+// The source block takes one argument per carried column, of its type, and ends naming
+// the source.
+LogicalResult UnwindComputed::verify() {
+    Block& sourceBlock = getSource().front();
+
+    if (sourceBlock.empty() || !isa<UnwindYield>(sourceBlock.back())) {
+        return emitOpError("source region must end with a db.unwind_yield");
+    }
+
+    const OperandRange carried = getColumnsToFilter();
+    if (sourceBlock.getNumArguments() != carried.size()) {
+        return emitOpError("source region takes one argument per carried column, ")
+               << "expected " << carried.size() << " but has " << sourceBlock.getNumArguments();
+    }
+
+    for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
+        const Type argumentType = sourceBlock.getArgument(static_cast<unsigned>(carriedIndex)).getType();
+
+        if (argumentType != carried[carriedIndex].getType()) {
+            return emitOpError("source argument ") << carriedIndex
+                                                   << " must have the type of carried column "
+                                                   << carriedIndex;
+        }
+    }
+
+    return verifyCarriedResults(getOperation(), carried, getCarried());
+}
+
+LogicalResult UnwindRange::verify() {
+    const ColumnType elementColumn = dyn_cast<ColumnType>(getElement().getType());
+    const Type element = elementColumn ? elementColumn.getType() : Type {};
+    const storage::NullableType nullable = dyn_cast_or_null<storage::NullableType>(element);
+
+    const bool nullableInteger = nullable && isa<IntegerType>(nullable.getValueType());
+    const bool resolvedInLowering = isa_and_nonnull<NoneType>(element);
+    if (!nullableInteger && !resolvedInLowering) {
+        return emitOpError("element must be a column of nullable integers, or of none for lowering to resolve");
+    }
+
+    return verifyCarriedResults(getOperation(), getColumnsToFilter(), getCarried());
+}
+
+// The body binds the element, the row tag and one argument per carried column, and ends
+// naming what each element contributes.
+LogicalResult ListComprehension::verify() {
+    return verifyElementBody(getOperation(), getBody().front(), getColumnsToFilter());
+}
+
+LogicalResult ListPredicate::verify() {
+    return verifyElementBody(getOperation(), getBody().front(), getColumnsToFilter());
+}
+
+// The body binds the element, the accumulator and one argument per carried column, and
+// ends naming the next accumulator.
+LogicalResult Reduce::verify() {
+    Block& bodyBlock = getBody().front();
+
+    if (bodyBlock.empty() || !isa<ReduceYield>(bodyBlock.back())) {
+        return emitOpError("body region must end with a db.reduce_yield");
+    }
+
+    const OperandRange carried = getColumnsToFilter();
+    const size_t expectedArguments = carried.size() + 2;
+
+    if (bodyBlock.getNumArguments() != expectedArguments) {
+        return emitOpError("body region takes the element and the accumulator plus one argument per "
+                           "carried column, ")
+               << "expected " << expectedArguments << " but has " << bodyBlock.getNumArguments();
+    }
+
+    for (size_t argumentIndex = 0; argumentIndex < 2; argumentIndex++) {
+        if (!llvm::isa<ColumnType>(bodyBlock.getArgument(argumentIndex).getType())) {
+            return emitOpError("body argument ") << argumentIndex << " must be a column";
+        }
+    }
+
+    for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
+        const mlir::Type argumentType = bodyBlock.getArgument(carriedIndex + 2).getType();
+
+        if (argumentType != carried[carriedIndex].getType()) {
+            return emitOpError("body argument ") << carriedIndex + 2
+                                                 << " must have the type of carried column "
+                                                 << carriedIndex;
+        }
+    }
+
+    return success();
+}
+
+// The pattern takes one argument per input column and the row tag, and ends naming what
+// each match contributes to the list of the row it came from.
+LogicalResult PatternComprehension::verify() {
+    Block& patternBlock = getPattern().front();
+
+    auto yield = dyn_cast_or_null<ComprehensionYield>(patternBlock.empty() ? nullptr : &patternBlock.back());
+    if (!yield) {
+        return emitOpError("pattern region must end with a db.comprehension_yield");
+    }
+
+    const mlir::OperandRange inputs = getInputColumns();
+    const size_t inputCount = inputs.size();
+
+    // No input column means no input row to tag: the one list covers the single empty row
+    // the query starts from, which every match belongs to.
+    const size_t expectedArguments = inputCount == 0 ? 0 : inputCount + 1;
+
+    if (patternBlock.getNumArguments() != expectedArguments) {
+        return emitOpError("pattern region takes one argument per input column plus the row tag, ")
+               << "expected " << expectedArguments << " but has " << patternBlock.getNumArguments();
+    }
+
+    for (size_t inputIndex = 0; inputIndex < inputCount; inputIndex++) {
+        if (patternBlock.getArgument(inputIndex).getType() != inputs[inputIndex].getType()) {
+            return emitOpError("pattern argument ") << inputIndex << " must have the type of input column "
+                                                    << inputIndex;
+        }
+    }
+
+    if (inputCount != 0) {
+        const auto rowTagType =
+            llvm::dyn_cast<ColumnType>(patternBlock.getArgument(inputCount).getType());
+
+        if (!rowTagType || !rowTagType.getType().isUnsignedInteger(64)) {
+            return emitOpError("pattern argument ") << inputCount << " must be the ui64 column of row tags";
+        }
+    }
+
+    const bool tagsRows = inputCount != 0;
+    const bool yieldsATag = yield.getRowTags() != nullptr;
+
+    if (tagsRows != yieldsATag) {
+        return emitOpError("the pattern yields a row tag exactly when the op takes input columns");
+    }
+
+    return success();
+}
+
+// There is a column for the list to be built out of, and what the op produces is a list.
+LogicalResult MakeList::verify() {
+    if (getElements().empty()) {
+        return emitOpError("requires at least one element column");
+    }
+
+    const ColumnType resultColumn = llvm::dyn_cast<ColumnType>(getResult().getType());
+    if (!resultColumn) {
+        return emitOpError("result must be a column");
+    }
+
+    if (!llvm::isa<storage::ListType>(resultColumn.getType())) {
+        return emitOpError("result must be a column of lists");
+    }
+
+    return success();
+}
+
+LogicalResult MakeMap::verify() {
+    const size_t valueCount = getValues().size();
+    if (valueCount == 0) {
+        return emitOpError("requires at least one value column");
+    }
+
+    const ArrayAttr keys = getKeys();
+    if (keys.size() != valueCount) {
+        return emitOpError("requires one key per value column");
+    }
+
+    llvm::SmallDenseSet<StringRef, 8> seenKeys;
+    for (const Attribute key : keys) {
+        if (!seenKeys.insert(llvm::cast<StringAttr>(key).getValue()).second) {
+            return emitOpError("requires distinct keys");
+        }
+    }
+
+    return success();
+}
+
+// The integers a range spans ride the list it builds, so the result is a column of them.
+LogicalResult Range::verify() {
+    const ColumnType resultColumn = llvm::dyn_cast<ColumnType>(getResult().getType());
+    if (!resultColumn) {
+        return emitOpError("result must be a column");
+    }
+
+    const storage::ListType listType = llvm::dyn_cast<storage::ListType>(resultColumn.getType());
+    if (!listType) {
+        return emitOpError("result must be a column of lists");
+    }
+
+    if (!llvm::isa<mlir::IntegerType>(listType.getElementType())) {
+        return emitOpError("result must be a column of integer lists");
+    }
+
+    return success();
+}
+
+LogicalResult Replace::verify() {
+    const bool readsStrings = llvm::all_of(getOperation()->getOperands(), [](Value operand) {
+        return isStringColumn(operand.getType());
+    });
+
+    if (!readsStrings) {
+        return emitOpError("operands must be string columns");
+    }
+
+    return verifyStringResult(getOperation(), getResult());
+}
+
+LogicalResult Split::verify() {
+    const bool readsStrings = isStringColumn(getString().getType()) && isStringColumn(getDelimiter().getType());
+    if (!readsStrings) {
+        return emitOpError("operands must be string columns");
+    }
+
+    const ColumnType resultColumn = llvm::dyn_cast<ColumnType>(getResult().getType());
+    const storage::ListType listType = resultColumn ? llvm::dyn_cast<storage::ListType>(resultColumn.getType())
+                                                    : storage::ListType {};
+
+    if (!listType || !llvm::isa<storage::StringType>(listType.getElementType())) {
+        return emitOpError("result must be a column of string lists");
+    }
+
+    return success();
+}
+
+// The unwound column's element type is the homogeneity verdict: a type-erased
+// A !storage.any column accepts any elements, a typed one requires them to share that one
+// type - the shared check the const_list verifier runs too.
+LogicalResult UnwindConst::verify() {
+    const ColumnType resultColumn = llvm::dyn_cast<ColumnType>(getResult().getType());
+    if (!resultColumn) {
+        return emitOpError("result must be a column");
+    }
+
+    const mlir::Type elementType = resultColumn.getType();
+    if (llvm::isa<storage::AnyType>(elementType)) {
+        return success();
+    }
+
+    return verifyHomogeneousElements(getOperation(), getElements());
+}
+
+// One column per field, and a field is named either by position or by header - a
+// header only where a header line was read, since nothing else resolves the name.
+LogicalResult LoadCSV::verify() {
+    const ArrayAttr fields = getFieldsAttr();
+
+    // A load producing no column produces no rows either: nothing downstream could read
+    // the records it opened, and its loop would have no chunk to size a step from
+    if (fields.empty()) {
+        return emitOpError("requires at least one field");
+    }
+
+    if (fields.size() != getResults().size()) {
+        return emitOpError("produces one column per field, but names ")
+               << fields.size() << " fields for " << getResults().size() << " columns";
+    }
+
+    for (const Attribute field : fields) {
+        if (const auto header = llvm::dyn_cast<StringAttr>(field)) {
+            if (!getWithHeaders()) {
+                return emitOpError("names field '") << header.getValue()
+                                                    << "' by header, which only a with_headers load resolves";
+            }
+        } else {
+            const auto index = llvm::dyn_cast<IntegerAttr>(field);
+            if (!index || !index.getType().isUnsignedInteger(64)) {
+                return emitOpError("field must be a ui64 position or a header name");
+            }
+        }
+    }
+
+    return success();
+}
+
+// A search reporting no neighbour, or searching for no vector, is a query that asked for
+// nothing: neither is a shape the index can be asked for, so both are rejected here rather
+// than left to return an empty result the query would read as "no match".
+LogicalResult VectorSearch::verify() {
+    if (getK() == 0) {
+        return emitOpError("must report at least one neighbour");
+    }
+
+    if (getQueryVector().empty()) {
+        return emitOpError("must search for a vector of at least one dimension");
+    }
+
+    return success();
+}
+
+// The region's entry block stands for the rows in flight: one argument per input
+// column, then the row tag. The db.optional_yield names the tag and the columns
+// the region contributes - the input columns as the pattern left them, then the
+// pattern's own variables - and the op's results are exactly those columns. A
+// pattern variable is what a row the pattern missed comes back with null, so it
+// has to be an ID column: those carry an invalid ID, which is how a null entity
+// is spelled, where a property value column would need a null of its own.
+LogicalResult OptionalMatch::verify() {
+    Block& patternBlock = getPattern().front();
+
+    auto yield = dyn_cast_or_null<OptionalYield>(patternBlock.empty() ? nullptr : &patternBlock.back());
+    if (!yield) {
+        return emitOpError("pattern region must end with a db.optional_yield");
+    }
+
+    const size_t inputCount = getInputColumns().size();
+
+    // No input column means no input row to tag: the rows the pattern joins onto are
+    // the single empty row the query starts from.
+    const size_t expectedArguments = inputCount == 0 ? 0 : inputCount + 1;
+
+    if (patternBlock.getNumArguments() != expectedArguments) {
+        return emitOpError("pattern region takes one argument per input column plus the row tag, ")
+               << "expected " << expectedArguments << " but has " << patternBlock.getNumArguments();
+    }
+
+    const bool tagsRows = inputCount != 0;
+    const bool yieldsATag = yield.getTag() != nullptr;
+
+    if (tagsRows != yieldsATag) {
+        return emitOpError("the pattern yields a row tag exactly when the op takes input columns");
+    }
+
+    for (size_t inputIndex = 0; inputIndex < inputCount; inputIndex++) {
+        if (patternBlock.getArgument(inputIndex).getType() != getInputColumns()[inputIndex].getType()) {
+            return emitOpError("pattern argument ") << inputIndex << " must have the type of input column "
+                                                    << inputIndex;
+        }
+    }
+
+    const ValueRange yieldedColumns = yield.getColumns();
+    if (yieldedColumns.empty()) {
+        return emitOpError("pattern must yield at least one column");
+    }
+
+    if (yieldedColumns.size() < inputCount) {
+        return emitOpError("pattern must yield at least one column per input column, expected ")
+               << inputCount << " but has " << yieldedColumns.size();
+    }
+
+    for (size_t inputIndex = 0; inputIndex < inputCount; inputIndex++) {
+        const mlir::Type inputType = getInputColumns()[inputIndex].getType();
+
+        // A traversal rebinds its source to a typed ID column, so a pattern walking from a
+        // column whose element type is still unspecified - what a CALL yields - hands it
+        // back refined. Any other change of type is a carry set that lost track of a column.
+        const auto inputColumn = llvm::dyn_cast<ColumnType>(inputType);
+        const bool refinesAnUnspecifiedColumn = inputColumn
+                                                && llvm::isa<mlir::NoneType>(inputColumn.getType());
+
+        if (yieldedColumns[inputIndex].getType() != inputType && !refinesAnUnspecifiedColumn) {
+            return emitOpError("yielded column ") << inputIndex << " must have the type of input column "
+                                                  << inputIndex;
+        }
+    }
+
+    for (size_t columnIndex = inputCount; columnIndex < yieldedColumns.size(); columnIndex++) {
+        const auto column = llvm::dyn_cast<ColumnType>(yieldedColumns[columnIndex].getType());
+        const mlir::Type elementType = column ? column.getType() : mlir::Type();
+        const bool isPaddable = llvm::isa_and_present<storage::NodeIDType,
+                                                      storage::EdgeIDType,
+                                                      storage::ListType,
+                                                      storage::EntityListType>(elementType);
+
+        if (!isPaddable) {
+            return emitOpError("pattern variable column ")
+                   << columnIndex << " must be a node or edge ID, list or path column, so a missed match can be null";
+        }
+    }
+
+    const Operation::result_type_range resultTypes = getOperation()->getResultTypes();
+    if (resultTypes.size() != yieldedColumns.size()) {
+        return emitOpError("expects ") << yieldedColumns.size()
+                                       << " results, the columns the pattern yields, but has "
+                                       << resultTypes.size();
+    }
+
+    for (size_t resultIndex = 0; resultIndex < resultTypes.size(); resultIndex++) {
+        if (resultTypes[resultIndex] != yieldedColumns[resultIndex].getType()) {
+            return emitOpError("result ") << resultIndex << " must be the yielded column type "
+                                          << yieldedColumns[resultIndex].getType();
+        }
+    }
+
+    return success();
+}
+
+LogicalResult ExistsSubquery::verify() {
+    return verifySubqueryExpression<ExistsYield>(*this);
+}
+
+LogicalResult CountSubquery::verify() {
+    return verifySubqueryExpression<CountSubqueryYield>(*this);
+}
+
+LogicalResult CollectSubquery::verify() {
+    return verifySubqueryExpression<CollectSubqueryYield>(*this);
+}
+
+LogicalResult CallSubquery::verify() {
+    Block& bodyBlock = getBody().front();
+
+    auto yield = dyn_cast_or_null<SubqueryYield>(bodyBlock.empty() ? nullptr : &bodyBlock.back());
+    if (!yield) {
+        return emitOpError("body region must end with a db.subquery_yield");
+    }
+
+    const OperandRange inputs = getInputColumns();
+    const size_t inputCount = inputs.size();
+
+    // The body carries the row tag through its dataflow only when it carries the scope,
+    // and only over rows it has: a body run one row at a time, or over the single empty
+    // row, is tagged by the lowering instead.
+    const bool tagsRows = getOptional() && getCarriesScope() && inputCount > 0;
+
+    const size_t expectedArguments = tagsRows ? inputCount + 1 : inputCount;
+    if (bodyBlock.getNumArguments() != expectedArguments) {
+        return emitOpError("body region takes one argument per input column")
+               << (tagsRows ? " plus the row tag" : "") << ", expected " << expectedArguments
+               << " but has " << bodyBlock.getNumArguments();
+    }
+
+    for (size_t inputIndex = 0; inputIndex < inputCount; inputIndex++) {
+        if (bodyBlock.getArgument(inputIndex).getType() != inputs[inputIndex].getType()) {
+            return emitOpError("body argument ") << inputIndex << " must have the type of input column "
+                                                 << inputIndex;
+        }
+    }
+
+    const bool yieldsATag = yield.getTag() != nullptr;
+    if (tagsRows != yieldsATag) {
+        return emitOpError("the body yields a row tag exactly when it takes one");
+    }
+
+    const ValueRange yieldedColumns = yield.getColumns();
+    const Operation::result_type_range resultTypes = getOperation()->getResultTypes();
+
+    if (getUnit()) {
+        if (getOptional()) {
+            return emitOpError("a unit subquery yields no row for OPTIONAL to pad");
+        }
+
+        if (!yieldedColumns.empty()) {
+            return emitOpError("a unit body yields no column");
+        }
+
+        if (resultTypes.size() != 0) {
+            return emitOpError("a unit subquery has no result");
+        }
+
+        return success();
+    }
+
+    // The columns the results stand for: what the body yields when it carries the scope
+    // itself, and the inputs ahead of what it yields otherwise.
+    llvm::SmallVector<Type, 8> expectedResults;
+    if (getCarriesScope()) {
+        if (yieldedColumns.size() < inputCount) {
+            return emitOpError("a body carrying its scope yields at least one column per input column, expected ")
+                   << inputCount << " but has " << yieldedColumns.size();
+        }
+
+        for (size_t inputIndex = 0; inputIndex < inputCount; inputIndex++) {
+            const Type inputType = inputs[inputIndex].getType();
+
+            // A traversal rebinds its source to a typed ID column, so a body walking from a
+            // column whose element type is still unspecified hands it back refined.
+            const auto inputColumn = llvm::dyn_cast<ColumnType>(inputType);
+            const bool refinesAnUnspecifiedColumn = inputColumn && llvm::isa<mlir::NoneType>(inputColumn.getType());
+
+            if (yieldedColumns[inputIndex].getType() != inputType && !refinesAnUnspecifiedColumn) {
+                return emitOpError("yielded column ") << inputIndex << " must have the type of input column "
+                                                      << inputIndex;
+            }
+        }
+    } else {
+        for (const Value input : inputs) {
+            expectedResults.push_back(input.getType());
+        }
+    }
+
+    for (const Value yielded : yieldedColumns) {
+        expectedResults.push_back(yielded.getType());
+    }
+
+    if (resultTypes.size() != expectedResults.size()) {
+        return emitOpError("expects ") << expectedResults.size()
+                                       << " results, one per input column then one per yielded column, but has "
+                                       << resultTypes.size();
+    }
+
+    for (size_t resultIndex = 0; resultIndex < expectedResults.size(); resultIndex++) {
+        if (resultTypes[resultIndex] != expectedResults[resultIndex]) {
+            return emitOpError("result ") << resultIndex << " must have type " << expectedResults[resultIndex];
+        }
+    }
+
+    return success();
+}
+
+Speculation::Speculatability Range::getSpeculatability() {
+    int64_t from = 0;
+    int64_t to = 0;
+    int64_t by = 1;
+
+    const Value step = getStep();
+    const bool literalBounds = matchIntegerLiteral(getStart(), from) && matchIntegerLiteral(getEnd(), to);
+    const bool literalStep = !step || matchIntegerLiteral(step, by);
+    const bool knownList = literalBounds && literalStep && by != 0;
+
+    if (!knownList) {
+        return Speculation::NotSpeculatable;
+    }
+
+    return speculatableWhen(::db::countRangeSteps(from, to, by) < ::db::RANGE_LENGTH_LIMIT);
+}
+
+Speculation::Speculatability UnwindRange::getSpeculatability() {
+    int64_t by = 0;
+    return speculatableWhen(matchIntegerLiteral(getStep(), by) && by != 0);
+}
+
+Speculation::Speculatability Substring::getSpeculatability() {
+    return speculatableOverCharacters(getOperation());
+}
+
+Speculation::Speculatability Replace::getSpeculatability() {
+    const bool readsStrings = llvm::all_of(getOperation()->getOperands(), [](Value operand) {
+        return isa<storage::StringType>(columnElement(operand));
+    });
+
+    return speculatableWhen(readsStrings);
+}
+
+Speculation::Speculatability Split::getSpeculatability() {
+    const bool readsAString = isa<storage::StringType>(columnElement(getString()));
+    const bool splitsOnAString = isa<storage::StringType>(columnElement(getDelimiter()));
+
+    return speculatableWhen(readsAString && splitsOnAString);
+}
+
+Speculation::Speculatability AndOp::getSpeculatability() {
+    return speculatableOverTruthValues(getOperation());
+}
+
+Speculation::Speculatability OrOp::getSpeculatability() {
+    return speculatableOverTruthValues(getOperation());
+}
+
+Speculation::Speculatability XorOp::getSpeculatability() {
+    return speculatableOverTruthValues(getOperation());
+}
+
+Speculation::Speculatability NotOp::getSpeculatability() {
+    return speculatableOverTruthValues(getOperation());
+}
+
+Speculation::Speculatability AddOp::getSpeculatability() {
+    return speculatableOverNumbers(getOperation());
+}
+
+// '||' raises on a value that is neither a string nor a list
+Speculation::Speculatability ConcatOp::getSpeculatability() {
+    return speculatableWhen(llvm::none_of(getOperation()->getOperands(), mayHoldAnyType));
+}
+
+Speculation::Speculatability SubOp::getSpeculatability() {
+    return speculatableOverNumbers(getOperation());
+}
+
+Speculation::Speculatability MulOp::getSpeculatability() {
+    return speculatableOverNumbers(getOperation());
+}
+
+Speculation::Speculatability DivOp::getSpeculatability() {
+    return speculatableWhen(isNumberColumn(getLhs()) && isSafeLiteralDivisor(getRhs(), true));
+}
+
+Speculation::Speculatability ModOp::getSpeculatability() {
+    return speculatableWhen(isNumberColumn(getLhs()) && isSafeLiteralDivisor(getRhs(), false));
 }

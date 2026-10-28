@@ -43,14 +43,16 @@ add_subdirectory(test_suite_queries)
 add_subdirectory(load_csv)
 add_subdirectory(load_csv_stations)
 add_subdirectory(vector_serialization)
+add_subdirectory(vector_sigkill)
 add_subdirectory(start-stop)
+add_subdirectory(start_failures)
 add_subdirectory(load_jsonl_reactome)
 add_subdirectory(load_jsonl_property_types)
 add_subdirectory(load_parquet)
 add_subdirectory(history_on_change)
 add_subdirectory(reload_submit_edge)
 add_subdirectory(json_escape_properties)
-add_subdirectory(mlir_samples_parse)
+add_subdirectory(query_parameters)
 
 # write run_regress target
 # The script finds the wheel at runtime to avoid needing to re-run cmake after wheel build

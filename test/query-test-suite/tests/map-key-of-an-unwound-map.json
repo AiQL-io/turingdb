@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "UNWIND [{a: 1}, {a: 2}] AS m RETURN m.a",
+  "expect": {
+    "result": "m.a\n1\n2"
+  },
+  "tags": [
+    "map",
+    "key",
+    "static",
+    "list"
+  ],
+  "write-required": false
+}

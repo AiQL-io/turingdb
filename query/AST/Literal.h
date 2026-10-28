@@ -1,13 +1,14 @@
 #pragma once
 
-#include <unordered_map>
 #include <string>
 #include <string_view>
 #include <stdint.h>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include "HybridString.h"
+#include "UnicodeNormalForm.h"
 
 #include "decl/EvaluatedType.h"
 
@@ -32,6 +33,7 @@ public:
         MAP,
         EMBEDDING,
         WILDCARD,
+        NORMAL_FORM,
     };
 
     virtual Kind getKind() const = 0;
@@ -171,6 +173,11 @@ public:
 
     void addItem(Expr* item);
 
+    /// Whether every item is a literal, at any depth - what makes the whole list a value
+    /// known without reading a row, rather than one built per row out of what its items
+    /// read.
+    bool isLiteralTree() const;
+
     bool empty() const { return _items.empty(); }
     size_t size() const { return _items.size(); }
 
@@ -183,8 +190,8 @@ private:
 
 class MapLiteral : public Literal {
 public:
-    using ExprMap = std::unordered_map<Symbol*, Expr*>;
-    using ExprMapConstIterator = ExprMap::const_iterator;
+    using Entries = std::vector<std::pair<Symbol*, Expr*>>;
+    using EntryConstIterator = Entries::const_iterator;
 
     constexpr Kind getKind() const override { return Kind::MAP; }
 
@@ -192,16 +199,25 @@ public:
 
     static MapLiteral* create(CypherAST* ast);
 
+    /**
+     * @brief Sets @param key to @param value, replacing in place the entry carrying the same
+     * key name if there is one.
+     */
     void set(Symbol* key, Expr* value);
 
-    bool empty() const { return _map.empty(); }
-    size_t size() const { return _map.size(); }
+    /// Whether every value is a literal, at any depth - what makes the whole map a value
+    /// known without reading a row, rather than one built per row out of what its values
+    /// read.
+    bool isLiteralTree() const;
 
-    ExprMapConstIterator begin() const { return _map.cbegin(); }
-    ExprMapConstIterator end() const { return _map.cend(); }
+    bool empty() const { return _entries.empty(); }
+    size_t size() const { return _entries.size(); }
+
+    EntryConstIterator begin() const { return _entries.cbegin(); }
+    EntryConstIterator end() const { return _entries.cend(); }
 
 private:
-    ExprMap _map;
+    Entries _entries;
 
     MapLiteral();
     ~MapLiteral() override;
@@ -245,6 +261,23 @@ public:
 private:
     WildcardLiteral();
     ~WildcardLiteral() override;
+};
+
+class NormalFormLiteral : public Literal {
+public:
+    static NormalFormLiteral* create(CypherAST* ast, UnicodeNormalForm form);
+
+    constexpr Kind getKind() const override { return Kind::NORMAL_FORM; }
+
+    constexpr EvaluatedType getType() const override { return EvaluatedType::NormalForm; }
+
+    UnicodeNormalForm getForm() const { return _form; }
+
+private:
+    UnicodeNormalForm _form {UnicodeNormalForm::NFC};
+
+    explicit NormalFormLiteral(UnicodeNormalForm form);
+    ~NormalFormLiteral() override;
 };
 
 }

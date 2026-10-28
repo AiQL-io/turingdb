@@ -5,7 +5,6 @@
 #include "AnalyzeException.h"
 #include "ExprAnalyzer.h"
 #include "FunctionInvocation.h"
-#include "SymbolChain.h"
 #include "YieldClause.h"
 #include "YieldItems.h"
 #include "decl/EvaluatedType.h"
@@ -37,7 +36,6 @@
 #include "expr/BinaryExpr.h"
 #include "expr/LiteralExpr.h"
 #include "expr/EntityTypeExpr.h"
-#include "expr/PathExpr.h"
 #include "expr/PropertyExpr.h"
 #include "expr/StringExpr.h"
 #include "expr/SymbolExpr.h"
@@ -52,6 +50,44 @@
 #include "FatalException.h"
 
 using namespace db;
+
+namespace {
+
+// A tagged scalar carries its type per row rather than in the plan, so no property type
+// rules it out: the comparison the constraint becomes settles it row by row, as the same
+// test written as a WHERE does. That comparison also settles two numbers, which compare by
+// value, and two types that can never hold equal values, where it is false on every row.
+bool constraintTypeCompatible(ValueType propertyType, EvaluatedType exprType) {
+    const bool comparesPerRow = namesATaggedCell(exprType);
+    const bool matchesNothing = exprType == EvaluatedType::Null;
+
+    if (comparesPerRow || matchesNothing) {
+        return true;
+    }
+
+    const std::optional<EvaluatedType> propertyEvaluated = toEvaluatedType(propertyType);
+    const bool comparesNumbers = propertyEvaluated && comparesAsNumbers(*propertyEvaluated, exprType);
+    const bool comparesDisjointTypes = propertyEvaluated && comparesAsDisjointTypes(*propertyEvaluated, exprType);
+
+    if (comparesNumbers || comparesDisjointTypes) {
+        return true;
+    }
+
+    return ExprAnalyzer::propTypeCompatible(propertyType, exprType);
+}
+
+// The type each row an UNWIND emits carries: one level out of a list's shape - however
+// the list was built - and the type of anything that is not a list, spread to its
+// singleton.
+EvaluatedType unwoundItemType(const Expr* arg) {
+    if (arg->getType() != EvaluatedType::List) {
+        return arg->getType();
+    }
+
+    return arg->getListShape().unwoundType();
+}
+
+}
 
 ReadStmtAnalyzer::ReadStmtAnalyzer(CypherAST* ast, GraphView graphView)
     : _ast(ast),
@@ -82,27 +118,28 @@ void ReadStmtAnalyzer::analyze(Stmt* stmt) {
         break;
 
         case Stmt::Kind::SHORTESTPATH:
-            analyze(static_cast<const ShortestPathStmt*>(stmt));
+            analyze(static_cast<ShortestPathStmt*>(stmt));
         break;
 
         case Stmt::Kind::UNWIND:
-            analyze(static_cast<const UnwindStmt*>(stmt));
+            analyze(static_cast<UnwindStmt*>(stmt));
         break;
 
         case Stmt::Kind::CREATE:
+        case Stmt::Kind::MERGE:
         case Stmt::Kind::SET:
+        case Stmt::Kind::REMOVE:
         case Stmt::Kind::DELETE:
         case Stmt::Kind::RETURN:
+        case Stmt::Kind::WITH:
+        case Stmt::Kind::CALL_SUBQUERY:
+        case Stmt::Kind::NEXT_SEGMENT:
             throw FatalException("Attempted to evaluate invalid read statement.");
         break;
     }
 }
 
 void ReadStmtAnalyzer::analyze(const MatchStmt* matchSt) {
-    if (matchSt->isOptional()) {
-        throwError("OPTIONAL MATCH not supported", matchSt);
-    }
-
     const Pattern* pattern = matchSt->getPattern();
     if (!pattern) {
         throwError("MATCH statement must have a pattern", matchSt);
@@ -147,11 +184,8 @@ void ReadStmtAnalyzer::analyze(const CallStmt* callStmt) {
     }
 
     // Step 3. Analyze YIELD clause
-    const YieldClause* yield = callStmt->getYield();
-    if (yield == nullptr || yield->getItems() == nullptr) {
-        // In the current implemention having YIELD * or no yield at all means the same thing.
-        // In neo4j YIELD * returns all columns including deprecated ones.
-        // including deprecated ones.
+    YieldClause* yield = callStmt->getYield();
+    if (yield == nullptr) {
         if (!callStmt->isStandaloneCall()) {
             throwError("Procedure call inside a query requires to name the "
                        "return items explicitly with a YIELD clause",
@@ -160,7 +194,27 @@ void ReadStmtAnalyzer::analyze(const CallStmt* callStmt) {
         return;
     }
 
+    // YIELD * names every return value the procedure declares. A standalone call needs no
+    // declarations for them, so its items stay unnamed for the code generator to spell out.
+    if (yield->getItems() == nullptr) {
+        if (callStmt->isStandaloneCall()) {
+            return;
+        }
+
+        yieldEveryReturnValue(*signature, yield);
+    }
+
     analyze(*func, yield);
+}
+
+void ReadStmtAnalyzer::yieldEveryReturnValue(const FunctionSignature& signature, YieldClause* yield) {
+    YieldItems* items = YieldItems::create(_ast);
+    for (const FunctionReturnType& returnType : signature.returnTypes()) {
+        Symbol* symbol = Symbol::create(_ast, returnType.getName());
+        items->add(SymbolExpr::create(_ast, symbol));
+    }
+
+    yield->setItems(items);
 }
 
 void ReadStmtAnalyzer::analyze(LoadCSVStmt* loadCSV) {
@@ -180,12 +234,14 @@ void ReadStmtAnalyzer::analyze(LoadCSVStmt* loadCSV) {
                                                      alias->getName());
 
     loadCSV->setAliasDecl(decl);
+
+    _exprAnalyzer->registerCSVSource(decl, loadCSV);
 }
 
 void ReadStmtAnalyzer::analyze(const FunctionInvocation& func, const YieldClause* yield) {
     bioassert(func.getSignature(), "Analyzed a yield function that has no signature");
 
-    FunctionSignature* signature = func.getSignature();
+    const FunctionSignature* signature = func.getSignature();
     YieldItems* yieldItems = yield->getItems();
 
     // Step 2. Create the decls for the yield items
@@ -218,18 +274,25 @@ void ReadStmtAnalyzer::analyze(const FunctionInvocation& func, const YieldClause
     }
 
     // Step 4. Analyze WHERE clause on YIELD items
-    WhereClause* where = yieldItems->getWhereClause();
-    if (where) {
-        Expr* whereExpr = where->getExpr();
-        _exprAnalyzer->analyzeRootExpr(whereExpr);
+    analyzeYieldFilter(yieldItems);
+}
 
-        if (whereExpr->isAggregate()) {
-            throwError("Invalid use of aggregate expression in this context", yield);
-        }
+void ReadStmtAnalyzer::analyzeYieldFilter(const YieldItems* yieldItems) {
+    const WhereClause* where = yieldItems->getWhereClause();
+    if (!where) {
+        return;
+    }
 
-        if (whereExpr->getType() != EvaluatedType::Bool) {
-            throwError("WHERE expression must be a boolean", yield);
-        }
+    Expr* whereExpr = where->getExpr();
+    _exprAnalyzer->analyzeRootExpr(whereExpr);
+
+    if (whereExpr->isAggregate()) {
+        throwError("Invalid use of aggregate expression in this context", where);
+    }
+
+    const EvaluatedType whereType = whereExpr->getType();
+    if (!namesATruthValue(whereType)) {
+        throwError("WHERE expression must be a boolean", where);
     }
 }
 
@@ -279,7 +342,7 @@ void ReadStmtAnalyzer::analyze(Limit* limit) {
 }
 
 void ReadStmtAnalyzer::analyze(const Pattern* pattern) {
-    for (const PatternElement* element : pattern->elements()) {
+    for (PatternElement* element : pattern->elements()) {
         analyze(element);
     }
 
@@ -291,13 +354,14 @@ void ReadStmtAnalyzer::analyze(const Pattern* pattern) {
             throwError("Invalid use of aggregate expression in this context", pattern);
         }
 
-        if (whereExpr->getType() != EvaluatedType::Bool) {
+        const EvaluatedType whereType = whereExpr->getType();
+        if (!namesATruthValue(whereType)) {
             throwError("WHERE expression must be a boolean", pattern);
         }
     }
 }
 
-void ReadStmtAnalyzer::analyze(const PatternElement* element) {
+void ReadStmtAnalyzer::analyze(PatternElement* element) {
     const auto& entities = element->getEntities();
 
     for (EntityPattern* entity : entities) {
@@ -309,15 +373,37 @@ void ReadStmtAnalyzer::analyze(const PatternElement* element) {
             throwError("Unsupported pattern entity type", entity);
         }
     }
+
+    analyzeNamedPath(element);
+}
+
+void ReadStmtAnalyzer::analyzeNamedPath(PatternElement* element) {
+    Symbol* symbol = element->getPathSymbol();
+    if (!symbol) {
+        return;
+    }
+
+    const std::string_view name = symbol->getName();
+
+    if (_ctxt->getDecl(name)) {
+        throwError(fmt::format("Variable '{}' is already bound: a named path takes a name of its own", name),
+                   element);
+    }
+
+    VarDecl* decl = _ctxt->getOrCreateNamedVariable(_ast, EvaluatedType::GraphPath, name);
+    element->setPathDecl(decl);
 }
 
 void ReadStmtAnalyzer::analyze(NodePattern* nodePattern) {
     VarDecl* decl = nullptr;
 
     if (Symbol* symbol = nodePattern->getSymbol()) {
-        decl = _ctxt->getOrCreateNamedVariable(_ast,
-                                               EvaluatedType::NodePattern,
-                                               symbol->getName());
+        decl = _ctxt->getOrCreateNodePatternVariable(_ast, symbol->getName());
+        if (decl->isQuantifiedPath()) {
+            throwError(fmt::format("Variable '{}' is already bound to the nodes a quantified pattern grouped", symbol->getName()),
+                       nodePattern);
+        }
+
         nodePattern->setDecl(decl);
     } else {
         decl = _ctxt->createUnnamedVariable(_ast, EvaluatedType::NodePattern);
@@ -327,18 +413,8 @@ void ReadStmtAnalyzer::analyze(NodePattern* nodePattern) {
     NodePatternData* data = NodePatternData::create(_ast);
     nodePattern->setData(data);
 
-    const auto& labels = nodePattern->labels();
-    if (labels && !labels->empty()) {
-        const LabelMap& labelMap = _graphMetadata.labels();
-
-        for (const Symbol* label : *labels) {
-            const std::optional<LabelID> labelID = labelMap.get(label->getName());
-            if (!labelID) {
-                throwError(fmt::format("Unknown label: {}", label->getName()), nodePattern);
-            }
-
-            data->addLabelConstraint(label->getName());
-        }
+    if (const LabelExpr* labelExpr = nodePattern->getLabelExpr()) {
+        data->addLabelExpr(labelExpr);
     }
 
     const MapLiteral* properties = nodePattern->getProperties();
@@ -353,11 +429,10 @@ void ReadStmtAnalyzer::analyze(NodePattern* nodePattern) {
             }
 
             const std::optional<PropertyType> propType = propTypeMap.get(propName->getName());
-            if (!propType) {
-                throwError(fmt::format("Unknown property: {}", propName->getName()), nodePattern);
-            }
 
-            if (!ExprAnalyzer::propTypeCompatible(propType->_valueType, expr->getType())) {
+            const bool incompatibleValue = propType
+                                           && !constraintTypeCompatible(propType->_valueType, expr->getType());
+            if (incompatibleValue) {
                 throwError(fmt::format("Cannot evaluate node property: types '{}' and '{}' are incompatible",
                                        ValueTypeName::value(propType->_valueType),
                                        EvaluatedTypeName::value(expr->getType())),
@@ -372,10 +447,13 @@ void ReadStmtAnalyzer::analyze(NodePattern* nodePattern) {
             fullName->addName(propName);
 
             PropertyExpr* propExpr = PropertyExpr::create(_ast, fullName);
+            propExpr->setEntityVarDecl(decl);
             BinaryExpr* predExpr = BinaryExpr::create(_ast, BinaryOperator::Equal, propExpr, expr);
             _exprAnalyzer->analyzeRootExpr(predExpr);
 
-            data->addExprConstraint(propName->getName(), propType->_valueType, predExpr);
+            const ValueType constraintType = propType ? propType->_valueType : ValueType::Invalid;
+
+            data->addExprConstraint(propName->getName(), constraintType, predExpr);
         }
     }
 }
@@ -387,6 +465,11 @@ void ReadStmtAnalyzer::analyze(EdgePattern* edgePattern) {
         decl = _ctxt->getOrCreateNamedVariable(_ast,
                                                EvaluatedType::EdgePattern,
                                                symbol->getName());
+        if (decl->isQuantifiedPath()) {
+            throwError(fmt::format("Variable '{}' is already bound to the relationships a quantified pattern grouped", symbol->getName()),
+                       edgePattern);
+        }
+
         edgePattern->setDecl(decl);
     } else {
         decl = _ctxt->createUnnamedVariable(_ast, EvaluatedType::EdgePattern);
@@ -396,90 +479,213 @@ void ReadStmtAnalyzer::analyze(EdgePattern* edgePattern) {
     EdgePatternData* data = EdgePatternData::create(_ast);
     edgePattern->setData(data);
 
-    const auto& types = edgePattern->types();
-    if (types && !types->empty()) {
-        const EdgeTypeMap& edgeTypeMap = _graphMetadata.edgeTypes();
-
-        for (const Symbol* edgeTypeSymbol : *types) {
-            const std::optional<EdgeTypeID> etID = edgeTypeMap.get(edgeTypeSymbol->getName());
-            if (!etID) {
-                throwError(fmt::format("Unknown edge type: {}",
-                                       edgeTypeSymbol->getName()),
-                           edgePattern);
-            }
-
-            data->addEdgeTypeConstraint(edgeTypeSymbol->getName());
-        }
+    if (const LabelExpr* typeExpr = edgePattern->getLabelExpr()) {
+        data->addEdgeTypeExpr(typeExpr);
     }
 
-    const MapLiteral* properties = edgePattern->getProperties();
-    if (properties) {
-        const PropertyTypeMap& propTypeMap = _graphMetadata.propTypes();
-
-        for (const auto& [propName, expr] : *properties) {
-            _exprAnalyzer->analyzeRootExpr(expr);
-
-            if (expr->isAggregate()) {
-                throwError("Invalid use of aggregate expression in this context", edgePattern);
-            }
-
-            const std::optional<PropertyType> propType = propTypeMap.get(propName->getName());
-            if (!propType) {
-                throwError(fmt::format("Unknown property: {}", propName->getName()), edgePattern);
-            }
-
-            if (!ExprAnalyzer::propTypeCompatible(propType->_valueType, expr->getType())) {
-                throwError(fmt::format("Cannot evaluate edge property: types '{}' and '{}' are incompatible",
-                                       ValueTypeName::value(propType->_valueType),
-                                       EvaluatedTypeName::value(expr->getType())),
-                           edgePattern);
-            }
-
-            // Create a dummy Expr that represents the predicate evaluation
-            Symbol* varSymbol = Symbol::create(_ast, decl->getName());
-            QualifiedName* fullName = QualifiedName::create(_ast);
-
-            fullName->addName(varSymbol);
-            fullName->addName(propName);
-
-            PropertyExpr* propExpr = PropertyExpr::create(_ast, fullName);
-            BinaryExpr* predExpr = BinaryExpr::create(_ast, BinaryOperator::Equal, propExpr, expr);
-            _exprAnalyzer->analyzeRootExpr(predExpr);
-
-            data->addExprConstraint(propName->getName(), propType->_valueType, predExpr);
-        }
-    }
-
-    // Validate QuantifiedPath
     const QuantifiedPath* qp = edgePattern->getQuantifiedPath();
-    if (qp) {
-        const int64_t lhs = qp->getLhs();
-        const int64_t rhs = qp->getRhs();
+    if (!qp) {
+        analyzeEdgeProperties(edgePattern, decl, data, nullptr);
+        return;
+    }
 
-        if (lhs < 0) {
-            throwError("Variable-length path minimum hops must be greater than or equal to 0",
-                       edgePattern);
-        }
+    const int64_t lhs = qp->getLhs();
+    const int64_t rhs = qp->getRhs();
 
-        if (rhs < 1) {
-            throwError("Variable-length path maximum hops must be greater than or equal to 1",
-                       edgePattern);
-        }
+    if (lhs < 0) {
+        throwError("Variable-length path minimum hops must be greater than or equal to 0",
+                   edgePattern);
+    }
 
-        if (!qp->isRhsUnbounded()) {
-            if (rhs < lhs) {
-                throwError("Variable-length path maximum hops must be "
-                           "greater than or equal to minimum hops",
-                           edgePattern);
-            }
-        }
+    if (rhs < 1) {
+        throwError("Variable-length path maximum hops must be greater than or equal to 1",
+                   edgePattern);
+    }
 
-        if (properties) {
-            throwError("Edge property filters are not supported with "
-                       "variable-length paths yet",
+    if (!qp->isRhsUnbounded()) {
+        if (rhs < lhs) {
+            throwError("Variable-length path maximum hops must be "
+                       "greater than or equal to minimum hops",
                        edgePattern);
         }
     }
+
+    decl->setIsQuantifiedPath(true);
+
+    analyzeHops(edgePattern);
+}
+
+void ReadStmtAnalyzer::analyzeEdgeProperties(EdgePattern* edgePattern,
+                                             VarDecl* decl,
+                                             EdgePatternData* data,
+                                             EdgePattern* walk) {
+    const MapLiteral* properties = edgePattern->getProperties();
+    if (!properties) {
+        return;
+    }
+
+    const PropertyTypeMap& propTypeMap = _graphMetadata.propTypes();
+
+    for (const auto& [propName, expr] : *properties) {
+        _exprAnalyzer->analyzeRootExpr(expr);
+
+        if (expr->isAggregate()) {
+            throwError("Invalid use of aggregate expression in this context", edgePattern);
+        }
+
+        const std::optional<PropertyType> propType = propTypeMap.get(propName->getName());
+
+        const bool incompatibleValue = propType
+                                       && !constraintTypeCompatible(propType->_valueType, expr->getType());
+        if (incompatibleValue) {
+            throwError(fmt::format("Cannot evaluate edge property: types '{}' and '{}' are incompatible",
+                                   ValueTypeName::value(propType->_valueType),
+                                   EvaluatedTypeName::value(expr->getType())),
+                       edgePattern);
+        }
+
+        // Create a dummy Expr that represents the predicate evaluation
+        Symbol* varSymbol = Symbol::create(_ast, decl->getName());
+        QualifiedName* fullName = QualifiedName::create(_ast);
+
+        fullName->addName(varSymbol);
+        fullName->addName(propName);
+
+        PropertyExpr* propExpr = PropertyExpr::create(_ast, fullName);
+        propExpr->setEntityVarDecl(decl);
+        BinaryExpr* predExpr = BinaryExpr::create(_ast, BinaryOperator::Equal, propExpr, expr);
+        _exprAnalyzer->analyzeRootExpr(predExpr);
+
+        const ValueType constraintType = propType ? propType->_valueType : ValueType::Invalid;
+
+        if (walk) {
+            walk->addHopPredicate(predExpr);
+        } else {
+            data->addExprConstraint(propName->getName(), constraintType, predExpr);
+        }
+    }
+}
+
+void ReadStmtAnalyzer::enterScope(DeclContext* scope) {
+    _ctxt = scope;
+    _exprAnalyzer->setDeclContext(scope);
+}
+
+void ReadStmtAnalyzer::analyzeHops(EdgePattern* walk) {
+    DeclContext* outer = _ctxt;
+    DeclContext* hopScope = DeclContext::create(_ast, outer);
+    hopScope->setReadsEnclosingScope(true);
+    enterScope(hopScope);
+
+    const size_t hopCount = walk->getHopCount();
+    std::vector<const WhereClause*> wheres;
+
+    for (size_t hopIndex = 0; hopIndex < hopCount; hopIndex++) {
+        EdgePattern* hop = walk->getHop(hopIndex);
+
+        VarDecl* hopDecl = nullptr;
+        if (const Symbol* symbol = hop->getSymbol()) {
+            hopDecl = hopScope->getOrCreateNamedVariable(_ast, EvaluatedType::EdgePattern, symbol->getName());
+        } else {
+            hopDecl = hopScope->createUnnamedVariable(_ast, EvaluatedType::EdgePattern);
+        }
+        hop->setHopDecl(hopDecl);
+
+        EdgePatternData* hopData = EdgePatternData::create(_ast);
+        hop->setData(hopData);
+
+        if (const LabelExpr* typeExpr = hop->getLabelExpr()) {
+            hopData->addEdgeTypeExpr(typeExpr);
+        }
+
+        wheres.push_back(hop->getWhere());
+    }
+
+    wheres.push_back(walk->getHopWhere());
+
+    std::vector<const VarDecl*>* const outerSink = _exprAnalyzer->getImportSink();
+
+    std::vector<const VarDecl*> imports;
+    _exprAnalyzer->setImportSink(&imports);
+
+    for (size_t position = 0; position <= hopCount; position++) {
+        if (NodePattern* node = walk->getHopNode(position)) {
+            analyze(node);
+            wheres.push_back(node->getWhere());
+        }
+    }
+
+    for (size_t hopIndex = 0; hopIndex < hopCount; hopIndex++) {
+        EdgePattern* hop = walk->getHop(hopIndex);
+        analyzeEdgeProperties(hop, hop->getHopDecl(), hop->getData(), walk);
+    }
+
+    for (const WhereClause* where : wheres) {
+        if (!where) {
+            continue;
+        }
+
+        Expr* predicate = where->getExpr();
+        _exprAnalyzer->analyzeRootExpr(predicate);
+
+        if (predicate->isAggregate()) {
+            throwError("Invalid use of aggregate expression in this context", walk);
+        }
+
+        const EvaluatedType predicateType = predicate->getType();
+        if (!namesATruthValue(predicateType)) {
+            throwError("WHERE expression must be a boolean", walk);
+        }
+
+        walk->addHopPredicate(predicate);
+    }
+
+    _exprAnalyzer->setImportSink(outerSink);
+
+    for (const VarDecl* decl : imports) {
+        walk->addHopImport(decl);
+    }
+
+    enterScope(outer);
+
+    for (size_t position = 0; position <= hopCount; position++) {
+        const NodePattern* node = walk->getHopNode(position);
+        throwIfGroupNameIsBound(outer, node ? node->getSymbol() : nullptr, walk);
+    }
+
+    for (size_t hopIndex = 0; hopIndex < hopCount; hopIndex++) {
+        const EdgePattern* hop = walk->getHop(hopIndex);
+        throwIfGroupNameIsBound(outer, hop->getSymbol(), walk);
+    }
+
+    for (size_t position = 0; position <= hopCount; position++) {
+        const NodePattern* node = walk->getHopNode(position);
+        const Symbol* symbol = node ? node->getSymbol() : nullptr;
+        walk->addHopNodeGroup(symbol ? declareGroupVariable(outer, EvaluatedType::NodePattern, symbol->getName()) : nullptr);
+    }
+
+    for (size_t hopIndex = 0; hopIndex < hopCount; hopIndex++) {
+        EdgePattern* hop = walk->getHop(hopIndex);
+        if (const Symbol* symbol = hop->getSymbol()) {
+            hop->setDecl(declareGroupVariable(outer, EvaluatedType::EdgePattern, symbol->getName()));
+        }
+    }
+}
+
+void ReadStmtAnalyzer::throwIfGroupNameIsBound(const DeclContext* outer, const Symbol* symbol, const EdgePattern* walk) const {
+    if (!symbol || !outer->getDecl(symbol->getName())) {
+        return;
+    }
+
+    throwError(fmt::format("Variable '{}' is already bound: a quantified pattern groups a name of its own", symbol->getName()),
+               walk);
+}
+
+VarDecl* ReadStmtAnalyzer::declareGroupVariable(DeclContext* outer, EvaluatedType type, std::string_view name) {
+    VarDecl* group = outer->getOrCreateNamedVariable(_ast, type, name);
+    group->setIsQuantifiedPath(true);
+
+    return group;
 }
 
 void ReadStmtAnalyzer::analyze(const VectorSearchStmt* stmt) {
@@ -490,9 +696,7 @@ void ReadStmtAnalyzer::analyze(const VectorSearchStmt* stmt) {
 
     // Validate vector has elements
     const EmbeddingLiteral* queryVector = stmt->getQueryVector();
-    const std::span<const float> query = queryVector->getValue();
-
-    if (!queryVector || query.empty()) {
+    if (!queryVector || queryVector->getValue().empty()) {
         throwError("VECTOR SEARCH query vector cannot be empty", stmt);
     }
 
@@ -509,16 +713,24 @@ void ReadStmtAnalyzer::analyze(const VectorSearchStmt* stmt) {
 
     for (SymbolExpr* yieldItemExpr : *yieldItems) {
         const Symbol* yieldItem = yieldItemExpr->getSymbol();
+
+        // The statement's own name for the value picks which of the two it is; the symbol's
+        // name is what the query calls it, which is the alias when the YIELD renamed it. So
+        // two searches in one query yield under names of their own rather than colliding.
+        const std::string_view yieldedValue = yieldItem->getOriginalName();
         const std::string_view yieldName = yieldItem->getName();
 
         EvaluatedType yieldType = EvaluatedType::Invalid;
-        if (yieldName == "ids") {
-            yieldType = EvaluatedType::Integer;
-        } else if (yieldName == "score") {
+        if (yieldedValue == "ids") {
+            // The engine reports each neighbour as the node the index holds it under, so a
+            // pattern can walk out of the yielded variable and an equality can compare a
+            // matched node to it.
+            yieldType = EvaluatedType::NodePattern;
+        } else if (yieldedValue == "score") {
             yieldType = EvaluatedType::Double;
         } else {
             throwError(fmt::format("VECTOR SEARCH only supports YIELD ids and score, got '{}'",
-                                   yieldName), stmt);
+                                   yieldedValue), stmt);
         }
 
         if (_ctxt->hasDecl(yieldName)) {
@@ -530,9 +742,11 @@ void ReadStmtAnalyzer::analyze(const VectorSearchStmt* stmt) {
         yieldItemExpr->setDecl(decl);
         yieldItemExpr->setExprVarDecl(decl);
     }
+
+    analyzeYieldFilter(yieldItems);
 }
 
-void ReadStmtAnalyzer::analyze(const ShortestPathStmt* spSt) {
+void ReadStmtAnalyzer::analyze(ShortestPathStmt* spSt) {
     const PropertyTypeMap& propTypeMap = _graphMetadata.propTypes();
     const std::string_view propName = spSt->getEdgeProperty()->getName();
 
@@ -541,82 +755,110 @@ void ReadStmtAnalyzer::analyze(const ShortestPathStmt* spSt) {
         throwError(fmt::format("Unknown property: {}", propName));
     }
 
+    const Symbol* source = spSt->getSource();
+    const Symbol* target = spSt->getTarget();
+    bioassert(source && target, "Null endpoints.");
+
+    spSt->setSourceDecl(resolveShortestPathEndpoint(source, spSt));
+    spSt->setTargetDecl(resolveShortestPathEndpoint(target, spSt));
+
     const Symbol* distVar = spSt->getDistVar();
     const Symbol* pathVar = spSt->getPathVar();
     bioassert(distVar && pathVar, "Null variables.");
 
+    const ValueType weightPropType = propType->_valueType;
+    const auto maybeEvalType = toEvaluatedType(weightPropType);
+    bioassert(maybeEvalType.has_value(), "Invalid value type.");
+    const EvaluatedType evalType = maybeEvalType.value();
+    const bool isNumeric = [evalType] -> bool {
+        const bool isInt = evalType == EvaluatedType::Integer;
+        const bool isDouble = evalType == EvaluatedType::Double;
+        return isInt or isDouble;
+    }();
+
+    if (!isNumeric) {
+        throwError("SHORTESTPATH may only use numeric edge properties as weights", spSt);
+    }
+
     const std::string_view distName = distVar->getName();
     const std::string_view pathName = pathVar->getName();
 
-    _ctxt->getOrCreateNamedVariable(_ast, EvaluatedType::Integer, distName);
-    _ctxt->getOrCreateNamedVariable(_ast, EvaluatedType::GraphPath, pathName);
+    VarDecl* distDecl = _ctxt->getOrCreateNamedVariable(_ast, evalType, distName);
+    VarDecl* pathDecl = _ctxt->getOrCreateNamedVariable(_ast, EvaluatedType::GraphPath, pathName);
+
+    spSt->setDistDecl(distDecl);
+    spSt->setPathDecl(pathDecl);
 }
 
-void ReadStmtAnalyzer::analyze(const UnwindStmt* unwind) {
-    const Expr* arg = unwind->arg();
+VarDecl* ReadStmtAnalyzer::resolveShortestPathEndpoint(const Symbol* endpoint, const ShortestPathStmt* spSt) const {
+    const std::string_view name = endpoint->getName();
+
+    VarDecl* decl = _ctxt->getDecl(name);
+    if (!decl) {
+        throwError(fmt::format("Variable '{}' not found", name), spSt);
+    }
+
+    const EvaluatedType type = decl->getType();
+    if (type != EvaluatedType::NodePattern) {
+        throwError(fmt::format("SHORTESTPATH endpoint '{}' must be a node, but is {} instead",
+                               name,
+                               EvaluatedTypeName::value(type)),
+                   spSt);
+    }
+
+    return decl;
+}
+
+void ReadStmtAnalyzer::analyze(UnwindStmt* unwind) {
+    Expr* arg = unwind->arg();
     bioassert(arg, "Invalid argument");
 
-    {
-        const Expr::Kind argKind = arg->getKind();
-        const bool isLiteral = argKind == Expr::Kind::LITERAL;
+    _exprAnalyzer->analyzeExpr(arg);
 
-        if (!isLiteral) {
-            throwError("Non-literal UNWIND expressions are not yet supported.", arg);
-        }
+    if (arg->isAggregate()) {
+        throwError("Invalid use of aggregate expression in this context", unwind);
     }
 
-    const auto* litArg = static_cast<const LiteralExpr*>(arg);
-
-    const Literal* lit = litArg->getLiteral();
-    bioassert(lit, "Invalid literal.");
-
-    const Literal::Kind litKind = lit->getKind();
-    const bool isList = litKind == Literal::Kind::LIST;
-
-    /// Non-lists can be unwound, it just turns the argument into a singleton list
-    if (!isList) {
-        // TODO: Implement
-        throwError("Non-list arguments to UNWIND are not yet supported", litArg);
-    }
-
-    const auto* list = static_cast<const ListLiteral*>(lit);
-    const ListLiteral::Items& items = list->items();
-    for (Expr* ele : items) {
-        _exprAnalyzer->analyzeExpr(ele);
-    }
-
-    EvaluatedType itemType = EvaluatedType::ListItem;
-    if (!items.empty()) {
-        // Check for homogeneity: update evaluated type if found
-        const auto differingType = [](const Expr* a, const Expr* b) {
-            return a->getType() != b->getType();
-        };
-
-        const auto typeIt = std::ranges::adjacent_find(items, differingType);
-        const bool homogeneous = typeIt == end(items);
-
-        if (homogeneous) {
-            // List is homogeneous and non empty: perform type restriction
-            const Expr* item = items.front();
-            const EvaluatedType homogeneity = item->getType();
-            // Could be a list of lists: there is no ValueType::List -> do not treat as
-            // homogeneous
-            const bool isValueType = convertibleToValueType(homogeneity);
-
-            const bool canBeHomogeneous = isValueType;
-
-            if (canBeHomogeneous) {
-                itemType = homogeneity;
-            }
-        }
-    }
+    throwOnNonListLiteral(arg);
 
     const Symbol* symbol = unwind->symbol();
     bioassert(symbol, "Invalid symbol.");
 
     const std::string_view symName = symbol->getName();
 
-    _ctxt->getOrCreateNamedVariable(_ast, itemType, symName);
+    // UNWIND names a new variable, so a name already in scope would put two of them under
+    // one name - the list's rows and whatever that name already holds
+    if (_ctxt->hasDecl(symName)) {
+        throwError(fmt::format("Variable '{}' is already declared", symName), unwind);
+    }
+
+    VarDecl* itemDecl = _ctxt->getOrCreateNamedVariable(_ast, unwoundItemType(arg), symName);
+    itemDecl->setIsUnwound(true);
+
+    unwind->setDecl(itemDecl);
+
+    // Unwinding a list of lists leaves a list, so the variable carries the shape it has
+    // left: what a second UNWIND of it reads to know its own elements.
+    itemDecl->setListShape(arg->getListShape().unwound());
+}
+
+void ReadStmtAnalyzer::throwOnNonListLiteral(const Expr* arg) const {
+    if (arg->getKind() != Expr::Kind::LITERAL) {
+        return;
+    }
+
+    const Literal::Kind literalKind = static_cast<const LiteralExpr*>(arg)->getLiteral()->getKind();
+    const bool unwindsAList = literalKind == Literal::Kind::LIST;
+
+    // Unwinding null yields no row rather than a type error, so it is the one literal
+    // that is no list and still passes
+    const bool unwindsNull = literalKind == Literal::Kind::NULL_LITERAL;
+
+    if (!unwindsAList && !unwindsNull) {
+        throwError(fmt::format("UNWIND requires a list, not '{}'",
+                               EvaluatedTypeName::value(arg->getType())),
+                   arg);
+    }
 }
 
 void ReadStmtAnalyzer::throwError(std::string_view msg, const void* obj) const {

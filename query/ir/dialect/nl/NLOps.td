@@ -7,6 +7,7 @@ include "mlir/IR/BuiltinAttributeInterfaces.td"
 
 include "NLDialect.td"
 include "NLTypes.td"
+include "NLSystemOps.td"
 
 /**
 * ScanNodes
@@ -42,7 +43,7 @@ def ScanNodesByLabel : NLOp<"scan_nodes_by_label", [Pure, InferTypeOpAdaptor]> {
     their shape, so - like nl.scan_nodes - the result is always
     !nl.iter<!nl.chunk<!storage.node_id>> and is inferred, not spelled out.
   }];
-  let arguments = (ins StrArrayAttr:$labels);
+  let arguments = (ins LabelRefArrayAttr:$labels);
   let results   = (outs NLIterator:$result);
   let assemblyFormat = "`(` $labels `)` attr-dict";
 }
@@ -70,6 +71,618 @@ def ConstScanNodes : NLOp<"const_scan_nodes", [Pure, InferTypeOpAdaptor]> {
 }
 
 /**
+* ScanNodesByPropertyValue
+*/
+def ScanNodesByPropertyValue : NLOp<"scan_nodes_by_property_value", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the nodes whose named property equals a literal";
+  let description = [{
+    Imperative counterpart of db.scan_nodes_by_property_value. Each step of an
+    enclosing nl.for fills one chunk of the node IDs whose `property` holds
+    exactly `value`, among the nodes carrying every label in `labels` when the
+    list is given:
+
+      %nodes = nl.scan_nodes_by_property_value("age", 32 : i64)
+      %people = nl.scan_nodes_by_property_value("age", 32 : i64, ["Person"])
+
+    `property`, `value` and `labels` are the same name, literal and label list
+    the db op carried; translation resolves the names against the schema and
+    coerces the literal to the stored type, the same way an nl.get_property_type
+    name is resolved by the property fetch that consumes it. A property or label
+    absent from the schema is carried by no node, so the loop yields no chunk.
+    Filtering by value narrows only the rows, never their shape, so - like
+    nl.scan_nodes - the result is always !nl.iter<!nl.chunk<!storage.node_id>>
+    and is inferred, not spelled out.
+  }];
+  let arguments = (ins StrAttr:$property, TypedAttrInterface:$value, OptionalAttr<LabelRefArrayAttr>:$labels);
+  let results   = (outs NLIterator:$result);
+  let hasVerifier = 1;
+  let assemblyFormat = "`(` $property `,` $value (`,` $labels^)? `)` attr-dict";
+}
+
+/**
+* UnwindConst
+*/
+// Pure: emitting a fixed list is deterministic; the per-element fan-out is in the nl.for.
+def UnwindConst : NLOp<"unwind_const", [Pure]> {
+  let summary = "Create a database iterator over a compile-time-known literal list";
+  let description = [{
+    Imperative counterpart of db.unwind_const. Each step of an enclosing nl.for fills
+    one chunk of the literal list's elements:
+
+      %rows = nl.unwind_const([1, 2, 3]) : !nl.iter<!nl.chunk<!storage.nullable<i64>>>
+      nl.for %x in %rows : !nl.iter<!nl.chunk<!storage.nullable<i64>>> {
+        nl.output(%x) : !nl.chunk<!storage.nullable<i64>>
+      }
+
+    `elements` is the same literal array db.unwind_const carried, each entry an
+    attribute keeping its own type. A homogeneous list yields a nullable value chunk of
+    that type - the shape a property fetch and the unwind_collect drain emit, so the
+    unwound column feeds the same consumers, even though such a literal is never null;
+    a heterogeneous or empty list yields a type-erased !storage.any chunk (a
+    tagged scalar per row), which is also what a list holding a null or a nested list
+    unwinds into. The single chunk element type depends on the elements, so -
+    unlike nl.scan_nodes, whose node-ID iterator is fixed and inferred - it is spelled
+    after the colon, as nl.collect's is. It opens the dataflow: no input, no carry.
+  }];
+
+  let arguments = (ins ArrayAttr:$elements);
+  let results   = (outs NLIterator:$result);
+  let assemblyFormat = "`(` $elements `)` attr-dict `:` qualified(type($result))";
+}
+
+/**
+* LoadCSV
+*/
+// Pure: reading a file is deterministic; the per-record fan-out is in the nl.for.
+def LoadCSV : NLOp<"load_csv", [Pure]> {
+  let summary = "Create a database iterator over the records of a CSV file";
+  let description = [{
+    Imperative counterpart of db.load_csv. Each step of an enclosing nl.for parses the
+    next chunk of records, filling one chunk per field the load produces:
+
+      %name, %age = nl.load_csv("people.csv", [0 : ui64, 1 : ui64])
+        : !nl.iter<!nl.chunk<!storage.string>, !nl.chunk<!storage.string>>
+
+    The path, the field list and the two flags are the ones db.load_csv carried,
+    forwarded as-is; the path is resolved against the data directory, and a header name
+    against the file's header line, when the loop first runs - the file is the one thing
+    a loop of this family reads outside the graph. Like nl.unwind_const it reads no
+    input chunk and carries nothing: it opens the dataflow.
+
+    Every field rides a string chunk viewing characters copied into the query's string
+    buffer - a record carries no type to read them as. The number of
+    chunks is the number of fields, so the iterator type is spelled after the colon
+    rather than inferred.
+  }];
+
+  let arguments = (ins StrAttr:$path,
+                       ArrayAttr:$fields,
+                       UnitAttr:$with_headers,
+                       UnitAttr:$skip_on_error);
+  let results   = (outs NLIterator:$result);
+  let assemblyFormat = [{
+    `(` $path `,` $fields `)` (`with_headers` $with_headers^)? (`skip_on_error` $skip_on_error^)?
+    attr-dict `:` qualified(type($result))
+  }];
+}
+
+/**
+* VectorSearch
+*/
+// Pure: reading the index is deterministic; the per-neighbour fan-out is in the nl.for.
+def VectorSearch : NLOp<"vector_search", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the nearest neighbours of a query vector";
+  let description = [{
+    Imperative counterpart of db.vector_search. Each step of an enclosing nl.for fills
+    one row of neighbour chunks - the nodes the index holds the vectors under, and the
+    distances the metric scored them at:
+
+      %n = nl.vector_search("vec1", 3, [1.000000e+00, 0.000000e+00])
+        : !nl.iter<!nl.chunk<!storage.node_id>, !nl.chunk<!storage.nullable<f64>>>
+
+    The parameters are the ones db.vector_search carried, forwarded as-is; the search
+    runs against the session's vector indexes, which is the one thing a loop of this
+    family reads outside the graph. Like nl.unwind_const it reads no input chunk and
+    carries nothing: it opens the dataflow. The neighbours ride the same node ID chunk a
+    scan binds, so a hop expands them unchanged; the distances ride a nullable value
+    chunk, the shape every value-chunk consumer dispatches on, even though a neighbour is
+    never null. Both element types are fixed, so the iterator type is inferred rather
+    than spelled.
+  }];
+
+  let arguments = (ins StrAttr:$index_name, UI64Attr:$k, DenseF32ArrayAttr:$query_vector);
+  let results   = (outs NLIterator:$result);
+  let assemblyFormat = "`(` $index_name `,` $k `,` $query_vector `)` attr-dict `:` qualified(type($result))";
+  let hasVerifier = 1;
+}
+
+/**
+* Unwind
+*/
+// Pure: expanding a chunk of values is deterministic; the per-element fan-out is in the nl.for.
+def Unwind : NLOp<"unwind", [Pure]> {
+  let summary = "Create a database iterator that expands a chunk of values, one row per element";
+  let description = [{
+    Imperative counterpart of db.unwind. Each step of an enclosing nl.for fills one
+    chunk of unwound elements plus one chunk per carried column, gathered so a carried
+    cell repeats once per row its source cell produced:
+
+      %rows = nl.unwind(%names, {%nodes})
+                : (!nl.chunk<!storage.list<!storage.string>>, !nl.chunk<!storage.node_id>)
+                -> !nl.iter<!nl.chunk<!storage.any>, !nl.chunk<!storage.node_id>>
+      nl.for %x, %n in %rows : !nl.iter<!nl.chunk<!storage.any>, !nl.chunk<!storage.node_id>> {
+        nl.output(%x, %n) : !nl.chunk<!storage.any>, !nl.chunk<!storage.node_id>
+      }
+
+    A list cell contributes one row per element, a null cell none, and any other cell
+    the single row it is - a tagged scalar included, so a !storage.any cell that is
+    itself a list unwinds one level deeper. Unlike nl.unwind_const it reads an input
+    chunk, so it nests in the loop that binds it, the way nl.get_out_edges nests in the
+    loop binding its nodes. The element chunk type follows the source's - a list unwinds
+    into the type-erased !storage.any chunk, a scalar column into its own - and, like
+    nl.collect's, is spelled out rather than inferred.
+  }];
+
+  // `columns_to_filter`: the variadic carry set, after the fixed source, mirroring
+  // nl.get_out_edges.
+  let arguments = (ins NLChunk:$source, Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLIterator:$result);
+
+  // The source chunk's element type decides the element chunk's, and the carried types
+  // vary from call to call, so operands and result print as a function type - as
+  // nl.broadcast_constant's do - rather than the result alone.
+  let assemblyFormat = [{
+    `(` $source `,` `{` $columns_to_filter `}` `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* UnwindRange
+*/
+// Pure: counting out a row's integers is deterministic; the per-integer fan-out is in the nl.for.
+def UnwindRange : NLOp<"unwind_range", [Pure, AttrSizedOperandSegments]> {
+  let summary = "Create a database iterator that counts out the integers each row's bounds span";
+  let description = [{
+    Imperative counterpart of db.unwind_range. Each step of an enclosing nl.for fills one
+    chunk of the next integers plus one chunk per carried column, gathered so a carried
+    cell repeats once per integer its row's bounds span:
+
+      %rows = nl.unwind_range(%from, %to, %by, {%nodes})
+                : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<!storage.nullable<i64>>,
+                   !nl.chunk<!storage.nullable<i64>>, !nl.chunk<!storage.node_id>)
+                -> !nl.iter<!nl.chunk<!storage.nullable<i64>>, !nl.chunk<!storage.node_id>>
+
+    Every bound carries rows - lowering lays a constant one out over them first - and is
+    read as a nullable value chunk. The integers are computed as the chunk is filled, so
+    the iterator holds one chunk of them however many a row spans. `from`, `to` and
+    `reversed` are db.unwind_range's, and the slice bounds are read as its range bounds are.
+  }];
+
+  let arguments = (ins NLChunk:$start,
+                       NLChunk:$end,
+                       NLChunk:$step,
+                       Optional<NLChunk>:$from,
+                       Optional<NLChunk>:$to,
+                       Variadic<NLChunk>:$columns_to_filter,
+                       UnitAttr:$reversed);
+  let results   = (outs NLIterator:$result);
+
+  let assemblyFormat = [{
+    `(` $start `,` $end `,` $step (`,` `from` $from^)? (`,` `to` $to^)? `,` `{` $columns_to_filter `}` `)`
+    (`reversed` $reversed^)? attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* UnwindComputed
+*/
+def UnwindComputed : NLOp<"unwind_computed", [Pure]> {
+  let summary = "Create a database iterator that computes its source over a few input rows at a time and unwinds it";
+  let description = [{
+    Imperative counterpart of db.unwind_computed. The region's arguments are the carried
+    chunks cut to a run of input rows, and its yield the source cells of that run. Each
+    step of an enclosing nl.for fills one chunk of elements, as nl.unwind does, plus one
+    chunk per carried column gathered from the whole input; once a run's cells are spent
+    the region runs again over the next, sized so it holds about one chunk of elements:
+
+      %rows = nl.unwind_computed({%names}) ({
+        ^bb0(%namesIn: !nl.chunk<!storage.nullable<!storage.string>>):
+          %parts = nl.split %namesIn, %comma : ...
+          nl.unwind_yield %parts : !nl.chunk<!storage.nullable<!storage.list<!storage.string>>>
+      }) : (!nl.chunk<!storage.nullable<!storage.string>>)
+         -> !nl.iter<!nl.chunk<!storage.nullable<!storage.string>>,
+                     !nl.chunk<!storage.nullable<!storage.string>>>
+  }];
+
+  let arguments = (ins Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLIterator:$result);
+
+  // Exactly one block, ending in an nl.unwind_yield.
+  let regions = (region SizedRegion<1>:$source);
+
+  let assemblyFormat = [{
+    `(` `{` $columns_to_filter `}` `)` $source attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* UnwindYield
+*/
+def UnwindYield : NLOp<"unwind_yield", [Pure, Terminator, HasParent<"UnwindComputed">]> {
+  let summary = "Name the source cells an nl.unwind_computed's region computes for a run of rows";
+
+  let arguments = (ins NLChunk:$source);
+
+  let assemblyFormat = [{
+    $source attr-dict `:` qualified(type($source))
+  }];
+}
+
+/**
+* FetchNodes
+*/
+def FetchNodes : NLOp<"fetch_nodes", [Pure]> {
+  let summary = "Keep the rows whose ID cell names a node, with that node, as freshly cut chunks";
+  let description = [{
+    Imperative counterpart of db.fetch_nodes. Each step reads the chunk of ID cells, keeps
+    the rows naming a node a scan would produce, and cuts the carry set to them:
+
+      %a, %i2 = nl.fetch_nodes(%ids, {%i})
+                  : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<!storage.nullable<i64>>)
+                  -> (!nl.chunk<!storage.node_id>, !nl.chunk<!storage.nullable<i64>>)
+  }];
+
+  let arguments = (ins NLChunk:$ids, Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLChunk:$nodes, Variadic<NLChunk>:$carried);
+
+  let assemblyFormat = [{
+    `(` $ids `,` `{` $columns_to_filter `}` `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* MakeList
+*/
+def MakeList : NLOp<"make_list", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise build of one list per row out of every element chunk";
+  let description = [{
+    Imperative counterpart of db.make_list. Row r of the result is the list of row r of
+    each operand, in operand order, written into the query's list buffer as one
+    contiguous run:
+
+      %xs = nl.make_list(%n, %m)
+              : (!nl.chunk<!storage.node_id>, !nl.chunk<!storage.node_id>)
+              -> !nl.chunk<!storage.list<!storage.node_id>>
+
+    Every operand carries rows - lowering lays a constant one out over them first - so
+    the cells are read at the same row index and the chunk is as long as they are. The
+    element type is the list of the type the operands share, or of type-erased tagged
+    scalars where they disagree, and is spelled out rather than inferred, as nl.unwind's
+    is.
+  }];
+
+  let arguments = (ins Variadic<NLChunk>:$elements);
+  let results   = (outs NLChunk:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "`(` $elements `)` attr-dict `:` functional-type(operands, results)";
+}
+
+/**
+* MakeMap
+*/
+def MakeMap : NLOp<"make_map", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise build of one map per row out of every value chunk";
+  let description = [{
+    Imperative counterpart of db.make_map. Row r of the result is the map whose key i
+    holds row r of operand i, written into the query's map buffer as one contiguous run:
+
+      %m = nl.make_map(%age, %name) keys ["age", "name"]
+             : !nl.chunk<!storage.nullable<i64>>, !nl.chunk<!storage.nullable<!storage.string>>
+
+    Every operand carries rows - lowering lays a constant one out over them first.
+  }];
+
+  let arguments = (ins Variadic<NLChunk>:$values, StrArrayAttr:$keys);
+  let results   = (outs NLMapChunk:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "`(` $values `)` `keys` $keys attr-dict `:` type($values)";
+}
+
+/**
+* StaticMapKey
+*/
+def StaticMapKey : NLOp<"static_map_key", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise read of one value of a map chunk, by a key fixed at plan time";
+  let description = [{
+    Imperative counterpart of db.static_map_key. Row r of the result views the entry row r's map
+    already holds, so the read copies nothing:
+
+      %v = nl.static_map_key %m key "name"
+             : (!nl.chunk<!storage.nullable<!storage.map>>) -> !nl.chunk<!storage.map_element>
+
+    The operand is nullable where a stored property fetched it and plain where a literal
+    built it, so both spellings are accepted. It is a chunk of tagged cells where the map
+    was itself read out of a list or a map. A cell holding a node or an edge reads that
+    entity's property, written into the step's map buffer as an entry of its own, and a
+    cell holding anything else answers like a row holding none. The result never is a
+    tagged cell: a map value carries its null in its own tag, so a
+    missing key and an absent map both read back as a Null-tagged entry rather than as an
+    absent optional.
+  }];
+
+  let arguments = (ins NLChunk:$map, StrAttr:$key);
+  let results   = (outs NLMapElementChunk:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$map `key` $key attr-dict `:` functional-type(operands, results)";
+}
+
+def MapEntryValue : NLOp<"map_entry_value", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise read of the value each map entry holds, as a tagged cell";
+  let description = [{
+    A value read out of a map rides the entry it views in the map buffer. Where it meets an
+    op reading the tagged cells every value of type any rides - a CASE, a list, an
+    aggregate, NOT or a minus - its value is copied into a cell of its own:
+
+      %c = nl.map_entry_value %v : (!nl.chunk<!storage.map_element>) -> !nl.chunk<!storage.any>
+
+    A Null-tagged entry answers a Null-tagged cell.
+  }];
+
+  let arguments = (ins NLMapElementChunk:$entries);
+  let results   = (outs NLChunk:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$entries attr-dict `:` functional-type(operands, results)";
+}
+
+/**
+* Range
+*/
+def Range : NLOp<"range", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise build of the list of integers each row's bounds span";
+
+  let description = [{
+    Imperative counterpart of db.range. Row r of the result is the list counting from row
+    r of `start` to row r of `end`, both included, by row r of `step`, written into the
+    query's list buffer as one contiguous run:
+
+      %xs = nl.range %from, %to
+              : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<!storage.nullable<i64>>)
+              -> !nl.chunk<!storage.nullable<!storage.list<i64>>>
+
+    Every bound carries rows - lowering lays a constant one out over them first - and is
+    read as a nullable value chunk, so a row whose bound is absent gets no list. The step
+    is absent where the query gave none, which counts by 1; a step of 0 is the error the
+    row raises, as is a row spanning more than 100000 integers.
+  }];
+
+  // The step is the only variable-length operand, so MLIR tells it apart from the bounds
+  // without operand-segment sizes, as nl.broadcast_constant's cardinality is.
+  let arguments = (ins NLChunk:$start, NLChunk:$end, Optional<NLChunk>:$step);
+  let results   = (outs NLChunk:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$start `,` $end (`,` $step^)? attr-dict `:` functional-type(operands, results)";
+}
+
+/**
+* ListSlice
+*/
+def ListSlice : NLOp<"list_slice", [Pure, RowAlignedThroughOperands, AttrSizedOperandSegments]> {
+  let summary = "Row-wise read of the run of a list its bounds span";
+
+  let description = [{
+    Imperative counterpart of db.list_slice. Row r of the result views the elements of row
+    r's list from the lower bound up to but not including the upper one, which needs no
+    copy: a list is a run of elements, and a slice of it is a shorter run of the same ones.
+
+      %run = nl.list_slice %xs, from %a, to %b
+               : (!nl.chunk<!storage.nullable<!storage.list<i64>>>,
+                  !nl.chunk<!storage.nullable<i64>>,
+                  !nl.chunk<!storage.nullable<i64>>)
+               -> !nl.chunk<!storage.nullable<!storage.list<i64>>>
+
+    Each bound carries rows - lowering lays a constant one out over them first - and is
+    read as a nullable value chunk. A bound the query left out is no operand at all, which
+    runs from the start or to the end.
+  }];
+
+  let arguments = (ins NLChunk:$list, Optional<NLChunk>:$from, Optional<NLChunk>:$to);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = [{
+    $list (`,` `from` $from^)? (`,` `to` $to^)? attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* PercentileCont / PercentileDisc
+*/
+// Imperative counterparts of db.percentile_cont and db.percentile_disc. Row r of the
+// result is the percentile row r's percentile names of the numbers row r's list holds,
+// null where the list holds none. The percentile carries rows - lowering lays a constant
+// one out over them first - and is read as a nullable value chunk.
+//
+//   %m = nl.percentile_cont %values, %p
+//          : (!nl.chunk<!storage.list<i64>>, !nl.chunk<!storage.nullable<f64>>)
+//          -> !nl.chunk<!storage.nullable<f64>>
+class NLPercentileOp<string mnemonic> : NLOp<mnemonic, [NoMemoryEffect, RowAlignedThroughOperands]> {
+  let summary = "Row-wise read of a percentile of the numbers a list holds";
+
+  let arguments = (ins NLChunk:$list, NLChunk:$percentile);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$list `,` $percentile attr-dict `:` functional-type(operands, results)";
+}
+
+def PercentileCont : NLPercentileOp<"percentile_cont">;
+def PercentileDisc : NLPercentileOp<"percentile_disc">;
+
+/**
+* ListComprehension
+*/
+def ListComprehension : NLOp<"list_comprehension", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise build of one list per row out of the elements of that row's list";
+
+  let description = [{
+    Imperative counterpart of db.list_comprehension. Row r of the result is the list of
+    what the body yields for the elements of row r that its predicate keeps:
+
+      %ts = nl.list_comprehension(%tags, {%n}) ({
+        ^bb0(%x: !nl.chunk<!storage.nullable<!storage.string>>,
+             %tag: !nl.chunk<ui64>,
+             %nIn: !nl.chunk<!storage.node_id>):
+          %keep = nl.neq %x, %c : ...
+          %xk, %tagk, %nk = nl.filter %keep, (%x, %tag, %nIn) : ...
+          nl.comprehension_yield %tagk, %xk : !nl.chunk<!storage.nullable<!storage.string>>
+      }) : (!nl.chunk<!storage.nullable<!storage.list<!storage.string>>>,
+            !nl.chunk<!storage.node_id>)
+        -> !nl.chunk<!storage.nullable<!storage.list<!storage.string>>>
+
+    A chunk of the elements does not measure the step the source chunk does, so the body
+    runs over chunks of its own: the op walks every (row, element) pair of the source
+    chunk in row order, fills the element chunk, the row tag holding the row each element
+    came from and each carried chunk gathered by that row - the cursor of nl.unwind - and
+    runs the body once per chunkful. The body hands back the tag as it left it, so the
+    elements a WHERE cut are gone from it, and each value goes to the list of the row its
+    tag names. The elements of one row arrive in order and in one run, so a row's list is
+    complete as soon as the run past it starts.
+
+    The result is nullable: a row whose source cell holds no list gets no list, which is
+    how `[x IN null | x]` reads, and a row whose elements were all cut gets the empty list.
+  }];
+
+  let arguments = (ins NLChunk:$source, Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLChunk:$result);
+
+  // Exactly one block, ending in an nl.comprehension_yield.
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $source `,` `{` $columns_to_filter `}` `)` $body attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* ListPredicate
+*/
+def ListPredicate : NLOp<"list_predicate", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise decision of whether a predicate holds for the elements of that row's list";
+
+  let description = [{
+    Imperative counterpart of db.list_predicate. Row r of the result is whether the
+    predicate the body yields holds for as many elements of row r as the kind asks:
+
+      %ok = nl.list_predicate(%tags, {%n}) kind all ({
+        ^bb0(%x: !nl.chunk<!storage.nullable<!storage.string>>,
+             %tag: !nl.chunk<ui64>,
+             %nIn: !nl.chunk<!storage.node_id>):
+          %p = nl.neq %x, %c : ...
+          nl.comprehension_yield %tag, %p : !nl.chunk<!storage.nullable<!storage.bool>>
+      }) : (!nl.chunk<!storage.nullable<!storage.list<!storage.string>>>,
+            !nl.chunk<!storage.node_id>)
+        -> !nl.chunk<!storage.nullable<!storage.bool>>
+
+    The body runs over chunks of the (row, element) pairs exactly as nl.list_comprehension's
+    does, and hands back the row tag and the predicate's value for each element. The
+    result is nullable: a row whose source cell holds no list gets a null, and so does a
+    row whose elements leave the answer unknown - a null predicate counts as neither
+    holding nor failing.
+  }];
+
+  let arguments = (ins NLChunk:$source, Variadic<NLChunk>:$columns_to_filter, ListPredicateKind:$kind);
+  let results   = (outs NLChunk:$result);
+
+  // Exactly one block, ending in an nl.comprehension_yield.
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $source `,` `{` $columns_to_filter `}` `)` `kind` $kind $body attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* Reduce
+*/
+def Reduce : NLOp<"reduce", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise fold of the elements of each row's list into one value per row";
+
+  let description = [{
+    Imperative counterpart of db.reduce. Row r of the result is the initial value of row
+    r, replaced by what the body yields for it and each element of row r's list in turn:
+
+      %sum = nl.reduce(%xs, %zero, {%n}) ({
+        ^bb0(%x: !nl.chunk<!storage.nullable<i64>>,
+             %acc: !nl.chunk<!storage.nullable<i64>>,
+             %nIn: !nl.chunk<!storage.node_id>):
+          %next = nl.add %acc, %x : ...
+          nl.reduce_yield %next : !nl.chunk<!storage.nullable<i64>>
+      }) : (!nl.chunk<!storage.nullable<!storage.list<i64>>>,
+            !nl.chunk<i64>,
+            !nl.chunk<!storage.node_id>)
+        -> !nl.chunk<!storage.nullable<i64>>
+
+    Each element depends on the accumulator the previous one left, so the body runs once
+    per element position rather than once per chunk of elements: run k holds element k of
+    every row whose list is longer than k, beside that row's accumulator and carried
+    chunks. The accumulator chunk has the result's type; the initial value and the body's
+    value are written into it, so either may be the narrower type it holds - a plain
+    value where it is nullable, a list of any element type where it holds lists of tagged
+    cells, any value where it holds tagged cells.
+  }];
+
+  let arguments = (ins NLChunk:$source, NLChunk:$initial_value, Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLChunk:$result);
+
+  // Exactly one block, ending in an nl.reduce_yield.
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $source `,` $initial_value `,` `{` $columns_to_filter `}` `)` $body attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* ReduceYield
+*/
+def ReduceYield : NLOp<"reduce_yield", [Pure, Terminator, HasParent<"Reduce">]> {
+  let summary = "Name the accumulator an nl.reduce's body computed for each element";
+
+  let arguments = (ins NLChunk:$value);
+
+  let assemblyFormat = [{
+    $value attr-dict `:` qualified(type($value))
+  }];
+}
+
+/**
+* ComprehensionYield
+*/
+def ComprehensionYield : NLOp<"comprehension_yield",
+                              [Pure, Terminator, ParentOneOf<["ListComprehension", "ListPredicate"]>]> {
+  let summary = "Name the row each element of an nl.list_comprehension or nl.list_predicate came from and what it contributes";
+
+  let arguments = (ins NLUInt64Chunk:$row_tags, NLChunk:$value);
+
+  // The tag's type is buildable and so left out; only the value's is spelled.
+  let assemblyFormat = [{
+    $row_tags `,` $value attr-dict `:` qualified(type($value))
+  }];
+}
+
+/**
 * ScanEdges
 */
 def ScanEdges : NLOp<"scan_edges", [Pure, InferTypeOpAdaptor]> {
@@ -85,6 +698,176 @@ def ScanEdges : NLOp<"scan_edges", [Pure, InferTypeOpAdaptor]> {
   }];
   let results   = (outs NLIterator:$result);
   let assemblyFormat = "`(`operands`)` attr-dict";
+}
+
+/**
+* ScanEdgesByType
+*/
+def ScanEdgesByType : NLOp<"scan_edges_by_type", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over all edges of the given types in the graph";
+  let description = [{
+    Imperative counterpart of db.scan_edges_by_type. Each step of an enclosing
+    nl.for fills the same four chunks nl.scan_edges fills - source node IDs, edge
+    IDs, edge type IDs and target node IDs - but only for the edges carrying one of
+    `edge_types`:
+
+      %knows = nl.get_edge_type_set(["KNOWS"])
+      %edges = nl.scan_edges_by_type(%knows)
+
+    `edge_types` is an !nl.edge_type_set handle produced by nl.get_edge_type_set,
+    not names on the op, exactly as on nl.get_out_edges_by_type: they are resolved
+    once above the loops. Narrowing by type changes only the rows, never their
+    shape, so the result is the same four-chunk edge iterator nl.scan_edges
+    produces and is inferred, not spelled out.
+  }];
+  let arguments = (ins NLEdgeTypeHandle:$edge_types);
+  let results   = (outs NLIterator:$result);
+  let assemblyFormat = "`(` $edge_types `)` attr-dict";
+}
+
+/**
+* ScanOutEdgesByLabelSrc
+*/
+def ScanOutEdgesByLabelSrc : NLOp<"scan_out_edges_by_label_src", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the out-edges of the nodes carrying every given label";
+  let description = [{
+    Imperative counterpart of db.scan_out_edges_by_label_src. Each step of an
+    enclosing nl.for fills the same four chunks nl.scan_edges fills - source node
+    IDs, edge IDs, edge type IDs and target node IDs - but only for the edges
+    leaving a node whose label set is a superset of `labels`:
+
+      %edges = nl.scan_out_edges_by_label_src(["Person"])
+
+    `labels` is the same list of label names db.scan_out_edges_by_label_src
+    carried; translation resolves each name to a storage LabelID, exactly as an
+    nl.scan_nodes_by_label name is resolved. A label absent from the schema leaves
+    the conjunction unsatisfiable, so the loop yields no chunk. Narrowing by the
+    source label changes only the rows, never their shape, so the result is the
+    same four-chunk edge iterator nl.scan_edges produces and is inferred, not
+    spelled out.
+  }];
+  let arguments = (ins LabelRefArrayAttr:$labels);
+  let results   = (outs NLIterator:$result);
+  let assemblyFormat = "`(` $labels `)` attr-dict";
+}
+
+/**
+* ScanInEdgesByLabelTgt
+*/
+def ScanInEdgesByLabelTgt : NLOp<"scan_in_edges_by_label_tgt", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the in-edges of the nodes carrying every given label";
+  let description = [{
+    Imperative counterpart of db.scan_in_edges_by_label_tgt, and the
+    reverse-direction sibling of nl.scan_out_edges_by_label_src: each step of an
+    enclosing nl.for fills the same four chunks nl.scan_edges fills, but only for
+    the edges arriving at a node whose label set is a superset of `labels`:
+
+      %edges = nl.scan_in_edges_by_label_tgt(["Person"])
+
+    The labels constrain the edge's target, so that is the end `tgtids` holds and the
+    unconstrained source is what `srcids` holds - the chunks carry the edge as the
+    graph stores it, as they do under nl.get_in_edges. `labels` is resolved the way an
+    nl.scan_nodes_by_label name is, and a label absent from the schema leaves the
+    conjunction unsatisfiable, so the loop yields no chunk. The result is the same
+    four-chunk edge iterator nl.scan_edges produces and is inferred, not spelled out.
+  }];
+  let arguments = (ins LabelRefArrayAttr:$labels);
+  let results   = (outs NLIterator:$result);
+  let assemblyFormat = "`(` $labels `)` attr-dict";
+}
+
+/**
+* ScanOutEdgesByLabelTgt
+*/
+def ScanOutEdgesByLabelTgt : NLOp<"scan_out_edges_by_label_tgt", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the out-edges arriving at the nodes carrying every given label";
+  let description = [{
+    Imperative counterpart of db.scan_out_edges_by_label_tgt. Each step of an
+    enclosing nl.for fills the same four chunks nl.scan_edges fills, but only for the
+    edges arriving at a node whose label set is a superset of `labels`:
+
+      %edges = nl.scan_out_edges_by_label_tgt(["Person"])
+
+    The labels constrain the edge's target, so `tgtids` holds the labelled end and
+    `srcids` the unconstrained one. `labels` is resolved the way an
+    nl.scan_nodes_by_label name is, and a label absent from the schema leaves the
+    conjunction unsatisfiable, so the loop yields no chunk. The result is the same
+    four-chunk edge iterator nl.scan_edges produces and is inferred, not spelled out.
+  }];
+  let arguments = (ins LabelRefArrayAttr:$labels);
+  let results   = (outs NLIterator:$result);
+  let assemblyFormat = "`(` $labels `)` attr-dict";
+}
+
+/**
+* ScanInEdgesByLabelSrc
+*/
+def ScanInEdgesByLabelSrc : NLOp<"scan_in_edges_by_label_src", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the in-edges leaving the nodes carrying every given label";
+  let description = [{
+    Imperative counterpart of db.scan_in_edges_by_label_src. Each step of an enclosing
+    nl.for fills the same four chunks nl.scan_edges fills, but only for the edges
+    leaving a node whose label set is a superset of `labels`:
+
+      %edges = nl.scan_in_edges_by_label_src(["Person"])
+
+    The labels constrain the edge's source, so `srcids` holds the labelled end and
+    `tgtids` the unconstrained one. `labels` is resolved the way an
+    nl.scan_nodes_by_label name is, and a label absent from the schema leaves the
+    conjunction unsatisfiable, so the loop yields no chunk. The result is the same
+    four-chunk edge iterator nl.scan_edges produces and is inferred, not spelled out.
+  }];
+  let arguments = (ins LabelRefArrayAttr:$labels);
+  let results   = (outs NLIterator:$result);
+  let assemblyFormat = "`(` $labels `)` attr-dict";
+}
+
+/**
+* ScanOutEdgesByLabelSrcTgt
+*/
+def ScanOutEdgesByLabelSrcTgt : NLOp<"scan_out_edges_by_label_src_tgt", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the edges whose two ends carry their labels, read off the source's index";
+  let description = [{
+    Imperative counterpart of db.scan_out_edges_by_label_src_tgt. Each step of an
+    enclosing nl.for fills the same four chunks nl.scan_edges fills, but only for the
+    edges whose source's label set is a superset of `src_labels` and whose target's is
+    a superset of `tgt_labels`:
+
+      %edges = nl.scan_out_edges_by_label_src_tgt(["Person"], ["Interest"])
+
+    It walks the index keyed by the source's label set, as
+    nl.scan_out_edges_by_label_src does, and keeps each edge whose target carries
+    `tgt_labels`. Both lists are resolved the way an nl.scan_nodes_by_label name is,
+    and a label absent from the schema in either leaves the scan unsatisfiable, so the
+    loop yields no chunk. The result is the same four-chunk edge iterator
+    nl.scan_edges produces and is inferred, not spelled out.
+  }];
+  let arguments = (ins LabelRefArrayAttr:$src_labels, LabelRefArrayAttr:$tgt_labels);
+  let results   = (outs NLIterator:$result);
+  let assemblyFormat = "`(` $src_labels `,` $tgt_labels `)` attr-dict";
+}
+
+/**
+* ScanInEdgesByLabelSrcTgt
+*/
+def ScanInEdgesByLabelSrcTgt : NLOp<"scan_in_edges_by_label_src_tgt", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the edges whose two ends carry their labels, read off the target's index";
+  let description = [{
+    Imperative counterpart of db.scan_in_edges_by_label_src_tgt: the rows of
+    nl.scan_out_edges_by_label_src_tgt, read off the index keyed by the target's label
+    set, as nl.scan_in_edges_by_label_tgt reads them, keeping each edge whose source
+    carries `src_labels`:
+
+      %edges = nl.scan_in_edges_by_label_src_tgt(["Interest"], ["Person"])
+
+    The chunks carry the edge as the graph stores it, so `srcids` holds the source and
+    `tgtids` the target, as under nl.get_in_edges. Both lists are resolved the way an
+    nl.scan_nodes_by_label name is, and a label absent from the schema in either leaves
+    the scan unsatisfiable, so the loop yields no chunk.
+  }];
+  let arguments = (ins LabelRefArrayAttr:$src_labels, LabelRefArrayAttr:$tgt_labels);
+  let results   = (outs NLIterator:$result);
+  let assemblyFormat = "`(` $src_labels `,` $tgt_labels `)` attr-dict";
 }
 
 /**
@@ -157,38 +940,50 @@ def GetInEdges : NLOp<"get_in_edges", [Pure, InferTypeOpAdaptor]> {
   }];
 }
 
+def GetEdges : NLOp<"get_edges", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the edges of a chunk of nodes";
+
+  let arguments = (ins NLNodeIDChunk:$input_nodes, Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLIterator:$result);
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` `{` $columns_to_filter `}` `)` attr-dict
+    ( `:` qualified(type($columns_to_filter))^ )?
+  }];
+}
+
 /**
 * GetOutEdgesByType
 */
 def GetOutEdgesByType : NLOp<"get_out_edges_by_type", [Pure, InferTypeOpAdaptor]> {
-  let summary = "Create a database iterator over the out-edges of one edge type of a chunk of nodes";
+  let summary = "Create a database iterator over the out-edges of the given types of a chunk of nodes";
   let description = [{
     Imperative counterpart of db.get_out_edges_by_type. It fills the same row of
     chunks as nl.get_out_edges - source node IDs, edge IDs, edge type IDs and
     target node IDs, then one filtered chunk per carried column - but keeps only
-    the out-edges whose type is `edge_type`:
+    the out-edges carrying one of `edge_types`:
 
-      %knows = nl.get_edge_type("KNOWS")
-      %likes = nl.get_edge_type("LIKES")
+      %knows = nl.get_edge_type_set(["KNOWS"])
+      %likes = nl.get_edge_type_set(["LIKES", "LOVES"])
       %edges = nl.get_out_edges_by_type(%a, %knows, {})
       nl.for %srcs, %eids, %etypes, %b in %edges {
         %hop = nl.get_out_edges_by_type(%b, %likes, {%srcs}) : !nl.chunk<!storage.node_id>
         ...
       }
 
-    `edge_type` is an !nl.edge_type handle produced by nl.get_edge_type, not a name
-    on the op: the name is resolved once above the loops, so a hop nested in a loop
-    reuses the resolved handle rather than looking the name up per step (the same
+    `edge_types` is an !nl.edge_type_set handle produced by nl.get_edge_type_set,
+    not names on the op: they are resolved once above the loops, so a hop nested in
+    a loop reuses the resolved handle rather than looking them up per step (the same
     split as nl.get_property_type and the property fetches). Filtering by type
     narrows only the rows, never their shape, so the result iterator type is
     identical to nl.get_out_edges' and is inferred; only the carried chunk types
     are spelled out, after the colon.
   }];
 
-  // `edge_type` is the resolved handle from nl.get_edge_type. The carry set is
+  // `edge_types` is the resolved handle from nl.get_edge_type_set. The carry set is
   // NLChunk, not NLNodeIDChunk, so chunks of any element type can be carried,
   // exactly as on nl.get_out_edges.
-  let arguments = (ins NLNodeIDChunk:$input_nodes, NLEdgeTypeHandle:$edge_type, Variadic<NLChunk>:$columns_to_filter);
+  let arguments = (ins NLNodeIDChunk:$input_nodes, NLEdgeTypeHandle:$edge_types, Variadic<NLChunk>:$columns_to_filter);
   let results   = (outs NLIterator:$result);
 
   // The handle prints as %h inside the parens after input_nodes; its type is
@@ -196,7 +991,7 @@ def GetOutEdgesByType : NLOp<"get_out_edges_by_type", [Pure, InferTypeOpAdaptor]
   // type. As on nl.get_out_edges, only the carried chunk types are spelled, in the
   // optional group that drops the colon when the carry set is empty.
   let assemblyFormat = [{
-    `(` $input_nodes `,` $edge_type `,` `{` $columns_to_filter `}` `)` attr-dict
+    `(` $input_nodes `,` $edge_types `,` `{` $columns_to_filter `}` `)` attr-dict
     ( `:` qualified(type($columns_to_filter))^ )?
   }];
 }
@@ -205,22 +1000,327 @@ def GetOutEdgesByType : NLOp<"get_out_edges_by_type", [Pure, InferTypeOpAdaptor]
 * GetInEdgesByType
 */
 def GetInEdgesByType : NLOp<"get_in_edges_by_type", [Pure, InferTypeOpAdaptor]> {
-  let summary = "Create a database iterator over the in-edges of one edge type of a chunk of nodes";
+  let summary = "Create a database iterator over the in-edges of the given types of a chunk of nodes";
   let description = [{
     The reverse-direction sibling of nl.get_out_edges_by_type and the by-type
     sibling of nl.get_in_edges: it fills the same chunk shape as in-edges but keeps
-    only the in-edges whose type is `edge_type`. The carry set and the result
+    only the in-edges carrying one of `edge_types`. The carry set and the result
     iterator type match nl.get_out_edges_by_type, so the two are interchangeable in
-    a loop; `edge_type` is the same nl.get_edge_type handle and an unresolved type
-    yields no chunk.
+    a loop; `edge_types` is the same nl.get_edge_type_set handle and a set nothing
+    resolved into yields no chunk.
   }];
 
-  let arguments = (ins NLNodeIDChunk:$input_nodes, NLEdgeTypeHandle:$edge_type, Variadic<NLChunk>:$columns_to_filter);
+  let arguments = (ins NLNodeIDChunk:$input_nodes, NLEdgeTypeHandle:$edge_types, Variadic<NLChunk>:$columns_to_filter);
   let results   = (outs NLIterator:$result);
 
   let assemblyFormat = [{
-    `(` $input_nodes `,` $edge_type `,` `{` $columns_to_filter `}` `)` attr-dict
+    `(` $input_nodes `,` $edge_types `,` `{` $columns_to_filter `}` `)` attr-dict
     ( `:` qualified(type($columns_to_filter))^ )?
+  }];
+}
+
+/**
+* GetOutEdgesByLabel
+*/
+def GetOutEdgesByLabel : NLOp<"get_out_edges_by_label", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the out-edges of a chunk of nodes arriving at the nodes carrying every given label";
+  let description = [{
+    Imperative counterpart of db.get_out_edges_by_label. It fills the same row of
+    chunks as nl.get_out_edges - source node IDs, edge IDs, edge type IDs and target
+    node IDs, then one filtered chunk per carried column - but keeps only the
+    out-edges whose target's label set is a superset of `labels`:
+
+      %edges = nl.get_out_edges_by_label(%a, ["Person"], {})
+      nl.for %srcs, %eids, %etypes, %b in %edges {
+        %hop = nl.get_out_edges_by_label(%b, ["Movie"], {%srcs}) : !nl.chunk<!storage.node_id>
+        ...
+      }
+
+    `labels` is the same list of label names db.get_out_edges_by_label carried, on
+    the op rather than on a handle: it is resolved to a storage LabelSet when the loop
+    is translated, exactly as an nl.scan_nodes_by_label name is. A label absent from
+    the schema leaves the conjunction unsatisfiable, so the loop yields no chunk.
+    Narrowing by the target label changes only the rows, never their shape, so the
+    result iterator type is identical to nl.get_out_edges' and is inferred; only the
+    carried chunk types are spelled out, after the colon.
+  }];
+
+  let arguments = (ins NLNodeIDChunk:$input_nodes, LabelRefArrayAttr:$labels, Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLIterator:$result);
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` $labels `,` `{` $columns_to_filter `}` `)` attr-dict
+    ( `:` qualified(type($columns_to_filter))^ )?
+  }];
+}
+
+/**
+* GetInEdgesByLabel
+*/
+def GetInEdgesByLabel : NLOp<"get_in_edges_by_label", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the in-edges of a chunk of nodes leaving the nodes carrying every given label";
+  let description = [{
+    The reverse-direction sibling of nl.get_out_edges_by_label and the by-label
+    sibling of nl.get_in_edges: it fills the same chunk shape as in-edges but keeps
+    only the in-edges whose source's label set is a superset of `labels`. The labels
+    constrain the end the hop leaves, so `srcids` holds it and `tgtids` the input node
+    the hop walked from - the chunks carry the edge as the graph stores it, as they do
+    under nl.get_in_edges. The carry set and the result iterator type match
+    nl.get_out_edges_by_label, so the two are interchangeable in a loop; `labels` is
+    resolved the same way and an absent name yields no chunk.
+  }];
+
+  let arguments = (ins NLNodeIDChunk:$input_nodes, LabelRefArrayAttr:$labels, Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLIterator:$result);
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` $labels `,` `{` $columns_to_filter `}` `)` attr-dict
+    ( `:` qualified(type($columns_to_filter))^ )?
+  }];
+}
+
+/**
+* GetOutEdgesByTypeAndLabel
+*/
+def GetOutEdgesByTypeAndLabel : NLOp<"get_out_edges_by_type_and_label", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the out-edges of the given types of a chunk of nodes arriving at the nodes carrying every given label";
+  let description = [{
+    Imperative counterpart of db.get_out_edges_by_type_and_label. It fills the same
+    chunks as nl.get_out_edges but keeps only the out-edges carrying one of
+    `edge_types` whose target's label set is a superset of `labels`:
+
+      %knows = nl.get_edge_type_set(["KNOWS"])
+      %edges = nl.get_out_edges_by_type_and_label(%a, %knows, ["Person"], {})
+
+    `edge_types` is the nl.get_edge_type_set handle nl.get_out_edges_by_type takes, and
+    `labels` the name list nl.get_out_edges_by_label takes. A set of types nothing
+    resolved into, or a label absent from the schema, yields no chunk.
+  }];
+
+  let arguments = (ins NLNodeIDChunk:$input_nodes, NLEdgeTypeHandle:$edge_types, LabelRefArrayAttr:$labels, Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLIterator:$result);
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` $edge_types `,` $labels `,` `{` $columns_to_filter `}` `)` attr-dict
+    ( `:` qualified(type($columns_to_filter))^ )?
+  }];
+}
+
+/**
+* GetInEdgesByTypeAndLabel
+*/
+def GetInEdgesByTypeAndLabel : NLOp<"get_in_edges_by_type_and_label", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create a database iterator over the in-edges of the given types of a chunk of nodes leaving the nodes carrying every given label";
+  let description = [{
+    The reverse-direction sibling of nl.get_out_edges_by_type_and_label: it keeps only
+    the in-edges carrying one of `edge_types` whose source's label set is a superset of
+    `labels`. The chunks carry the edge as the graph stores it, as under
+    nl.get_in_edges.
+  }];
+
+  let arguments = (ins NLNodeIDChunk:$input_nodes, NLEdgeTypeHandle:$edge_types, LabelRefArrayAttr:$labels, Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLIterator:$result);
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` $edge_types `,` $labels `,` `{` $columns_to_filter `}` `)` attr-dict
+    ( `:` qualified(type($columns_to_filter))^ )?
+  }];
+}
+
+/**
+* NodeSetBuffer
+*/
+def NodeSetBuffer : NLOp<"node_set_buffer", []> {
+  let summary = "Create (and empty) the node set one exploration ends on";
+  let description = [{
+    Hoisted above the loops; produces the !nl.node_set_state handle the collects append
+    chunks to and nl.explore_paths reads its ends from. The result type is buildable and
+    omitted.
+
+      %ends = nl.node_set_buffer
+  }];
+
+  let results = (outs NLNodeSetState:$state);
+
+  let assemblyFormat = "attr-dict";
+}
+
+/**
+* NodeSetCollect
+*/
+def NodeSetCollect : NLOp<"node_set_collect", []> {
+  let summary = "Append this step's nodes to a node set";
+  let description = [{
+    Runs in the loop that binds the node chunk, once per step, so that by the time that loop
+    is exhausted the set holds every node of the column.
+
+      nl.node_set_collect %ends, %b
+  }];
+
+  let arguments = (ins NLNodeSetStateHandle:$state, NLNodeIDChunk:$nodes);
+
+  let assemblyFormat = "$state `,` $nodes attr-dict";
+}
+
+/**
+* ExplorePaths
+*/
+def ExplorePaths : NLOp<"explore_paths", [Pure, InferTypeOpAdaptor, AttrSizedOperandSegments]> {
+  let summary = "Create a database iterator over the variable-length paths leaving a chunk of nodes";
+  let description = [{
+    Imperative counterpart of db.explore_paths. Each step of an enclosing nl.for fills
+    one chunk of seed node IDs, end node IDs and path handles, then one filtered chunk
+    per carried column, exactly as nl.get_out_edges fills its edge chunks:
+
+      %paths = nl.explore_paths(%a, {%x}) forward hops 1 to 3 : !nl.chunk<!storage.node_id>
+      nl.for %seeds, %ends, %p, %x2 in %paths { ... }
+
+    The direction, hop bounds, end labels, end column and distinct flag are the db op's,
+    carried through unchanged. Its edge_types names arrive resolved, as the same
+    nl.get_edge_type_set handle a by-type hop takes, so a query resolves one set above the
+    loops and both read it. The db op's end_nodes column arrives as a node set
+    handle instead: the loop binding it fills the set through nl.node_set_collect, and the
+    walk reads the set once that loop has run to its end. The optional `hop` region is the
+    db op's hop predicate lowered: a block over the source node, edge and end node chunks of one hop,
+    yielding a boolean mask chunk; `hop_labels` is the db op's label-only hop predicate,
+    carried as it is. The input chunk type and the three fixed result chunks
+    are inferred; only the carried chunk types are spelled out, after the colon.
+
+    A body of several steps is the db op's too: a direction, a hop labels list and a hop
+    region per step, the region of step `k` over the node and edge chunks of its repetition
+    up to its hop. Each edge type handle filters one step; `edge_type_steps` names which
+    when not every step has one.
+  }];
+
+  let arguments = (ins NLNodeIDChunk:$input_nodes,
+                       Variadic<NLChunk>:$columns_to_filter,
+                       Optional<NLNodeSetStateHandle>:$end_nodes,
+                       Variadic<NLEdgeTypeHandle>:$edge_types,
+                       Variadic<NLChunk>:$hop_imports,
+                       DenseI64ArrayAttr:$directions,
+                       UI64Attr:$min_hops,
+                       OptionalAttr<UI64Attr>:$max_hops,
+                       OptionalAttr<DenseI64ArrayAttr>:$edge_type_steps,
+                       OptionalAttr<LabelRefArrayAttr>:$end_labels,
+                       OptionalAttr<LabelRefArrayArrayAttr>:$hop_labels,
+                       OptionalAttr<UI64Attr>:$end_column,
+                       UnitAttr:$ends_on_seed,
+                       UnitAttr:$distinct);
+  let results   = (outs NLIterator:$result);
+
+  let regions = (region VariadicRegion<MaxSizedRegion<1>>:$hops);
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` `{` $columns_to_filter `}` `)` custom<PathDirections>($directions) `hops` $min_hops
+    (`to` $max_hops^)? (`edge_types` $edge_types^)? (`edge_type_steps` $edge_type_steps^)? (`end_labels` $end_labels^)?
+    (`hop_labels` custom<StepNames>($hop_labels)^)? (`end_nodes` $end_nodes^)? (`end_column` $end_column^)?
+    (`hop_imports` `{` $hop_imports^ `:` qualified(type($hop_imports)) `}`)? (`ends_on_seed` $ends_on_seed^)?
+    (`distinct` $distinct^)? `` custom<HopRegions>($hops, ref($directions))
+    attr-dict ( `:` qualified(type($columns_to_filter))^ )?
+  }];
+
+  let extraClassDeclaration = [{
+    size_t getStepCount() { return getDirections().size(); }
+    ::mlir::storage::PathDirection getStepDirection(size_t step);
+
+    // The edge type handle filtering one step, null when the step has none
+    ::mlir::Value getStepEdgeTypes(size_t step);
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* ExpandPath
+*/
+def ExpandPath : NLOp<"expand_path", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Expand each path handle of a chunk into a list";
+  let description = [{
+    Imperative counterpart of db.expand_path: one list per row, of the path's edges, of
+    the end node of each hop, of the source node of each hop (the seed chunk's row
+    then every end but the last), or of every node (the seed then every end).
+
+      %e = nl.expand_path(%p, %s) kind edges
+             : (!nl.chunk<!storage.path_ref>, !nl.chunk<!storage.node_id>) -> !nl.chunk<!storage.list<!storage.edge_id>>
+  }];
+
+  let arguments = (ins NLChunk:$paths,
+                       Optional<NLNodeIDChunk>:$srcids,
+                       PathExpansionKind:$kind,
+                       UnitAttr:$reversed,
+                       OptionalAttr<UI64Attr>:$step,
+                       OptionalAttr<UI64Attr>:$steps);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = [{
+    `(` $paths (`,` $srcids^)? `)` `kind` $kind (`reversed` $reversed^)? (`step` $step^ `of` $steps)?
+    attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* PathLength
+*/
+def PathLength : NLOp<"path_length", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Read the number of edges of each path of a chunk";
+  let description = [{
+    Imperative counterpart of db.path_length: one unsigned count per row.
+
+      %n = nl.path_length(%p) : (!nl.chunk<!storage.path_ref>) -> !nl.chunk<ui64>
+  }];
+
+  let arguments = (ins NLChunk:$paths);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = [{
+    `(` $paths `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* MakePath
+*/
+def MakePath : NLOp<"make_path", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Build the path of a named pattern element, one entity sequence per row";
+  let description = [{
+    Imperative counterpart of db.make_path: one sequence of graph entities per row, the
+    nodes and edges the element runs through in written order, a path operand expanded
+    into the hops it stands for.
+
+      %p = nl.make_path(%a, %x, %b)
+             : (!nl.chunk<!storage.node_id>, !nl.chunk<!storage.edge_id>, !nl.chunk<!storage.node_id>)
+               -> !nl.chunk<!storage.entity_list>
+  }];
+
+  let arguments = (ins Variadic<NLChunk>:$entities,
+                       OptionalAttr<I64ArrayAttr>:$reversed_paths);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = [{
+    `(` $entities `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* PathElements
+*/
+def PathElements : NLOp<"path_elements", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Read the nodes, the relationships or the length of each named path of a chunk";
+  let description = [{
+    Imperative counterpart of db.path_elements: one list of node IDs, one list of edge
+    IDs or one hop count per row, read off the entity sequence nl.make_path laid out
+    or the path nl.shortest_path found, and null on the rows whose sequence is empty -
+    the paths an OPTIONAL MATCH missed.
+
+      %ns = nl.path_elements(%p) kind nodes
+              : (!nl.chunk<!storage.entity_list>) -> !nl.chunk<!storage.nullable<!storage.list<!storage.node_id>>>
+  }];
+
+  let arguments = (ins NLChunk:$path, PathElementsKind:$kind);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = [{
+    `(` $path `)` `kind` $kind attr-dict `:` functional-type(operands, results)
   }];
 }
 
@@ -253,37 +1353,43 @@ def GetPropertyType : NLOp<"get_property_type", [Pure]> {
 }
 
 /**
-* GetEdgeType
+* GetEdgeTypeSet
 */
-def GetEdgeType : NLOp<"get_edge_type", [Pure]> {
-  let summary = "Resolve an edge type name to an edge type handle, once, ahead of the loops";
+def GetEdgeTypeSet : NLOp<"get_edge_type_set", [Pure]> {
+  let summary = "Resolve a pattern's edge type names to an edge type set, once, ahead of the loops";
   let description = [{
-    The edge sibling of nl.get_property_type. Looks the relationship-type name up
-    in the graph schema and yields an !nl.edge_type handle for its storage
-    EdgeTypeID. It takes no chunk, so it sits at function scope above the loop
-    nest: a query resolves each name once here and feeds the handle to every
-    get_out_edges_by_type / get_in_edges_by_type hop, instead of resolving the name
-    per step when the hop is nested in a loop.
+    The edge sibling of nl.get_property_type. Looks the relationship-type names up
+    in the graph schema and yields an !nl.edge_type_set handle for their storage
+    EdgeTypeIDs. It takes no chunk, so it sits at function scope above the loop
+    nest: a query resolves each set once here and feeds the handle to every
+    get_out_edges_by_type / get_in_edges_by_type hop, instead of resolving the
+    names per step when the hop is nested in a loop.
 
-      %knows = nl.get_edge_type("KNOWS")
+      %knows = nl.get_edge_type_set(["KNOWS"])
+      %either = nl.get_edge_type_set(["KNOWS", "LIKES"])
 
-    The result is always !nl.edge_type. That type is parameterless and so
+    The names are a disjunction, as `-[:KNOWS|LIKES]->` spells it: an edge matches
+    when it carries any one of them. A name no edge has ever carried drops out of
+    the set when it is resolved, and a set left empty that way matches no edge. An empty
+    `names` says the same outright, for a read a pass has narrowed to nothing.
+
+    The result is always !nl.edge_type_set. That type is parameterless and so
     buildable, so the assembly omits it. Pure, so it can be hoisted and shared
     across the loops below it.
   }];
 
-  // The edge type name, the same `KNOWS` spelled in the query.
-  let arguments = (ins StrAttr:$name);
-  let results   = (outs NLEdgeType:$result);
+  // The edge type names, the same `KNOWS|LIKES` spelled in the query.
+  let arguments = (ins EdgeTypeRefArrayAttr:$names);
+  let results   = (outs NLEdgeTypeSet:$result);
 
-  // No operands and a constant result type, so nothing is printed after the name.
-  let assemblyFormat = "`(` $name `)` attr-dict";
+  // No operands and a constant result type, so nothing is printed after the names.
+  let assemblyFormat = "`(` $names `)` attr-dict";
 }
 
 /**
 * GetNodeProperties
 */
-def GetNodeProperties : NLOp<"get_node_properties", [Pure]> {
+def GetNodeProperties : NLOp<"get_node_properties", [Pure, RowAlignedThroughOperands]> {
   let summary = "Read one property of a chunk of nodes, as a nullable value chunk";
   let description = [{
     Imperative counterpart of db.get_node_properties. The property is named once
@@ -293,8 +1399,7 @@ def GetNodeProperties : NLOp<"get_node_properties", [Pure]> {
 
     A node may not have the property, so the result is a nullable value chunk -
     !nl.chunk<!storage.nullable<...>>, storage's ColumnOptVector. Missing values come
-    back null; no row is dropped. The wrapped type is the concrete primitive the
-    property resolved to during lowering.
+    back null; no row is dropped. The wrapped type is the one the db read declares.
 
       %weight = nl.get_property_type("weight")
       nl.for %nodes in %scan {
@@ -303,20 +1408,30 @@ def GetNodeProperties : NLOp<"get_node_properties", [Pure]> {
       }
   }];
 
-  // The node chunk and the property handle are both buildable, so their types
-  // are omitted; only the nullable value chunk type is spelled, after the colon.
-  let arguments = (ins NLNodeIDChunk:$input_nodes, NLPropertyTypeHandle:$property_type);
+  // The node chunk, the property handle and the optional pending mask are all
+  // buildable, so their types are omitted; only the nullable value chunk type is
+  // spelled, after the colon. `pending` is the mask an nl.merge produced beside its
+  // node chunk: such a row holds a write-buffer offset rather than an ID the graph
+  // knows, so its value is read out of the write buffer rather than off the node the
+  // offset collides with - null there when the write set the property on none.
+  // `all_pending` says that of every row without a mask, which an nl.create_node's
+  // chunk is.
+  let arguments = (ins NLNodeIDChunk:$input_nodes,
+                       NLPropertyTypeHandle:$property_type,
+                       Optional<NLBoolChunk>:$pending,
+                       UnitAttr:$all_pending);
   let results   = (outs NLChunk:$values);
 
   let assemblyFormat = [{
-    `(` $input_nodes `,` $property_type `)` attr-dict `:` qualified(type($values))
+    `(` $input_nodes `,` $property_type `)` (`pending` $pending^)? (`all_pending` $all_pending^)?
+    attr-dict `:` qualified(type($values))
   }];
 }
 
 /**
 * GetEdgeProperties
 */
-def GetEdgeProperties : NLOp<"get_edge_properties", [Pure]> {
+def GetEdgeProperties : NLOp<"get_edge_properties", [Pure, RowAlignedThroughOperands]> {
   let summary = "Read one property of a chunk of edges, as a nullable value chunk";
   let description = [{
     The edge counterpart of get_node_properties: same shape, but the input is a
@@ -324,15 +1439,19 @@ def GetEdgeProperties : NLOp<"get_edge_properties", [Pure]> {
     It opens no loop and yields a nullable value chunk, one value per input edge.
   }];
 
-  let arguments = (ins NLEdgeIDChunk:$input_edges, NLPropertyTypeHandle:$property_type);
+  let arguments = (ins NLEdgeIDChunk:$input_edges,
+                       NLPropertyTypeHandle:$property_type,
+                       Optional<NLBoolChunk>:$pending,
+                       UnitAttr:$all_pending);
   let results   = (outs NLChunk:$values);
 
   let assemblyFormat = [{
-    `(` $input_edges `,` $property_type `)` attr-dict `:` qualified(type($values))
+    `(` $input_edges `,` $property_type `)` (`pending` $pending^)? (`all_pending` $all_pending^)?
+    attr-dict `:` qualified(type($values))
   }];
 }
 
-def GetNodeLabelSet : NLOp<"get_node_label_set", [Pure]> {
+def GetNodeLabelSet : NLOp<"get_node_label_set", [Pure, RowAlignedThroughOperands]> {
   let summary = "Read the label-set ID of each node in a chunk";
   let description = [{
     For each node ID in the input chunk, fetches its LabelSetID.
@@ -351,44 +1470,73 @@ def GetNodeLabelSet : NLOp<"get_node_label_set", [Pure]> {
   }];
 }
 
-def CheckLabelConstraint : NLOp<"check_label_constraint", [Pure]> {
-  let summary = "Test each label-set ID against a precomputed matching set";
+def GetEdgeTypes : NLOp<"get_edge_types", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Read the type ID of each edge in a chunk";
   let description = [{
-    For each LabelSetID in the input chunk, emits true if the ID appears in
-    `matching_ids`.
+    For each edge ID in the input chunk, fetches its EdgeTypeID.
 
-      nl.for %nodes in %scan {
-        %ls  = nl.get_node_label_set(%nodes) : !nl.chunk<!storage.labelset_id>
-        %ok  = nl.check_label_constraint(%ls, [3, 7]) : !nl.chunk<!storage.bool>
+      nl.for %edges in %scan {
+        %et = nl.get_edge_types(%edges) : !nl.chunk<!storage.edge_type_id>
         ...
       }
   }];
 
-  let arguments = (ins NLLabelSetIDChunk:$labelset_ids, DenseI64ArrayAttr:$matching_ids);
-  let results   = (outs NLChunk:$result);
+  let arguments = (ins NLEdgeIDChunk:$input_edges);
+  let results   = (outs NLChunk:$edge_type_ids);
 
   let assemblyFormat = [{
-    `(` $labelset_ids `,` $matching_ids `)` attr-dict `:` qualified(type($result))
+    `(` $input_edges `)` attr-dict `:` qualified(type($edge_type_ids))
   }];
 }
 
-def CheckEdgeTypeConstraint : NLOp<"check_edge_type_constraint", [Pure]> {
-  let summary = "Test each edge type ID against a precomputed allowed set";
+def CheckLabelConstraint : NLOp<"check_label_constraint", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Test each label-set ID against a required-label constraint";
   let description = [{
-    For each EdgeTypeID in the input chunk, emits true if the ID appears in
-    `matching_ids` (OR semantics: any match passes).
+    For each LabelSetID in the input chunk, emits true if the label set it names
+    carries every label of at least one of `alternatives` - a superset match. A single
+    alternative is written flat, several are written nested.
 
-      nl.for %etypes in %scan {
-        %ok = nl.check_edge_type_constraint(%etypes, [2, 5]) : !nl.chunk<!storage.bool>
+      nl.for %nodes in %scan {
+        %ls  = nl.get_node_label_set(%nodes) : !nl.chunk<!storage.labelset_id>
+        %ok  = nl.check_label_constraint(%ls, ["Person"]) : !nl.chunk<!storage.bool>
         ...
       }
+
+    The names are turned into the IDs of the label sets that satisfy them when the
+    program is translated rather than when it is lowered: a CREATE ahead of the test
+    interns a label set of its own, and that one is in the change's schema only once
+    the create has been translated.
   }];
 
-  let arguments = (ins NLEdgeTypeIDChunk:$edge_type_ids, DenseI64ArrayAttr:$matching_ids);
+  let arguments = (ins NLLabelSetIDChunk:$labelset_ids, LabelRefArrayArrayAttr:$alternatives);
   let results   = (outs NLChunk:$result);
 
   let assemblyFormat = [{
-    `(` $edge_type_ids `,` $matching_ids `)` attr-dict `:` qualified(type($result))
+    `(` $labelset_ids `,` custom<LabelAlternatives>($alternatives) `)` attr-dict `:` qualified(type($result))
+  }];
+}
+
+def CheckEdgeTypeConstraint : NLOp<"check_edge_type_constraint", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Test each edge type ID against an allowed-type constraint";
+  let description = [{
+    For each EdgeTypeID in the input chunk, emits true if it is one of `edge_types`
+    (OR semantics: any match passes).
+
+      nl.for %etypes in %scan {
+        %ok = nl.check_edge_type_constraint(%etypes, ["KNOWS"]) : !nl.chunk<!storage.bool>
+        ...
+      }
+
+    The names are resolved when the program is translated, for the reason
+    nl.check_label_constraint's are: a CREATE ahead of the test may be what put the
+    type in the change's schema.
+  }];
+
+  let arguments = (ins NLEdgeTypeIDChunk:$edge_type_ids, EdgeTypeRefArrayAttr:$edge_types);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = [{
+    `(` $edge_type_ids `,` $edge_types `)` attr-dict `:` qualified(type($result))
   }];
 }
 
@@ -437,64 +1585,111 @@ def For : NLOp<"for", [SingleBlockImplicitTerminator<"Yield">]> {
 /**
 * Yield
 */
-def Yield : NLOp<"yield", [Pure, Terminator, HasParent<"For">]> {
-  let summary = "End one step of an nl.for loop";
-  let assemblyFormat = "attr-dict";
+def Yield : NLOp<"yield", [Pure, Terminator, ParentOneOf<["For", "ExplorePaths"]>]> {
+  let summary = "End one step of an nl.for loop, or yield the mask of an explore_paths hop";
+  let description = [{
+    The implicit terminator of an nl.for body carries nothing. The terminator of an
+    nl.explore_paths hop region yields the one boolean mask chunk that says which
+    candidates of a hop pass its predicate.
+  }];
+
+  let arguments = (ins Variadic<NLChunk>:$columns);
+
+  let assemblyFormat = "( $columns^ `:` qualified(type($columns)) )? attr-dict";
+
+  // nl.for's implicit terminator is built with no operands
+  let builders = [
+      OpBuilder<(ins)>
+  ];
 }
 
 /**
 * CrossProduct
 */
 def CrossProduct : NLOp<"cross_product", [Pure, InferTypeOpAdaptor, AttrSizedOperandSegments]> {
-  let summary = "Cross every row of one loop's chunks with every row of another";
+  let summary = "Create an iterator over every pair of one loop's chunk rows with another's";
 
   let description = [{
-    Given an outer chunk of N rows and an inner chunk of M rows it produces N*M
-    rows: each outer column is block-repeated x M (outer row i becomes M
-    consecutive rows) and each inner column is tiled x N (the whole inner chunk
-    repeated N times), so result row k pairs outer row k/M with inner row k%M -
-    every outer row against every inner row.
+    Given an outer chunk of N rows and an inner chunk of M rows the product has
+    N*M rows: pair k is outer row k/M with inner row k%M, so every outer row meets
+    every inner row. Each step of an enclosing nl.for fills one chunk of that
+    sequence - each outer column block-repeated and each inner column tiled over
+    the pairs the step covers:
 
-      %a, %b = nl.cross_product {%a} {%b}
+      %pairs = nl.cross_product {%a} {%b}
                  : {!nl.chunk<!storage.node_id>} {!nl.chunk<!storage.node_id>}
+      nl.for %ra, %rb in %pairs : !nl.iter<!nl.chunk<!storage.node_id>, !nl.chunk<!storage.node_id>> {
+        ...
+      }
+
+    The product is the one operator whose result outgrows its inputs, so it is an
+    iterator rather than a straight-line op: laying all N*M rows out at once would
+    mean a chunk of 64Ki rows crossed with another holding 4.29e9 rows - 64 GiB for
+    two id columns. Chunked, a step holds the chunk size whatever the sides measure,
+    which is what the v2 CartesianProductProcessor does with its own cursor.
 
     The two brace groups are the columns each factor contributes, in db.yield
-    order; the op's results are the outer columns followed by the inner, each
-    result chunk keeping its input's element type - only the row count changes.
+    order; the iterator's chunk types are the outer columns' followed by the
+    inner's, each keeping its input's element type - only the row count changes.
     N and M are read from the first column of each group, so each group must be
-    non-empty.
+    non-empty, and every column of a group must be row-aligned with that first one.
 
-    An optional `limit` operand carries an !nl.limit_state handle. When present,
-    the product is built only up to limit.getRemaining() rows: rows are laid out in
-    (outer, inner) order, so the product's prefix is exactly the prefix the
-    following nl.limit_update/nl.output can emit this step, and building the rest
-    would be wasted work. Absent, the whole N*M product is built.
-
-      %a, %b = nl.cross_product {%a} {%b} limit %h
-                 : {!nl.chunk<!storage.node_id>} {!nl.chunk<!storage.node_id>}
+    A `limit` on the enclosing nl.for bounds the product the way it bounds a scan:
+    the loop stops once the budget is spent, and - since the pairs come out in
+    (outer, inner) order - a step lays out only the prefix the following
+    nl.limit_update/nl.output can still emit.
   }];
 
-  // The outer and inner column groups to cross, plus the optional limit handle.
-  // Three operand groups of independent size need AttrSizedOperandSegments to
-  // record each group's size.
+  // The outer and inner column groups to cross. Two operand groups of independent
+  // size need AttrSizedOperandSegments to record each group's size.
   let arguments = (ins Variadic<NLChunk>:$outer_columns,
-                       Variadic<NLChunk>:$inner_columns,
-                       Optional<NLLimitStateHandle>:$limit);
+                       Variadic<NLChunk>:$inner_columns);
 
-  // One result per crossed column, outer group then inner group; inferred from
-  // the operands since the broadcast keeps each chunk's element type.
-  let results = (outs Variadic<NLChunk>:$results);
+  // An iterator over the crossed columns, outer group then inner group; inferred
+  // from the operands since the broadcast keeps each chunk's element type.
+  let results = (outs NLIterator:$result);
 
-  // The two SSA brace groups mirror the two factors. The result types are
-  // inferred, so only the operand chunk types are spelled - the same two
-  // groups, each in braces, after the colon (as nl.output spells its chunk
-  // types). The optional limit handle, when present, prints after a `limit`
-  // keyword (its type is buildable and so omitted, as on nl.output). The
+  // The two SSA brace groups mirror the two factors. The result type is inferred,
+  // so only the operand chunk types are spelled - the same two groups, each in
+  // braces, after the colon (as nl.output spells its chunk types). The
   // operandSegmentSizes attribute is populated and elided automatically by the
   // generated parser/printer.
   let assemblyFormat = [{
-    `{` $outer_columns `}` `{` $inner_columns `}` (`limit` $limit^)? attr-dict `:`
+    `{` $outer_columns `}` `{` $inner_columns `}` attr-dict `:`
     `{` qualified(type($outer_columns)) `}` `{` qualified(type($inner_columns)) `}`
+  }];
+}
+
+/**
+* EachRow
+*/
+def EachRow : NLOp<"each_row", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Create an iterator over the rows of a step, one row per step";
+
+  let description = [{
+    Each step of an enclosing nl.for binds one row of the given chunks, in the order
+    they hold it: step k fills one-row chunks with row k of every column. The
+    iterator's chunk types are the columns' own, so the body reads the row through
+    the same kinds of chunk the step held it in:
+
+      %rows = nl.each_row {%p, %h} : {!nl.chunk<!storage.node_id>, !nl.chunk<none>}
+      nl.for %p1, %h1 in %rows : !nl.iter<!nl.chunk<!storage.node_id>, !nl.chunk<none>> {
+        ...
+      }
+
+    This is how a CALL subquery whose body aggregates, sorts, cuts or dedups runs
+    once per row in flight: the body's loops nest in this loop and its accumulators
+    are hoisted into its body, so they cover one input row at a time. The columns
+    must be row-aligned with each other, and there must be at least one - the step's
+    row count is read from the first. A `limit` on the enclosing nl.for stops the
+    walk over the rows once the budget is spent.
+  }];
+
+  let arguments = (ins Variadic<NLChunk>:$columns);
+  let results   = (outs NLIterator:$result);
+
+  let assemblyFormat = [{
+    `{` $columns `}` attr-dict `:` `{` qualified(type($columns)) `}`
   }];
 }
 
@@ -538,13 +1733,28 @@ def Output : NLOp<"output", [AttrSizedOperandSegments]> {
     nl.output(%targets) skip %h : !nl.chunk<!storage.node_id>
 
     An optional `cardinality` operand carries a representative chunk of the driving
-    relation (a node-ID loop variable). A projection of only constants - RETURN 5 -
-    has no per-row column to size the emission, yet its cardinality is the driving
-    relation's (projection preserves cardinality), so the output nests in the driving
-    loop and reads its row count from this chunk; the constants broadcast against it.
-    Absent for a per-row projection (its own columns size it) or a single-row emit.
+    relation - any loop variable of the loop this output nests in. A projection of
+    only constants - RETURN 5 - has no per-row column to size the emission, yet its
+    cardinality is the driving relation's (projection preserves cardinality), so the
+    output nests in the driving loop and reads its row count from this chunk; the
+    constants broadcast against it. Absent for a per-row projection (its own columns
+    size it) or a single-row emit.
 
-    nl.output(%c) cardinality %n : !nl.chunk<i64>
+    nl.output(%c) cardinality(%n : !nl.chunk<!storage.node_id>) : !nl.chunk<i64>
+
+    Only that row count is read, never a value, so the driver is a chunk of any
+    element type - the node IDs a scan binds, the values an UNWIND unwinds, the return
+    values a procedure drive binds - as nl.broadcast_constant's own cardinality
+    operand is:
+
+    nl.output(%c) cardinality(%x : !nl.chunk<!storage.nullable<i64>>) : !nl.chunk<i64>
+
+    An optional `names` array carries the result column names db.output was given,
+    one per column, which the interpreter hands to the sink so it can label the
+    columns it is fed. They name the result and never steer execution, so an output
+    that carries none emits exactly the same rows.
+
+    nl.output(%a) names ["person"] : !nl.chunk<!storage.node_id>
   }];
 
   // Four variable-length operand groups - the columns, the optional limit, the
@@ -552,11 +1762,11 @@ def Output : NLOp<"output", [AttrSizedOperandSegments]> {
   // operand-segment sizes to tell them apart, the same as nl.cross_product's column
   // groups. A folded output carries at most one of limit/skip (the truncate adjacent
   // to it); the two are not produced together (see foldSkipTruncatesIntoOutputs).
-  // cardinality's type is buildable (always a node-ID chunk) and so omitted.
   let arguments = (ins Variadic<NLChunk>:$columns,
                        Optional<NLLimitStateHandle>:$limit,
                        Optional<NLSkipStateHandle>:$skip,
-                       Optional<NLNodeIDChunk>:$cardinality);
+                       Optional<NLChunk>:$cardinality,
+                       OptionalAttr<StrArrayAttr>:$column_names);
 
   // The chunk element types vary from call to call and - unlike the source
   // ops - cannot be inferred, so they are spelled after the colon. This keeps
@@ -566,15 +1776,28 @@ def Output : NLOp<"output", [AttrSizedOperandSegments]> {
   // annotation. qualified(...) forces the leading !nl. on every printed type.
   // The optional limit and skip handles, when present, print after a `limit` or
   // `skip` keyword; both types are buildable and so omitted. Each optional group
-  // has its own literal anchor, so the declarative parser tells them apart.
+  // has its own literal anchor, so the declarative parser tells them apart. The
+  // cardinality driver is a chunk of any element type, which no recipe can build, so
+  // it is parenthesized with its own type - keeping the trailing colon the columns'.
   let assemblyFormat = [{
-    `(` $columns `)` (`limit` $limit^)? (`skip` $skip^)? (`cardinality` $cardinality^)? attr-dict `:` qualified(type($columns))
+    `(` $columns `)` (`names` $column_names^)? (`limit` $limit^)? (`skip` $skip^)? (`cardinality` `(` $cardinality^ `:` qualified(type($cardinality)) `)`)? attr-dict `:` qualified(type($columns))
   }];
+
+  // Emitting an unnamed result is the common case - every hand-written program and
+  // every lowering of a db.output that carries no names - so it gets a builder that
+  // takes the operands alone.
+  let builders = [
+      OpBuilder<(ins "::mlir::ValueRange":$columns,
+                     "::mlir::Value":$limit,
+                     "::mlir::Value":$skip,
+                     "::mlir::Value":$cardinality)>
+  ];
 
   // Enforce the "at most one of limit/skip" invariant the description promises:
   // a folded output carries the single handle of the truncate adjacent to it,
   // never both. runOutput reads them as an if(skip)/else if(limit) chain, so a
   // malformed both-handles op would silently drop the limit; reject it here.
+  // One name per column, when the output carries names at all.
   let hasVerifier = 1;
 }
 
@@ -596,6 +1819,28 @@ def Limit : NLOp<"limit", []> {
   let arguments = (ins UI64Attr:$count);
   let results   = (outs NLLimitState:$state);
   let assemblyFormat = "`(` $count `)` attr-dict";
+}
+
+/**
+* LimitRemaining
+*/
+// NOT Pure: like nl.limit, it resets a distinct counter each time it runs, so it must
+// not be CSE'd, hoisted or eliminated.
+def LimitRemaining : NLOp<"limit_remaining", []> {
+  let summary = "Create (and reset) a row-limit counter, initialized to what another one still admits";
+  let description = [{
+    Reads the remaining budget of the source counter at the point it runs and
+    produces a fresh !nl.limit_state initialized to it. The source is only read;
+    the new counter is charged by its own nl.limit_update and read by the loops
+    it bounds, as a counter nl.limit produces is. The result type is buildable
+    and omitted.
+
+      %budget = nl.limit_remaining(%h)
+  }];
+
+  let arguments = (ins NLLimitStateHandle:$source);
+  let results   = (outs NLLimitState:$state);
+  let assemblyFormat = "`(` $source `)` attr-dict";
 }
 
 /**
@@ -842,6 +2087,128 @@ def Sort : NLOp<"sort", [Pure]> {
   let assemblyFormat = "`(` $state `)` attr-dict `:` qualified(type($result))";
 }
 
+/**
+* HashJoinBuffer
+*/
+// NOT Pure: each nl.hash_join_buffer is a distinct build side, so two must never
+// be CSE'd into one, and an unread one must not be DCE'd - resetting its buffers
+// and its key index is a side effect (like nl.sort_buffer).
+def HashJoinBuffer : NLOp<"hash_join_buffer", []> {
+  let summary = "Create (and reset) the build side of one hash join";
+  let description = [{
+    Sits at the top of the block the join's two loop nests are rooted in - the
+    entry block for a top-level join, the enclosing loop body for one nested in a
+    factor - so the build side is emptied once per entry into that block, before
+    the build loop refills it. Produces the !nl.hash_join_state handle that
+    nl.hash_join_collect fills and nl.hash_join_probe reads.
+
+    `build_key` and `probe_key` are the column indices the two sides match on:
+    `build_key` indexes the columns nl.hash_join_collect appends, `probe_key` the
+    columns nl.hash_join_probe reads. The buffers' column types are not spelled
+    here - they are recovered from the collect that feeds the same handle - so
+    only the key spec appears. The result type is buildable and omitted.
+
+      %state = nl.hash_join_buffer build_key 1 probe_key 1
+  }];
+
+  let arguments = (ins UI64Attr:$buildKey, UI64Attr:$probeKey);
+  let results   = (outs NLHashJoinState:$state);
+
+  let assemblyFormat = "`build_key` $buildKey `probe_key` $probeKey attr-dict";
+}
+
+/**
+* HashJoinCollect
+*/
+// NOT Pure: it appends the current chunk's rows to the handle's buffers and
+// indexes their keys, so it must run exactly where it sits, once per build-loop
+// step, and must not be hoisted, CSE'd or eliminated.
+def HashJoinCollect : NLOp<"hash_join_collect", []> {
+  let summary = "Append this step's chunk of every build column to a hash join";
+  let description = [{
+    Runs in the build loop body, once per step. Appends the current chunk of each
+    build column to the matching buffer of the handle and records where each row's
+    key lands, so that by the time the build loop is exhausted the buffers hold
+    every build row and the index answers any probe key. The columns are taken
+    together so the buffers stay row-aligned. A row whose key can match nothing is
+    buffered like any other but left out of the index: a null matches nothing, and
+    so does a NaN, or an embedding holding one, which no `=` calls equal.
+
+      nl.hash_join_collect %state, (%b, %name) : !nl.chunk<!storage.node_id>, !nl.chunk<!storage.nullable<!storage.string>>
+
+    The build side's sibling of nl.sort_collect.
+  }];
+
+  // The build handle, then the columns to append. The column chunk types are
+  // spelled after the colon (as nl.sort_collect spells its own), since the
+  // buffers' element types are recovered from them.
+  let arguments = (ins NLHashJoinStateHandle:$state, Variadic<NLChunk>:$columns);
+
+  let assemblyFormat = [{
+    $state `,` `(` $columns `)` attr-dict `:` qualified(type($columns))
+  }];
+  let hasVerifier = 1;
+}
+
+/**
+* HashJoinProbe
+*/
+// Pure: given a filled build side it deterministically produces the same matched
+// rows from the same probe chunk, and it writes only its own result chunks.
+def HashJoinProbe : NLOp<"hash_join_probe", [Pure]> {
+  let summary = "Create an iterator over each probe row paired with the build rows its key matches";
+  let description = [{
+    Runs in the probe loop body and stands where nl.cross_product stands in a
+    nested loop: it is what makes the join's rows. For each row of the probe chunk
+    it looks the row's key up in the handle's index and pairs the row with every
+    build row that matches - the probe row's columns repeated once per match,
+    beside the matched build row's columns read back from the buffers. A probe row
+    whose key is null, or whose key matches nothing, pairs with nothing.
+
+      %pairs = nl.hash_join_probe %state, (%arg0, %key)
+          : (!nl.chunk<!storage.node_id>, !nl.chunk<!storage.nullable<!storage.string>>)
+         -> !nl.iter<!nl.chunk<!storage.node_id>, !nl.chunk<!storage.nullable<!storage.string>>, !nl.chunk<!storage.node_id>>
+      nl.for %n, %name, %m in %pairs
+          : !nl.iter<!nl.chunk<!storage.node_id>, !nl.chunk<!storage.nullable<!storage.string>>, !nl.chunk<!storage.node_id>> {
+        ...
+      }
+
+    A key that many build rows carry makes more pairs than either side holds, so -
+    like the cross product - this is an iterator rather than a straight-line op:
+    pairing a whole probe chunk at once means a side of 6345 rows sharing one key
+    lays out 40e6 rows in a single step. Chunked, a step holds the chunk size
+    whatever the fan-out measures, so a step may start and end partway through one
+    probe row's matches.
+
+    The iterator's chunks are the probe columns followed by the build columns, so
+    they line up with the db.hash_join results this lowers from: the left (probed)
+    factor's yielded columns followed by the right (built) factor's. The build
+    columns are not operands - they live in the handle - so their chunk types
+    cannot be inferred and the iterator type is spelled out, the way nl.sort
+    spells its own.
+
+    The whole build side is indexed before any probing, so a probe row's matches
+    come out together and in build order at any chunk size - where
+    nl.cross_product, re-running the inner nest per outer chunk, interleaves a
+    multi-chunk inner side. Neither order is one an ORDER BY constrains, so they
+    may differ under a LIMIT.
+
+    A `limit` on the enclosing nl.for bounds the pairing the way it bounds a
+    product: the loop stops once the budget is spent, and a step lays out only the
+    prefix the following nl.limit_update/nl.output can still emit.
+  }];
+
+  let arguments = (ins NLHashJoinStateHandle:$state,
+                       Variadic<NLChunk>:$columns);
+  let results   = (outs NLIterator:$result);
+
+  let assemblyFormat = [{
+    $state `,` `(` $columns `)` attr-dict `:`
+    `(` qualified(type($columns)) `)` `->` qualified(type($result))
+  }];
+  let hasVerifier = 1;
+}
+
 // NOT Pure: resetting the seen-set is a side effect, and two seen-sets must never
 // be CSE'd into one (like nl.limit / nl.sort_buffer).
 def Distinct : NLOp<"distinct", []> {
@@ -924,13 +2291,20 @@ def CountUpdate : NLOp<"count_update", []> {
     the rows in which x is not null). The sole counter mutator.
 
       nl.count_update %c, %a : !nl.chunk<!storage.node_id>
+
+    `all_rows` charges the chunk's row count whatever it holds - Cypher count(*),
+    which counts rows and reads no value, so the chunk it is anchored on may be a
+    nullable one whose nulls a value tally would have skipped:
+
+      nl.count_update %c, %age all_rows : !nl.chunk<!storage.nullable<i64>>
   }];
 
   // The accumulator handle, then the column whose non-null rows are charged. The
-  // handle type is buildable and omitted; the column chunk type is spelled.
-  let arguments = (ins NLCountStateHandle:$state, NLChunk:$rows);
+  // handle type is buildable and omitted; the column chunk type is spelled. all_rows
+  // is a unit attribute: its presence is the flag.
+  let arguments = (ins NLCountStateHandle:$state, NLChunk:$rows, UnitAttr:$all_rows);
 
-  let assemblyFormat = "$state `,` $rows attr-dict `:` qualified(type($rows))";
+  let assemblyFormat = "$state `,` $rows (`all_rows` $all_rows^)? attr-dict `:` qualified(type($rows))";
 }
 
 /**
@@ -964,6 +2338,50 @@ def CountResult : NLOp<"count_result", []> {
   let results   = (outs NLChunk:$result);
 
   let assemblyFormat = "`(` $state `)` attr-dict `:` qualified(type($result))";
+}
+
+/**
+* CountScanRows
+*/
+def CountScanRows : NLOp<"count_scan_rows", [Pure, InferTypeOpAdaptor]> {
+  let summary = "Materialize the node counts of whole scans as their single-row product";
+  let description = [{
+    Imperative counterpart of db.count_scan_rows. Reads one node count per label
+    conjunction listed in `labels` and materializes their product as a single-row
+    chunk - one unsigned i64, the chunk nl.count_result emits:
+
+      %n = nl.count_scan_rows([["Reaction"], ["Pathway"]])
+
+    Unlike a count it opens no loop and reads no chunk: the counts come from the
+    graph's own per-label node counts, so there is no relation to walk and nothing
+    to accumulate. It produces the chunk in place at function scope, where nl.output
+    consumes it.
+
+    `property`, when given, narrows the scan `propertyScan` names to the nodes holding
+    that property - the count(a.name) form, answered off the index the graph keeps of
+    each property by the label set of its holders. The scan is counted from 0 and
+    defaults to the first:
+
+      %m = nl.count_scan_rows([["Person"]]) property "name"
+      %p = nl.count_scan_rows([["Reaction"], ["Pathway"]]) property "stId" of scan 1
+
+    `labels` is the list db.count_scan_rows carried; translation resolves each name
+    to a storage LabelID, the same way an nl.scan_nodes_by_label name is resolved, and
+    the property name to a storage PropertyTypeID. A name absent from the schema leaves
+    the conjunction unsatisfiable, so that factor counts 0 and the product is 0. An
+    empty conjunction filters nothing and counts every node.
+
+    The chunk is always a !nl.chunk<ui64> - a non-negative tally that is never null -
+    so the result type is inferred, not spelled out.
+  }];
+
+  let arguments = (ins LabelRefArrayArrayAttr:$labels,
+                       OptionalAttr<StrAttr>:$property,
+                       OptionalAttr<UI64Attr>:$propertyScan);
+  let results   = (outs NLChunk:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "`(` $labels `)` (`property` $property^)? (`of` `scan` $propertyScan^)? attr-dict";
 }
 
 /**
@@ -1066,23 +2484,76 @@ def AggregateResult : NLOp<"aggregate_result", []> {
   let hasVerifier = 1;
 }
 
-def Constant : NLOp<"constant", [Pure, InferTypeOpAdaptor]> {
+def Constant : NLOp<"constant", [Pure, ConstantLike, InferTypeOpAdaptor]> {
   let summary = "Materialize a constant scalar as a single-row chunk";
   let description = [{
       Represents a ColumnVector<T> with a single row
       %c = nl.constant(30 : i64) : !nl.chunk<i64>
   }];
 
-  let arguments = (ins TypedAttrInterface:$value);
+  let arguments = (ins AnyAttrOf<[TypedAttrInterface, DenseF32ArrayAttr, ArrayAttr, DictionaryAttr]>: $value);
   let results   = (outs NLChunk:$result);
 
   let assemblyFormat = "`(` $value `)` attr-dict";
 }
 
+def BroadcastConstant : NLOp<"broadcast_constant", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Repeat a constant chunk's single value over the rows of a step";
+  let description = [{
+      A constant chunk holds one value standing for every row rather than one per
+      row, so a step that walks rows - an aggregate's fold, a grouped fold - cannot
+      read it: it would see the single row the constant is, not the rows the step
+      has. This lays that value out over the rows of the driving relation, whose
+      chunk the cardinality operand is, giving a row-aligned nullable value chunk
+      the folds read like any column. The projection's sibling is nl.output's own
+      cardinality operand, against which its constants broadcast as it emits.
+
+      %r = nl.broadcast_constant %c, %n : (!nl.chunk<i64>, !nl.chunk<!storage.node_id>) -> !nl.chunk<!storage.nullable<i64>>
+
+      The cardinality operand is absent when no relation drives the projection -
+      RETURN 1 AS x, count(x) with no MATCH - which is one row of its own, so the
+      value is laid out over that single row:
+
+      %r = nl.broadcast_constant %c : (!nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i64>>
+  }];
+
+  // The cardinality is the only variable-length operand, so MLIR can tell it apart
+  // from the value without operand-segment sizes (as nl.for's limit handle is).
+  let arguments = (ins NLChunk:$value, Optional<NLChunk>:$cardinality);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$value (`,` $cardinality^)? attr-dict `:` functional-type(operands, results)";
+}
+
+/**
+* RowConstant
+*/
+def RowConstant : NLOp<"row_constant", [Pure, ConstantResult, SameOperandsAndResultType]> {
+  let summary = "Read the single row a computation over constants produced as a constant";
+  let description = [{
+      A row-wise op whose operands are all constants is computed once, ahead of the loops,
+      over the single row its constants are laid out on. This reads that row as the constant
+      it is, standing for every row of whichever step reads it:
+
+      %from = nl.broadcast_constant %one : (!nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i64>>
+      %to = nl.broadcast_constant %thousand : (!nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i64>>
+      %row = nl.range %from, %to : (...) -> !nl.chunk<!storage.nullable<!storage.list<i64>>>
+      %list = nl.row_constant %row : !nl.chunk<!storage.nullable<!storage.list<i64>>>
+
+      No row of a step may reach the operand: it is computed from constants alone.
+  }];
+
+  let arguments = (ins NLChunk:$row);
+  let results   = (outs NLChunk:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$row attr-dict `:` type($row)";
+}
+
 /**
 * Add
 */
-def Add : NLOp<"add", [Pure]> {
+def Add : NLOp<"add", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise addition of two value chunks";
   let description = [{
       Result type is determined by the types (e.g. int -> double promotion
@@ -1097,7 +2568,65 @@ def Add : NLOp<"add", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def Sub : NLOp<"sub", [Pure]> {
+def Concat : NLOp<"concat", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise concatenation of two string or two list chunks";
+  let description = [{
+      %r = nl.concat %x, %y : (!nl.chunk<!storage.string>, !nl.chunk<!storage.string>) -> !nl.chunk<!storage.string>
+      %l = nl.concat %s, %t : (!nl.chunk<!storage.list<none>>, !nl.chunk<!storage.list<none>>) -> !nl.chunk<!storage.list<none>>
+  }];
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def ListIndex : NLOp<"list_index", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise read of one element of a list chunk, by position";
+  let description = [{
+      %e = nl.list_index %xs, %i : (!nl.chunk<!storage.list<i64>>, !nl.chunk<i64>) -> !nl.chunk<!storage.nullable<!storage.any>>
+
+      A list of nodes or of edges hands its elements back as the entity chunk they were
+      gathered from, an invalid ID standing for a position the list does not hold:
+
+      %n = nl.list_index %ns, %i : (!nl.chunk<!storage.list<!storage.node_id>>, !nl.chunk<i64>) -> !nl.chunk<!storage.node_id>
+
+      A chunk of tagged cells is indexed too - a list read out of a list or out of a map -
+      and a cell holding no list reads back as the absent element.
+  }];
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def DynamicMapKey : NLOp<"dynamic_map_key", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise read of one value of a map chunk, by a key read per row";
+  let description = [{
+    Imperative counterpart of db.dynamic_map_key. Row r of the result views the entry row
+    r's map already holds under row r's key, so the read copies nothing:
+
+      %v = nl.dynamic_map_key %m, %k
+             : (!nl.chunk<!storage.nullable<!storage.map>>, !nl.chunk<!storage.string>)
+               -> !nl.chunk<!storage.map_element>
+
+    Either operand is nullable where a stored property fetched it and plain where a literal
+    built it, so both spellings are accepted on both. The map operand is a chunk of tagged
+    cells where the map was itself read out of a list or a map, and a cell holding a node or
+    an edge reads that entity's property under the key. The result never is: a map
+    value carries its null in its own tag, so a map holding no such key, a row holding no
+    map and a row holding no key all read back as a Null-tagged entry.
+  }];
+
+  let arguments = (ins NLChunk:$map, NLChunk:$key);
+  let results   = (outs NLMapElementChunk:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$map `,` $key attr-dict `:` functional-type(operands, results)";
+}
+
+def Sub : NLOp<"sub", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise subtraction of two value chunks";
   let description = [{
       Result type is determined by the types (e.g. int -> double promotion
@@ -1112,7 +2641,7 @@ def Sub : NLOp<"sub", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def Mul : NLOp<"mul", [Pure]> {
+def Mul : NLOp<"mul", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise multiplication of two value chunks";
   let description = [{
       Result type is determined by the types (e.g. int -> double promotion
@@ -1127,12 +2656,12 @@ def Mul : NLOp<"mul", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def Div : NLOp<"div", [Pure]> {
+def Div : NLOp<"div", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise division of two value chunks";
   let description = [{
       Result type is determined by the types (e.g. int -> double promotion
       on double / double), and nullability (e.g. null / non-null = null).
-      Division by zero yields null.
+      Division by zero throws.
 
       %r = nl.div %x, %y : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i64>>
   }];
@@ -1143,7 +2672,33 @@ def Div : NLOp<"div", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def Eq : NLOp<"eq", [Pure]> {
+def Mod : NLOp<"mod", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise modulo of two value chunks";
+  let description = [{
+      Modulo by zero throws.
+
+      %r = nl.mod %x, %y : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i64>>
+  }];
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def Pow : NLOp<"pow", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise exponentiation of two value chunks";
+  let description = [{
+      %r = nl.pow %x, %y : (!nl.chunk<i64>, !nl.chunk<i64>) -> !nl.chunk<f64>
+  }];
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def Eq : NLOp<"eq", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise equality of two value chunks";
   let description = [{
       %r = nl.eq %x, %y : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i1>>
@@ -1155,7 +2710,19 @@ def Eq : NLOp<"eq", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def Gt : NLOp<"gt", [Pure]> {
+def Neq : NLOp<"neq", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise inequality of two value chunks";
+  let description = [{
+      %r = nl.neq %x, %y : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i1>>
+  }];
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def Gt : NLOp<"gt", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise greater-than comparison of two value chunks";
   let description = [{
       %r = nl.gt %x, %y : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i1>>
@@ -1167,7 +2734,7 @@ def Gt : NLOp<"gt", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def Lt : NLOp<"lt", [Pure]> {
+def Lt : NLOp<"lt", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise less-than comparison of two value chunks";
   let description = [{
       %r = nl.lt %x, %y : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i1>>
@@ -1179,7 +2746,7 @@ def Lt : NLOp<"lt", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def Gte : NLOp<"gte", [Pure]> {
+def Gte : NLOp<"gte", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise greater-than-or-equal comparison of two value chunks";
   let description = [{
       %r = nl.gte %x, %y : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i1>>
@@ -1191,7 +2758,7 @@ def Gte : NLOp<"gte", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def Lte : NLOp<"lte", [Pure]> {
+def Lte : NLOp<"lte", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise less-than-or-equal comparison of two value chunks";
   let description = [{
       %r = nl.lte %x, %y : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i1>>
@@ -1203,7 +2770,55 @@ def Lte : NLOp<"lte", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def And : NLOp<"and", [Pure]> {
+def StartsWith : NLOp<"starts_with", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise test of whether each string chunk value starts with the given prefix";
+  let description = [{
+      %r = nl.starts_with %x, %y : (!nl.chunk<!storage.string>, !nl.chunk<!storage.string>) -> !nl.chunk<!storage.nullable<i1>>
+  }];
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def EndsWith : NLOp<"ends_with", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise test of whether each string chunk value ends with the given suffix";
+  let description = [{
+      %r = nl.ends_with %x, %y : (!nl.chunk<!storage.string>, !nl.chunk<!storage.string>) -> !nl.chunk<!storage.nullable<i1>>
+  }];
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def Contains : NLOp<"contains", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise test of whether each string chunk value contains the given substring";
+  let description = [{
+      %r = nl.contains %x, %y : (!nl.chunk<!storage.string>, !nl.chunk<!storage.string>) -> !nl.chunk<!storage.nullable<i1>>
+  }];
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def In : NLOp<"in", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise test of whether each chunk value is an element of the given list";
+  let description = [{
+      %r = nl.in %x, %y : (!nl.chunk<i64>, !nl.chunk<!storage.list<i64>>) -> !nl.chunk<!storage.nullable<i1>>
+  }];
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def And : NLOp<"and", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise logical AND of two boolean chunks";
   let description = [{
       Three-valued (Kleene) logic: null AND false is false, null AND true is
@@ -1218,7 +2833,7 @@ def And : NLOp<"and", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def Or : NLOp<"or", [Pure]> {
+def Or : NLOp<"or", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise logical OR of two boolean chunks";
   let description = [{
       Three-valued (Kleene) logic: null OR true is true, null OR false is
@@ -1233,13 +2848,285 @@ def Or : NLOp<"or", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def Not : NLOp<"not", [Pure]> {
+def Xor : NLOp<"xor", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise logical XOR of two boolean chunks";
+  let description = [{
+      %r = nl.xor %x, %y : (!nl.chunk<!storage.nullable<i1>>, !nl.chunk<i1>) -> !nl.chunk<!storage.nullable<i1>>
+  }];
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def Not : NLOp<"not", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise logical NOT of a boolean chunk";
   let description = [{
       Three-valued logic: NOT null is null, so the result is nullable when the
       operand is.
 
       %r = nl.not %x : (!nl.chunk<i1>) -> !nl.chunk<i1>
+  }];
+
+  let arguments = (ins NLChunk:$operand);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
+}
+
+def ToNullable : NLOp<"to_nullable", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Read a plain value chunk as a nullable value chunk holding a value in every row";
+  let description = [{
+      %r = nl.to_nullable %x : (!nl.chunk<ui64>) -> !nl.chunk<!storage.nullable<ui64>>
+  }];
+
+  let arguments = (ins NLChunk:$operand);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
+}
+
+class NLUnaryFunctionOp<string mnemonic, list<Trait> extraTraits = []>
+    : NLOp<mnemonic, !listconcat([Pure, RowAlignedThroughOperands], extraTraits)> {
+  let summary = "Apply a unary scalar function row-wise to a value chunk";
+
+  let arguments = (ins NLChunk:$operand);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
+}
+
+def Labels : NLUnaryFunctionOp<"labels">;
+def EdgeType : NLUnaryFunctionOp<"edge_type">;
+def Keys : NLUnaryFunctionOp<"keys", [ConstantThroughOperands]>;
+def PropertyMap : NLUnaryFunctionOp<"properties", [ConstantThroughOperands]>;
+
+// db.start_node and db.end_node lower to these: an edge chunk in, the node chunk holding
+// the end of each of its edges out.
+def StartNode : NLUnaryFunctionOp<"start_node">;
+def EndNode : NLUnaryFunctionOp<"end_node">;
+
+def ToInteger : NLUnaryFunctionOp<"to_integer", [ConstantThroughOperands]>;
+def ToFloat : NLUnaryFunctionOp<"to_float", [ConstantThroughOperands]>;
+def ToBoolean : NLUnaryFunctionOp<"to_boolean", [ConstantThroughOperands]>;
+def ToDateTime : NLUnaryFunctionOp<"to_datetime", [ConstantThroughOperands]>;
+def ToDuration : NLUnaryFunctionOp<"to_duration", [ConstantThroughOperands]>;
+def ToString : NLUnaryFunctionOp<"to_string", [ConstantThroughOperands]>;
+
+def ToIntegerOrNull : NLUnaryFunctionOp<"to_integer_or_null", [ConstantThroughOperands]>;
+def ToFloatOrNull : NLUnaryFunctionOp<"to_float_or_null", [ConstantThroughOperands]>;
+def ToBooleanOrNull : NLUnaryFunctionOp<"to_boolean_or_null", [ConstantThroughOperands]>;
+def ToStringOrNull : NLUnaryFunctionOp<"to_string_or_null", [ConstantThroughOperands]>;
+
+// The db.datetime_* family lowers to these. Each reads one instant and answers one
+// integer, so a constant instant - what datetime() and datetime('...') are - keeps its
+// constancy through the field read.
+def DateTimeYear : NLUnaryFunctionOp<"datetime_year", [ConstantThroughOperands]>;
+def DateTimeMonth : NLUnaryFunctionOp<"datetime_month", [ConstantThroughOperands]>;
+def DateTimeDay : NLUnaryFunctionOp<"datetime_day", [ConstantThroughOperands]>;
+def DateTimeHour : NLUnaryFunctionOp<"datetime_hour", [ConstantThroughOperands]>;
+def DateTimeMinute : NLUnaryFunctionOp<"datetime_minute", [ConstantThroughOperands]>;
+def DateTimeSecond : NLUnaryFunctionOp<"datetime_second", [ConstantThroughOperands]>;
+def DateTimeMillisecond : NLUnaryFunctionOp<"datetime_millisecond", [ConstantThroughOperands]>;
+def DateTimeMicrosecond : NLUnaryFunctionOp<"datetime_microsecond", [ConstantThroughOperands]>;
+
+// The db.duration_* family lowers to these.
+def DurationYears : NLUnaryFunctionOp<"duration_years", [ConstantThroughOperands]>;
+def DurationQuarters : NLUnaryFunctionOp<"duration_quarters", [ConstantThroughOperands]>;
+def DurationMonths : NLUnaryFunctionOp<"duration_months", [ConstantThroughOperands]>;
+def DurationWeeks : NLUnaryFunctionOp<"duration_weeks", [ConstantThroughOperands]>;
+def DurationDays : NLUnaryFunctionOp<"duration_days", [ConstantThroughOperands]>;
+def DurationHours : NLUnaryFunctionOp<"duration_hours", [ConstantThroughOperands]>;
+def DurationMinutes : NLUnaryFunctionOp<"duration_minutes", [ConstantThroughOperands]>;
+def DurationSeconds : NLUnaryFunctionOp<"duration_seconds", [ConstantThroughOperands]>;
+def DurationMilliseconds : NLUnaryFunctionOp<"duration_milliseconds", [ConstantThroughOperands]>;
+def DurationMicroseconds : NLUnaryFunctionOp<"duration_microseconds", [ConstantThroughOperands]>;
+def DurationQuartersOfYear : NLUnaryFunctionOp<"duration_quarters_of_year", [ConstantThroughOperands]>;
+def DurationMonthsOfYear : NLUnaryFunctionOp<"duration_months_of_year", [ConstantThroughOperands]>;
+def DurationMonthsOfQuarter : NLUnaryFunctionOp<"duration_months_of_quarter", [ConstantThroughOperands]>;
+def DurationDaysOfWeek : NLUnaryFunctionOp<"duration_days_of_week", [ConstantThroughOperands]>;
+def DurationMinutesOfHour : NLUnaryFunctionOp<"duration_minutes_of_hour", [ConstantThroughOperands]>;
+def DurationSecondsOfMinute : NLUnaryFunctionOp<"duration_seconds_of_minute", [ConstantThroughOperands]>;
+def DurationMillisecondsOfSecond : NLUnaryFunctionOp<"duration_milliseconds_of_second", [ConstantThroughOperands]>;
+def DurationMicrosecondsOfSecond : NLUnaryFunctionOp<"duration_microseconds_of_second", [ConstantThroughOperands]>;
+
+def CurrentDateTime : NLOp<"current_datetime", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "The instant the query runs, as a single-value chunk";
+  let description = [{
+      db.current_datetime lowers to this. The translator reads the clock and fills the
+      chunk with the answer, so the op runs no step of its own.
+
+        %now = nl.current_datetime() : !nl.chunk<!storage.datetime>
+  }];
+
+  let arguments = (ins);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "`(` `)` attr-dict `:` type($result)";
+}
+
+// The list family db.size / db.head / db.last / db.tail lower to. A literal list is one
+// cell standing for every row, and so is what these read off it, so each carries its
+// operand's constancy rather than being spread over the rows it was read on.
+// db.element_id lowers to this, and carries its operand's constancy as the list family does.
+def ElementID : NLUnaryFunctionOp<"element_id", [ConstantThroughOperands]>;
+
+def Size : NLUnaryFunctionOp<"size", [ConstantThroughOperands]>;
+def CharLength : NLUnaryFunctionOp<"char_length", [ConstantThroughOperands]>;
+def Head : NLUnaryFunctionOp<"head", [ConstantThroughOperands]>;
+def Last : NLUnaryFunctionOp<"last", [ConstantThroughOperands]>;
+def Tail : NLUnaryFunctionOp<"tail", [ConstantThroughOperands]>;
+
+def Abs : NLUnaryFunctionOp<"abs", [ConstantThroughOperands]>;
+def Negate : NLUnaryFunctionOp<"negate", [ConstantThroughOperands]>;
+def UnaryPlus : NLUnaryFunctionOp<"unary_plus", [ConstantThroughOperands]>;
+def Sign : NLUnaryFunctionOp<"sign", [ConstantThroughOperands]>;
+def Ceil : NLUnaryFunctionOp<"ceil", [ConstantThroughOperands]>;
+def Floor : NLUnaryFunctionOp<"floor", [ConstantThroughOperands]>;
+def Round : NLUnaryFunctionOp<"round", [ConstantThroughOperands]>;
+def Sqrt : NLUnaryFunctionOp<"sqrt", [ConstantThroughOperands]>;
+def Exp : NLUnaryFunctionOp<"exp", [ConstantThroughOperands]>;
+def Log : NLUnaryFunctionOp<"log", [ConstantThroughOperands]>;
+def Log10 : NLUnaryFunctionOp<"log10", [ConstantThroughOperands]>;
+def Sin : NLUnaryFunctionOp<"sin", [ConstantThroughOperands]>;
+def Cos : NLUnaryFunctionOp<"cos", [ConstantThroughOperands]>;
+def Tan : NLUnaryFunctionOp<"tan", [ConstantThroughOperands]>;
+def Cot : NLUnaryFunctionOp<"cot", [ConstantThroughOperands]>;
+def Asin : NLUnaryFunctionOp<"asin", [ConstantThroughOperands]>;
+def Acos : NLUnaryFunctionOp<"acos", [ConstantThroughOperands]>;
+def Atan : NLUnaryFunctionOp<"atan", [ConstantThroughOperands]>;
+def Degrees : NLUnaryFunctionOp<"degrees", [ConstantThroughOperands]>;
+def Radians : NLUnaryFunctionOp<"radians", [ConstantThroughOperands]>;
+def Haversin : NLUnaryFunctionOp<"haversin", [ConstantThroughOperands]>;
+
+def ToUpper : NLUnaryFunctionOp<"to_upper", [ConstantThroughOperands]>;
+def ToLower : NLUnaryFunctionOp<"to_lower", [ConstantThroughOperands]>;
+def Trim : NLUnaryFunctionOp<"trim", [ConstantThroughOperands]>;
+def LTrim : NLUnaryFunctionOp<"ltrim", [ConstantThroughOperands]>;
+def RTrim : NLUnaryFunctionOp<"rtrim", [ConstantThroughOperands]>;
+def Reverse : NLUnaryFunctionOp<"reverse", [ConstantThroughOperands]>;
+
+class NLNormalFormFunctionOp<string mnemonic> : NLUnaryFunctionOp<mnemonic, [ConstantThroughOperands]> {
+  let arguments = (ins NLChunk:$operand, UnicodeNormalForm:$form);
+
+  let assemblyFormat = "$operand `,` $form attr-dict `:` functional-type(operands, results)";
+}
+
+def Normalize : NLNormalFormFunctionOp<"normalize">;
+def IsNormalized : NLNormalFormFunctionOp<"is_normalized">;
+
+def Substring : NLOp<"substring", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise substring [start, start + length)";
+
+  let arguments = (ins NLChunk:$string, NLChunk:$start, Optional<NLChunk>:$length);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$string `,` $start (`,` $length^)? attr-dict `:` functional-type(operands, results)";
+}
+
+def Split : NLOp<"split", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise split on delimiter";
+
+  let arguments = (ins NLChunk:$string, NLChunk:$delimiter);
+  let results   = (outs NLChunk:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$string `,` $delimiter attr-dict `:` functional-type(operands, results)";
+}
+
+class NLStringEndOp<string mnemonic> : NLOp<mnemonic, [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise run of characters at one end of a string";
+
+  let arguments = (ins NLChunk:$string, NLChunk:$length);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$string `,` $length attr-dict `:` functional-type(operands, results)";
+}
+
+def Left : NLStringEndOp<"left">;
+def Right : NLStringEndOp<"right">;
+
+def Replace : NLOp<"replace", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise replacement of every occurrence of a search string";
+
+  let arguments = (ins NLChunk:$string, NLChunk:$search, NLChunk:$replacement);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$string `,` $search `,` $replacement attr-dict `:` functional-type(operands, results)";
+}
+
+class NLBinaryFunctionOp<string mnemonic> : NLOp<mnemonic, [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Apply a binary scalar function row-wise to two value chunks";
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def CosineSimilarity : NLBinaryFunctionOp<"cosine_similarity">;
+def EuclideanDistance : NLBinaryFunctionOp<"euclidean_distance">;
+
+def Case : NLOp<"case", [Pure, RowAlignedThroughOperands, AttrSizedOperandSegments]> {
+  let summary = "Row-wise selection of the first branch whose condition holds";
+  let description = [{
+      The lowered db.case: parallel condition and value chunks, an optional default, and
+      a nullable value chunk holding the branch each row took - an entity chunk when the
+      branches are nodes or edges, whose null is the invalid ID rather than an absent
+      optional. Every operand carries rows - a constant among them was laid out over the
+      driving relation during lowering - so the selection reads one cell of each per row
+      it writes.
+
+      %r = nl.case({%c0}, {%v0}, %d) : (!nl.chunk<i1>, !nl.chunk<!storage.nullable<i64>>,
+                                        !nl.chunk<!storage.nullable<i64>>)
+                                        -> !nl.chunk<!storage.nullable<i64>>
+  }];
+
+  let arguments = (ins Variadic<NLChunk>:$conditions,
+                       Variadic<NLChunk>:$values,
+                       Optional<NLChunk>:$defaultValue);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = [{
+    `(` `{` $conditions `}` `,` `{` $values `}` (`,` $defaultValue^)? `)`
+    attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def CaseMerge : NLOp<"case_merge", [Pure, RowAlignedWithFirstOperand, AttrSizedOperandSegments]> {
+  let summary = "Row-wise selection of the first branch whose condition holds, out of branches computed only over the rows reaching them";
+  let description = [{
+      The lowered db.lazy_case. Its operands are cut down the way the CASE reads its rows:
+      the first condition holds one row per row of the CASE, each later one a row per row
+      no earlier condition held for, each value a row per row its condition held for, and
+      the default a row per row no condition held for. The kernel walks the rows of the
+      first condition, with a cursor into every other operand.
+
+      %r = nl.case_merge({%c0, %c1}, {%v0, %v1}, %d) : (!nl.chunk<i1>, !nl.chunk<i1>,
+                                                        !nl.chunk<!storage.nullable<i64>>,
+                                                        !nl.chunk<!storage.nullable<i64>>,
+                                                        !nl.chunk<!storage.nullable<i64>>)
+                                                        -> !nl.chunk<!storage.nullable<i64>>
+  }];
+
+  let arguments = (ins Variadic<NLChunk>:$conditions,
+                       Variadic<NLChunk>:$values,
+                       Optional<NLChunk>:$defaultValue);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = [{
+    `(` `{` $conditions `}` `,` `{` $values `}` (`,` $defaultValue^)? `)`
+    attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def IsNotTrue : NLOp<"is_not_true", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise test of whether a condition is false or null";
+  let description = [{
+      The rows a CASE condition lets through to the next branch.
+
+      %r = nl.is_not_true %c : (!nl.chunk<!storage.nullable<i1>>) -> !nl.chunk<!storage.bool>
   }];
 
   let arguments = (ins NLChunk:$operand);
@@ -1366,6 +3253,39 @@ def GroupAggregate : NLOp<"group_aggregate", [Pure]> {
 }
 
 /**
+* Procedure
+*/
+// NOT Pure: it prepares a live procedure - the alloc callback's data and the
+// procedure's PREPARE step - so two must never be CSE'd into one (each CALL is its
+// own call), and an unread one must not be DCE'd: preparing it is a side effect
+// (like nl.limit / nl.sort_buffer).
+def Procedure : NLOp<"procedure", []> {
+  let summary = "Prepare one procedure call, once, ahead of the loops";
+  let description = [{
+    Sits at the top of the scope it governs - function scope for a top-level CALL -
+    where it prepares the procedure once and re-initializes it each further time
+    that block runs. Produces the !nl.procedure_state handle nl.procedure_init reads.
+
+      %call = nl.procedure("db.labels") yields ["id", "label"]
+
+    `name` is the procedure's full name, resolved against the procedure registry
+    during translation - the procedure sibling of nl.get_property_type, which
+    resolves a property name once above the loops so the consumers below reuse it.
+    `yields` names the return values this call binds, in the order the consuming op
+    produces them, so the columns the procedure writes into are allocated once here
+    and shared by every step. It may be empty - a procedure declaring no return value
+    binds no column and is driven for what it does rather than for rows. The result
+    type is buildable and omitted.
+  }];
+
+  let arguments = (ins StrAttr:$name, StrArrayAttr:$yields);
+  let results   = (outs NLProcedureState:$state);
+
+  let assemblyFormat = "`(` $name `)` `yields` $yields attr-dict";
+  let hasVerifier = 1;
+}
+
+/**
 * CollectBuffer
 */
 // NOT Pure: a distinct accumulator (no CSE); resetting its group table is a side effect.
@@ -1374,17 +3294,32 @@ def CollectBuffer : NLOp<"collect_buffer", []> {
   let description = [{
     Hoisted above the loops; produces the !nl.collect_state handle nl.collect_update
     appends to and the drain reads. `keys` is how many collected columns are grouping
-    keys (0 = one global list); the column types are recovered from the update.
+    keys (0 = one global list); the column types, and how many value columns follow the
+    keys, are recovered from the update.
 
       %buf = nl.collect_buffer keys 1
+
+    `distinct` makes the accumulator charge each of a group's values once - Cypher's
+    collect(DISTINCT x) - naming the value columns that dedupe by index. It sits on the
+    buffer rather than the update because it is part of what the accumulator is, as its
+    key count is: the update carries no spec of its own.
+
+      %buf = nl.collect_buffer keys 0 distinct [1]
   }];
 
   // keyCount is unsigned; 0 is a valid ungrouped collect, so nothing to verify here
-  // (the one-value-column split is checked during translation).
-  let arguments = (ins UI64Attr:$keyCount);
+  // (the value-column split is checked during translation). kinds names the reductions
+  // taken over the same groups as the list, one per aggregate input the update carries
+  // after the value columns, and is absent when the collect reduces nothing beside it.
+  let arguments = (ins UI64Attr:$keyCount,
+                       OptionalAttr<DenseI64ArrayAttr>:$kinds,
+                       OptionalAttr<DenseI64ArrayAttr>:$distinctValues);
   let results   = (outs NLCollectState:$state);
 
-  let assemblyFormat = "`keys` $keyCount attr-dict";
+  let assemblyFormat = [{
+    `keys` $keyCount (`aggregates` custom<GroupAggregateKinds>($kinds)^)?
+    (`distinct` custom<ColumnIndices>($distinctValues)^)? attr-dict
+  }];
 }
 
 /**
@@ -1394,9 +3329,9 @@ def CollectBuffer : NLOp<"collect_buffer", []> {
 def CollectUpdate : NLOp<"collect_update", []> {
   let summary = "Append this step's rows to the per-group value lists";
   let description = [{
-    Assigns each row to its group by the grouping-key tuple and appends its value to
-    that group's list. Columns are the grouping keys then the single value column, per
-    the buffer's `keys`; nulls are dropped (Cypher collect ignores them).
+    Assigns each row to its group by the grouping-key tuple and appends its values to
+    that group's lists. Columns are the grouping keys then the value columns, per the
+    buffer's `keys`; nulls are dropped (Cypher collect ignores them).
 
       nl.collect_update %buf, (%city, %name) : !nl.chunk<!storage.nullable<i64>>, !nl.chunk<!storage.nullable<!storage.string>>
   }];
@@ -1438,10 +3373,11 @@ def UnwindCollect : NLOp<"unwind_collect", [Pure]> {
 def Collect : NLOp<"collect", [Pure]> {
   let summary = "Create a database iterator that drains a collect accumulator, one row per group carrying the whole list";
   let description = [{
-    Per-group drain of an nl.collect_state: one row per group - the key values then a
-    list cell (a ListView over the group's elements). An empty group yields an empty
-    list (unlike nl.unwind_collect). The iterator chunk types (keys then the list cell) are
-    spelled after the colon, and it is placed after the producing loop.
+    Per-group drain of an nl.collect_state: one row per group - the key values then one
+    list cell per value column (a ListView over the group's elements). An empty group
+    yields an empty list (unlike nl.unwind_collect). The iterator chunk types (the keys
+    then the list cells) are spelled after the colon, and it is placed after the
+    producing loop.
 
       %rows = nl.collect(%buf) : !nl.iter<!nl.chunk<!storage.nullable<i64>>, !nl.chunk<!storage.list<!storage.string>>>
   }];
@@ -1452,7 +3388,58 @@ def Collect : NLOp<"collect", [Pure]> {
   let assemblyFormat = "`(` $state `)` attr-dict `:` qualified(type($result))";
 }
 
-def CreateNode : NLOp<"create_node"> {
+/**
+* ShortestPathBuffer
+*/
+def ShortestPathBuffer : NLOp<"shortest_path_buffer", []> {
+  let summary = "Create (and reset) a shortest-path search accumulator";
+  let description = [{
+    Hoisted above the loops; produces the !nl.shortest_path_state handle the updates
+    append node sets to and the drain runs the search over. The result type is buildable
+    and omitted.
+
+      %buf = nl.shortest_path_buffer
+  }];
+
+  let results = (outs NLShortestPathState:$state);
+
+  let assemblyFormat = "attr-dict";
+}
+
+/**
+* ShortestPathUpdate
+*/
+def ShortestPathUpdate : NLOp<"shortest_path_update", []> {
+  let summary = "Append this step's nodes to the source or target node set";
+  let description = [{
+    Appends the step's node chunk to the target set when `target` is present, else the
+    source set. Source and target are filled by separate updates, each in its own loop.
+
+      nl.shortest_path_update %buf, %a
+      nl.shortest_path_update %buf, %b target
+  }];
+
+  let arguments = (ins NLShortestPathStateHandle:$state, NLNodeIDChunk:$nodes, UnitAttr:$target);
+
+  let assemblyFormat = "$state `,` $nodes (`target` $target^)? attr-dict";
+}
+
+/**
+* ShortestPath
+*/
+def ShortestPath : NLOp<"shortest_path", [Pure]> {
+  let summary = "Create a database iterator that runs the weighted search and drains its one result row";
+  let description = [{
+      %rows = nl.shortest_path(%buf, %cost) : !nl.iter<!nl.chunk<f64>, !nl.chunk<!storage.path>>
+  }];
+
+  let arguments = (ins NLShortestPathStateHandle:$state, NLPropertyTypeHandle:$edgeProperty);
+  let results   = (outs NLIterator:$result);
+
+  let assemblyFormat = "`(` $state `,` $edgeProperty `)` attr-dict `:` qualified(type($result))";
+}
+
+def CreateNode : NLOp<"create_node", [AttrSizedOperandSegments, RowAlignedThroughOperands]> {
   let summary = "Write one node per input row into the open transaction's write buffer";
   let description = [{
     Adds one pending node per row to the transaction's CommitWriteBuffer.
@@ -1464,19 +3451,21 @@ def CreateNode : NLOp<"create_node"> {
       }
   }];
 
-  let arguments = (ins StrArrayAttr:$labels,
+  let arguments = (ins LabelRefArrayAttr:$labels,
                        StrArrayAttr:$prop_names,
-                       Variadic<NLChunk>:$prop_values);
+                       Variadic<NLChunk>:$prop_values,
+                       Optional<NLChunk>:$cardinality);
   let results   = (outs NLNodeIDChunk:$result);
   let hasVerifier = 1;
 
   let assemblyFormat = [{
-    $labels `,` $prop_names `,` `{` $prop_values `}` attr-dict
+    $labels `,` $prop_names `,` `{` $prop_values `}`
+    ( `foreach` $cardinality^ `:` qualified(type($cardinality)) )? attr-dict
     ( `:` qualified(type($prop_values))^ )?
   }];
 }
 
-def CreateEdge : NLOp<"create_edge"> {
+def CreateEdge : NLOp<"create_edge", [AttrSizedOperandSegments, RowAlignedThroughOperands]> {
   let summary = "Write one edge per input row into the open transaction's write buffer";
   let description = [{
     Adds one pending edge per row to the transaction's CommitWriteBuffer.
@@ -1490,16 +3479,690 @@ def CreateEdge : NLOp<"create_edge"> {
 
   let arguments = (ins NLNodeIDChunk:$src_ids,
                        NLNodeIDChunk:$tgt_ids,
-                       StrAttr:$edge_type,
+                       EdgeTypeRef:$edge_type,
                        StrArrayAttr:$prop_names,
-                       Variadic<NLChunk>:$prop_values);
+                       Variadic<NLChunk>:$prop_values,
+                       Optional<NLBoolChunk>:$src_pending,
+                       Optional<NLBoolChunk>:$tgt_pending,
+                       UnitAttr:$src_all_pending,
+                       UnitAttr:$tgt_all_pending);
   let results   = (outs NLEdgeIDChunk:$result);
   let hasVerifier = 1;
 
+  // The two optional masks say, row by row, which endpoints are nodes this change wrote
+  // and has not committed - what an nl.merge's node chunk mixes. A chunk an
+  // nl.create_node produced is pending in every row and says so with the matching
+  // all_pending flag instead of a mask.
   let assemblyFormat = [{
-    $src_ids `,` $tgt_ids `,` $edge_type `,` $prop_names `,` `{` $prop_values `}` attr-dict
+    $src_ids `,` $tgt_ids `,` $edge_type `,` $prop_names `,` `{` $prop_values `}`
+    (`src_pending` $src_pending^)? (`tgt_pending` $tgt_pending^)?
+    (`src_all_pending` $src_all_pending^)? (`tgt_all_pending` $tgt_all_pending^)? attr-dict
     ( `:` qualified(type($prop_values))^ )?
   }];
+}
+
+def Merge : NLOp<"merge", [AttrSizedOperandSegments]> {
+  let summary = "Look one MERGE path pattern up per row of the input chunks, writing it when the graph does not hold it";
+
+  let description = [{
+    Imperative counterpart of db.merge, and the one op of the family that both reads
+    the graph and writes the transaction's CommitWriteBuffer. For each row of its
+    input chunks it looks the whole chain up - candidate nodes by label and property
+    value, then each hop by type and property value - and fills its result chunks
+    with one row per match. A row that matches nothing has the entities the pattern
+    does not already bind written as pending nodes and edges, and contributes the one
+    row those make.
+
+      nl.for %names in %unwind {
+        %n, %n_pending, %created = nl.merge nodes [["Person"]] props [["name"]]
+                                           edges [] props [] dirs []
+                                           bound {} pending {} values {%names} {} carrying {}
+          : (!nl.chunk<!storage.string>)
+            -> (!nl.chunk<!storage.node_id>, !nl.chunk<!storage.bool>, !nl.chunk<!storage.bool>)
+      }
+
+    The results grow or shrink the row count, the way nl.cross_product does: a row
+    matched twice is emitted twice and the carry set is gathered onto the emitted
+    rows, so every result chunk of one step holds the same rows.
+
+    A node chunk the op produces mixes node IDs the graph holds with offsets into the
+    write buffer, and the mask beside it says which rows are which - the same mask a
+    following nl.set_node_property or nl.merge reads to know how to resolve a row. A
+    bound node has no chunk of its own: it came in through `bound_nodes` and comes back
+    through the carry set, gathered onto the emitted rows like every other chunk.
+    The graph the match reads is the commit the change sits on, so a pattern this
+    query wrote is invisible to it; what the op wrote itself it does remember, so
+    merging the same node twice in one query writes it once.
+  }];
+
+  let arguments = (ins LabelRefArrayArrayAttr:$node_labels,
+                       StrArrayArrayAttr:$node_prop_names,
+                       EdgeTypeRefArrayAttr:$edge_types,
+                       StrArrayArrayAttr:$edge_prop_names,
+                       DenseI64ArrayAttr:$edge_directions,
+                       DenseI64ArrayAttr:$pending_nodes,
+                       Variadic<NLChunk>:$bound_nodes,
+                       Variadic<NLChunk>:$bound_pending,
+                       Variadic<NLChunk>:$node_prop_values,
+                       Variadic<NLChunk>:$edge_prop_values,
+                       Variadic<NLChunk>:$carried_columns);
+
+  let results = (outs Variadic<NLChunk>:$results);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `nodes` $node_labels `props` $node_prop_names
+    `edges` $edge_types `props` $edge_prop_names `dirs` custom<EdgeDirections>($edge_directions)
+    `bound` `{` $bound_nodes `}` `pending` custom<ColumnIndices>($pending_nodes) `{` $bound_pending `}`
+    `values` `{` $node_prop_values `}` `{` $edge_prop_values `}`
+    `carrying` `{` $carried_columns `}`
+    attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def SetNodeProperty : NLOp<"set_node_property", [AttrSizedOperandSegments]> {
+  let summary = "Update one named property per input node in the open transaction's write buffer";
+  let description = [{
+      nl.for %nodes in %scan {
+        nl.set_node_property %nodes, "age", %val_chunk : !nl.chunk<i64>
+      }
+  }];
+
+  let arguments = (ins NLNodeIDChunk:$input_nodes,
+                       StrAttr:$property,
+                       NLChunk:$value,
+                       Optional<NLBoolChunk>:$pending,
+                       Optional<NLBoolChunk>:$rows,
+                       UnitAttr:$all_pending);
+
+  let assemblyFormat = [{
+    $input_nodes `,` $property `,` $value (`pending` $pending^)? (`rows` $rows^)?
+    (`all_pending` $all_pending^)? attr-dict `:` qualified(type($value))
+  }];
+
+  let hasVerifier = 1;
+}
+
+def SetEdgeProperty : NLOp<"set_edge_property", [AttrSizedOperandSegments]> {
+  let summary = "Update one named property per input edge in the open transaction's write buffer";
+  let description = [{
+      nl.for %s, %e, %t in %edges {
+        nl.set_edge_property %e, "weight", %val_chunk : !nl.chunk<f64>
+      }
+  }];
+
+  let arguments = (ins NLEdgeIDChunk:$input_edges,
+                       StrAttr:$property,
+                       NLChunk:$value,
+                       Optional<NLBoolChunk>:$pending,
+                       Optional<NLBoolChunk>:$rows,
+                       UnitAttr:$all_pending);
+
+  let assemblyFormat = [{
+    $input_edges `,` $property `,` $value (`pending` $pending^)? (`rows` $rows^)?
+    (`all_pending` $all_pending^)? attr-dict `:` qualified(type($value))
+  }];
+
+  let hasVerifier = 1;
+}
+
+def DeleteNode : NLOp<"delete_node"> {
+  let summary = "Tombstone each input node in the open transaction's write buffer";
+  let description = [{
+      nl.for %nodes in %scan {
+        nl.delete_node %nodes detach
+      }
+  }];
+
+  // `pending` is the mask an nl.merge produced beside its node chunk: such a row names
+  // a node this change wrote and has not committed, which is dropped from the write
+  // buffer rather than tombstoned by an ID the graph does not hold. `all_pending` says
+  // that of every row without a mask, which an nl.create_node's chunk is.
+  let arguments = (ins NLNodeIDChunk:$input_nodes,
+                       UnitAttr:$detach,
+                       Optional<NLBoolChunk>:$pending,
+                       UnitAttr:$all_pending);
+
+  let assemblyFormat = [{
+    $input_nodes (`detach` $detach^)? (`pending` $pending^)? (`all_pending` $all_pending^)? attr-dict
+  }];
+}
+
+def DeleteEdge : NLOp<"delete_edge"> {
+  let summary = "Tombstone each input edge in the open transaction's write buffer";
+  let description = [{
+      nl.for %s, %e, %t in %edges {
+        nl.delete_edge %e
+      }
+  }];
+
+  let arguments = (ins NLEdgeIDChunk:$input_edges,
+                       Optional<NLBoolChunk>:$pending,
+                       UnitAttr:$all_pending);
+
+  let assemblyFormat = [{
+    $input_edges (`pending` $pending^)? (`all_pending` $all_pending^)? attr-dict
+  }];
+}
+
+/**
+* ProcedureInit
+*/
+// NOT Pure: driving the iterator runs the procedure's execute callback, so no CSE of two
+// iterators over one call and no DCE of an unread one.
+def ProcedureInit : NLOp<"procedure_init", [AttrSizedOperandSegments]> {
+  let summary = "Create a database iterator driving a procedure over its arguments";
+  let description = [{
+    The row-producing form of a CALL, the procedure counterpart of nl.scan_nodes and
+    nl.get_out_edges: it opens an iterator over the rows the procedure produces, and
+    each step of the enclosing nl.for calls the procedure's execute callback once,
+    which refills the result columns with that step's rows. The loop runs until the
+    procedure declares itself finished, so - exactly like an edge hop over one chunk of
+    nodes - a procedure may answer one chunk of arguments with as many chunks of rows as
+    it needs:
+
+      %call = nl.procedure("db.labels") yields ["id", "label"]
+      %rows = nl.procedure_init(%call, (), {}) : (!nl.procedure_state) -> !nl.iter<!nl.chunk<!storage.label_id>, !nl.chunk<!storage.string>>
+      nl.for %ids, %labels in %rows : !nl.iter<...> {
+        nl.output(%ids, %labels) : !nl.chunk<!storage.label_id>, !nl.chunk<!storage.string>
+      }
+
+    `inputs` are the call's arguments, in the procedure's declaration order, so operand
+    i is argument i. With none the procedure is a source and its loop sits at function
+    scope, as above. With arguments the iterator is created inside the loop that binds
+    them and re-opened once per chunk of them - the nested-loop shape nl.get_out_edges
+    has - so the procedure is reset at the top of each drive and starts afresh for the
+    new chunk.
+
+    `columns_to_filter` is the carry set, mirroring nl.get_out_edges: the chunks bound
+    alongside the arguments that must survive the call. A procedure need not emit one
+    row per input row, so a carried chunk cannot pass through untouched - each step
+    rebuilds it from the input-row index the procedure reports for every row it emits,
+    which replicates the rows of an expanding call and drops those of a filtering one.
+    Each carried chunk comes back as a trailing chunk of the iterator, so the nl.for
+    binds it after the yields:
+
+      %rows = nl.procedure_init(%call, (%m), {%n, %m})
+                : (!nl.procedure_state, !nl.chunk<!storage.node_id>, !nl.chunk<!storage.node_id>, !nl.chunk<!storage.node_id>)
+                  -> !nl.iter<!nl.chunk<i64>, !nl.chunk<!storage.node_id>, !nl.chunk<!storage.node_id>>
+      nl.for %x, %n2, %m2 in %rows : !nl.iter<...> {
+        nl.output(%n2, %m2, %x) : ...
+      }
+
+    Only a procedure that declares it makes that report can be carried past
+    (Procedure::getIndices), which lowering settles at plan time; hand-written IR
+    is caught during translation. A procedure that declares it and then reports nothing
+    is caught at the first step it emits, rather than silently misaligning the
+    projection.
+
+    The iterator's chunk types are the yielded return values' column types followed by
+    the carried ones. Neither can be recovered from the parameterless state handle, so
+    they are spelled after the colon (as the nl.for iterator type is). A call binding no
+    return value gives an iterator of no chunk, whose nl.for binds no variable and runs an
+    empty body: the drive is all there is to it, which is what a call made for its side
+    effect wants.
+  }];
+
+  // Two variadic operand groups - the arguments and the carry set - so the op carries
+  // operand-segment sizes to tell them apart, as nl.cross_product does.
+  let arguments = (ins NLProcedureStateHandle:$state,
+                       Variadic<NLChunk>:$inputs,
+                       Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLIterator:$result);
+
+  // The handle prints first, then the parenthesized argument chunks and the
+  // brace-wrapped carry set, so a source call reads `nl.procedure_init(%call, (), {})`
+  // - the brace style nl.get_out_edges uses, which keeps the syntax total without an
+  // optional group. Neither operand group's chunk types are buildable and the iterator
+  // type cannot be inferred from them, so functional-type spells both sides, as
+  // nl.filter does.
+  let assemblyFormat = [{
+    `(` $state `,` `(` $inputs `)` `,` `{` $columns_to_filter `}` `)` attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* OptionalBuffer
+*/
+// NOT Pure: it re-initializes the accumulator, so it must run exactly where it
+// sits - once per step of the rows the OPTIONAL MATCH joins onto - and must not
+// be hoisted, CSE'd or eliminated (like nl.sort_buffer).
+def OptionalBuffer : NLOp<"optional_buffer", [RowAlignedThroughOperands]> {
+  let summary = "Create (and reset) the accumulator for one OPTIONAL MATCH over this step's rows";
+  let description = [{
+    Sits at the top of the block whose step it covers - the innermost loop body
+    binding the columns the OPTIONAL MATCH joins onto - so the accumulator is
+    empty again at every step. It records this step's input chunks, clears the
+    matched flag of each of their rows, and produces the row tag: a chunk holding
+    each input row's position, which the pattern carries alongside the columns it
+    walks so nl.optional_collect knows which rows matched.
+
+      %state, %tag = nl.optional_buffer (%p) : {!nl.chunk<!storage.node_id>}
+
+    With no input columns - a query opening on OPTIONAL MATCH - the step is the
+    single empty row Cypher starts from, so the accumulator holds one flag and the
+    tag one row. The pattern has nothing to join onto there, so it never carries
+    that tag, which is why the op is row-aligned through its operands: a tag over
+    input rows holds exactly the rows those chunks do.
+  }];
+
+  // The chunks the OPTIONAL MATCH joins onto; the accumulator reads its row count
+  // from the first of them, and rebuilds the rows the pattern missed out of them.
+  let arguments = (ins Variadic<NLChunk>:$input_columns);
+
+  // The accumulator, then the row tag over this step's input rows.
+  let results = (outs NLOptionalState:$state, NLUInt64Chunk:$tag);
+
+  // The tag's type is buildable and so omitted; only the input chunk types are
+  // spelled, in braces as nl.cross_product spells a factor's.
+  let assemblyFormat = [{
+    `(` $input_columns `)` attr-dict (`:` `{` qualified(type($input_columns))^ `}`)?
+  }];
+}
+
+/**
+* OptionalCollect
+*/
+// NOT Pure: it appends the step's matched rows to the accumulator and marks the
+// input rows they came from, so it must run exactly where it sits (like
+// nl.sort_collect).
+def OptionalCollect : NLOp<"optional_collect", [AttrSizedOperandSegments]> {
+  let summary = "Append this step's matched rows to an OPTIONAL MATCH accumulator";
+  let description = [{
+    Runs in the pattern's innermost loop body, once per step. Appends the current
+    chunk of every column the pattern contributes to the accumulator's buffers,
+    and marks as matched each input row the tag names, so once the pattern is
+    walked the unmarked rows are exactly the ones it missed.
+
+      nl.optional_collect %state, %tag, (%p2, %e, %f)
+        : {!nl.chunk<!storage.node_id>, !nl.chunk<!storage.edge_id>, !nl.chunk<!storage.node_id>}
+
+    The tag is absent when the accumulator has no input columns: the step is then
+    the single empty row, which any collected row marks.
+  }];
+
+  let arguments = (ins NLOptionalStateHandle:$state,
+                       Optional<NLUInt64Chunk>:$tag,
+                       Variadic<NLChunk>:$columns);
+
+  let assemblyFormat = [{
+    $state `,` ($tag^ `,`)? `(` $columns `)` attr-dict `:` `{` qualified(type($columns)) `}`
+  }];
+}
+
+/**
+* OptionalDrain
+*/
+// Pure: given a filled accumulator it deterministically yields the same rows, and
+// produces no side effect of its own - the emission happens in the driving
+// nl.for. Mirrors nl.sort: a source op whose loop does the work.
+def OptionalDrain : NLOp<"optional_drain", [Pure]> {
+  let summary = "Create a database iterator over an OPTIONAL MATCH's matched rows, then its missed ones";
+  let description = [{
+    The emit phase of an OPTIONAL MATCH. Consumes a filled nl.optional_state and
+    produces an iterator whose steps yield first the rows the pattern matched, as
+    collected, and then one row per input row it missed: the input columns taken
+    from the step's own chunks and the pattern's own columns null - an invalid ID,
+    which reads as null through a property fetch.
+
+      %rows = nl.optional_drain(%state) : !nl.iter<!nl.chunk<!storage.node_id>, ...>
+      nl.for %p, %e, %f in %rows : !nl.iter<...> { ... }
+
+    Its first step must find every matched row already collected, so place it after
+    the pattern's loop nest, in the block holding the nl.optional_buffer that opened
+    the accumulator.
+  }];
+
+  let arguments = (ins NLOptionalStateHandle:$state);
+  let results   = (outs NLIterator:$result);
+
+  let assemblyFormat = "`(` $state `)` attr-dict `:` qualified(type($result))";
+}
+
+/**
+* ExistsBuffer
+*/
+def ExistsBuffer : NLOp<"exists_buffer", [RowAlignedThroughOperands]> {
+  let summary = "Create (and reset) the accumulator for one EXISTS over this step's rows";
+  let description = [{
+    Sits at the top of the block whose step it covers - the innermost loop body
+    binding the columns the EXISTS answers for - so the accumulator is empty again at
+    every step. It records this step's input chunks, clears the matched flag of each
+    of their rows, and produces the row tag: a chunk holding each input row's
+    position, which the body carries alongside the columns it walks so nl.exists_mark
+    knows which rows it produced a row for.
+
+      %state, %tag = nl.exists_buffer (%p) : {!nl.chunk<!storage.node_id>}
+
+    With no input columns - an EXISTS over the single empty row Cypher starts from -
+    the accumulator holds one flag and the tag one row. The body has nothing to join
+    onto there, so it never carries that tag, which is why the op is row-aligned
+    through its operands: a tag over input rows holds exactly the rows those chunks do.
+  }];
+
+  // The chunks the EXISTS answers for; the accumulator reads its row count from the
+  // first of them, and nl.exists_result lays its answer out over the same rows.
+  let arguments = (ins Variadic<NLChunk>:$input_columns);
+
+  // The accumulator, then the row tag over this step's input rows.
+  let results = (outs NLExistsState:$state, NLUInt64Chunk:$tag);
+
+  // The tag's type is buildable and so omitted; only the input chunk types are
+  // spelled, in braces as nl.optional_buffer spells its own.
+  let assemblyFormat = [{
+    `(` $input_columns `)` attr-dict (`:` `{` qualified(type($input_columns))^ `}`)?
+  }];
+}
+
+/**
+* ExistsMark
+*/
+// NOT Pure: it marks the input rows this step's rows came from, so it must run exactly
+// where it sits (like nl.optional_collect).
+def ExistsMark : NLOp<"exists_mark", [AttrSizedOperandSegments]> {
+  let summary = "Mark the input rows an EXISTS body produced a row for";
+  let description = [{
+    Runs in the body's innermost loop body, once per step. Marks as matched each input
+    row the tag names, so once the body is walked the marked rows are exactly the ones
+    it produced a row for.
+
+      nl.exists_mark %state, %tag, (%k) : {!nl.chunk<!storage.node_id>}
+
+    The tag is absent when the accumulator has no input column: the step is then the
+    single empty row, which the columns mark when they hold a row at all - which is
+    what they are named for, an untagged mark having nothing else to answer from.
+  }];
+
+  let arguments = (ins NLExistsStateHandle:$state,
+                       Optional<NLUInt64Chunk>:$tag,
+                       Variadic<NLChunk>:$columns);
+
+  let assemblyFormat = [{
+    $state `,` ($tag^ `,`)? `(` $columns `)` attr-dict (`:` `{` qualified(type($columns))^ `}`)?
+  }];
+}
+
+/**
+* ExistsResult
+*/
+// Pure: given a filled accumulator it deterministically lays out the same flags and
+// produces no side effect of its own. Mirrors nl.optional_drain, and like it must be
+// placed after the body's loop nest, in the block holding the nl.exists_buffer.
+def ExistsResult : NLOp<"exists_result", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Read an EXISTS accumulator's flags as a boolean chunk";
+  let description = [{
+    The answer phase of an EXISTS. Consumes a filled nl.exists_state and produces one
+    boolean per input row of the step - true for a row the body produced a row for -
+    row-aligned with the chunks the accumulator was opened over, which is what lets the
+    result stand beside them in the rows in flight. The cardinality operand is one of
+    those chunks; it is absent when the accumulator was opened over none, which is one
+    row of its own.
+
+      %b = nl.exists_result(%state, %p) : (!nl.chunk<!storage.node_id>) -> !nl.chunk<!storage.bool>
+
+    Its read must find every mark already made, so place it after the body's loop nest,
+    in the block holding the nl.exists_buffer that opened the accumulator.
+  }];
+
+  let arguments = (ins NLExistsStateHandle:$state, Optional<NLChunk>:$cardinality);
+  let results   = (outs NLBoolChunk:$result);
+
+  let assemblyFormat = [{
+    `(` $state (`,` $cardinality^)? `)` attr-dict `:` functional-type($cardinality, results)
+  }];
+}
+
+/**
+* CountSubqueryBuffer
+*/
+def CountSubqueryBuffer : NLOp<"count_subquery_buffer", [RowAlignedThroughOperands]> {
+  let summary = "Create (and reset) the accumulator for one COUNT subquery over this step's rows";
+  let description = [{
+    nl.exists_buffer's counting sibling: it sits at the top of the block whose step it
+    covers, records this step's input chunks, zeroes the count of each of their rows and
+    produces the row tag the body carries.
+
+      %state, %tag = nl.count_subquery_buffer (%p) : {!nl.chunk<!storage.node_id>}
+
+    With no input columns the accumulator holds one count, for the single empty row
+    Cypher starts from.
+  }];
+
+  let arguments = (ins Variadic<NLChunk>:$input_columns);
+
+  let results = (outs NLCountSubqueryState:$state, NLUInt64Chunk:$tag);
+
+  let assemblyFormat = [{
+    `(` $input_columns `)` attr-dict (`:` `{` qualified(type($input_columns))^ `}`)?
+  }];
+}
+
+/**
+* CountSubqueryTally
+*/
+// NOT Pure: it adds to the counts of the input rows this step's rows came from, so it
+// must run exactly where it sits.
+def CountSubqueryTally : NLOp<"count_subquery_tally", [AttrSizedOperandSegments]> {
+  let summary = "Count the rows a COUNT body produced toward the input rows they came from";
+  let description = [{
+    Runs in the body's innermost loop body, once per step. Adds one to the count of the
+    input row each entry of the tag names, so once the body is walked every input row
+    holds the number of rows it produced.
+
+      nl.count_subquery_tally %state, %tag
+
+    A body with no tag answers for a single row - the single empty row, or the one row a
+    body run per row is handed - and adds the row count of `rows` to it instead.
+
+      nl.count_subquery_tally %state rows(%k : !nl.chunk<!storage.node_id>)
+  }];
+
+  let arguments = (ins NLCountSubqueryStateHandle:$state,
+                       Optional<NLUInt64Chunk>:$tag,
+                       Optional<NLChunk>:$rows);
+
+  let assemblyFormat = [{
+    $state (`,` $tag^)? (`rows` `(` $rows^ `:` qualified(type($rows)) `)`)? attr-dict
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* CountSubqueryResult
+*/
+// Pure, as nl.exists_result is, and placed like it: after the body's loop nest, in the
+// block holding the nl.count_subquery_buffer.
+def CountSubqueryResult : NLOp<"count_subquery_result", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Read a COUNT subquery accumulator's counts as a chunk";
+  let description = [{
+    Produces one count per input row of the step, row-aligned with the chunks the
+    accumulator was opened over. The cardinality operand is one of those chunks; it is
+    absent when the accumulator was opened over none, which is one row of its own.
+
+      %n = nl.count_subquery_result(%state, %p) : (!nl.chunk<!storage.node_id>) -> !nl.chunk<ui64>
+  }];
+
+  let arguments = (ins NLCountSubqueryStateHandle:$state, Optional<NLChunk>:$cardinality);
+  let results   = (outs NLUInt64Chunk:$result);
+
+  let assemblyFormat = [{
+    `(` $state (`,` $cardinality^)? `)` attr-dict `:` functional-type($cardinality, results)
+  }];
+}
+
+/**
+* RowListsBuffer
+*/
+// NOT Pure: it re-initializes the accumulator, so it must run exactly where it sits -
+// once per step of the rows the lists are read beside - and must not be hoisted, CSE'd
+// or eliminated (like nl.optional_buffer).
+def RowListsBuffer : NLOp<"row_lists_buffer", [RowAlignedThroughOperands]> {
+  let summary = "Create (and reset) the accumulator for one list per row of this step";
+
+  let description = [{
+    The accumulator of a pattern comprehension or a COLLECT subquery. Sits at the top of
+    the block whose step it covers - the innermost loop body binding the columns the lists
+    are read beside - so the accumulator is empty again at every step. It sizes itself to
+    the rows of the cardinality chunk and produces the row tag: a chunk holding each row's
+    position, which the body carries alongside the columns it walks so
+    nl.row_lists_collect knows which row's list a value goes into.
+
+      %state, %tag = nl.row_lists_buffer(%a) : !nl.chunk<!storage.node_id>
+
+    The cardinality operand is absent when nothing is in flight where the lists are read -
+    RETURN [(a:Person)-->(b) | b.name] - which is one row of its own. The body has nothing
+    to join onto there, so it never carries that tag, and neither does a COLLECT body run
+    one row at a time. That is why the op is row-aligned through its operands: a tag over
+    the step's rows holds exactly the rows that chunk does.
+  }];
+
+  // Any chunk of the step, which the tag runs over.
+  let arguments = (ins Optional<NLChunk>:$cardinality);
+
+  // The accumulator, then the row tag over this step's rows.
+  let results = (outs NLRowListsState:$state, NLUInt64Chunk:$tag);
+
+  // The tag's type is buildable and so omitted; only the cardinality chunk's is spelled.
+  let assemblyFormat = [{
+    `(` ($cardinality^)? `)` attr-dict (`:` qualified(type($cardinality))^)?
+  }];
+}
+
+/**
+* RowListsCollect
+*/
+// NOT Pure: it stages this step's values in the accumulator, so it must run exactly
+// where it sits (like nl.optional_collect).
+def RowListsCollect : NLOp<"row_lists_collect", []> {
+  let summary = "Stage what this step of a body's rows contribute to the lists";
+
+  let description = [{
+    Runs in the innermost loop body of the body's nest, once per step of it. Stages one
+    value per row the body produced, each under the row the tag names, so once the body
+    is walked every row's values are in hand.
+
+      nl.row_lists_collect %state, tag %tag, %name : !nl.chunk<!storage.nullable<!storage.string>>
+
+    The tag is absent when the step is a single row: the single empty row where nothing
+    is in flight, or the one row a per-row COLLECT body runs over. Every value belongs to
+    it.
+  }];
+
+  let arguments = (ins NLRowListsStateHandle:$state,
+                       Optional<NLUInt64Chunk>:$tag,
+                       NLChunk:$value);
+
+  let assemblyFormat = [{
+    $state `,` (`tag` $tag^ `,`)? $value attr-dict `:` qualified(type($value))
+  }];
+}
+
+/**
+* RowListsResult
+*/
+// Pure: given a filled accumulator it deterministically builds the same lists, and
+// produces no side effect of its own. Mirrors nl.collect, except that it writes a chunk
+// in place rather than opening an iterator: the rows are the step's own.
+def RowListsResult : NLOp<"row_lists_result", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Build this step's lists out of a filled row lists accumulator";
+
+  let description = [{
+    The build phase. Consumes a filled !nl.row_lists_state and produces one list cell per
+    row of the step, in row order: the values the body staged for that row, and the empty
+    list for a row it produced nothing for.
+
+      %lists = nl.row_lists_result(%state, %a) : (!nl.chunk<!storage.node_id>) -> !nl.chunk<!storage.list<!storage.string>>
+
+    Its lists are complete only once every value is staged, so place it after the body's
+    loop nest, in the block holding the nl.row_lists_buffer that opened the accumulator.
+    The cardinality operand is a chunk of that step, which the lists are row-aligned with;
+    it is absent when nothing was in flight where the lists are read, which is one row of
+    its own.
+  }];
+
+  // The cardinality is the only variable-length operand, so MLIR can tell it apart from
+  // the handle without operand-segment sizes (as nl.broadcast_constant's is).
+  let arguments = (ins NLRowListsStateHandle:$state, Optional<NLChunk>:$cardinality);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = [{
+    `(` $state (`,` $cardinality^)? `)` attr-dict `:` functional-type($cardinality, results)
+  }];
+}
+
+/**
+* RowBuffer
+*/
+// NOT Pure: each nl.row_buffer is a distinct accumulator, and resetting its buffers
+// is a side effect (like nl.sort_buffer).
+def RowBuffer : NLOp<"row_buffer", []> {
+  let summary = "Create (and reset) a row accumulator";
+  let description = [{
+    Sits at the top of the block whose step it covers - the block the branches of a
+    UNION inside a CALL body, or of a NEXT segment, are rooted in - so the accumulator
+    is empty again at every step. The buffers' column types are recovered from the
+    nl.row_collect ops that feed the handle.
+
+      %state = nl.row_buffer
+  }];
+
+  let results = (outs NLRowState:$state);
+
+  let assemblyFormat = "attr-dict";
+}
+
+/**
+* RowCollect
+*/
+// NOT Pure: it appends the current chunk's rows to the handle's buffers, so it must run
+// exactly where it sits (like nl.sort_collect).
+def RowCollect : NLOp<"row_collect", []> {
+  let summary = "Append this step's chunk of every column to a row accumulator";
+  let description = [{
+    Runs in the innermost loop body of what produces the rows, once per step, and
+    appends the current chunk of each column to the matching buffer. Each branch of a
+    UNION in a CALL body has its own nl.row_collect on the same handle, with the same
+    column types, so the buffers hold the rows of one branch and then of the next.
+
+      nl.row_collect %state, (%name) : !nl.chunk<!storage.nullable<!storage.string>>
+  }];
+
+  let arguments = (ins NLRowStateHandle:$state, Variadic<NLChunk>:$columns);
+
+  let assemblyFormat = [{
+    $state `,` `(` $columns `)` attr-dict `:` qualified(type($columns))
+  }];
+  let hasVerifier = 1;
+}
+
+/**
+* RowDrain
+*/
+// Pure: given a filled accumulator it deterministically yields the same rows, and
+// produces no side effect of its own - the emission happens in the driving nl.for.
+// Mirrors nl.sort: a source op whose loop does the work.
+def RowDrain : NLOp<"row_drain", [Pure]> {
+  let summary = "Create a database iterator over the rows a row accumulator collected";
+  let description = [{
+    The emit phase of a row accumulator. Reads a filled nl.row_state without consuming
+    it, so each drain of a NEXT segment's table walks every row, and produces an
+    iterator whose steps yield its rows in the order they were collected, one chunk per
+    column per step:
+
+      %rows = nl.row_drain(%state) : !nl.iter<!nl.chunk<!storage.node_id>>
+      nl.for %z in %rows : !nl.iter<!nl.chunk<!storage.node_id>> { ... }
+
+    Its first step must find every row already collected, so place it after the loop
+    nests that collect, in the block holding the nl.row_buffer.
+  }];
+
+  let arguments = (ins NLRowStateHandle:$state);
+  let results   = (outs NLIterator:$result);
+
+  let assemblyFormat = "`(` $state `)` attr-dict `:` qualified(type($result))";
 }
 
 #endif //TURINGDB_NL_OPS

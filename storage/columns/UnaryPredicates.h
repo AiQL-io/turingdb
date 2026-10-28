@@ -21,7 +21,7 @@ namespace {
  */
 template <typename Pred, typename T>
     requires OptionalPredicate<Pred, T>
-inline auto optionalUnaryPredicate(T&& a) -> TypeUtils::optional_invoke_result<Pred, T>{
+inline std::optional<CustomBool> optionalUnaryPredicate(T&& a) {
     if constexpr (TypeUtils::is_optional_v<T>) {
         if (!a.has_value()) {
             return std::nullopt;
@@ -81,9 +81,7 @@ struct UnaryPredicateExecutor {
             const bool result = op(arg->getRaw());
             res->set(result);
         } else {
-            // Should not occur. Optional T implies property, which will fill a mask.
-            // Implementation is purely to satsify compiler when expanding templates.
-            throw FatalException("Invalid unary-predicate operation on ColumnConst.");
+            res->set(op(arg->getRaw()));
         }
     }
 

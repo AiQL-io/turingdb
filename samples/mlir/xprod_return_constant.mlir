@@ -7,6 +7,7 @@ func.func @main() {
     db.yield %b : !db.column<!storage.node_id>
   }
   %c = db.constant(5 : i64)
-  db.output(%c) : !db.column<i64>
+  %rows = db.broadcast_constant(%c, %0#0) : (!db.column<i64>, !db.column<!storage.node_id>) -> !db.column<none>
+  db.output(%rows) : !db.column<none>
   return
 }

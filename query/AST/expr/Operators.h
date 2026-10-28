@@ -7,9 +7,6 @@
 namespace db {
 
 enum class BinaryOperator : uint8_t {
-    Or,
-    Xor,
-    And,
     NotEqual,
     Equal,
     LessThan,
@@ -17,20 +14,20 @@ enum class BinaryOperator : uint8_t {
     LessThanOrEqual,
     GreaterThanOrEqual,
     Add,
+    Concat,
     Sub,
     Mult,
     Div,
     Mod,
     Pow,
     In,
+    IsNull,
+    IsNotNull,
 
     _SIZE
 };
 
 using BinaryOperatorDescription = EnumToString<BinaryOperator>::Create<
-    EnumStringPair<BinaryOperator::Or, "OR">,
-    EnumStringPair<BinaryOperator::Xor, "XOR">,
-    EnumStringPair<BinaryOperator::And, "AND">,
     EnumStringPair<BinaryOperator::NotEqual, "NOTEQUAL">,
     EnumStringPair<BinaryOperator::Equal, "EQUAL">,
     EnumStringPair<BinaryOperator::LessThan, "LESSTHAN">,
@@ -38,12 +35,29 @@ using BinaryOperatorDescription = EnumToString<BinaryOperator>::Create<
     EnumStringPair<BinaryOperator::LessThanOrEqual, "LESSTHANOREQUAL">,
     EnumStringPair<BinaryOperator::GreaterThanOrEqual, "GREATERTHANOREQUAL">,
     EnumStringPair<BinaryOperator::Add, "ADD">,
+    EnumStringPair<BinaryOperator::Concat, "CONCAT">,
     EnumStringPair<BinaryOperator::Sub, "SUB">,
     EnumStringPair<BinaryOperator::Mult, "MULT">,
     EnumStringPair<BinaryOperator::Div, "DIV">,
     EnumStringPair<BinaryOperator::Mod, "MOD">,
     EnumStringPair<BinaryOperator::Pow, "POW">,
-    EnumStringPair<BinaryOperator::In, "IN">
+    EnumStringPair<BinaryOperator::In, "IN">,
+    EnumStringPair<BinaryOperator::IsNull, "ISNULL">,
+    EnumStringPair<BinaryOperator::IsNotNull, "ISNOTNULL">
+>;
+
+enum class LogicalOperator : uint8_t {
+    Or,
+    Xor,
+    And,
+
+    _SIZE
+};
+
+using LogicalOperatorDescription = EnumToString<LogicalOperator>::Create<
+    EnumStringPair<LogicalOperator::Or, "OR">,
+    EnumStringPair<LogicalOperator::Xor, "XOR">,
+    EnumStringPair<LogicalOperator::And, "AND">
 >;
 
 enum class UnaryOperator : uint8_t {

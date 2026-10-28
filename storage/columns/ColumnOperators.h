@@ -19,8 +19,10 @@ namespace db {
 /// Generic binary operators, returning a non-Bool-like
 struct BinaryOperators {
     template <typename Op, typename ColW, typename ColT, typename ColU>
-    requires is_result_column<Op, ColT, ColU, ColW>
-    static void exec(ColW* res, const ColT* lhs, const ColU* rhs) {
+        requires is_result_column<Op, ColT, ColU, ColW>
+    static void exec(ColW* res, const ColT* lhs, const ColU* rhs, Op op = {}) {
+        static_assert(std::is_trivially_copyable_v<Op>, "NOTE: Op passed by value");
+
         using DecayColT = TypeUtils::decay_col_t<ColT>;
         using DecayColU = TypeUtils::decay_col_t<ColU>;
         using DecayColW = TypeUtils::decay_col_t<ColW>;
@@ -29,7 +31,7 @@ struct BinaryOperators {
         using InternalU = InnerTypeHelper<DecayColU>::type;
         using InternalRes = InnerTypeHelper<DecayColW>::type;
 
-        BinaryOpExecutor<Op, InternalRes, InternalT, InternalU>::apply(res, lhs, rhs);
+        BinaryOpExecutor<Op, InternalRes, InternalT, InternalU>::apply(res, lhs, rhs, op);
     }
 };
 
@@ -69,6 +71,17 @@ struct BinaryPredicates {
         BinaryPredicateExecutor<Op, InternalT, InternalU>::apply(res, lhs, rhs);
     }
 
+    template <typename Op, typename ColT, typename ColU>
+    static void exec(ColumnConst<std::optional<CustomBool>>* res, const ColT* lhs, const ColU* rhs) {
+        using DecayColT = TypeUtils::decay_col_t<ColT>;
+        using DecayColU = TypeUtils::decay_col_t<ColU>;
+
+        using InternalT = InnerTypeHelper<DecayColT>::type;
+        using InternalU = InnerTypeHelper<DecayColU>::type;
+
+        BinaryPredicateExecutor<Op, InternalT, InternalU>::apply(res, lhs, rhs);
+    }
+
     /// Const x Const predicates e.g. 1 = 1
     // FIXME: Do we need opt version for null-literals ?
     template <typename Op, typename ColT, typename ColU>
@@ -97,7 +110,7 @@ struct UnaryPredicates {
     // Both Bool and opt<Bool> are needed as there is no way to limit to
     // ColumnConst<{Bool}> whilst also having ColumnVector<{Bool, optional<Bool>}>
     template <typename Op, typename T>
-    requires(std::is_same_v<T, types::Bool::Primitive>)
+        requires(std::is_same_v<T, types::Bool::Primitive>)
              || (std::is_same_v<T, std::optional<types::Bool::Primitive>>)
     static void exec(ColumnConst<T>* res, const ColumnConst<T>* arg) {
         UnaryPredicateExecutor<Op, T>::apply(res, arg);
@@ -107,7 +120,7 @@ struct UnaryPredicates {
     // The optional<Bool> case is handled by @ref exec(ColumnOptMask*, ...) because
     // ColOptMask is a weak alias for ColumnVector<opt<Bool>>
     template <typename Op, typename T>
-    requires(std::is_same_v<T, types::Bool::Primitive>)
+        requires(std::is_same_v<T, types::Bool::Primitive>)
     static void exec(ColumnVector<T>* res, const ColumnVector<T>* arg) {
         UnaryPredicateExecutor<Op, T>::apply(res, arg);
     }
@@ -150,13 +163,26 @@ struct MaskOperators {
 };
 
 struct ColumnFunctions {
-    /// labels() function; result type is string
     template <typename Op, typename ColT>
-    static void exec(ColumnVector<std::string>* res, const ColT* arg, const GraphView view) {
+    static void exec(ColumnVector<ListView>* res,
+                     const ColT* arg,
+                     const GraphView view,
+                     QueryListBuffer* listBuffer) {
         using DecayColT = TypeUtils::decay_col_t<ColT>;
         using InternalT = InnerTypeHelper<DecayColT>::type;
 
-        FunctionExecutor<Op, std::string, InternalT>::apply(res, arg, view);
+        FunctionExecutor<Op, ListView, InternalT>::apply(res, arg, view, listBuffer);
+    }
+
+    template <typename Op, typename ColT>
+    static void exec(ColumnVector<std::string_view>* res,
+                     const ColT* arg,
+                     const GraphView view,
+                     StringBuffer* stringBuffer) {
+        using DecayColT = TypeUtils::decay_col_t<ColT>;
+        using InternalT = InnerTypeHelper<DecayColT>::type;
+
+        FunctionExecutor<Op, std::string_view, InternalT>::apply(res, arg, view, stringBuffer);
     }
 
     template <typename Op, typename ColW, typename ColT>

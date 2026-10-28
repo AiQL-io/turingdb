@@ -6,6 +6,7 @@
 #include <memory>
 #include <string>
 
+#include "CompilerContext.h"
 #include "QueryConfig.h"
 #include "TuringConfig.h"
 #include "versioning/ChangeID.h"
@@ -35,7 +36,7 @@ public:
     void setCommitHash(const std::string& s);
     void clearCommitHash() { _commitHash = db::CommitHash::head(); }
 
-    nb::dict query(const std::string& cypher);
+    nb::dict query(const std::string& cypher, nb::handle parameters);
 
 private:
     void init();
@@ -43,6 +44,7 @@ private:
     db::TuringConfig _config;
     db::QueryConfig _queryConfig;
     std::unique_ptr<db::LocalMemory> _localMem;
+    db::CompilerContext _compilerContext;
     std::unique_ptr<db::TuringDB> _db;
 
     std::string _graphName {"default"};

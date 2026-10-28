@@ -8,6 +8,7 @@ include "mlir/IR/BuiltinAttributeInterfaces.td"
 
 include "DBDialect.td"
 include "DBTypes.td"
+include "DBSystemOps.td"
 
 /**
 * ScanNodes
@@ -49,7 +50,7 @@ def ScanNodesByLabel : TuringOp<"scan_nodes_by_label", [Pure]> {
   // `labels` is the set of symbolic label names. Being an attribute and not an
   // SSA value, it is absent from `operands`; lowering resolves each name to a
   // storage LabelID.
-  let arguments = (ins StrArrayAttr:$labels);
+  let arguments = (ins LabelRefArrayAttr:$labels);
   let results   = (outs ColumnNodeIDs:$result);
   let hasVerifier = 1;
 
@@ -101,6 +102,807 @@ def ConstScanNodes : TuringOp<"const_scan_nodes", [Pure]> {
 }
 
 /**
+* FetchNodes
+*/
+def FetchNodes : TuringOp<"fetch_nodes", [Pure]> {
+  let summary = "Produce for each row the node its ID cell names, dropping the rows naming none";
+
+  let description = [{
+    The per-row counterpart of db.const_scan_nodes: the IDs are a column computed for
+    each row rather than a list known at plan time.
+
+      %a, %i2 = db.fetch_nodes(%ids, {%i}) : (!db.column<none>, !db.column<none>)
+                                         -> (!db.column<!storage.node_id>, !db.column<none>)
+
+    A row is kept where its cell equals a node a scan would produce - one the graph
+    holds or the query created - as `n = cell` would hold of it: a node, an integer
+    holding the node's ID, or a tagged cell holding either. Every other row is dropped -
+    a null, a value of another type, a negative integer, an ID naming no node or a
+    deleted one.
+    `columns_to_filter` is the carry set, cut to the kept rows as db.filter cuts it.
+  }];
+
+  let arguments = (ins Column:$ids, Variadic<Column>:$columns_to_filter);
+  let results   = (outs ColumnNodeIDs:$nodes, Variadic<Column>:$carried);
+
+  let assemblyFormat = [{
+    `(` $ids `,` `{` $columns_to_filter `}` `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* ScanNodesByPropertyValue
+*/
+def ScanNodesByPropertyValue : TuringOp<"scan_nodes_by_property_value", [Pure]> {
+  let summary = "Produce the nodes whose named property equals a literal";
+
+  let description = [{
+    The property-equality counterpart of db.scan_nodes_by_label: where that
+    produces the nodes carrying a label, this produces the nodes whose named
+    property holds exactly the given literal, optionally among the nodes
+    carrying every listed label:
+
+      %a = db.scan_nodes_by_property_value("age", 32 : i64) : !db.column<!storage.node_id>
+      %b = db.scan_nodes_by_property_value("age", 32 : i64, ["Person"]) : !db.column<!storage.node_id>
+
+    It is what a `WHERE n.age = 32` filter over a plain or labelled scan fuses
+    into (FuseScanByPropertyValue): rather than scanning every node, fetching the
+    property of each and masking, the scan walks each part's property column in
+    place - only the ranges of the matching label sets when labels are given -
+    and emits only the matching node IDs. A node that lacks the property never
+    appears, exactly as the filter dropped it on a null value.
+
+    `property` is the property name as spelled in the query; `value` is the
+    literal it is compared against - the typed attribute db.constant carried,
+    which is one of the literal kinds the query language can spell: a signless
+    i64 integer, an f64 double, an i1 boolean or a !storage.string. Lowering
+    forwards both as-is; translation resolves the name against the schema and
+    coerces the literal to the stored type. A name the schema does not hold, or
+    a literal no stored value of that property could equal, deliberately scans
+    nothing rather than raising: the fusion is more permissive than the filter
+    form, which throws on both. Neither shape reaches here from Cypher - the
+    analyzer rejects an unknown property and a mismatched literal type before
+    codegen. `labels`, when present, is the label list db.scan_nodes_by_label
+    carried, with the same superset semantics: a label absent from the schema
+    likewise yields no rows.
+
+    Like db.scan_nodes it reads no column and takes no input, so it opens a
+    dataflow rather than consuming one. Scanning the graph is a deterministic
+    read, so the op is Pure.
+  }];
+
+  let arguments = (ins StrAttr:$property, TypedAttrInterface:$value, OptionalAttr<LabelRefArrayAttr>:$labels);
+  let results   = (outs ColumnNodeIDs:$result);
+  let hasVerifier = 1;
+
+  // The name, literal and optional labels print inside the parens as
+  // `"age", 32 : i64, ["Person"]`, ahead of the colon, the same place
+  // db.get_node_properties prints its name; the result type follows, qualified,
+  // as db.scan_nodes prints it.
+  let assemblyFormat = "`(` $property `,` $value (`,` $labels^)? `)` attr-dict `:` qualified(type($result))";
+}
+
+/**
+* UnwindConst
+*/
+def UnwindConst : TuringOp<"unwind_const", [Pure]> {
+  let summary = "Produce one row per element of a compile-time-known literal list";
+
+  let description = [{
+    The source op for `UNWIND [<literals>] AS x` where the list is known at plan
+    time, independent of any input row. It opens a dataflow, one row per element, the
+    way db.const_scan_nodes opens one from a fixed set of node IDs:
+
+      %x = db.unwind_const([1, 2, 3]) : !db.column<i64>
+
+    `elements` carries the literals as an array of attributes, so each element keeps
+    its own type: a typed attribute for a scalar, a unit attribute for a null, a
+    nested array attribute for a nested list. When they share one type the list is
+    homogeneous and the result is that typed column; when they differ - or the list
+    is empty, or holds a null or a nested list, neither of which has a type - it is
+    heterogeneous and the result is a type-erased !storage.any column, a
+    tagged scalar per row, matching Cypher's LIST OF ANY:
+
+      %row = db.unwind_const([true, "s", 10]) : !db.column<!storage.any>
+
+    So the result element type is the homogeneity verdict: a downstream op sees a
+    concrete typed column for a homogeneous list, and a !storage.any column - which
+    only pass-through ops (a cross_product broadcast, the output) accept - for a
+    heterogeneous one. An empty list yields no row, matching UNWIND of an empty list.
+    Producing a fixed list is deterministic, so the op is Pure. With incoming rows
+    (MATCH (a) UNWIND [...] AS x) it is crossed with the input through
+    db.cross_product; there is no expanding variant of this op.
+  }];
+
+  // `elements` is the literal list, each entry a typed builtin attribute carrying its
+  // own type. Being an attribute and not an SSA value, it is absent from `operands`.
+  let arguments = (ins ArrayAttr:$elements);
+  let results   = (outs Column:$result);
+  let hasVerifier = 1;
+
+  // The literals print inside the parens as `[1, 2, 3]`, ahead of the colon, the same
+  // place db.const_scan_nodes prints its IDs; the result column type follows,
+  // qualified, as db.const_scan_nodes prints it.
+  let assemblyFormat = "`(` $elements `)` attr-dict `:` qualified(type($result))";
+}
+
+/**
+* LoadCSV
+*/
+def LoadCSV : TuringOp<"load_csv", [Pure]> {
+  let summary = "Produce one row per record of a CSV file, a column per field the query reads";
+
+  let description = [{
+    The source op for `LOAD CSV 'people.csv' AS row`. The file is fixed by the query, so
+    it reads no column and opens a dataflow of its own, the way db.unwind_const opens one
+    from a literal list - one row per record of the file:
+
+      %name, %age = db.load_csv("people.csv", [0 : ui64, 1 : ui64])
+        : !db.column<!storage.string>, !db.column<!storage.string>
+
+    A record is many values, and an op has a fixed number of results, so the row is not
+    one column: `fields` names the fields the query reads and the op produces one column
+    per name, in that order. A positional entry is the index `row[2]` names; a string
+    entry is the header `row.age` names, which only a `with_headers` load can resolve.
+    Every access to the same field reads the same column, so a field appears once
+    however many times the query names it, and a field the query never names is not
+    produced at all - the 768 columns of an embedding file cost nothing to skip. At least
+    one field is named even so: a query reading none still runs over the records, and a
+    row set needs a column to ride, so the first field stands for them.
+
+      %age = db.load_csv("people.csv", ["age"]) with_headers
+        : !db.column<!storage.string>
+
+    Every field is a string: a CSV file carries no types, so a record's fields are the
+    characters as written and a query converts them itself (`toInteger(row[1])`). The
+    characters are copied into the query's string buffer, so a row's view outlives the
+    chunk that parsed it.
+
+    `with_headers` consumes the first record as the header line - it names the fields
+    rather than holding a row - and is what lets a string entry of `fields` resolve.
+    `skip_on_error` is `ON ERROR SKIP`: a malformed record (an unterminated quote, a
+    field count differing from the file's) is dropped with a warning instead of failing
+    the query.
+
+    Reading a file is deterministic, so the op is Pure. With incoming rows
+    (`LOAD CSV ... MATCH (a)`) it is crossed with them through db.cross_product, the way
+    a search reading no column is; there is no expanding variant of this op.
+  }];
+
+  // The file to read and the fields to produce, each entry a ui64 index or a header
+  // name. Being attributes and not SSA values they are absent from `operands`; the
+  // path is resolved against the data directory, and a header name against the file's
+  // header line, when the load runs.
+  let arguments = (ins StrAttr:$path,
+                       ArrayAttr:$fields,
+                       UnitAttr:$with_headers,
+                       UnitAttr:$skip_on_error);
+  let results   = (outs Variadic<ColumnStrings>:$results);
+  let hasVerifier = 1;
+
+  // The path and the field list print inside the parens, ahead of the colon, the same
+  // place db.unwind_const prints its literals; the flags print as their keywords after
+  // it, as db.count's do. The result types follow, qualified, as db.scan_nodes prints
+  // its one.
+  let assemblyFormat = [{
+    `(` $path `,` $fields `)` (`with_headers` $with_headers^)? (`skip_on_error` $skip_on_error^)?
+    attr-dict `:` qualified(type($results))
+  }];
+}
+
+/**
+* VectorSearch
+*/
+def VectorSearch : TuringOp<"vector_search", [Pure]> {
+  let summary = "Produce the nearest neighbours of a query vector, with the distance each scored";
+
+  let description = [{
+    The source op for `VECTOR SEARCH IN vec1 FOR 3 (1.0, 0.0) YIELD ids, score`. The
+    index, the neighbour count and the query vector are all fixed by the query, so it
+    reads no column and opens a dataflow of its own, the way db.unwind_const opens one
+    from a literal list:
+
+      %ids, %scores = db.vector_search("vec1", 3, [1.000000e+00, 0.000000e+00])
+        : !db.column<!storage.node_id>, !db.column<f64>
+
+    The two results are row-aligned, one row per neighbour, ordered nearest first:
+    `ids` is the node the index holds each vector under - the ID a `LOAD VECTOR` row
+    carried, read as a node ID - and `scores` the distance the index' metric scored it
+    at (squared L2 for euclidean, inner product for cosine). The search returns at most
+    `k` neighbours and fewer when the index holds fewer, so a `k` larger than the index
+    is not an error.
+
+    Reporting a node is what lets the rest of the query treat the neighbours as matched
+    rows: a pattern walks out of them (`YIELD ids MATCH (ids)-[e]->(m)`, which expands
+    this column rather than scanning) and an equality compares a matched node to them
+    (`WHERE n = ids`). An ID naming no node is kept rather than dropped - it simply
+    matches no edge and holds no property - so an index whose IDs are not node IDs still
+    reports every neighbour it found.
+
+    `query_vector` must have as many elements as the index' dimension, which the schema
+    holds rather than the IR, so the search itself reports a mismatch. Reading the index
+    is a deterministic read, so the op is Pure. With incoming rows
+    (VECTOR SEARCH ... YIELD ids MATCH (n)) it is crossed with them through
+    db.cross_product; there is no variant of this op that takes a column.
+  }];
+
+  // Every parameter is fixed by the query, so none is an SSA value: the index to search,
+  // how many neighbours to report, and the vector to search for.
+  let arguments = (ins StrAttr:$index_name, UI64Attr:$k, DenseF32ArrayAttr:$query_vector);
+  let results   = (outs ColumnNodeIDs:$ids, ColumnDoubles:$scores);
+  let hasVerifier = 1;
+
+  // The parameters print inside the parens ahead of the colon, as db.const_scan_nodes
+  // prints its IDs; the two result types follow, qualified, as db.scan_edges prints its.
+  let assemblyFormat = [{
+    `(` $index_name `,` $k `,` $query_vector `)`
+    attr-dict `:` qualified(type($ids)) `,` qualified(type($scores))
+  }];
+}
+
+/**
+* Unwind
+*/
+def Unwind : TuringOp<"unwind", [Pure]> {
+  let summary = "Produce one row per element of a value computed for each input row";
+
+  let description = [{
+    `UNWIND <expr> AS x` where the expression is evaluated per row rather than known
+    at plan time - the general form db.unwind_const is the literal special case of. It
+    reads one source column and expands the rows in flight through it:
+
+      %x, %n = db.unwind(%names, {%node}) : (!db.column<none>, !db.column<!storage.node_id>)
+                                        -> (!db.column<none>, !db.column<!storage.node_id>)
+
+    Each source cell contributes the rows Cypher unwinds it into: a list one row per
+    element, a null none at all, and any other value the single row that value is - the
+    singleton an UNWIND of a scalar spreads to. A tagged scalar is read the same way, so
+    a cell that is itself a list unwinds one level deeper. `columns_to_filter` is the
+    carry set, as on db.get_out_edges: each carried column comes back replicated, its
+    cell repeated once per row its source cell produced, so everything in flight stays
+    row-aligned with the elements. A constant source stands for every carried row, so it
+    expands each of them.
+
+    The element column's type is the source's to decide and is resolved during
+    lowering, as a property fetch's value column is: unwinding a list yields a
+    type-erased !storage.any column of tagged scalars, matching Cypher's LIST
+    OF ANY, while a source that is already a scalar column keeps its own type - the
+    singleton is the value it already holds.
+  }];
+
+  let arguments = (ins Column:$source, Variadic<Column>:$columns_to_filter);
+  let results   = (outs Column:$element, Variadic<Column>:$carried);
+  let hasVerifier = 1;
+
+  // The carry set prints in braces, as db.get_out_edges' does; the source and the
+  // result types follow as a function type, so the element column's type is spelled
+  // beside the ones the carried columns keep.
+  let assemblyFormat = [{
+    `(` $source `,` `{` $columns_to_filter `}` `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* UnwindRange
+*/
+def UnwindRange : TuringOp<"unwind_range", [NoMemoryEffect, AttrSizedOperandSegments, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Produce one row per integer a row's range bounds span, without building the list";
+
+  let description = [{
+    `UNWIND range(start, end, step) AS x`: db.unwind over db.range, fused so the list is
+    never built. It reads one column per bound and expands the rows in flight through
+    them, as db.unwind expands them through its source:
+
+      %x, %n = db.unwind_range(%from, %to, %by, {%node})
+        : (!db.column<i64>, !db.column<i64>, !db.column<i64>, !db.column<!storage.node_id>)
+        -> (!db.column<!storage.nullable<i64>>, !db.column<!storage.node_id>)
+
+    Row r contributes one row per integer from row r of `start` to row r of `end`, both
+    included, by row r of `step`: none when a bound is null or the step walks away from
+    `end`, and the error db.range raises for a step of 0. The step is always an operand,
+    so a range the query gave none counts by a constant 1. Nothing is laid out, so no
+    length limit applies. `columns_to_filter` is the carry set, replicated as db.unwind's
+    is, and the element column is the one db.unwind gives a list of integers, or none
+    where the list above the range was left for lowering to type, as db.reverse's is.
+
+    `from` and `to` restrict each row to the run of its range that db.list_slice would
+    keep, with the same bounds, and `reversed` counts that run out backwards. Both are
+    where db.reverse, db.list_slice and db.tail over a db.range fold, so the list is not
+    built for those either:
+
+      %x = db.unwind_range(%from, %to, %by, from %a, {}) reversed : ...
+
+    reads `UNWIND reverse(range(from, to, by)[a..]) AS x`.
+  }];
+
+  let arguments = (ins Column:$start,
+                       Column:$end,
+                       Column:$step,
+                       Optional<Column>:$from,
+                       Optional<Column>:$to,
+                       Variadic<Column>:$columns_to_filter,
+                       UnitAttr:$reversed);
+  let results   = (outs Column:$element, Variadic<Column>:$carried);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $start `,` $end `,` $step (`,` `from` $from^)? (`,` `to` $to^)? `,` `{` $columns_to_filter `}` `)`
+    (`reversed` $reversed^)? attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* UnwindComputed
+*/
+def UnwindComputed : TuringOp<"unwind_computed", [Pure]> {
+  let summary = "Produce one row per element of a value its region computes for each input row";
+
+  let description = [{
+    db.unwind whose source is computed inside the op rather than before it, so lowering
+    can compute it over a few input rows at a time and never hold the lists of a whole
+    chunk. sink_unwind_source moves the ops computing a db.unwind's source in here:
+
+      %x, %n = db.unwind_computed({%node}) ({
+        ^bb0(%nodeIn: !db.column<!storage.node_id>):
+          %name = db.get_node_properties(%nodeIn) {property = "name"} : ...
+          %parts = db.split(%name, %comma) : ...
+          db.unwind_yield %parts : !db.column<!storage.list<!storage.string>>
+      }) : (!db.column<!storage.node_id>) -> (!db.column<none>, !db.column<!storage.node_id>)
+
+    The region's entry block takes one argument per carried column and reads the input
+    rows through them; a constant it reads stands for every row and needs no carrying.
+    The yield names the source, whose cells unwind as db.unwind's do. `columns_to_filter`
+    is the carry set, replicated as db.unwind's is, and the element type is resolved the
+    same way.
+  }];
+
+  let arguments = (ins Variadic<Column>:$columns_to_filter);
+  let results   = (outs Column:$element, Variadic<Column>:$carried);
+
+  // Exactly one block, ending in a db.unwind_yield.
+  let regions = (region SizedRegion<1>:$source);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` `{` $columns_to_filter `}` `)` $source attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* UnwindYield
+*/
+def UnwindYield : TuringOp<"unwind_yield", [Pure, Terminator, HasParent<"UnwindComputed">]> {
+  let summary = "Name the source a db.unwind_computed's region computes";
+
+  let arguments = (ins Column:$source);
+
+  let assemblyFormat = [{
+    $source attr-dict `:` qualified(type($source))
+  }];
+}
+
+/**
+* MakeList
+*/
+def MakeList : TuringOp<"make_list", [Pure, ConstantThroughOperands]> {
+  let summary = "Build one list per row out of the row's cell in each element column";
+
+  let description = [{
+    The list `[n, m]` whose elements are read per row rather than known at plan time -
+    the row-varying form db.constant's array of literals is the constant case of. It
+    reads one column per element and produces one list cell per row:
+
+      %xs = db.make_list(%n, %m) : (!db.column<!storage.node_id>, !db.column<!storage.node_id>)
+                                -> !db.column<!storage.list<!storage.node_id>>
+
+    Row r of the result is the list of row r of each operand, in operand order. A cell
+    is a view over the query's list buffer, as an nl.collect drain's is, so a row copies
+    in O(1) however long the list. An operand holding one value for every row rather
+    than one per row is laid out over the rows during lowering, so `[n, 1]` gives every
+    row a two-element list.
+
+    The result element type is the homogeneity verdict, as db.unwind_const's is: columns
+    that agree give a list of that type, columns that disagree a list of type-erased
+    tagged scalars, matching Cypher's LIST OF ANY. A column whose own type is resolved
+    during lowering - a property fetch's - names none here, and no verdict is taken
+    against a type that is not known yet: one such column makes the whole list none, and
+    lowering takes the verdict over the resolved chunks:
+
+      %xs = db.make_list(%age, %name) : (!db.column<none>, !db.column<none>)
+                                     -> !db.column<!storage.list<none>>
+
+    `UNWIND [n, m] AS x` is this op feeding db.unwind, which spreads each cell back into
+    one row per element.
+  }];
+
+  let arguments = (ins Variadic<Column>:$elements);
+  let results   = (outs Column:$result);
+  let hasVerifier = 1;
+
+  // The element columns print inside the parens, as db.collect's columns do; the operand
+  // and result types follow as a function type, so the list is spelled beside the columns
+  // it was built from.
+  let assemblyFormat = [{
+    `(` $elements `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* MakeMap
+*/
+def MakeMap : TuringOp<"make_map", [Pure, ConstantThroughOperands]> {
+  let summary = "Build one map per row out of the row's cell in each value column";
+
+  let description = [{
+    The map `{name: n.name, age: m.age}` whose values are read per row rather than known
+    at plan time. Key i names the value read from operand i:
+
+      %m = db.make_map(%age, %name) keys ["age", "name"] : !db.column<none>, !db.column<none>
+
+    Row r of the result is the map of row r of each operand. A null cell is an entry
+    holding null, not a missing key. An operand holding one value for every row is laid
+    out over the rows during lowering.
+  }];
+
+  let arguments = (ins Variadic<Column>:$values, StrArrayAttr:$keys);
+  let results   = (outs ColumnMaps:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $values `)` `keys` $keys attr-dict `:` type($values)
+  }];
+}
+
+/**
+* StaticMapKey
+*/
+def StaticMapKey : TuringOp<"static_map_key", [Pure, ConstantThroughOperands]> {
+  let summary = "Row-wise read of one value of a map column, by a key known at plan time";
+
+  let description = [{
+    `m.name`, or `n.attrs.name`. The key is spelled in the query, so it rides an attribute
+    rather than a column:
+
+      %v = db.static_map_key %m key "name" : (!db.column<none>) -> !db.column<map_element>
+
+    Row r of the result is the entry row r's map holds under the key. A row whose map holds
+    no such key - and a row holding no map at all - reads back as a null entry, since a map
+    value carries its null in its own tag. The map column is a column of tagged cells where
+    the map was itself read out of a list or a map. A cell holding a node or an edge reads
+    that entity's property under the key, as `n.name` does.
+  }];
+
+  let arguments = (ins Column:$map, StrAttr:$key);
+  let results   = (outs ColumnMapElements:$result);
+
+  let assemblyFormat = "$map `key` $key attr-dict `:` functional-type(operands, results)";
+}
+
+/**
+* Range
+*/
+def Range : TuringOp<"range", [NoMemoryEffect, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Build one list of the integers a row's bounds span";
+
+  let description = [{
+    Cypher's `range(start, end)` and `range(start, end, step)`. The op reads one column
+    per bound and produces one list cell per row, as db.make_list does:
+
+      %xs = db.range(%from, %to) : (!db.column<i64>, !db.column<i64>)
+                                -> !db.column<!storage.list<i64>>
+
+    Row r's list counts from row r of `start` to row r of `end`, both included, by
+    `step` - 1 where it is absent, and negative to count down. A step walking away from
+    `end` gives the empty list; a step of 0 is the error the row raises, as is a row
+    spanning more than 100000 integers. A bound holding no value gives its row no list,
+    which is what Cypher reads `range(null, 3)` as.
+
+    The elements are integers whatever the bounds were, so the result element type is
+    written here rather than inferred, unlike db.make_list's homogeneity verdict. A bound
+    holding one value for every row rather than one per row is laid out over the rows
+    during lowering, so `range(1, n.age)` is read at the rows the fetch carries.
+  }];
+
+  // The step is the only variable-length operand, so MLIR tells it apart from the bounds
+  // without operand-segment sizes, as db.get_node_properties' pending mask is.
+  let arguments = (ins Column:$start, Column:$end, Optional<Column>:$step);
+  let results   = (outs Column:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $start `,` $end (`,` $step^)? `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* ListSlice
+*/
+def ListSlice : TuringOp<"list_slice", [Pure, ConstantThroughOperands, AttrSizedOperandSegments]> {
+  let summary = "Read the run of each row's list that its bounds span";
+
+  let description = [{
+    Cypher's `xs[1..3]`, `xs[..3]`, `xs[1..]`. The op reads one list column and produces
+    one list cell per row - the elements from the lower bound up to but not including the
+    upper one - so the rows in flight are the ones it started with:
+
+      %run = db.list_slice(%xs, from %a, to %b) : (!db.column<!storage.list<i64>>,
+                                                   !db.column<i64>,
+                                                   !db.column<i64>) -> !db.column<none>
+
+    A bound is absent where the query left it out, which runs from the start or to the
+    end. A negative bound counts from the end, and one running past the list is clamped to
+    it, so no row errors on a bound; a row whose list or whose bound is null gets a null
+    cell, which is what Cypher reads `null[1..2]` as.
+
+    The elements are the ones the list already holds, so the result element type is the
+    input's and is resolved during lowering, as db.list_comprehension's is.
+  }];
+
+  let arguments = (ins Column:$list, Optional<Column>:$from, Optional<Column>:$to);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = [{
+    `(` $list (`,` `from` $from^)? (`,` `to` $to^)? `)` attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* PercentileCont / PercentileDisc
+*/
+// Cypher's percentileCont(x, p) and percentileDisc(x, p) are a db.collect of the values
+// followed by one of these, which reads each row's list and sorts the numbers in it.
+// percentileCont interpolates between the two values around the percentile, so it is a
+// float; percentileDisc answers the value at it, with the type the list holds. A list
+// holding no value has no percentile, so its row is null. Beside a list holding numbers,
+// a percentile that is null or outside 0.0 to 1.0 is the error the row raises, as is an
+// element that is no number - which is why the op is not speculatable.
+//
+//   %m = db.percentile_cont(%values, %p) : (!db.column<none>, !db.column<f64>) -> !db.column<none>
+class PercentileOp<string mnemonic> : TuringOp<mnemonic, [NoMemoryEffect, ConstantThroughOperands]> {
+  let summary = "Read a percentile of the numbers each row's list holds";
+
+  let arguments = (ins Column:$list, Column:$percentile);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = [{
+    `(` $list `,` $percentile `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def PercentileCont : PercentileOp<"percentile_cont">;
+def PercentileDisc : PercentileOp<"percentile_disc">;
+
+/**
+* ListComprehension
+*/
+def ListComprehension : TuringOp<"list_comprehension", [Pure, ConstantThroughOperands]> {
+  let summary = "Build one list per row out of the elements of that row's list, filtered and projected";
+
+  let description = [{
+    Cypher's `[x IN xs WHERE p(x) | f(x)]`. The op reads one list column and produces one
+    list cell per row, so - unlike db.unwind, which spreads the elements over rows of
+    their own - the rows in flight are the ones it started with:
+
+      %ts = db.list_comprehension(%tags, {%n}) ({
+        ^bb0(%x: !db.column<none>, %tag: !db.column<ui64>, %nIn: !db.column<!storage.node_id>):
+          %keep = db.neq %x, %c : (!db.column<none>, !db.column<none>) -> !db.column<!storage.bool>
+          %xk, %tagk, %nk = db.filter(%keep, {%x, %tag, %nIn}) : ...
+          %up = db.concat %xk, %suffix : (!db.column<none>, !db.column<none>) -> !db.column<none>
+          db.comprehension_yield %tagk, %up : !db.column<none>
+      }) : (!db.column<none>, !db.column<!storage.node_id>) -> !db.column<none>
+
+    The region's entry block takes the element the variable is bound to, the row tag - the
+    position of the row whose list that element came from - and then one argument per
+    carried column: the element rows are not the rows in flight, so a column the body
+    reads has to be repeated once per element of its own row, which is what carrying it
+    does - the carry set of db.unwind, laid out the same way. Everything else the body
+    reads stands for every row already: a constant needs no carrying.
+
+    The WHERE is a db.filter over those arguments rather than a mask the op is handed, so
+    an element it drops is one the projection is never computed for - `[x IN xs WHERE x <>
+    0 | 100 / x]` divides by no zero. The yield names the tag as the body left it, which
+    is what says how many elements each row's list ends up with, and the value one element
+    contributes.
+
+    The element column's type is the source's to decide and is resolved during lowering,
+    as db.unwind's element is - a list of tagged scalars hands out tagged scalars, a list
+    of one type hands out that type. So is the result's: the list is of whatever the body
+    yields, and a row whose source cell is null gets a null list rather than an empty one,
+    which is what Cypher reads `[x IN null | x]` as.
+  }];
+
+  let arguments = (ins Column:$source, Variadic<Column>:$columns_to_filter);
+  let results   = (outs Column:$result);
+
+  // Exactly one block, ending in a db.comprehension_yield.
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasVerifier = 1;
+
+  // The carry set prints in braces, as db.unwind's does; the region follows, then the
+  // source and the carried types as a function type.
+  let assemblyFormat = [{
+    `(` $source `,` `{` $columns_to_filter `}` `)` $body attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* ListPredicate
+*/
+def ListPredicate : TuringOp<"list_predicate", [Pure, ConstantThroughOperands]> {
+  let summary = "Decide, per row, whether a predicate holds for the elements of that row's list";
+
+  let description = [{
+    Cypher's `all(x IN xs WHERE p(x))`, and `any`, `none` and `single` over the same
+    form. The op reads one list column and produces one boolean per row: whether the
+    predicate holds for as many of the row's elements as the kind asks.
+
+      %ok = db.list_predicate(%tags, {%n}) kind all ({
+        ^bb0(%x: !db.column<none>, %tag: !db.column<ui64>, %nIn: !db.column<!storage.node_id>):
+          %p = db.neq %x, %c : (!db.column<none>, !db.column<none>) -> !db.column<!storage.bool>
+          db.comprehension_yield %tag, %p : !db.column<!storage.bool>
+      }) : (!db.column<none>, !db.column<!storage.node_id>) -> !db.column<!storage.bool>
+
+    The region is db.list_comprehension's: the entry block takes the element, the row
+    tag and one argument per carried column, and the yield names the tag and the
+    predicate's value for each element. The body cuts nothing: an element whose
+    predicate is null counts as unknown, which is what makes the answer null where
+    Cypher says so - `all` is null when no element fails and one is unknown, `any` when
+    none holds and one is unknown, `none` as `any` is, `single` when the elements known
+    to hold are at most one and one is unknown. An empty list holds for `all` and `none`
+    and fails `any` and `single`; a row whose source cell is null gets a null.
+  }];
+
+  let arguments = (ins Column:$source, Variadic<Column>:$columns_to_filter, ListPredicateKind:$kind);
+  let results   = (outs ColumnBools:$result);
+
+  // Exactly one block, ending in a db.comprehension_yield.
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $source `,` `{` $columns_to_filter `}` `)` `kind` $kind $body attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* Reduce
+*/
+def Reduce : TuringOp<"reduce", [Pure, ConstantThroughOperands]> {
+  let summary = "Fold the elements of each row's list into one value per row";
+
+  let description = [{
+    Cypher's `reduce(acc = init, x IN xs | f(acc, x))`. The op reads one list column and
+    produces one value per row: the initial value, replaced by what the body computes
+    from it and each element of the row's list in turn.
+
+      %sum = db.reduce(%xs, %zero, {%n}) ({
+        ^bb0(%x: !db.column<none>, %acc: !db.column<none>, %nIn: !db.column<!storage.node_id>):
+          %next = db.add %acc, %x : (!db.column<none>, !db.column<none>) -> !db.column<none>
+          db.reduce_yield %next : !db.column<none>
+      }) : (!db.column<none>, !db.column<none>, !db.column<!storage.node_id>) -> !db.column<none>
+
+    The region's entry block takes the element, the accumulator as the previous element
+    left it, and one argument per carried column - db.list_comprehension's carry set. The
+    body cuts nothing, so the yield names only the next accumulator.
+
+    The accumulator's type is resolved during lowering: it is the type the initial value
+    and the body's value share, so `reduce(s = 0, x IN [1.5] | s + x)` accumulates a
+    float. An empty list gives the initial value, and a row whose source cell is null
+    gives a null.
+  }];
+
+  let arguments = (ins Column:$source, Column:$initial_value, Variadic<Column>:$columns_to_filter);
+  let results   = (outs Column:$result);
+
+  // Exactly one block, ending in a db.reduce_yield.
+  let regions = (region SizedRegion<1>:$body);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $source `,` $initial_value `,` `{` $columns_to_filter `}` `)` $body attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* ReduceYield
+*/
+def ReduceYield : TuringOp<"reduce_yield", [Pure, Terminator, HasParent<"Reduce">]> {
+  let summary = "Name the accumulator a db.reduce's body computed for each element";
+
+  let arguments = (ins Column:$value);
+
+  let assemblyFormat = [{
+    $value attr-dict `:` qualified(type($value))
+  }];
+}
+
+/**
+* PatternComprehension
+*/
+def PatternComprehension : TuringOp<"pattern_comprehension", [Pure]> {
+  let summary = "Build one list per row out of the matches a pattern finds for that row";
+
+  let description = [{
+    Cypher's `[(a)-[:KNOWS]->(b) WHERE p(b) | f(b)]`. The op matches a pattern once per row
+    in flight and produces one list cell per row - the values the matches of that row
+    contribute - so the rows in flight are the ones it started with, as
+    db.list_comprehension leaves them:
+
+      %names = db.pattern_comprehension(%a, %c) ({
+        ^bb0(%aIn: !db.column<!storage.node_id>, %cIn: !db.column<none>, %tag: !db.column<ui64>):
+          %s, %e, %et, %b, %tag2 = db.get_out_edges(%aIn, {%tag}) : ...
+          %name = db.get_node_properties(%b) {property = "name"} : ...
+          db.comprehension_yield %tag2, %name : !db.column<none>
+      }) : (!db.column<!storage.node_id>, !db.column<none>) -> !db.column<none>
+
+    `input_columns` are every column in flight where the comprehension is read, and the
+    region's entry block takes one argument per input column plus a trailing
+    `!db.column<ui64>` row tag - the position of each input row, carried through the
+    pattern the way any other column is, so the row each match belongs to is known once
+    the pattern is walked. The pattern joins onto the columns whose variables it names and
+    carries the rest along, exactly as db.optional_match's does; a comprehension read
+    where no column is in flight - `RETURN [(a:Person)-->(b) | b.name]` - has no input
+    column and so no tag either, and its one list covers the single empty row Cypher
+    starts from.
+
+    The WHERE is a db.filter inside the region, so a match it drops is one the projection
+    is never computed for, and it cuts the tag alongside the match. The db.comprehension_yield
+    names the tag as the pattern left it and the value each match contributes.
+
+    The result's type is the body's to decide and is resolved during lowering, as
+    db.list_comprehension's is: the list is of whatever the body yields. A row the pattern
+    matches nothing for gets the empty list, never a null - a pattern comprehension is the
+    one list-valued expression that cannot be null.
+  }];
+
+  let arguments = (ins Variadic<Column>:$input_columns);
+  let results   = (outs Column:$result);
+
+  // Exactly one block, ending in a db.comprehension_yield.
+  let regions = (region SizedRegion<1>:$pattern);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $input_columns `)` $pattern attr-dict `:` functional-type($input_columns, results)
+  }];
+}
+
+/**
+* ComprehensionYield
+*/
+def ComprehensionYield : TuringOp<"comprehension_yield",
+                                  [Pure, Terminator,
+                                   ParentOneOf<["ListComprehension", "ListPredicate", "PatternComprehension"]>]> {
+  let summary = "Name the row each surviving element of a comprehension came from and what it contributes";
+
+  let description = [{
+    Terminates the body of a db.list_comprehension or a db.list_predicate, or the pattern
+    of a db.pattern_comprehension. `row_tags` is the row tag as the body left it - the row
+    each surviving element came from, which a WHERE cuts alongside the element - and
+    `value` is what that element contributes to its row's list, or its row's predicate. The tag is absent only for a
+    db.pattern_comprehension that takes no input column: the one list it builds covers the
+    single empty row, which every match belongs to.
+  }];
+
+  let arguments = (ins Optional<ColumnRowTags>:$row_tags, Column:$value);
+
+  // The tag's type is buildable and so left out, as db.optional_yield leaves it out; only
+  // the value's is spelled.
+  let assemblyFormat = [{
+    ($row_tags^ `,`)? $value attr-dict `:` qualified(type($value))
+  }];
+}
+
+/**
 * ScanEdges
 */
 def ScanEdges : TuringOp<"scan_edges", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
@@ -135,6 +937,287 @@ def ScanEdges : TuringOp<"scan_edges", [Pure, DeclareOpInterfaceMethods<OpAsmOpI
   // functional-type; qualified(...) keeps the leading !db. on each.
   let assemblyFormat = [{
     `(`operands`)` attr-dict `:` qualified(type($srcids)) `,` qualified(type($eids)) `,`
+    qualified(type($etypes)) `,` qualified(type($tgtids))
+  }];
+}
+
+/**
+* ScanEdgesByType
+*/
+def ScanEdgesByType : TuringOp<"scan_edges_by_type", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Produce every edge of the named types in the graph as four row-aligned columns";
+
+  let description = [{
+    The by-type sibling of db.scan_edges: where that produces every edge, this
+    produces every edge carrying one of the named types, in the same four
+    row-aligned columns - the source node, the edge, its type and the target node:
+
+      %srcs, %eids, %etypes, %tgts = db.scan_edges_by_type(["KNOWS"]) : !db.column<!storage.node_id>, !db.column<!storage.edge_id>, !db.column<!storage.edge_type_id>, !db.column<!storage.node_id>
+
+    An edge carries exactly one type, so `edge_types` is a disjunction over the
+    types the pattern named, as `-[:KNOWS|LIKES]->` spells it: an edge matches when
+    it carries any one of them. The names are spelled the same as in the query and
+    resolved against the graph schema; one absent from the schema drops out, and a
+    set nothing resolved into matches no edge, so the scan yields no rows. An empty
+    `edge_types` says that outright - a pass narrowing the read to nothing writes one -
+    and the scan then walks no edge at all. Like
+    db.scan_edges it reads no column and takes no input, so it opens a dataflow
+    rather than consuming one, and the result shape is identical - only the rows
+    are narrowed.
+  }];
+
+  // `edge_types` are the symbolic relationship-type names. Being an attribute and
+  // not an SSA value, the op still has no operands; lowering hoists them into an
+  // nl.get_edge_type_set handle so they are resolved once above the loops.
+  let arguments = (ins EdgeTypeRefArrayAttr:$edge_types);
+
+  let results = (outs ColumnNodeIDs:$srcids,
+                      ColumnEdgeIDs:$eids,
+                      ColumnEdgeTypes:$etypes,
+                      ColumnNodeIDs:$tgtids);
+
+  // The type names print inside the parens where db.scan_edges prints nothing;
+  // the result types follow the colon, as on db.scan_edges, since a source op has
+  // no meaningful operand arrow.
+  let assemblyFormat = [{
+    `(` $edge_types `)` attr-dict `:` qualified(type($srcids)) `,` qualified(type($eids)) `,`
+    qualified(type($etypes)) `,` qualified(type($tgtids))
+  }];
+}
+
+/**
+* ScanOutEdgesByLabelSrc
+*/
+def ScanOutEdgesByLabelSrc : TuringOp<"scan_out_edges_by_label_src", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Produce every out-edge of the nodes carrying every given label as four row-aligned columns";
+
+  let description = [{
+    The by-label sibling of db.scan_edges: where that produces every edge, this
+    produces the edges leaving the nodes whose label set is a superset of `labels`,
+    in the same four row-aligned columns - the source node, the edge, its type and
+    the target node:
+
+      %srcs, %eids, %etypes, %tgts = db.scan_out_edges_by_label_src(["Person"]) : !db.column<!storage.node_id>, !db.column<!storage.edge_id>, !db.column<!storage.edge_type_id>, !db.column<!storage.node_id>
+
+    It is `MATCH (a:Person)-->(b)` read off the edge index rather than walked: the
+    same edges a db.scan_nodes_by_label feeding a db.get_out_edges produces, in one
+    op that never builds the node column between them. `labels` is the label set
+    db.scan_nodes_by_label carried, matched the same way - a node labelled
+    `Person:Employee` still matches `["Person"]`, and a label absent from the schema
+    leaves the conjunction unsatisfiable, so the scan yields no rows. Like
+    db.scan_edges it reads no column and takes no input, so it opens a dataflow
+    rather than consuming one.
+
+    The label list must not be empty: a label-free scan of every edge is
+    db.scan_edges.
+  }];
+
+  // `labels` is the set of symbolic label names the source nodes must carry. Being
+  // an attribute and not an SSA value, the op still has no operands; lowering
+  // resolves each name to a storage LabelID.
+  let arguments = (ins LabelRefArrayAttr:$labels);
+
+  let results = (outs ColumnNodeIDs:$srcids,
+                      ColumnEdgeIDs:$eids,
+                      ColumnEdgeTypes:$etypes,
+                      ColumnNodeIDs:$tgtids);
+  let hasVerifier = 1;
+
+  // The label list prints inside the parens where db.scan_edges_by_type prints its
+  // type name; the result types follow the colon, as on db.scan_edges, since a
+  // source op has no meaningful operand arrow.
+  let assemblyFormat = [{
+    `(` $labels `)` attr-dict `:` qualified(type($srcids)) `,` qualified(type($eids)) `,`
+    qualified(type($etypes)) `,` qualified(type($tgtids))
+  }];
+}
+
+/**
+* ScanInEdgesByLabelTgt
+*/
+def ScanInEdgesByLabelTgt : TuringOp<"scan_in_edges_by_label_tgt", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Produce every in-edge of the nodes carrying every given label as four row-aligned columns";
+
+  let description = [{
+    The reverse-direction sibling of db.scan_out_edges_by_label_src: where that
+    produces the edges leaving the nodes whose label set is a superset of `labels`,
+    this produces the edges arriving at them, in the same four row-aligned columns:
+
+      %srcs, %eids, %etypes, %tgts = db.scan_in_edges_by_label_tgt(["Person"]) : !db.column<!storage.node_id>, !db.column<!storage.edge_id>, !db.column<!storage.edge_type_id>, !db.column<!storage.node_id>
+
+    It is `MATCH (a:Person)<--(b)` read off the edge index rather than walked: the
+    same edges a db.scan_nodes_by_label feeding a db.get_in_edges produces. The
+    labels constrain the node the walk arrives at, which is the edge's target, so
+    `srcids` holds the unconstrained end and `tgtids` the labelled one - the reverse
+    of the out-edge scan, where the labelled end is the source. Both columns still
+    hold the edge as the graph stores it, exactly as db.get_in_edges fills them, so
+    a consumer reads them the same way whichever scan produced them.
+
+    The label list must not be empty: a label-free scan of every edge is
+    db.scan_edges.
+  }];
+
+  let arguments = (ins LabelRefArrayAttr:$labels);
+
+  let results = (outs ColumnNodeIDs:$srcids,
+                      ColumnEdgeIDs:$eids,
+                      ColumnEdgeTypes:$etypes,
+                      ColumnNodeIDs:$tgtids);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $labels `)` attr-dict `:` qualified(type($srcids)) `,` qualified(type($eids)) `,`
+    qualified(type($etypes)) `,` qualified(type($tgtids))
+  }];
+}
+
+/**
+* ScanOutEdgesByLabelTgt
+*/
+def ScanOutEdgesByLabelTgt : TuringOp<"scan_out_edges_by_label_tgt", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Produce every out-edge arriving at the nodes carrying every given label as four row-aligned columns";
+
+  let description = [{
+    The other endpoint's sibling of db.scan_out_edges_by_label_src: there the labels
+    constrain the node the hop leaves, here the one it arrives at, which is the edge's
+    target. It produces the edges whose target's label set is a superset of `labels`,
+    in the same four row-aligned columns:
+
+      %srcs, %eids, %etypes, %tgts = db.scan_out_edges_by_label_tgt(["Person"]) : !db.column<!storage.node_id>, !db.column<!storage.edge_id>, !db.column<!storage.edge_type_id>, !db.column<!storage.node_id>
+
+    It is `MATCH (a)-->(b:Person)` read off the edge index rather than scanned and
+    filtered: the same edges a db.scan_edges keeps once a db.check_label_constraint
+    over its target column has dropped the rest. `srcids` holds the unconstrained end
+    and `tgtids` the labelled one. Those are the rows db.scan_in_edges_by_label_tgt
+    produces, since both read the index keyed by the target's label set; the two are
+    told apart by the hop the query wrote, not by what they emit.
+
+    The label list must not be empty: a label-free scan of every edge is
+    db.scan_edges.
+  }];
+
+  let arguments = (ins LabelRefArrayAttr:$labels);
+
+  let results = (outs ColumnNodeIDs:$srcids,
+                      ColumnEdgeIDs:$eids,
+                      ColumnEdgeTypes:$etypes,
+                      ColumnNodeIDs:$tgtids);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $labels `)` attr-dict `:` qualified(type($srcids)) `,` qualified(type($eids)) `,`
+    qualified(type($etypes)) `,` qualified(type($tgtids))
+  }];
+}
+
+/**
+* ScanInEdgesByLabelSrc
+*/
+def ScanInEdgesByLabelSrc : TuringOp<"scan_in_edges_by_label_src", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Produce every in-edge leaving the nodes carrying every given label as four row-aligned columns";
+
+  let description = [{
+    The other endpoint's sibling of db.scan_in_edges_by_label_tgt: there the labels
+    constrain the node the in-hop arrives at, here the one it leaves, which is the
+    edge's source. It produces the edges whose source's label set is a superset of
+    `labels`:
+
+      %srcs, %eids, %etypes, %tgts = db.scan_in_edges_by_label_src(["Person"]) : !db.column<!storage.node_id>, !db.column<!storage.edge_id>, !db.column<!storage.edge_type_id>, !db.column<!storage.node_id>
+
+    It is `MATCH (a)<--(b:Person)` read off the edge index rather than scanned and
+    filtered: the same edges a db.scan_edges keeps once a db.check_label_constraint
+    over its source column has dropped the rest. `srcids` holds the labelled end and
+    `tgtids` the unconstrained one. Those are the rows db.scan_out_edges_by_label_src
+    produces, since both read the index keyed by the source's label set.
+
+    The label list must not be empty: a label-free scan of every edge is
+    db.scan_edges.
+  }];
+
+  let arguments = (ins LabelRefArrayAttr:$labels);
+
+  let results = (outs ColumnNodeIDs:$srcids,
+                      ColumnEdgeIDs:$eids,
+                      ColumnEdgeTypes:$etypes,
+                      ColumnNodeIDs:$tgtids);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $labels `)` attr-dict `:` qualified(type($srcids)) `,` qualified(type($eids)) `,`
+    qualified(type($etypes)) `,` qualified(type($tgtids))
+  }];
+}
+
+/**
+* ScanOutEdgesByLabelSrcTgt
+*/
+def ScanOutEdgesByLabelSrcTgt : TuringOp<"scan_out_edges_by_label_src_tgt", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Produce every edge whose source and target each carry every given label of their end as four row-aligned columns";
+
+  let description = [{
+    The both-ends sibling of db.scan_out_edges_by_label_src: it produces the edges
+    whose source's label set is a superset of `src_labels` and whose target's is a
+    superset of `tgt_labels`, in the same four row-aligned columns:
+
+      %srcs, %eids, %etypes, %tgts = db.scan_out_edges_by_label_src_tgt(["Person"], ["Interest"]) : !db.column<!storage.node_id>, !db.column<!storage.edge_id>, !db.column<!storage.edge_type_id>, !db.column<!storage.node_id>
+
+    It is `MATCH (a:Person)-->(b:Interest)`: the edges db.scan_out_edges_by_label_src
+    keeps once a db.check_label_constraint over its target column has dropped the
+    rest. It reads the index keyed by the source's label set, as that scan does, and
+    checks each edge's target against `tgt_labels`. db.scan_in_edges_by_label_src_tgt
+    produces the same rows off the index keyed by the target's label set.
+
+    Neither label list may be empty: a scan labelled on one end only is
+    db.scan_out_edges_by_label_src or db.scan_in_edges_by_label_tgt.
+  }];
+
+  let arguments = (ins LabelRefArrayAttr:$src_labels, LabelRefArrayAttr:$tgt_labels);
+
+  let results = (outs ColumnNodeIDs:$srcids,
+                      ColumnEdgeIDs:$eids,
+                      ColumnEdgeTypes:$etypes,
+                      ColumnNodeIDs:$tgtids);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $src_labels `,` $tgt_labels `)` attr-dict `:` qualified(type($srcids)) `,` qualified(type($eids)) `,`
+    qualified(type($etypes)) `,` qualified(type($tgtids))
+  }];
+}
+
+/**
+* ScanInEdgesByLabelSrcTgt
+*/
+def ScanInEdgesByLabelSrcTgt : TuringOp<"scan_in_edges_by_label_src_tgt", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Produce every edge whose target and source each carry every given label of their end, read off the target's index";
+
+  let description = [{
+    The both-ends sibling of db.scan_in_edges_by_label_tgt: it produces the edges
+    whose source's label set is a superset of `src_labels` and whose target's is a
+    superset of `tgt_labels`:
+
+      %srcs, %eids, %etypes, %tgts = db.scan_in_edges_by_label_src_tgt(["Interest"], ["Person"]) : !db.column<!storage.node_id>, !db.column<!storage.edge_id>, !db.column<!storage.edge_type_id>, !db.column<!storage.node_id>
+
+    It is `MATCH (a:Person)<--(b:Interest)`: the edges db.scan_in_edges_by_label_tgt
+    keeps once a db.check_label_constraint over its source column has dropped the
+    rest. It reads the index keyed by the target's label set, as that scan does, and
+    checks each edge's source against `src_labels`. The rows are those of
+    db.scan_out_edges_by_label_src_tgt; the two differ in the index they read.
+
+    Neither label list may be empty: a scan labelled on one end only is
+    db.scan_in_edges_by_label_tgt or db.scan_out_edges_by_label_src.
+  }];
+
+  let arguments = (ins LabelRefArrayAttr:$src_labels, LabelRefArrayAttr:$tgt_labels);
+
+  let results = (outs ColumnNodeIDs:$srcids,
+                      ColumnEdgeIDs:$eids,
+                      ColumnEdgeTypes:$etypes,
+                      ColumnNodeIDs:$tgtids);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $src_labels `,` $tgt_labels `)` attr-dict `:` qualified(type($srcids)) `,` qualified(type($eids)) `,`
     qualified(type($etypes)) `,` qualified(type($tgtids))
   }];
 }
@@ -213,34 +1296,63 @@ def GetInEdges : TuringOp<"get_in_edges", [Pure, DeclareOpInterfaceMethods<OpAsm
 }
 
 /**
+* GetEdges
+*/
+def GetEdges : TuringOp<"get_edges", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Fetch the neighbours of input over an edge in either direction, filtering carried columns alongside";
+
+  let description = [{
+      %s, %e, %t, %b = get_edges(%a, {})
+      %c, %b2, %a2 = get_edges(%b, {%a})
+  }];
+
+  let arguments = (ins Column:$input_nodes, Variadic<Column>:$columns_to_filter);
+
+  let results   = (outs ColumnNodeIDs:$srcids,
+                        ColumnEdgeIDs:$eids,
+                        ColumnEdgeTypes:$etypes,
+                        ColumnNodeIDs:$tgtids,
+                        Variadic<Column>:$filtered_columns);
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` `{` $columns_to_filter `}` `)` attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
 * GetOutEdgesByType
 */
-def GetOutEdgesByType : TuringOp<"get_out_edges_by_type", [Pure]> {
-  let summary = "Fetch the out-edges of one edge type, filtering carried columns alongside";
+def GetOutEdgesByType : TuringOp<"get_out_edges_by_type", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Fetch the out-edges of the named types, filtering carried columns alongside";
 
   let description = [{
     The by-type sibling of get_out_edges. In `MATCH (a)-[:KNOWS]->(b)` only the
     successors reached over a KNOWS edge count, so this walks each node's out-edges
-    but keeps only those of the named type - the plain get_out_edges narrowed by
-    the relationship type spelled in the query:
+    but keeps only those carrying one of the named types - the plain get_out_edges
+    narrowed by the relationship types spelled in the query:
 
-      %s, %e, %t, %b = get_out_edges_by_type(%a, "KNOWS", {})
-      %c, %b2, %a2 = get_out_edges_by_type(%b, "LIKES", {%a})   // eids/etypes omitted
+      %s, %e, %t, %b = get_out_edges_by_type(%a, ["KNOWS"], {})
+      %c, %b2, %a2 = get_out_edges_by_type(%b, ["LIKES", "LOVES"], {%a})   // eids/etypes omitted
 
-    An edge carries exactly one type, so the filter is an equality on that type,
-    not a set match. `edge_type` is the type name spelled the same as in the query,
-    resolved against the graph schema; a name absent from the schema matches no
-    edge, so the hop yields no rows. `columns_to_filter` is the carry set, exactly
-    as on get_out_edges: each one comes back in `filtered_columns`, and the result
-    chunk shape - srcids, eids, etypes, tgtids - is identical, so a hop is
-    interchangeable with the unfiltered fetch.
+    An edge carries exactly one type, so `edge_types` is a disjunction over the
+    types the pattern named, as `-[:KNOWS|LIKES]->` spells it: an edge matches when
+    it carries any one of them. The names are spelled the same as in the query and
+    resolved against the graph schema; one absent from the schema drops out, and a
+    set nothing resolved into matches no edge, so the hop yields no rows. An empty
+    `edge_types` says that outright - a pass narrowing the read to nothing writes one -
+    and the hop then walks no edge at all.
+    `columns_to_filter` is the carry set, exactly as on get_out_edges: each one
+    comes back in `filtered_columns`, and the result chunk shape - srcids, eids,
+    etypes, tgtids - is identical, so a hop is interchangeable with the unfiltered
+    fetch.
   }];
 
-  // `edge_type` is the symbolic relationship-type name. Being an attribute and
-  // not an SSA value, it is absent from `operands`; lowering hoists it into an
-  // nl.get_edge_type handle so the name is resolved once above the loops.
+  // `edge_types` are the symbolic relationship-type names. Being an attribute and
+  // not an SSA value, they are absent from `operands`; lowering hoists them into an
+  // nl.get_edge_type_set handle so they are resolved once above the loops.
   // `columns_to_filter` is the variadic carry set.
-  let arguments = (ins Column:$input_nodes, StrAttr:$edge_type, Variadic<Column>:$columns_to_filter);
+  let arguments = (ins Column:$input_nodes, EdgeTypeRefArrayAttr:$edge_types, Variadic<Column>:$columns_to_filter);
 
   // `filtered_columns`: one per carried column, after the four fixed results.
   let results   = (outs ColumnNodeIDs:$srcids,
@@ -249,11 +1361,11 @@ def GetOutEdgesByType : TuringOp<"get_out_edges_by_type", [Pure]> {
                         ColumnNodeIDs:$tgtids,
                         Variadic<Column>:$filtered_columns);
 
-  // The type name prints inside the parens as `"KNOWS"`, between input_nodes and
-  // the brace-wrapped carry set; MLIR elides it from attr-dict because the format
-  // already names it. functional-type spells only the operand and result types.
+  // The type names print inside the parens as `["KNOWS"]`, between input_nodes and
+  // the brace-wrapped carry set; MLIR elides them from attr-dict because the format
+  // already names them. functional-type spells only the operand and result types.
   let assemblyFormat = [{
-    `(` $input_nodes `,` $edge_type `,` `{` $columns_to_filter `}` `)` attr-dict `:`
+    `(` $input_nodes `,` $edge_types `,` `{` $columns_to_filter `}` `)` attr-dict `:`
     functional-type(operands, results)
   }];
 }
@@ -261,24 +1373,24 @@ def GetOutEdgesByType : TuringOp<"get_out_edges_by_type", [Pure]> {
 /**
 * GetInEdgesByType
 */
-def GetInEdgesByType : TuringOp<"get_in_edges_by_type", [Pure]> {
-  let summary = "Fetch the in-edges of one edge type, filtering carried columns alongside";
+def GetInEdgesByType : TuringOp<"get_in_edges_by_type", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Fetch the in-edges of the named types, filtering carried columns alongside";
 
   let description = [{
     The reverse-direction sibling of get_out_edges_by_type: where that keeps a
-    node's out-edges of the named type, this keeps its in-edges of that type. In
+    node's out-edges of the named types, this keeps its in-edges of those types. In
     `MATCH (a)<-[:KNOWS]-(b)` only the predecessors reached over a KNOWS edge
     count:
 
-      %s, %e, %t, %b = get_in_edges_by_type(%a, "KNOWS", {})
+      %s, %e, %t, %b = get_in_edges_by_type(%a, ["KNOWS"], {})
 
     The result chunk shape - srcids, eids, etypes, tgtids - and the
     `columns_to_filter` carry set match get_out_edges_by_type, so the two are
-    interchangeable in a hop; `edge_type` is resolved the same way and an absent
-    name yields no rows.
+    interchangeable in a hop; `edge_types` is resolved the same way and a set
+    nothing resolved into, or an empty one a pass wrote, yields no rows.
   }];
 
-  let arguments = (ins Column:$input_nodes, StrAttr:$edge_type, Variadic<Column>:$columns_to_filter);
+  let arguments = (ins Column:$input_nodes, EdgeTypeRefArrayAttr:$edge_types, Variadic<Column>:$columns_to_filter);
 
   let results   = (outs ColumnNodeIDs:$srcids,
                         ColumnEdgeIDs:$eids,
@@ -287,9 +1399,460 @@ def GetInEdgesByType : TuringOp<"get_in_edges_by_type", [Pure]> {
                         Variadic<Column>:$filtered_columns);
 
   let assemblyFormat = [{
-    `(` $input_nodes `,` $edge_type `,` `{` $columns_to_filter `}` `)` attr-dict `:`
+    `(` $input_nodes `,` $edge_types `,` `{` $columns_to_filter `}` `)` attr-dict `:`
     functional-type(operands, results)
   }];
+}
+
+/**
+* GetOutEdgesByLabel
+*/
+def GetOutEdgesByLabel : TuringOp<"get_out_edges_by_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Fetch the out-edges arriving at the nodes carrying every given label, filtering carried columns alongside";
+
+  let description = [{
+    The by-label sibling of get_out_edges. In `MATCH (a)-->(b:Person)` only the
+    successors that are Person count, so this walks each input node's out-edges but
+    keeps only those whose target's label set is a superset of `labels`:
+
+      %s, %e, %t, %b = get_out_edges_by_label(%a, ["Person"], {})
+      %c, %b2, %a2 = get_out_edges_by_label(%b, ["Movie"], {%a})   // eids/etypes omitted
+
+    The labelled end is the one the hop arrives at - the edge's target - since the
+    end it leaves is the input column, which a by-label node scan constrains
+    instead. db.scan_out_edges_by_label_tgt keeps the same edges of the whole graph;
+    this one keeps them of a chunk of nodes, so the hop carries the input rows the
+    scan has none of.
+
+    `columns_to_filter` is the carry set, exactly as on get_out_edges: each one comes
+    back in `filtered_columns`, and the result chunk shape - srcids, eids, etypes,
+    tgtids - is identical, so a hop is interchangeable with the unfiltered fetch. The
+    label list must not be empty: a label-free hop is db.get_out_edges. A label absent
+    from the schema leaves the conjunction unsatisfiable, so the hop yields no rows.
+  }];
+
+  // `labels` is the label conjunction the target must carry, spelled as in the query.
+  // Being an attribute and not an SSA value, it is absent from `operands`; lowering
+  // hands the list to the nl hop, which resolves each name once.
+  let arguments = (ins Column:$input_nodes, LabelRefArrayAttr:$labels, Variadic<Column>:$columns_to_filter);
+
+  // `filtered_columns`: one per carried column, after the four fixed results.
+  let results   = (outs ColumnNodeIDs:$srcids,
+                        ColumnEdgeIDs:$eids,
+                        ColumnEdgeTypes:$etypes,
+                        ColumnNodeIDs:$tgtids,
+                        Variadic<Column>:$filtered_columns);
+  let hasVerifier = 1;
+
+  // The label list prints inside the parens as `["Person"]`, between input_nodes and
+  // the brace-wrapped carry set, the way get_out_edges_by_type prints its type name.
+  let assemblyFormat = [{
+    `(` $input_nodes `,` $labels `,` `{` $columns_to_filter `}` `)` attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* GetInEdgesByLabel
+*/
+def GetInEdgesByLabel : TuringOp<"get_in_edges_by_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Fetch the in-edges leaving the nodes carrying every given label, filtering carried columns alongside";
+
+  let description = [{
+    The reverse-direction sibling of get_out_edges_by_label: where that keeps the
+    out-edges arriving at a label set, this keeps the in-edges leaving one. In
+    `MATCH (a)<--(b:Person)` only the predecessors that are Person count:
+
+      %s, %e, %t, %b = get_in_edges_by_label(%a, ["Person"], {})
+
+    The labelled end is the one the in-hop leaves, which is the edge's source, so
+    `srcids` holds it and `tgtids` the input node the hop walked from. The result
+    chunk shape and the `columns_to_filter` carry set match get_out_edges_by_label,
+    so the two are interchangeable in a hop; the label list must not be empty and an
+    absent name yields no rows.
+  }];
+
+  let arguments = (ins Column:$input_nodes, LabelRefArrayAttr:$labels, Variadic<Column>:$columns_to_filter);
+
+  let results   = (outs ColumnNodeIDs:$srcids,
+                        ColumnEdgeIDs:$eids,
+                        ColumnEdgeTypes:$etypes,
+                        ColumnNodeIDs:$tgtids,
+                        Variadic<Column>:$filtered_columns);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` $labels `,` `{` $columns_to_filter `}` `)` attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* GetOutEdgesByTypeAndLabel
+*/
+def GetOutEdgesByTypeAndLabel : TuringOp<"get_out_edges_by_type_and_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Fetch the out-edges of the named types arriving at the nodes carrying every given label, filtering carried columns alongside";
+
+  let description = [{
+    get_out_edges_by_type and get_out_edges_by_label in one hop. In
+    `MATCH (a)-[:KNOWS]->(b:Person)` an out-edge is kept when it carries one of
+    `edge_types` and its target's label set is a superset of `labels`:
+
+      %s, %e, %t, %b = get_out_edges_by_type_and_label(%a, ["KNOWS"], ["Person"], {})
+
+    `edge_types` is a disjunction resolved as on get_out_edges_by_type, and an empty
+    one walks no edge. `labels` is a conjunction resolved as on get_out_edges_by_label
+    and must not be empty. The result chunk shape and the `columns_to_filter` carry set
+    match get_out_edges.
+  }];
+
+  let arguments = (ins Column:$input_nodes, EdgeTypeRefArrayAttr:$edge_types, LabelRefArrayAttr:$labels, Variadic<Column>:$columns_to_filter);
+
+  let results   = (outs ColumnNodeIDs:$srcids,
+                        ColumnEdgeIDs:$eids,
+                        ColumnEdgeTypes:$etypes,
+                        ColumnNodeIDs:$tgtids,
+                        Variadic<Column>:$filtered_columns);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` $edge_types `,` $labels `,` `{` $columns_to_filter `}` `)` attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* GetInEdgesByTypeAndLabel
+*/
+def GetInEdgesByTypeAndLabel : TuringOp<"get_in_edges_by_type_and_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Fetch the in-edges of the named types leaving the nodes carrying every given label, filtering carried columns alongside";
+
+  let description = [{
+    The reverse-direction sibling of get_out_edges_by_type_and_label. In
+    `MATCH (a)<-[:KNOWS]-(b:Person)` an in-edge is kept when it carries one of
+    `edge_types` and its source's label set is a superset of `labels`:
+
+      %s, %e, %t, %b = get_in_edges_by_type_and_label(%a, ["KNOWS"], ["Person"], {})
+
+    `srcids` holds the labelled end and `tgtids` the input node the hop walked from,
+    as on get_in_edges_by_label.
+  }];
+
+  let arguments = (ins Column:$input_nodes, EdgeTypeRefArrayAttr:$edge_types, LabelRefArrayAttr:$labels, Variadic<Column>:$columns_to_filter);
+
+  let results   = (outs ColumnNodeIDs:$srcids,
+                        ColumnEdgeIDs:$eids,
+                        ColumnEdgeTypes:$etypes,
+                        ColumnNodeIDs:$tgtids,
+                        Variadic<Column>:$filtered_columns);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` $edge_types `,` $labels `,` `{` $columns_to_filter `}` `)` attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* ExplorePaths
+*/
+def ExplorePaths : TuringOp<"explore_paths", [Pure, AttrSizedOperandSegments, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+  let summary = "Enumerate the variable-length paths leaving each input node, filtering carried columns alongside";
+
+  let description = [{
+    The variable-length sibling of get_out_edges. In `MATCH (n)-[e]->{1,3}(m)` every
+    trail of one to three edges leaving `n` is one row: `srcids` is the seed `n`,
+    `tgtids` the node the path ends on, `paths` the path itself - a handle into the
+    query's path trie that db.expand_path turns into the list of edge IDs `e` binds to.
+    An edge appears at most once on a path; nodes may repeat. `min_hops` of zero emits
+    one zero-length path per seed (its end is the seed, its list empty); an absent
+    `max_hops` is unbounded, which trail semantics keep finite.
+
+      %s, %t, %p = db.explore_paths(%n, {}) forward hops 1 to 3
+      %s, %t, %p, %a2 = db.explore_paths(%n, {%a}) both hops 0 edge_types ["KNOWS"]
+      %s, %t, %p = db.explore_paths(%n, {}) forward hops 2 to 4 end_labels ["Interest"]
+
+    `direction` is which edges a hop follows; `srcids` is always the seed, whatever the
+    direction. `edge_types` restricts every hop to edges carrying one of those types, a
+    disjunction as `-[:KNOWS|LIKES*]->` spells it; a name absent from the schema drops
+    out, and a set left empty that way matches no edge. The optional `hop`
+    region is a predicate on each hop, evaluated over its source node, its edge and its
+    end node - the first three block arguments - and yielding one boolean column; a hop
+    that fails it is neither emitted nor expanded. The region reads nothing from outside
+    but constants. `columns_to_filter` is the carry set, exactly as on get_out_edges.
+
+    A walk can repeat a body of several steps instead of one hop, the way
+    `MATCH (a)((x)-[:KNOWS]->(y)<-[:LIKES]-(z)){1,2}(c)` repeats two. The direction is then a
+    list with one entry per step, `edge_types` and `hop_labels` hold one list per step, an
+    empty one leaving that step free, and there is one hop region per step, `{}` for a step
+    without a predicate. The hop bounds count repetitions of the body, and a path ends only
+    after a whole number of them. The region of step `k` takes the nodes and edges of the
+    repetition up to its hop, interleaved from the node the repetition started on - `k`
+    earlier nodes and edges, then the hop's source node, edge and end node - and then the
+    hop imports.
+
+      %s, %t, %p = db.explore_paths(%a, {}) [forward, backward] hops 1 to 2
+                     edge_types [["KNOWS"], ["LIKES"]]
+
+    `hop_imports` are the columns the hop predicate reads from outside the hop, the way
+    `MATCH (n)-[e*1..3 WHERE e.since > n.born]->(m)` reads the seed. Each is row-aligned
+    with `input_nodes` and becomes one further block argument of the region, in that order,
+    holding the seed row's own value repeated over the candidates of the hop. They are
+    operands of their own rather than carried columns: a carry set is trimmed and
+    reordered, and nothing comes back for them. An exploration that imports is walked seed
+    by seed, so the distinct search, which expands many seeds at one level, is not used for
+    it.
+
+    `end_labels` keeps only the paths ending on a node carrying every listed label, the
+    way `(m:Interest)` constrains the end of `MATCH (n)-[e]->{2,4}(m:Interest)`. The
+    fuse_explore_end_constraint pass sets it from the label filter codegen leaves over
+    `tgtids`. A path ending elsewhere is walked through but never emitted, and a prefix
+    that cannot reach such a node within the hops it has left is not walked at all.
+
+    `hop_labels` is a hop predicate that asks only for labels on the hop's end node, the way
+    `(b:Event)` constrains every hop of `MATCH (n)((a)-[e]->(b:Event)){1,3}(m)`: a hop whose end
+    lacks one of them is neither emitted nor expanded. The fuse_explore_hop_labels pass sets it
+    from the label checks a `hop` region asks of the end node, which leave the region; the region
+    goes when they were all it asked. A `hop` region beside it runs over the hops that carry the
+    labels.
+
+      %s, %t, %p = db.explore_paths(%n, {}) forward hops 1 to 3 hop_labels ["Event"]
+
+    `end_column` names, by its index in `columns_to_filter`, the carried node column
+    holding each seed row's own end: the way `(a)-->(b)` binds the end of
+    `MATCH (a)-[e]->+(b), (a)-->(b)` before the exploration runs. The
+    fuse_explore_end_nodes pass sets it from the equality filter codegen leaves between
+    `tgtids` and that column's carried copy; the copy still comes back, equal to `tgtids`
+    row by row. Only the paths ending on the row's target are emitted, and each seed prunes
+    the prefixes that cannot reach its target in time.
+
+      %s, %t, %p, %b2 = db.explore_paths(%a, {%b}) forward hops 1 end_column 0
+
+    `end_nodes` binds the end to one set of nodes every seed shares, the way
+    `MATCH (a)-[e]->+(b {name:"Adam"})` ends on the nodes named Adam, and
+    `MATCH (a)-[e]->+(b)-->(c {name:"Adam"})` on the nodes with an edge to one: where
+    `end_column` gives each row its own target, this gives the whole walk the same ones. The
+    column is consumed in full before the walk runs, as db.shortest_path consumes its two node
+    columns, so it is a pipeline breaker on that operand: it comes from a scan of its own and
+    the hops walked from it, standing ahead of the scan the seeds come from, and lowering
+    rejects a set the walk would outrun.
+    Only the paths ending on a node of the set are emitted, the prefixes that cannot reach one
+    in time are not walked, and an empty set emits nothing.
+
+      %s, %t, %p = db.explore_paths(%a, {}) forward hops 1 to 5 end_nodes %b
+
+    `ends_on_seed` is that same constraint when the end the pattern names is the seed it
+    started from - `MATCH (a)-[e]->+(a)`, the cycle through `a` - so each row's target is
+    its own `srcids` and no carried column holds it. The same pass sets it, from the
+    equality codegen leaves between `tgtids` and `srcids`, and the paths that do not come
+    back are pruned exactly as a bound end's are.
+
+      %s, %t, %p = db.explore_paths(%a, {}) forward hops 1 to 7 ends_on_seed
+
+    `distinct` asks for each (seed, end) pair once and no path at all, which is what a
+    downstream DISTINCT or distinct aggregate reads out of an exploration whose path is
+    unread; the fuse_explore_distinct_ends pass sets it. Up to a `min_hops` of one the
+    walk answers it as a reachability search, since a walk of one to `max_hops` hops
+    always shortens to a trail of as many; deeper minimums keep the trail semantics and
+    walk, remembering each subtree no held edge constrained so that the prefixes arriving
+    at a node later stop there. `paths` must have no use, which the verifier requires.
+  }];
+
+  let arguments = (ins Column:$input_nodes,
+                       Variadic<Column>:$columns_to_filter,
+                       Optional<ColumnNodeIDs>:$end_nodes,
+                       Variadic<Column>:$hop_imports,
+                       DenseI64ArrayAttr:$directions,
+                       UI64Attr:$min_hops,
+                       OptionalAttr<UI64Attr>:$max_hops,
+                       OptionalAttr<EdgeTypeRefArrayArrayAttr>:$edge_types,
+                       OptionalAttr<LabelRefArrayAttr>:$end_labels,
+                       OptionalAttr<LabelRefArrayArrayAttr>:$hop_labels,
+                       OptionalAttr<UI64Attr>:$end_column,
+                       UnitAttr:$ends_on_seed,
+                       UnitAttr:$distinct);
+
+  let results   = (outs ColumnNodeIDs:$srcids,
+                        ColumnNodeIDs:$tgtids,
+                        ColumnPathRefs:$paths,
+                        Variadic<Column>:$filtered_columns);
+
+  let regions = (region VariadicRegion<MaxSizedRegion<1>>:$hops);
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` `{` $columns_to_filter `}` `)` custom<PathDirections>($directions) `hops` $min_hops
+    (`to` $max_hops^)? (`edge_types` custom<StepNames>($edge_types)^)? (`end_labels` $end_labels^)?
+    (`hop_labels` custom<StepNames>($hop_labels)^)? (`end_nodes` $end_nodes^)? (`end_column` $end_column^)?
+    (`hop_imports` `{` $hop_imports^ `}`)? (`ends_on_seed` $ends_on_seed^)?
+    (`distinct` $distinct^)? `` custom<HopRegions>($hops, ref($directions))
+    attr-dict `:` functional-type(operands, results)
+  }];
+
+  let extraClassDeclaration = [{
+    size_t getStepCount() { return getDirections().size(); }
+    ::mlir::storage::PathDirection getStepDirection(size_t step);
+
+    // The names of one step, null when the step has none
+    ::mlir::ArrayAttr getStepEdgeTypes(size_t step);
+    ::mlir::ArrayAttr getStepHopLabels(size_t step);
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* ExpandPath
+*/
+def ExpandPath : TuringOp<"expand_path", [Pure]> {
+  let summary = "Expand each path handle into the list its variable binds to";
+
+  let description = [{
+    Turns a column of path handles into a column of lists, one per row: `kind edges`
+    is the ordered edge IDs the path variable binds to, `kind ends` the end node of each
+    hop and `kind sources` the source node of each hop (the seed, read from `srcids`,
+    followed by every end but the last) - the lists the group variables of a
+    quantified path pattern bind to. `kind nodes` is every node the path runs through,
+    the seed then the end of each hop, which is what nodes() reads off a named path
+    over the walk; a path of no hops gives the seed alone.
+
+    `reversed` writes the list backwards, for an exploration the pattern's far end seeded:
+    the walk took its hops the other way round, so the last one it took is the pattern's
+    first. The kinds swap with it - a reversed `kind ends` is the pattern's source list and
+    a reversed `kind sources` its end list - so it is the reversed `kind sources` that
+    reads the seed.
+
+      %e = db.expand_path(%p, %s) kind edges
+             : (!db.column<!storage.path_ref>, !db.column<!storage.node_id>) -> !db.column<!storage.list<!storage.edge_id>>
+
+    `step k of n` reads a walk repeating a body of `n` steps: the list holds hop `k` of each
+    repetition alone, one entry per repetition, the way a group variable of a body of several
+    hops binds one entity per repetition. `reversed` reverses that list in turn. `kind nodes`
+    lists every node of the walk and takes no step.
+
+      %y = db.expand_path(%p) kind ends step 0 of 2
+             : (!db.column<!storage.path_ref>) -> !db.column<!storage.list<!storage.node_id>>
+  }];
+
+  // The seeds are read by whichever kind ends up holding them - `kind sources` in walk
+  // order, `kind ends` reversed, `kind nodes` either way - so the other kind leaves them out
+  let arguments = (ins ColumnPathRefs:$paths,
+                       Optional<ColumnNodeIDs>:$srcids,
+                       PathExpansionKind:$kind,
+                       UnitAttr:$reversed,
+                       OptionalAttr<UI64Attr>:$step,
+                       OptionalAttr<UI64Attr>:$steps);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = [{
+    `(` $paths (`,` $srcids^)? `)` `kind` $kind (`reversed` $reversed^)? (`step` $step^ `of` $steps)?
+    attr-dict `:` functional-type(operands, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* PathLength
+*/
+def PathLength : TuringOp<"path_length", [Pure]> {
+  let summary = "Read the number of edges of each path";
+
+  let description = [{
+    The `size(e)` of a path variable: one unsigned count per row, read off the handle
+    without expanding the path.
+
+      %n = db.path_length(%p) : (!db.column<!storage.path_ref>) -> !db.column<ui64>
+  }];
+
+  let arguments = (ins ColumnPathRefs:$paths);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = [{
+    `(` $paths `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
+* MakePath
+*/
+def MakePath : TuringOp<"make_path", [Pure]> {
+  let summary = "Build the path a named pattern element binds, one entity sequence per row";
+
+  let description = [{
+    `MATCH p = (a)-[x]->(b)` binds `p` to the path the element spells out. This op lays
+    that path out as one sequence of graph entities per row - the nodes and the edges it
+    runs through, in the order they are written, each entry saying which of the two it is.
+
+      %p = db.make_path(%a, %x, %b)
+             : (!db.column<!storage.node_id>, !db.column<!storage.edge_id>, !db.column<!storage.node_id>)
+               -> !db.column<!storage.entity_list>
+
+    The operands are the element's entities in written order. A node column contributes
+    one node entry, an edge column one edge entry, and a path column - what a quantified
+    relationship binds - the whole walk it stands for: one edge entry and one node entry
+    per hop, its seed left out because the node operand ahead of it already holds it. So
+    `MATCH p = (a)-[e]->+(b)` is `db.make_path(%a, %pe)`, with no operand for `b`: the
+    last node the walk reaches is `b`.
+
+      %p = db.make_path(%a, %pe) : (...) -> !db.column<!storage.entity_list>
+      %p = db.make_path(%a, %x, %b, %pe) : (...) -> !db.column<!storage.entity_list>
+
+    A path of no hops contributes no entry, so `MATCH p = (a)-[e]->*(m)` reads back as
+    the single node `a` on the rows where the walk stayed put.
+
+    `reversed_paths` lists the path operands the exploration walked against the pattern,
+    because the pattern's far end was bound first and seeding there was cheaper. Such an
+    operand contributes its hops from the far end back - the node an edge lands on, then
+    that edge - so the sequence still reads the way the pattern is written. The node the
+    walk seeded from is written after the path rather than before it. Written after a
+    node, the path writes over that node, which is the one the walk ended at.
+
+      %p = db.make_path(%pe, %b) {reversed_paths = [0]} : (...) -> !db.column<!storage.entity_list>
+      %p = db.make_path(%a, %x, %k, %pe, %b) {reversed_paths = [3]} : (...) -> !db.column<!storage.entity_list>
+  }];
+
+  let arguments = (ins Variadic<Column>:$entities,
+                       OptionalAttr<I64ArrayAttr>:$reversed_paths);
+  let results   = (outs ColumnEntityList:$result);
+
+  let assemblyFormat = [{
+    `(` $entities `)` attr-dict `:` functional-type(operands, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* PathElements
+*/
+def PathElements : TuringOp<"path_elements", [Pure]> {
+  let summary = "Read the nodes, the relationships or the length of each named path";
+
+  let description = [{
+    `nodes(p)`, `relationships(p)` and `length(p)` over the path a named pattern
+    element binds: one list of node IDs, one list of edge IDs or one hop count per row,
+    read off the entity sequence db.make_path laid out, or off the path db.shortest_path
+    found.
+
+      %ns = db.path_elements(%p) kind nodes
+              : (!db.column<!storage.entity_list>) -> !db.column<!storage.nullable<!storage.list<!storage.node_id>>>
+      %n = db.path_elements(%p) kind length
+              : (!db.column<!storage.entity_list>) -> !db.column<!storage.nullable<ui64>>
+
+    A path an OPTIONAL MATCH missed is an empty sequence, and each function of it is
+    null, so the results are nullable. Over the path of one node and one walk,
+    fuse_path_elements answers from the walk's handles instead: db.path_length for the
+    length and db.expand_path for the two lists.
+  }];
+
+  let arguments = (ins AnyTypeOf<[ColumnEntityList, ColumnPath]>:$path, PathElementsKind:$kind);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = [{
+    `(` $path `)` `kind` $kind attr-dict `:` functional-type(operands, results)
+  }];
+
+  let hasVerifier = 1;
 }
 
 /**
@@ -304,27 +1867,47 @@ def GetNodeProperties : TuringOp<"get_node_properties", [Pure]> {
     one per node, into a new column:
 
       %a    = db.scan_nodes() : !db.column<!storage.node_id>
-      %name = db.get_node_properties(%a, "name") : (!db.column<!storage.node_id>) -> !db.column<none>
+      %name = db.get_node_properties(%a, "name") : (!db.column<!storage.node_id>) -> !db.column<!storage.nullable<!storage.string>>
 
     A node may not have the property, so missing values come back null and no
-    node is dropped - the lowering uses the with-null property fetch. One op
+    node is dropped - the lowering uses the with-null property fetch. The value
+    column is the property's value type made nullable, which the analyzer resolves
+    against the schema and the properties the query itself creates. One op
     reads one property; `RETURN a.name, a.age` is two ops sharing %a. Reading a
     property is a deterministic read of the graph, so the op is Pure.
+
+    `pending`, when present, is the mask a db.merge produced beside its node
+    column: those rows hold an offset into the change's write buffer rather than
+    an ID the graph knows, so their value is read out of that buffer instead of off
+    whatever node the offset would collide with - null there when the write set the
+    property on none of them.
+
+      %v = db.get_node_properties(%n, "age") pending %mask
+             : (!db.column<!storage.node_id>, !db.column<!storage.bool>) -> !db.column<!storage.nullable<i64>>
+
+    `all_pending` says the same of every row without a mask to say it row by row,
+    which is what a db.create_node's column is: the read comes wholly out of the
+    write buffer.
+
+      %v = db.get_node_properties(%n, "age") all_pending
+             : (!db.column<!storage.node_id>) -> !db.column<!storage.nullable<i64>>
   }];
 
   // `property` is the symbolic property name, the same `name`/`age` spelled in
   // the query. Being an attribute and not an SSA value, it is absent from
   // `operands` below; lowering resolves it to a storage PropertyTypeID.
-  let arguments = (ins Column:$input_nodes, StrAttr:$property);
-  let results   = (outs Column:$result);
+  let arguments = (ins Column:$input_nodes,
+                       StrAttr:$property,
+                       Optional<Column>:$pending,
+                       UnitAttr:$all_pending);
+  let results   = (outs ColumnNullables:$result);
 
-  // One operand and one result, so functional-type(operands, results) prints the
-  // `(!db.column<...>) -> !db.column<...>` form, as get_out_edges does; the
-  // string attribute prints inside the parens, ahead of the colon, and MLIR
-  // elides it from attr-dict because the format already names it.
+  // The string attribute prints inside the parens, ahead of the colon, and MLIR
+  // elides it from attr-dict because the format already names it. The optional
+  // mask prints after a `pending` keyword, which anchors its group.
   let assemblyFormat = [{
-    `(` $input_nodes `,` $property `)` attr-dict `:`
-    functional-type(operands, results)
+    `(` $input_nodes `,` $property `)` (`pending` $pending^)? (`all_pending` $all_pending^)?
+    attr-dict `:` functional-type(operands, results)
   }];
 }
 
@@ -340,20 +1923,27 @@ def GetEdgeProperties : TuringOp<"get_edge_properties", [Pure]> {
     this op fetches the value behind `e.weight`, one per edge, with missing
     values null:
 
-      %weight = db.get_edge_properties(%eids, "weight") : (!db.column<!storage.edge_id>) -> !db.column<none>
+      %weight = db.get_edge_properties(%eids, "weight") : (!db.column<!storage.edge_id>) -> !db.column<!storage.nullable<i64>>
 
     The input column carries its element type - !storage.edge_id here - and the
     op chosen (get_node_properties vs get_edge_properties) selects which side of
-    the graph the property is read from. The value column is left typed none: the
-    property's value type is only resolved against the schema during lowering.
+    the graph the property is read from. The value column is typed as
+    get_node_properties' is.
+
+    `pending` is get_node_properties' mask, over edges: a row a db.merge wrote
+    holds a write-buffer offset, and its value is read out of the write buffer.
+    `all_pending` is its maskless form, which a db.create_edge's column is.
   }];
 
-  let arguments = (ins Column:$input_edges, StrAttr:$property);
-  let results   = (outs Column:$result);
+  let arguments = (ins Column:$input_edges,
+                       StrAttr:$property,
+                       Optional<Column>:$pending,
+                       UnitAttr:$all_pending);
+  let results   = (outs ColumnNullables:$result);
 
   let assemblyFormat = [{
-    `(` $input_edges `,` $property `)` attr-dict `:`
-    functional-type(operands, results)
+    `(` $input_edges `,` $property `)` (`pending` $pending^)? (`all_pending` $all_pending^)?
+    attr-dict `:` functional-type(operands, results)
   }];
 }
 
@@ -375,24 +1965,56 @@ def GetNodeLabelSet : TuringOp<"get_node_label_set", [Pure]> {
   }];
 }
 
+def GetEdgeTypes : TuringOp<"get_edge_types", [Pure]> {
+  let summary = "Read the type ID of each edge as a column";
+
+  let description = [{
+    The edge counterpart of get_node_label_set: for each edge in the input column,
+    fetches its EdgeTypeID. A traversal already publishes this column beside the edges
+    it walks, so this reads the type of edges that reach it any other way - the ones a
+    barrier republished, whose type column the barrier did not carry.
+
+      %et = db.get_edge_types(%e) : (!db.column<!storage.edge_id>) -> !db.column<!storage.edge_type_id>
+      %ok = db.check_edge_type_constraint(%et, ["KNOWS"]) : (!db.column<!storage.edge_type_id>) -> !db.column<!storage.bool>
+  }];
+
+  let arguments = (ins Column:$input_edges);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = [{
+    `(` $input_edges `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
 def CheckLabelConstraint : TuringOp<"check_label_constraint", [Pure]> {
   let summary = "Test each label-set ID against a required-label constraint";
 
   let description = [{
     For each LabelSetID in the input column, emits true if the node's label set
-    contains every label in `labels` (a superset match), false otherwise.
+    contains every label of at least one of `alternatives` (a superset match), false
+    otherwise. A single alternative is written flat, several are written nested.
 
       %ok = db.check_label_constraint(%ls, ["Person", "Employee"])
               : (!db.column<!storage.labelset_id>) -> !db.column<!storage.bool>
+      %ok = db.check_label_constraint(%ls, [["Person", "Employee"], ["Interest"]])
+              : (!db.column<!storage.labelset_id>) -> !db.column<!storage.bool>
+
+    With `nullable`, a row whose node is null - one an OPTIONAL MATCH missed - tests
+    null rather than false, as a label test written in an expression must.
   }];
 
-  let arguments = (ins Column:$labelset_ids, StrArrayAttr:$labels);
+  let arguments = (ins Column:$labelset_ids, LabelRefArrayArrayAttr:$alternatives, UnitAttr:$nullable);
   let results   = (outs Column:$result);
 
   let hasVerifier = 1;
 
+  let extraClassDeclaration = [{
+    // The labels of the sole alternative, or null when there are several
+    ::mlir::ArrayAttr getConjunction();
+  }];
+
   let assemblyFormat = [{
-    `(` $labelset_ids `,` $labels `)` attr-dict `:` functional-type(operands, results)
+    `(` $labelset_ids `,` custom<LabelAlternatives>($alternatives) `)` attr-dict `:` functional-type(operands, results)
   }];
 }
 
@@ -405,9 +2027,12 @@ def CheckEdgeTypeConstraint : TuringOp<"check_edge_type_constraint", [Pure]> {
 
       %ok = db.check_edge_type_constraint(%et, ["KNOWS", "LIKES"])
               : (!db.column<!storage.edge_type_id>) -> !db.column<!storage.bool>
+
+    With `nullable`, a row whose edge is null tests null rather than false, as for
+    db.check_label_constraint.
   }];
 
-  let arguments = (ins Column:$edge_type_ids, StrArrayAttr:$edge_types);
+  let arguments = (ins Column:$edge_type_ids, EdgeTypeRefArrayAttr:$edge_types, UnitAttr:$nullable);
   let results   = (outs Column:$result);
 
   let hasVerifier = 1;
@@ -473,17 +2098,91 @@ def CrossProduct : TuringOp<"cross_product", [Pure]> {
 }
 
 /**
-* Yield
+* HashJoin
 */
-def Yield : TuringOp<"yield", [Pure, Terminator, HasParent<"CrossProduct">]> {
-  let summary = "Name the columns a cross_product factor contributes to the result";
+def HashJoin : TuringOp<"hash_join", [Pure]> {
+  let summary = "Cross two column dataflows, keeping the rows their key columns agree on";
 
   let description = [{
-    Terminates a db.cross_product factor region, naming the columns that factor
-    contributes to the product. The cross_product's results are the left
+    The fused form of a db.cross_product whose product one db.filter cuts by a
+    single db.eq between a column of each factor - an inner equi-join. It holds
+    each side the way the product does, in its own region ending in a db.yield,
+    and its results are the left factor's yielded columns followed by the right
+    factor's.
+
+      %a, %ka, %b, %kb = db.hash_join factor {
+        %x = db.scan_nodes() : !db.column<!storage.node_id>
+        %k = db.get_node_properties(%x, "name") : (!db.column<!storage.node_id>) -> !db.column<!storage.nullable<!storage.string>>
+        db.yield %x, %k : !db.column<!storage.node_id>, !db.column<!storage.nullable<!storage.string>>
+      } factor {
+        %y = db.scan_nodes() : !db.column<!storage.node_id>
+        %k = db.get_node_properties(%y, "name") : (!db.column<!storage.node_id>) -> !db.column<!storage.nullable<!storage.string>>
+        db.yield %y, %k : !db.column<!storage.node_id>, !db.column<!storage.nullable<!storage.string>>
+      } on 1, 1
+
+    `on` names the key column of each side as an index into that factor's
+    db.yield - the left factor's first, the right factor's second. A result row
+    pairs a left row with a right row whose keys hold the same value. A row whose
+    key is null joins with nothing, which is what the equality it replaces did:
+    `=` against a null gives null and the filter keeps only the true rows.
+
+    The right factor is the built side and the left the probed one, so a left
+    row's matches come out together and in right-factor order, however either
+    side was chunked. That is not the order the product and its filter emitted
+    the surviving rows in: the product re-runs its right factor once per chunk
+    of the left, so a right side spanning several chunks interleaves them. Row
+    order is what an ORDER BY is for, so the fusion is free to change it - but
+    a LIMIT with no ORDER BY over a join can keep other rows than the same
+    LIMIT over the product.
+
+    As on db.cross_product the result types are not spelled after the regions;
+    the parser recovers them from the two yields and the verifier checks they line
+    up. Reading the graph is deterministic, so the op is Pure.
+  }];
+
+  // Which column of each factor's yield carries the join key: the left factor's,
+  // then the right factor's.
+  let arguments = (ins UI64Attr:$leftKey, UI64Attr:$rightKey);
+
+  // The results are the concatenation of the two factors' yielded columns; the
+  // count and types are recovered from the yields, never spelled out.
+  let results = (outs Variadic<Column>:$results);
+
+  // Each factor is exactly one block: a self-contained dataflow ending in a
+  // db.yield, with no operands and no block arguments.
+  let regions = (region SizedRegion<1>:$leftFactor, SizedRegion<1>:$rightFactor);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+
+  // The only builder takes the result types and the two key indices and creates
+  // the two empty factor blocks; the caller fills each region and terminates it
+  // with a db.yield whose operands match the result types contributed by that
+  // factor.
+  let skipDefaultBuilders = 1;
+  let builders = [
+      OpBuilder<(ins "::mlir::TypeRange":$resultTypes, "uint64_t":$leftKey, "uint64_t":$rightKey)>
+  ];
+}
+
+/**
+* Yield
+*/
+def Yield : TuringOp<"yield", [Pure, Terminator, ParentOneOf<["CrossProduct", "HashJoin", "Union", "Conditional", "ExplorePaths"]>]> {
+  let summary = "Name the columns a region contributes to the result of the op holding it";
+
+  let description = [{
+    Terminates a factor region of a db.cross_product or a db.hash_join, naming
+    the columns that factor contributes. Either op's results are the left
     factor's yielded columns followed by the right factor's. A factor must yield
-    at least one column - the cross_product verifier rejects an empty yield,
-    since a side's row count is read from its first yielded column.
+    at least one column - the holder's verifier rejects an empty yield, since a
+    side's row count is read from its first yielded column.
+
+    It also terminates each branch of a db.union that has results and of a
+    db.conditional, naming the rows that branch adds to them. It terminates each
+    condition of a db.conditional and the hop region of a db.explore_paths too, yielding
+    one boolean column: whether the row takes the branch, or which candidates of a hop
+    pass its predicate.
   }];
 
   let arguments = (ins Variadic<Column>:$columns);
@@ -491,9 +2190,64 @@ def Yield : TuringOp<"yield", [Pure, Terminator, HasParent<"CrossProduct">]> {
   // The yielded column types vary from query to query and cannot be built from
   // a recipe, so - when present - they are spelled after the colon, as in
   // db.output. The optional group, anchored on the operands, keeps the syntax
-  // total: an empty yield (`db.yield`) still parses, then the cross_product
-  // verifier rejects it with a clear db-level diagnostic.
+  // total: an empty yield (`db.yield`) still parses, then the holder's verifier
+  // rejects it with a clear db-level diagnostic.
   let assemblyFormat = "( $columns^ `:` qualified(type($columns)) )? attr-dict";
+}
+
+/**
+* CallProcedure
+*/
+def CallProcedure : TuringOp<"call_procedure", [AttrSizedOperandSegments]> {
+  let summary = "Call a registered procedure, yielding the return values named";
+
+  let description = [{
+    The declarative counterpart of a Cypher CALL ... YIELD. Calls the procedure
+    registered under `procedure` and produces one column per yielded return value,
+    then one per column carried past the call:
+
+      %id, %label = db.call_procedure("db.labels", {}, {}) yields ["id", "label"]
+                      : () -> (!db.column<none>, !db.column<none>)
+      db.output(%id, %label) : !db.column<none>, !db.column<none>
+
+    `yields` names the return values the query asked
+    for, one per leading result and in result order. A procedure's other return
+    values are left unbound and the procedure skips them. A yielded name that the
+    procedure does not return, or a result count that disagrees with `yields` and
+    the carry set, is rejected.
+
+    The result value types come from the procedure's declared return types, so they
+    are left typed none here and resolved during lowering.
+
+    An argument-less call is a source: the procedure produces rows on its own and is
+    driven until it declares itself finished, so it lowers to an nl.procedure_init
+    and its own nl.for. With arguments it is a per-chunk call: the procedure's
+    execute callback runs once per chunk of its argument columns, inside the loop
+    that produces them, refilling its result columns each step - the same
+    nl.procedure_init shape, opened where those arguments are bound.
+
+    A carried column must be row-aligned with the arguments (both bound by the same
+    loop), since the correspondence the procedure reports is an index into its own
+    input rows. Only a procedure reporting those indices can be carried past, which
+    every procedure declaring a row-aligned argument owes: one taking no argument, or
+    only constant ones, has no input row to report against (cross its rows in with
+    db.cross_product instead).
+  }];
+
+  let arguments = (ins StrAttr:$procedure,
+                       Variadic<Column>:$inputs,
+                       Variadic<Column>:$carried_columns,
+                       StrArrayAttr:$yields);
+
+  // One result per yielded return value, then one per carried column.
+  let results   = (outs Variadic<Column>:$results);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $procedure `,` `{` $inputs `}` `,` `{` $carried_columns `}` `)` `yields` $yields
+    attr-dict `:` functional-type(operands, results)
+  }];
 }
 
 /**
@@ -509,13 +2263,34 @@ def Output : TuringOp<"output"> {
     Variadic<Column> accepts any number of columns of any value. The op has no
     results and is deliberately not Pure: emitting the result is its whole
     purpose, so it must survive dead-code elimination.
+
+    An optional `names` array gives the result columns their query-level names,
+    one per column: the alias a RETURN item was given through AS, or the item
+    spelled as it was written when it has none. A hand-written program that
+    names nothing leaves the array off, and the result columns are unnamed.
+
+      db.output(%a, %b) names ["person", "n.age"] : !db.column<!storage.node_id>, !db.column<i64>
   }];
-  let arguments = (ins Variadic<Column>:$columns);
+  let arguments = (ins Variadic<Column>:$columns,
+                       OptionalAttr<StrArrayAttr>:$column_names);
 
   // The column types vary from query to query and cannot be built from a
   // recipe, so they are spelled after the colon, the same as nl.output.
-  // qualified(...) forces the leading !db. on every printed type.
-  let assemblyFormat = "`(` $columns `)` attr-dict `:` qualified(type($columns))";
+  // qualified(...) forces the leading !db. on every printed type. The names,
+  // when present, print after a `names` keyword, which anchors the optional
+  // group for the declarative parser.
+  let assemblyFormat = [{
+    `(` $columns `)` (`names` $column_names^)? attr-dict `:` qualified(type($columns))
+  }];
+
+  // A hand-written program names nothing, so it gets a builder taking the columns alone.
+  let builders = [
+      OpBuilder<(ins "::mlir::ValueRange":$columns)>
+  ];
+
+  // One name per column or none at all: a shorter array would name the wrong
+  // column, and a longer one names a column that is not emitted.
+  let hasVerifier = 1;
 }
 
 /**
@@ -598,10 +2373,10 @@ def Sort : TuringOp<"sort", [Pure]> {
     projection stays row-aligned:
 
       %a     = db.scan_nodes() : !db.column<!storage.node_id>
-      %score = db.get_node_properties(%a, "score") : (!db.column<!storage.node_id>) -> !db.column<none>
+      %score = db.get_node_properties(%a, "score") : (!db.column<!storage.node_id>) -> !db.column<!storage.nullable<i64>>
       %sa, %sscore = db.sort(%a, %score) keys [1] ascending [true]
-                       : (!db.column<!storage.node_id>, !db.column<none>) -> (!db.column<!storage.node_id>, !db.column<none>)
-      db.output(%sa, %sscore) : !db.column<!storage.node_id>, !db.column<none>
+                       : (!db.column<!storage.node_id>, !db.column<!storage.nullable<i64>>) -> (!db.column<!storage.node_id>, !db.column<!storage.nullable<i64>>)
+      db.output(%sa, %sscore) : !db.column<!storage.node_id>, !db.column<!storage.nullable<i64>>
 
     A row is sorted across several columns: `keys` is the list of column indices
     to sort by, most significant first (so `keys [1, 0]` sorts by column 1, ties
@@ -641,7 +2416,9 @@ def Sort : TuringOp<"sort", [Pure]> {
 /**
 * RemoveDuplicates
 */
-def RemoveDuplicates : TuringOp<"remove_duplicates", [Pure]> {
+// NOT Pure: it records each row it emits in a seen-set, so it must run where it sits and
+// must not be hoisted, CSE'd or eliminated (like nl.distinct_filter, which it lowers to).
+def RemoveDuplicates : TuringOp<"remove_duplicates", [AttrSizedOperandSegments]> {
   let summary = "Emit each distinct row of a column set once";
   let description = [{
     The declarative counterpart of a Cypher RETURN DISTINCT / WITH DISTINCT. Takes
@@ -663,23 +2440,228 @@ def RemoveDuplicates : TuringOp<"remove_duplicates", [Pure]> {
     further MATCH. Because it streams and shrinks each chunk, a following db.limit
     charges the deduped survivor count and bounds the producing loop through the
     ordinary early-exit, so DISTINCT ... LIMIT k needs no special fusion - the scan
-    stops once k distinct rows are found. Deduplicating a deterministic read of the
-    graph is itself deterministic, so the op is Pure.
+    stops once k distinct rows are found.
   }];
 
   // The columns flow through unchanged; every column is part of the dedup key, so
-  // - unlike db.sort's keys - no key attribute is needed.
-  let arguments = (ins Variadic<Column>:$columns);
+  // - unlike db.sort's keys - no key attribute is needed. The optional set is the
+  // seen-set this dedup shares with its siblings; absent, it keeps one of its own.
+  let arguments = (ins Variadic<Column>:$columns, Optional<DistinctSetType>:$set);
   let results   = (outs Variadic<Column>:$results);
 
   // One result per input column, same types; functional-type prints the
-  // `(operandTypes) -> resultTypes` form, the same as db.limit and db.sort.
+  // `(operandTypes) -> resultTypes` form, the same as db.limit and db.sort. The set
+  // prints after an `against` keyword, ahead of the colon, so the functional type
+  // stays the columns alone.
   let assemblyFormat = [{
-    `(` $columns `)` attr-dict `:` functional-type(operands, results)
+    `(` $columns `)` (`against` $set^)? attr-dict `:` functional-type($columns, $results)
   }];
 
   // results arity and types must equal the columns (the shared pass-through check).
   let hasVerifier = 1;
+}
+
+/**
+* DistinctSet
+*/
+// NOT Pure: two seen-sets must never be CSE'd into one, and this op has no operands to
+// tell one from another (like nl.distinct, which it lowers to).
+def DistinctSet : TuringOp<"distinct_set", []> {
+  let summary = "Open a dedup key set for several db.remove_duplicates to share";
+  let description = [{
+    A UNION dedups its whole result, but each of its branches reaches that result
+    through a db.output of its own, so no single db.remove_duplicates sees every row.
+    This produces the set they all record their rows in, making the dedup one:
+
+      %s = db.distinct_set : !db.distinct_set
+      db.union {
+        ...
+        %da = db.remove_duplicates(%a) against %s : (!db.column<none>) -> !db.column<none>
+        db.output(%da) names ["name"] : !db.column<none>
+      }, {
+        ...
+      }
+
+    It lowers to the single nl.distinct handle every branch's nl.distinct_filter reads.
+    A db.remove_duplicates naming no set is unaffected: it keeps a set of its own.
+  }];
+
+  let results = (outs DistinctSetType:$set);
+  let assemblyFormat = "attr-dict `:` qualified(type($set))";
+}
+
+/**
+* Materialize
+*/
+def Materialize : TuringOp<"materialize", [Pure]> {
+  let summary = "Hold every row in flight for several dataflows to read in turn";
+  let description = [{
+    The table a NEXT hands a UNION segment, every branch of which reads all of it. The
+    columns in flight are held once and each branch walks them with a db.scan_materialized
+    of its own, as a common table expression is scanned once per reference:
+
+      %t = db.materialize(%name, %age) : (!db.column<none>, !db.column<none>) -> !db.materialized
+      %n = db.union {
+        %name1, %age1 = db.scan_materialized(%t) : (!db.materialized) -> (!db.column<none>, !db.column<none>)
+        ...
+        db.yield %c : !db.column<ui64>
+      }, {
+        %name2, %age2 = db.scan_materialized(%t) : (!db.materialized) -> (!db.column<none>, !db.column<none>)
+        ...
+        db.yield %l : !db.column<none>
+      } : !db.column<none>
+
+    A pipeline breaker: a scan starts once the dataflow feeding the op has run to its end.
+    The columns are row-aligned, the rows of one relation, and no constant is among them:
+    a constant stands for every row, and a branch reads it where it is bound.
+  }];
+
+  let arguments = (ins Variadic<Column>:$columns);
+  let results   = (outs MaterializedType:$rows);
+
+  let assemblyFormat = [{
+    `(` $columns `)` attr-dict `:` functional-type($columns, $rows)
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* ScanMaterialized
+*/
+def ScanMaterialized : TuringOp<"scan_materialized", [Pure]> {
+  let summary = "Walk every row a db.materialize holds";
+  let description = [{
+    A source like a scan: it opens a loop over the rows `rows` holds, in the order they
+    were held, one result per column the db.materialize took, of the same type.
+  }];
+
+  let arguments = (ins MaterializedType:$rows);
+  let results   = (outs Variadic<Column>:$columns);
+
+  let assemblyFormat = [{
+    `(` $rows `)` attr-dict `:` functional-type($rows, $columns)
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* Union
+*/
+def Union : TuringOp<"union", [NoTerminator]> {
+  let summary = "Emit the results of several query bodies as one result table";
+  let description = [{
+    The declarative counterpart of Cypher's UNION and UNION ALL. Holds one region per
+    branch, each a self-contained db query body ending in its own db.output, and emits
+    their rows one branch after another:
+
+      db.union {
+        %a = db.scan_nodes_by_label(["Person"]) : !db.column<!storage.node_id>
+        %n = db.get_node_properties(%a, "name") : (!db.column<!storage.node_id>) -> !db.column<!storage.nullable<!storage.string>>
+        db.output(%n) names ["name"] : !db.column<!storage.nullable<!storage.string>>
+      }, {
+        %c = db.scan_nodes_by_label(["City"]) : !db.column<!storage.node_id>
+        %m = db.get_node_properties(%c, "name") : (!db.column<!storage.node_id>) -> !db.column<!storage.nullable<!storage.string>>
+        db.output(%m) names ["name"] : !db.column<!storage.nullable<!storage.string>>
+      }
+
+    The branches share no SSA value and read none from outside, bar the db.distinct_set
+    a deduping union hands each of them. Every branch outputs the same number of columns
+    under the same names - one result table - so the op needs no result of its own and is
+    the whole program, as a lone db.output is for a query without a union.
+
+    UNION (as against UNION ALL) is not held here: a deduping union is spelled as a
+    db.distinct_set above the op and a db.remove_duplicates against it in each branch it
+    covers, so the dedup is in the dataflow it applies to rather than in a flag on the
+    holder. It lowers to one loop nest per branch, run in order, in the same nl function -
+    the concatenation is the sink seeing each nest's rows in turn. Not Pure: its branches
+    emit the result, so it must survive dead-code elimination as db.output does.
+
+    The body of a db.call_subquery is a UNION when the CALL's is, and so is a UNION
+    segment of a NEXT chain. The rows the branches produce then feed what follows rather
+    than the result table, so the op has one result per column and each branch ends in a
+    db.yield of its columns. The branches of a CALL body read the body's arguments, the
+    columns of the row the body runs for; those of a segment read the table in flight
+    through a db.scan_materialized each:
+
+      %z = db.union {
+        %s, %e, %et, %i = db.get_out_edges(%pIn, {}) : ...
+        db.yield %i : !db.column<!storage.node_id>
+      }, {
+        %s2, %e2, %et2, %k = db.get_in_edges(%pIn, {}) : ...
+        db.yield %k : !db.column<!storage.node_id>
+      } : !db.column<!storage.node_id>
+  }];
+
+  let results = (outs Variadic<Column>:$results);
+
+  // One region per branch, each exactly one block. The blocks have no arguments: a
+  // branch reads nothing the branch before it bound.
+  let regions = (region VariadicRegion<SizedRegion<1>>:$branches);
+
+  let hasCustomAssemblyFormat = 1;
+  let hasVerifier = 1;
+
+  // Both builders take the branch count and create that many empty blocks; the caller
+  // fills each region and ends it with a db.output, or with a db.yield when the op has
+  // results.
+  let skipDefaultBuilders = 1;
+  let builders = [
+      OpBuilder<(ins "size_t":$branchCount)>,
+      OpBuilder<(ins "::mlir::TypeRange":$resultTypes, "size_t":$branchCount)>
+  ];
+}
+
+/**
+* Conditional
+*/
+def Conditional : TuringOp<"conditional", []> {
+  let summary = "Run the first branch whose condition is true, or the default one";
+  let description = [{
+    The declarative counterpart of Cypher's WHEN ... THEN ... ELSE. The regions alternate
+    condition and branch, one pair per WHEN, and end with the ELSE branch when there is
+    one. Branch i runs when condition i is true and no condition before it is, and the
+    ELSE when none is. A null condition is not true. A condition is computed only when no
+    branch before it is taken, and a branch that does not run computes nothing, an
+    aggregate in it included.
+
+    It sits in the body of a db.call_subquery, which runs it once per input row, or at
+    the top of a standalone WHEN, where nothing is in flight. Either way a condition holds
+    one row. The regions read the scope around the op the way the branches of a db.union
+    in a CALL body do. A condition ends in a db.yield of one boolean column, and each
+    branch in a db.yield of the same number of columns, which are the op's results;
+    branches that only write yield none:
+
+      %z = db.conditional ({
+        %c = db.get_node_properties(%pIn, "isFrench") : ...
+        db.yield %c : !db.column<none>
+      }, {
+        %n = db.get_node_properties(%pIn, "name") : ...
+        db.yield %n : !db.column<none>
+      }, {
+        %c = db.constant("other") : !db.column<!storage.string>
+        db.yield %c : !db.column<!storage.string>
+      }) : !db.column<none>
+
+    Not Pure: its branches may write to the graph.
+  }];
+
+  let results = (outs Variadic<Column>:$results);
+
+  let regions = (region VariadicRegion<SizedRegion<1>>:$branches);
+
+  let assemblyFormat = [{
+    `(` $branches `)` attr-dict (`:` type($results)^)?
+  }];
+
+  let hasVerifier = 1;
+
+  // Creates one empty block per region; the caller fills each and ends it with a db.yield
+  let skipDefaultBuilders = 1;
+  let builders = [
+      OpBuilder<(ins "::mlir::TypeRange":$resultTypes, "size_t":$regionCount)>
+  ];
 }
 
 /**
@@ -697,23 +2679,109 @@ def Count : TuringOp<"count", [Pure]> {
       %a = db.scan_nodes() : !db.column<!storage.node_id>
       %n = db.count(%a) : (!db.column<!storage.node_id>) -> !db.column<ui64>
       db.output(%n) : !db.column<ui64>
+
+    `rows` makes it Cypher's count(*): the tally charges every row, whatever the input
+    column holds, so the wildcard can be anchored on whichever column of the query part
+    carries its rows - a nullable property column included, which a null-skipping tally
+    would under-count:
+
+      %n = db.count(%age) rows : (!db.column<none>) -> !db.column<ui64>
+
+    `distinct` makes it Cypher's count(DISTINCT x): the tally charges each distinct
+    non-null value once, however many rows carry it. It stays one op rather than
+    two because the reduction is the same tally over a deduplicated column - it
+    lowers to the DISTINCT seen-set (nl.distinct / nl.distinct_filter) feeding the
+    ordinary nl.count_update, so nulls are dropped by the count as usual:
+
+      %n = db.count(%a) distinct : (!db.column<!storage.node_id>) -> !db.column<ui64>
   }];
 
   // One column in, one integer column out. The input and result types are
   // unrelated (an integer count of any column), so - unlike the pass-through ops -
-  // there is nothing to cross-check and no verifier.
-  let arguments = (ins Column:$input);
+  // there is nothing to cross-check and no verifier. distinct and rows are unit
+  // attributes: their presence is the flag, so a plain db.count is two absent ones.
+  let arguments = (ins Column:$input, UnitAttr:$distinct, UnitAttr:$rows);
   let results   = (outs Column:$result);
 
   // One operand and one result, so functional-type(operands, results) prints the
   // `(!db.column<...>) -> !db.column<...>` form, the same as db.get_node_properties.
+  // The flags print as their keywords ahead of the colon when set, so a plain count
+  // keeps the form it had before they existed.
   let assemblyFormat = [{
-    `(` $input `)` attr-dict `:` functional-type(operands, results)
+    `(` $input `)` (`distinct` $distinct^)? (`rows` $rows^)? attr-dict `:` functional-type(operands, results)
   }];
 }
 
 /**
-* Aggregates: Sum / Min / Max / Avg
+* CountScanRows
+*/
+def CountScanRows : TuringOp<"count_scan_rows", [Pure]> {
+  let summary = "Count the rows of whole node scans from the graph's node counts";
+
+  let description = [{
+    What a db.count collapses to when the rows it tallies are whole node scans and
+    nothing else. `MATCH (a:Reaction) RETURN count(*)` asks how many Reaction nodes
+    there are, not which ones, and the graph already holds that number per label -
+    so the answer is a metadata read rather than a walk.
+
+    `labels` lists one label conjunction per scan, in factor order, and the result
+    is the product of their node counts - the row count of the cartesian product
+    those scans form:
+
+      %n = db.count_scan_rows([["Reaction"]]) : !db.column<none>
+      %m = db.count_scan_rows([["Reaction"], ["Pathway"]]) : !db.column<none>
+
+    An empty conjunction is an unlabelled scan and counts every node, so
+    `MATCH (a) RETURN count(*)` is db.count_scan_rows([[]]). The list itself must
+    not be empty: with no scan listed there is nothing to count. A label absent from
+    the schema matches no node, so its factor counts 0 and the whole product is 0 -
+    the same unsatisfiable conjunction db.scan_nodes_by_label yields no row for.
+
+    `property`, when given, narrows one scan to the nodes holding that property -
+    Cypher's count(a.name), which counts the rows in which a.name is not null, so the
+    answer is how many of that scan's nodes hold it rather than how many there are.
+    That too the graph knows without reading a value: it indexes each property by the
+    label set of the nodes holding it.
+
+      %n = db.count_scan_rows([["Person"]]) property "name" : !db.column<none>
+
+    `propertyScan` is which of the listed scans it is read from, counted from 0 and
+    defaulting to the first. `MATCH (a:Reaction), (b:Pathway) RETURN count(b.stId)`
+    reads it from the second, so the tally is every Reaction crossed with the Pathways
+    that hold stId:
+
+      %m = db.count_scan_rows([["Reaction"], ["Pathway"]]) property "stId" of scan 1
+             : !db.column<none>
+
+    A count reads one column, so at most one scan is ever narrowed; the others
+    contribute their whole node count.
+
+    The result is the single-row unsigned tally db.count produces, typed as loosely
+    as db.count types its own so that replacing one leaves its consumers untouched.
+    Reading the counts is a deterministic read, so the op is Pure.
+  }];
+
+  // `labels` is one label conjunction per scan, `property` the name whose holders one
+  // of them is narrowed to and `propertyScan` which one. Being attributes and not SSA
+  // values, they are absent from `operands`; lowering forwards them as-is.
+  let arguments = (ins LabelRefArrayArrayAttr:$labels,
+                       OptionalAttr<StrAttr>:$property,
+                       OptionalAttr<UI64Attr>:$propertyScan);
+  let results   = (outs Column:$result);
+  let hasVerifier = 1;
+
+  // The conjunctions print inside the parens as `[["Reaction"], ["Pathway"]]`, ahead
+  // of the colon, the same place db.scan_nodes_by_label prints its labels; the
+  // property and the scan it is read from follow their keywords when set, the way
+  // db.count prints its flags; the result type follows, qualified, as db.count prints
+  // its own.
+  let assemblyFormat = [{
+    `(` $labels `)` (`property` $property^)? (`of` `scan` $propertyScan^)? attr-dict `:` qualified(type($result))
+  }];
+}
+
+/**
+* Aggregates: Sum / Min / Max / Avg / StDev / StDevP
 */
 // The value-reducing counterparts of db.count. Each consumes the whole dataflow of
 // one property column and produces a single-row column holding the reduction.
@@ -729,16 +2797,29 @@ def Count : TuringOp<"count", [Pure]> {
 // One op per reduction, the way db.count is its own op: the op name is the
 // aggregate, so no kind attribute is needed and each reads like `db.sum(%x)`. They
 // share this base since only the name differs.
+//
+// `distinct` is Cypher's sum(DISTINCT x) / avg(DISTINCT x): the reduction charges
+// each distinct value once, however many rows carry it. As on db.count it stays one
+// op, since the reduction is unchanged over a deduplicated column - it lowers to the
+// DISTINCT seen-set (nl.distinct / nl.distinct_filter) feeding the ordinary
+// nl.aggregate_update:
+//
+//   %s = db.sum(%x) distinct : (!db.column<none>) -> !db.column<none>
+//
+// db.min and db.max share the flag but the frontend never sets it: dropping repeated
+// values cannot move an extremum, so min(DISTINCT x) generates a plain db.min.
 class AggregateOp<string mnemonic> : TuringOp<mnemonic, [Pure]> {
   let summary = "Reduce a column of property values to a single-row result";
 
-  let arguments = (ins Column:$input);
+  let arguments = (ins Column:$input, UnitAttr:$distinct);
   let results   = (outs Column:$result);
 
   // One operand and one result, so functional-type(operands, results) prints the
-  // `(!db.column<...>) -> !db.column<...>` form, the same as db.count.
+  // `(!db.column<...>) -> !db.column<...>` form, the same as db.count. The distinct
+  // flag prints as its keyword ahead of the colon when set, so a plain reduction
+  // keeps the form it had before the flag existed.
   let assemblyFormat = [{
-    `(` $input `)` attr-dict `:` functional-type(operands, results)
+    `(` $input `)` (`distinct` $distinct^)? attr-dict `:` functional-type(operands, results)
   }];
 }
 
@@ -747,33 +2828,356 @@ def Min : AggregateOp<"min">;
 def Max : AggregateOp<"max">;
 def Avg : AggregateOp<"avg">;
 
+// The sample and the population standard deviation. Both are floats, and 0 rather than
+// null where there are too few values to spread: none, or one for the sample.
+def StDev : AggregateOp<"stdev">;
+def StDevP : AggregateOp<"stdevp">;
+
+class UnaryFunctionOp<string mnemonic, list<Trait> traits = [Pure]>
+    : TuringOp<mnemonic, !listconcat(traits, [ConstantThroughOperands])> {
+  let summary = "Apply a unary function row-wise to a value column";
+
+  let arguments = (ins Column:$input);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = [{
+    `(` $input `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+// A unary function reading values of some types raises on a row holding another, which a
+// column of type-erased cells or of an unresolved type can: it is speculatable over a
+// column of the types it reads alone
+class TypedUnaryFunctionOp<string mnemonic, string readTypes>
+    : UnaryFunctionOp<mnemonic, [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let extraClassDefinition = [{
+    ::mlir::Speculation::Speculatability $cppClass::getSpeculatability() {
+      return speculatableOverElement<}] # readTypes # [{>(getInput());
+    }
+  }];
+}
+
+class NumberFunctionOp<string mnemonic> : TypedUnaryFunctionOp<mnemonic, "::mlir::IntegerType, ::mlir::FloatType">;
+class TextFunctionOp<string mnemonic> : TypedUnaryFunctionOp<mnemonic, "::mlir::storage::StringType">;
+class ListFunctionOp<string mnemonic> : TypedUnaryFunctionOp<mnemonic, "::mlir::storage::ListType">;
+
+def Labels : TypedUnaryFunctionOp<"labels", "::mlir::storage::NodeIDType">;
+def EdgeType : TypedUnaryFunctionOp<"edge_type", "::mlir::storage::EdgeIDType">;
+def Keys : TypedUnaryFunctionOp<"keys", "::mlir::storage::NodeIDType, ::mlir::storage::EdgeIDType, ::mlir::storage::MapType">;
+def PropertyMap : TypedUnaryFunctionOp<"properties", "::mlir::storage::NodeIDType, ::mlir::storage::EdgeIDType, ::mlir::storage::MapType">;
+
+// The two ends of each edge of a column, as node columns of their own. The edge is read as
+// the graph stores it, so a hop that walked it backwards or undirected reports the same
+// pair rather than the one its own direction suggests.
+def StartNode : TypedUnaryFunctionOp<"start_node", "::mlir::storage::EdgeIDType">;
+def EndNode : TypedUnaryFunctionOp<"end_node", "::mlir::storage::EdgeIDType">;
+
+def ToInteger : UnaryFunctionOp<"to_integer">;
+def ToFloat : UnaryFunctionOp<"to_float">;
+def ToBoolean : UnaryFunctionOp<"to_boolean">;
+def ToDateTime : UnaryFunctionOp<"to_datetime">;
+def ToDuration : TypedUnaryFunctionOp<"to_duration", "::mlir::IntegerType">;
+def ToString : UnaryFunctionOp<"to_string">;
+
+def ToIntegerOrNull : UnaryFunctionOp<"to_integer_or_null">;
+def ToFloatOrNull : UnaryFunctionOp<"to_float_or_null">;
+def ToBooleanOrNull : UnaryFunctionOp<"to_boolean_or_null">;
+def ToStringOrNull : UnaryFunctionOp<"to_string_or_null">;
+
+// The calendar fields of an instant, as integer columns. The sub-second pair reads the
+// fraction of the second truncated to its own precision, so .123456 of a second in is a
+// db.datetime_millisecond of 123 and a db.datetime_microsecond of 123456.
+def DateTimeYear : TypedUnaryFunctionOp<"datetime_year", "::mlir::storage::DateTimeType">;
+def DateTimeMonth : TypedUnaryFunctionOp<"datetime_month", "::mlir::storage::DateTimeType">;
+def DateTimeDay : TypedUnaryFunctionOp<"datetime_day", "::mlir::storage::DateTimeType">;
+def DateTimeHour : TypedUnaryFunctionOp<"datetime_hour", "::mlir::storage::DateTimeType">;
+def DateTimeMinute : TypedUnaryFunctionOp<"datetime_minute", "::mlir::storage::DateTimeType">;
+def DateTimeSecond : TypedUnaryFunctionOp<"datetime_second", "::mlir::storage::DateTimeType">;
+def DateTimeMillisecond : TypedUnaryFunctionOp<"datetime_millisecond", "::mlir::storage::DateTimeType">;
+def DateTimeMicrosecond : TypedUnaryFunctionOp<"datetime_microsecond", "::mlir::storage::DateTimeType">;
+
+// The units of a duration, each the whole count of that unit it spans, as integer columns.
+def DurationYears : TypedUnaryFunctionOp<"duration_years", "::mlir::storage::DurationType">;
+def DurationQuarters : TypedUnaryFunctionOp<"duration_quarters", "::mlir::storage::DurationType">;
+def DurationMonths : TypedUnaryFunctionOp<"duration_months", "::mlir::storage::DurationType">;
+def DurationWeeks : TypedUnaryFunctionOp<"duration_weeks", "::mlir::storage::DurationType">;
+def DurationDays : TypedUnaryFunctionOp<"duration_days", "::mlir::storage::DurationType">;
+def DurationHours : TypedUnaryFunctionOp<"duration_hours", "::mlir::storage::DurationType">;
+def DurationMinutes : TypedUnaryFunctionOp<"duration_minutes", "::mlir::storage::DurationType">;
+def DurationSeconds : TypedUnaryFunctionOp<"duration_seconds", "::mlir::storage::DurationType">;
+def DurationMilliseconds : TypedUnaryFunctionOp<"duration_milliseconds", "::mlir::storage::DurationType">;
+def DurationMicroseconds : TypedUnaryFunctionOp<"duration_microseconds", "::mlir::storage::DurationType">;
+def DurationQuartersOfYear : TypedUnaryFunctionOp<"duration_quarters_of_year", "::mlir::storage::DurationType">;
+def DurationMonthsOfYear : TypedUnaryFunctionOp<"duration_months_of_year", "::mlir::storage::DurationType">;
+def DurationMonthsOfQuarter : TypedUnaryFunctionOp<"duration_months_of_quarter", "::mlir::storage::DurationType">;
+def DurationDaysOfWeek : TypedUnaryFunctionOp<"duration_days_of_week", "::mlir::storage::DurationType">;
+def DurationMinutesOfHour : TypedUnaryFunctionOp<"duration_minutes_of_hour", "::mlir::storage::DurationType">;
+def DurationSecondsOfMinute : TypedUnaryFunctionOp<"duration_seconds_of_minute", "::mlir::storage::DurationType">;
+def DurationMillisecondsOfSecond : TypedUnaryFunctionOp<"duration_milliseconds_of_second", "::mlir::storage::DurationType">;
+def DurationMicrosecondsOfSecond : TypedUnaryFunctionOp<"duration_microseconds_of_second", "::mlir::storage::DurationType">;
+
+def CurrentDateTime : TuringOp<"current_datetime", [Pure, ConstantThroughOperands]> {
+  let summary = "The instant the query runs, as a constant column";
+  let description = [{
+      What datetime() emits. The instant is read when the program is translated rather
+      than carried in an attribute, so the same query prints the same IR on every run.
+      Reading no operand makes it constant through them, which is what lays one instant
+      over every row instead of one per row.
+
+        %now = db.current_datetime() : !db.column<!storage.datetime>
+  }];
+
+  let arguments = (ins);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = "`(` `)` attr-dict `:` type($result)";
+}
+
+// The list family. Each reads a whole !storage.list cell and answers per row: db.size the
+// element count as an integer, db.tail the same list one element shorter - a subspan of
+// the cell, so the row still costs O(1) - and db.head and db.last the list's first and
+// final element. A stored list may mix types, so those two answer with the type-erased
+// !storage.any every element of a heterogeneous list rides, and an empty list
+// reads as the null such a cell carries itself rather than as a nullable column of its own.
+// The ID of a node, an edge, or the entity a type-erased cell holds, as an integer.
+def ElementID : TypedUnaryFunctionOp<"element_id", "::mlir::storage::NodeIDType, ::mlir::storage::EdgeIDType">;
+
+def Size : TypedUnaryFunctionOp<"size", "::mlir::storage::StringType, ::mlir::storage::ListType">;
+def CharLength : TextFunctionOp<"char_length">;
+def Head : ListFunctionOp<"head">;
+def Last : ListFunctionOp<"last">;
+def Tail : ListFunctionOp<"tail">;
+
+def Abs : NumberFunctionOp<"abs">;
+
+// Unary minus: the number or the duration of the opposite sign. The opposite of the lowest
+// integer or duration overflows, so it is speculatable over doubles alone.
+def Negate : TypedUnaryFunctionOp<"negate", "::mlir::FloatType">;
+
+// Unary plus: the number or the duration itself, and a type error on any other value
+def UnaryPlus : TypedUnaryFunctionOp<"unary_plus", "::mlir::IntegerType, ::mlir::FloatType, ::mlir::storage::DurationType">;
+def Sign : NumberFunctionOp<"sign">;
+def Ceil : NumberFunctionOp<"ceil">;
+def Floor : NumberFunctionOp<"floor">;
+def Round : NumberFunctionOp<"round">;
+def Sqrt : NumberFunctionOp<"sqrt">;
+def Exp : NumberFunctionOp<"exp">;
+def Log : NumberFunctionOp<"log">;
+def Log10 : NumberFunctionOp<"log10">;
+def Sin : NumberFunctionOp<"sin">;
+def Cos : NumberFunctionOp<"cos">;
+def Tan : NumberFunctionOp<"tan">;
+def Cot : NumberFunctionOp<"cot">;
+def Asin : NumberFunctionOp<"asin">;
+def Acos : NumberFunctionOp<"acos">;
+def Atan : NumberFunctionOp<"atan">;
+def Degrees : NumberFunctionOp<"degrees">;
+def Radians : NumberFunctionOp<"radians">;
+def Haversin : NumberFunctionOp<"haversin">;
+
+def ToUpper : TextFunctionOp<"to_upper">;
+def ToLower : TextFunctionOp<"to_lower">;
+def Trim : TextFunctionOp<"trim">;
+def LTrim : TextFunctionOp<"ltrim">;
+def RTrim : TextFunctionOp<"rtrim">;
+def Reverse : TypedUnaryFunctionOp<"reverse", "::mlir::storage::StringType, ::mlir::storage::ListType">;
+
+class NormalFormFunctionOp<string mnemonic> : TextFunctionOp<mnemonic> {
+  let arguments = (ins Column:$input, UnicodeNormalForm:$form);
+
+  let assemblyFormat = [{
+    `(` $input `,` $form `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def Normalize : NormalFormFunctionOp<"normalize">;
+def IsNormalized : NormalFormFunctionOp<"is_normalized">;
+
+def Substring : TuringOp<"substring", [NoMemoryEffect, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Take the run of each row's string its start and length span";
+
+  let description = [{
+      %s = db.substring(%name, %from, %count) : (!db.column<!storage.string>, !db.column<i64>,
+                                                 !db.column<i64>) -> !db.column<!storage.string>
+  }];
+
+  let arguments = (ins Column:$string, Column:$start, Optional<Column>:$length);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = [{
+    `(` $string `,` $start (`,` $length^)? `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def Split : TuringOp<"split", [NoMemoryEffect, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Split on delimiter";
+
+  let description = [{
+      %parts = db.split(%name, %delimiter) : (!db.column<!storage.string>, !db.column<!storage.string>)
+                                           -> !db.column<!storage.list<!storage.string>>
+  }];
+
+  let arguments = (ins Column:$string, Column:$delimiter);
+  let results   = (outs Column:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $string `,` $delimiter `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+class StringEndOp<string mnemonic> : TuringOp<mnemonic, [NoMemoryEffect, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Take the run of characters at one end of each row's string";
+
+  let description = [{
+      %s = db.left(%name, %count) : (!db.column<!storage.string>, !db.column<i64>) -> !db.column<!storage.string>
+  }];
+
+  let arguments = (ins Column:$string, Column:$length);
+  let results   = (outs Column:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $string `,` $length `)` attr-dict `:` functional-type(operands, results)
+  }];
+
+  let extraClassDefinition = [{
+    ::mlir::LogicalResult $cppClass::verify() {
+      return verifyStringEnd(getOperation(), getString(), getLength(), getResult());
+    }
+
+    ::mlir::Speculation::Speculatability $cppClass::getSpeculatability() {
+      return speculatableOverCharacters(getOperation());
+    }
+  }];
+}
+
+def Left : StringEndOp<"left">;
+def Right : StringEndOp<"right">;
+
+def Replace : TuringOp<"replace", [NoMemoryEffect, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Replace every occurrence of a search string in each row's string";
+
+  let description = [{
+      %s = db.replace(%name, %search, %replacement) : (!db.column<!storage.string>, !db.column<!storage.string>,
+                                                       !db.column<!storage.string>) -> !db.column<!storage.string>
+  }];
+
+  let arguments = (ins Column:$string, Column:$search, Column:$replacement);
+  let results   = (outs Column:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $string `,` $search `,` $replacement `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+class BinaryFunctionOp<string mnemonic> : TuringOp<mnemonic, [Pure, ConstantThroughOperands]> {
+  let summary = "Apply a binary function row-wise to two value columns";
+
+  let arguments = (ins Column:$lhs, Column:$rhs);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = [{
+    `(` $lhs `,` $rhs `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def CosineSimilarity : BinaryFunctionOp<"cosine_similarity">;
+def EuclideanDistance : BinaryFunctionOp<"euclidean_distance">;
+
 def ConstantOp : TuringOp<"constant", [Pure, ConstantLike, DeclareOpInterfaceMethods<InferTypeOpInterface>]> {
   let summary = "Produces a constant value in a column";
 
-  let arguments = (ins TypedAttrInterface: $value);
+  // A typed attribute for a scalar, a dense f32 array for an embedding, an array of
+  // per-element attributes for a list literal, or a dictionary for map literals.
+  // Neither array carries a type of its own, so the column's element type is what
+  // inferReturnTypes reads off them: an embedding for the dense array, the homogeneity
+  // verdict over the elements for the list - which is why a list needs no separate op.
+  let arguments = (ins AnyAttrOf<[TypedAttrInterface, DenseF32ArrayAttr, ArrayAttr, DictionaryAttr]>: $value);
   let results = (outs Column : $result);
 
   let assemblyFormat = "`(` $value `)` attr-dict";
 }
 
+def BroadcastConstant : TuringOp<"broadcast_constant", [Pure]> {
+  let summary = "Lay a constant column's single value out over the rows of a relation";
+  let description = [{
+    A constant column holds one value standing for every row rather than one per row,
+    so nothing shaped by rows can read it: a filter has no row of it to drop, a dedup
+    no two rows to tell apart, a count no rows to tally. This binds that value to the
+    rows of the relation the driver column carries, giving a column that carries rows
+    like any other:
+
+      %p = db.scan_nodes() : !db.column<!storage.node_id>
+      %c = db.constant(1 : i64) : !db.column<i64>
+      %x = db.broadcast_constant(%c, %p) : (!db.column<i64>, !db.column<!storage.node_id>) -> !db.column<none>
+
+    It is what a WITH publishing constants alone emits: `MATCH (p:Person) WITH 1 AS x`
+    publishes one row per Person, not the single row the literal is, so the statements
+    after the barrier - a WHERE cutting those rows, a count(*) tallying them, a pattern
+    crossed with them - read a column that has them.
+
+    The driver is absent when no relation drives the scope, which is then the single row
+    the constants are - `WITH 1 AS x WHERE x > 100`, whose one row the filter drops - so
+    the value is laid out over that row:
+
+      %x = db.broadcast_constant(%c) : (!db.column<i64>) -> !db.column<none>
+
+    The result element type is resolved during lowering, as for the arithmetic ops:
+    the rows are laid out as a nullable value column, present in every row.
+  }];
+
+  // The driver is the only optional operand, so MLIR tells it from the value without
+  // operand-segment sizes, as nl.broadcast_constant's cardinality is.
+  let arguments = (ins Column:$value, Optional<Column>:$driver);
+  let results = (outs Column:$result);
+
+  let assemblyFormat = [{
+    `(` $value (`,` $driver^)? `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def ToNullable : TuringOp<"to_nullable", [Pure, ConstantThroughOperands]> {
+  let summary = "Read a column as the nullable column of its values, holding a value in every row";
+  let description = [{
+    What a rewrite answering a nullable column with a plain one wraps it in, so that
+    every reader of the column keeps the type it was built against:
+
+      %l = db.to_nullable %n : (!db.column<ui64>) -> !db.column<!storage.nullable<ui64>>
+  }];
+
+  let arguments = (ins Column:$operand);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
+
+  let hasVerifier = 1;
+}
+
 class PredicateOp<string mnemonic, list<Trait> traits = []>
-    : TuringOp<mnemonic, traits>,
+    : TuringOp<mnemonic, !listconcat(traits, [ConstantThroughOperands])>,
       Arguments<(ins Column:$lhs, Column:$rhs)> {
   let results = (outs ColumnBools:$result);
   let assemblyFormat = "$lhs`,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def AndOp : PredicateOp<"and", [Pure]> {
+def AndOp : PredicateOp<"and", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Performs row-wise logical AND on its two input columns";
   let arguments = (ins Column : $lhs, Column : $rhs);
 }
 
-def OrOp : PredicateOp<"or", [Pure]> {
+def OrOp : PredicateOp<"or", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Performs row-wise logical OR on its two input columns";
   let arguments = (ins Column : $lhs, Column : $rhs);
 }
 
-def NotOp : TuringOp<"not", [Pure]> {
+def XorOp : PredicateOp<"xor", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Performs row-wise logical XOR on its two input boolean columns";
+  let arguments = (ins Column : $lhs, Column : $rhs);
+}
+
+def NotOp : TuringOp<"not", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>, ConstantThroughOperands]> {
   let summary = "Row-wise logical NOT of a boolean column";
   let arguments = (ins Column:$operand);
   let results   = (outs ColumnBools:$result);
@@ -789,7 +3193,11 @@ def EqOp : PredicateOp<"eq", [Pure]> {
   }];
 }
 
-def AddOp : BinaryOp<"add", [Pure]> {
+def NeqOp : PredicateOp<"neq", [Pure]> {
+  let summary = "Row-wise inequality of two value columns";
+}
+
+def AddOp : BinaryOp<"add", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Row-wise addition of two value columns";
 
   let arguments = (ins Column:$lhs, Column:$rhs);
@@ -798,7 +3206,53 @@ def AddOp : BinaryOp<"add", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def SubOp : BinaryOp<"sub", [Pure]> {
+def ConcatOp : BinaryOp<"concat", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Row-wise concatenation of two string or two list columns";
+
+  let arguments = (ins Column:$lhs, Column:$rhs);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def ListIndex : BinaryOp<"list_index", [Pure]> {
+  let summary = "Row-wise read of one element of a list column, by position";
+
+  let description = [{
+    `[1, 3, 4][2]`
+
+      %e = db.list_index %xs, %i : (!db.column<none>, !db.column<i64>) -> !db.column<none>
+  }];
+
+  let arguments = (ins Column:$lhs, Column:$rhs);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def DynamicMapKey : BinaryOp<"dynamic_map_key", [Pure]> {
+  let summary = "Row-wise read of one value of a map column, by a key computed per row";
+
+  let description = [{
+    `m[k]`. The key is an expression rather than a name spelled in the query, so it rides a
+    column rather than the attribute db.static_map_key carries:
+
+      %v = db.dynamic_map_key %m, %k : (!db.column<none>, !db.column<none>) -> !db.column<map_element>
+
+    Row r of the result is the entry row r's map holds under row r's key. A row whose map
+    holds no such key - and a row holding no map at all - reads back as a null entry, as
+    db.static_map_key's does. The map column is a column of tagged cells where the map was
+    itself read out of a list or a map, and a cell holding a node or an edge reads that
+    entity's property under the key.
+  }];
+
+  let arguments = (ins Column:$map, Column:$key);
+  let results   = (outs ColumnMapElements:$result);
+
+  let assemblyFormat = "$map`,` $key attr-dict `:` functional-type(operands, results)";
+}
+
+def SubOp : BinaryOp<"sub", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Row-wise subtraction of two value columns";
 
   let arguments = (ins Column:$lhs, Column:$rhs);
@@ -807,7 +3261,7 @@ def SubOp : BinaryOp<"sub", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def MulOp : BinaryOp<"mul", [Pure]> {
+def MulOp : BinaryOp<"mul", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Row-wise multiplication of two value columns";
 
   let arguments = (ins Column:$lhs, Column:$rhs);
@@ -816,8 +3270,26 @@ def MulOp : BinaryOp<"mul", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def DivOp : BinaryOp<"div", [Pure]> {
+def DivOp : BinaryOp<"div", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Row-wise division of two value columns";
+
+  let arguments = (ins Column:$lhs, Column:$rhs);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def ModOp : BinaryOp<"mod", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Row-wise modulo of two value columns";
+
+  let arguments = (ins Column:$lhs, Column:$rhs);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def PowOp : BinaryOp<"pow", [Pure]> {
+  let summary = "Row-wise exponentiation of two value columns";
 
   let arguments = (ins Column:$lhs, Column:$rhs);
   let results   = (outs Column:$result);
@@ -841,6 +3313,116 @@ def LteOp : PredicateOp<"lte", [Pure]> {
   let summary = "Row-wise less-than-or-equal comparison of two value columns";
 }
 
+def StartsWithOp : PredicateOp<"starts_with", [Pure]> {
+  let summary = "Row-wise test of whether each string column value starts with the given prefix";
+}
+
+def EndsWithOp : PredicateOp<"ends_with", [Pure]> {
+  let summary = "Row-wise test of whether each string column value ends with the given suffix";
+}
+
+def ContainsOp : PredicateOp<"contains", [Pure]> {
+  let summary = "Row-wise test of whether each string column value contains the given substring";
+}
+
+def InOp : PredicateOp<"in", [Pure]> {
+  let summary = "Row-wise test of whether each value is an element of the given list";
+}
+
+def Case : TuringOp<"case", [Pure, ConstantThroughOperands, AttrSizedOperandSegments]> {
+  let summary = "Row-wise selection of the first branch whose condition holds";
+
+  let description = [{
+    A selection between columns computed for every row, which is what coalesce() emits.
+    `conditions` and `values` are parallel: a row takes the value of the first branch
+    whose condition is true, the default when none is, and null when there is no default.
+
+      %r = db.case({%c0, %c1}, {%v0, %v1}, %d)
+             : (!db.column<!storage.bool>, !db.column<!storage.bool>,
+                !db.column<i64>, !db.column<i64>, !db.column<i64>) -> !db.column<none>
+
+    A Cypher CASE is a db.lazy_case instead, which computes a branch only over the rows
+    that reach it.
+
+    The result element type is resolved during lowering, as for the arithmetic ops: the
+    branches promote against each other into one nullable value column, or - when they are
+    all nodes, or all edges - into the entity column they already are, which carries the
+    null of an unmatched row in its ID. A selection walks rows, so - unlike the arithmetic
+    ops - it is not constant through its operands: the constants among them are laid out
+    over the driving relation during lowering.
+  }];
+
+  let arguments = (ins Variadic<Column>:$conditions,
+                       Variadic<Column>:$values,
+                       Optional<Column>:$defaultValue);
+  let results = (outs Column:$result);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` `{` $conditions `}` `,` `{` $values `}` (`,` $defaultValue^)? `)`
+    attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def LazyCase : TuringOp<"lazy_case", [Pure, ConstantThroughOperands]> {
+  let summary = "A Cypher CASE, whose conditions and values are computed only over the rows reaching them";
+
+  let description = [{
+    The branches are regions rather than operands, so that what a row does not reach is
+    never computed for it: `CASE WHEN t = 0 THEN 0 ELSE 10 / t END` divides by no zero.
+    The regions alternate condition and value, one pair per WHEN, and end with the ELSE
+    when there is one:
+
+      %r = db.lazy_case({%t}) ({
+        ^bb0(%tIn: !db.column<i64>):
+          %c = db.eq %tIn, %zero : (!db.column<i64>, !db.column<i64>) -> !db.column<!storage.bool>
+          db.case_yield %c : !db.column<!storage.bool>
+      }, {
+        ^bb0(%tIn: !db.column<i64>):
+          db.case_yield %zero : !db.column<i64>
+      }, {
+        ^bb0(%tIn: !db.column<i64>):
+          %q = db.div %ten, %tIn : (!db.column<i64>, !db.column<i64>) -> !db.column<none>
+          db.case_yield %q : !db.column<none>
+      }) : (!db.column<i64>) -> !db.column<none>
+
+    Every region takes one argument per carried column: the columns of the rows in flight
+    that some region reads, as db.list_comprehension carries them. A condition region sees
+    the rows no earlier condition held for, a value region the rows its condition held
+    for, and the ELSE the rows no condition held for. A row takes the first branch whose
+    condition is true and null when none is and there is no ELSE. A constant needs no
+    carrying.
+
+    The simple form `CASE s WHEN v THEN ...` is the generic one, with a db.eq of the
+    subject against each WHEN value as the condition. The subject is computed once over
+    every row and, unless it is a constant, carried as the last column.
+
+    The result element type is resolved during lowering, as db.case's is.
+  }];
+
+  let arguments = (ins Variadic<Column>:$columns_to_filter);
+  let results   = (outs Column:$result);
+
+  let regions = (region VariadicRegion<SizedRegion<1>>:$branches);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` `{` $columns_to_filter `}` `)` $branches attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def CaseYield : TuringOp<"case_yield", [Pure, Terminator, HasParent<"LazyCase">]> {
+  let summary = "Name the condition or the value a region of a db.lazy_case computes";
+
+  let arguments = (ins Column:$value);
+
+  let assemblyFormat = [{
+    $value attr-dict `:` qualified(type($value))
+  }];
+}
+
 def FilterOp : TuringOp<"filter", [Pure]> {
   let summary = "Keep only the rows where the mask is true, filtering carried columns alongside";
 
@@ -860,7 +3442,7 @@ def FilterOp : TuringOp<"filter", [Pure]> {
   }];
 }
 
-def CreateNode : TuringOp<"create_node"> {
+def CreateNode : TuringOp<"create_node", [AttrSizedOperandSegments]> {
   let summary = "Create one node per input row, with given labels and property values";
 
   let description = [{
@@ -871,24 +3453,25 @@ def CreateNode : TuringOp<"create_node"> {
 
     `MATCH ... CREATE`,
       %a    = db.scan_nodes_by_label(["Person"]) : !db.column<!storage.node_id>
-      %name = db.get_node_properties(%a, "name") : ... -> !db.column<none>
+      %name = db.get_node_properties(%a, "name") : ... -> !db.column<!storage.nullable<!storage.string>>
       %b    = db.create_node (["Bot"], ["name"], {%name})
-                : (!db.column<none>) -> !db.column<!storage.node_id>
+                : (!db.column<!storage.nullable<!storage.string>>) -> !db.column<!storage.node_id>
   }];
 
-  let arguments = (ins StrArrayAttr:$labels,
+  let arguments = (ins LabelRefArrayAttr:$labels,
                        StrArrayAttr:$prop_names,
-                       Variadic<Column>:$prop_values);
+                       Variadic<Column>:$prop_values,
+                       Optional<Column>:$cardinality);
   let results   = (outs ColumnNodeIDs:$result);
   let hasVerifier = 1;
 
   let assemblyFormat = [{
-    `(` $labels `,` $prop_names `,` `{` $prop_values `}` `)` attr-dict `:`
-    functional-type(operands, results)
+    `(` $labels `,` $prop_names `,` `{` $prop_values `}` `)` ( `foreach` $cardinality^ )?
+    attr-dict `:` functional-type(operands, results)
   }];
 }
 
-def CreateEdge : TuringOp<"create_edge"> {
+def CreateEdge : TuringOp<"create_edge", [AttrSizedOperandSegments]> {
   let summary = "Create one edge per input row between corresponding source and target nodes";
 
   let description = [{
@@ -909,14 +3492,205 @@ def CreateEdge : TuringOp<"create_edge"> {
 
   let arguments = (ins Column:$src_ids,
                        Column:$tgt_ids,
-                       StrAttr:$edge_type,
+                       EdgeTypeRef:$edge_type,
                        StrArrayAttr:$prop_names,
-                       Variadic<Column>:$prop_values);
+                       Variadic<Column>:$prop_values,
+                       Optional<Column>:$src_pending,
+                       Optional<Column>:$tgt_pending,
+                       UnitAttr:$src_all_pending,
+                       UnitAttr:$tgt_all_pending);
   let results   = (outs ColumnEdgeIDs:$result);
   let hasVerifier = 1;
 
+  // The two optional masks say, row by row, which endpoints are entities this change
+  // wrote and has not committed - what a db.merge's node column mixes. A column a
+  // db.create_node produced is pending in every row and says so with the matching
+  // all_pending flag; one a scan or a traversal bound is pending in none and carries
+  // neither a mask nor a flag.
   let assemblyFormat = [{
-    `(` $src_ids `,` $tgt_ids `,` $edge_type `,` $prop_names `,` `{` $prop_values `}` `)` attr-dict `:`
+    `(` $src_ids `,` $tgt_ids `,` $edge_type `,` $prop_names `,` `{` $prop_values `}` `)`
+    (`src_pending` $src_pending^)? (`tgt_pending` $tgt_pending^)?
+    (`src_all_pending` $src_all_pending^)? (`tgt_all_pending` $tgt_all_pending^)? attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+def Merge : TuringOp<"merge", [AttrSizedOperandSegments]> {
+  let summary = "Bind one MERGE path pattern per input row, writing it when the graph does not hold it";
+
+  let description = [{
+    The declarative counterpart of Cypher's MERGE. The pattern is one path - a chain
+    of nodes joined by hops - and it is matched and written as a unit: for each input
+    row the op looks the whole chain up, emits one row per match it finds, and only
+    when it finds none writes the entities the pattern does not already have bound
+    and emits that one row. That whole-pattern rule is what keeps MERGE from being a
+    sequence of per-entity merges: `MERGE (a:P {n: 1})-[:K]->(b:P {n: 2})` writes a
+    fresh `a` and `b` when no such hop exists, even when nodes matching each end do.
+
+    The chain is spelled out by the attributes, one entry per entity in pattern order:
+
+      %n, %n_pending, %created = db.merge nodes [["Person"]] props [["name"]]
+                                         edges [] props [] dirs []
+                                         bound {} pending {} values {%name} {} carrying {}
+        : (!db.column<!storage.string>)
+          -> (!db.column<!storage.node_id>, !db.column<!storage.bool>, !db.column<!storage.bool>)
+
+    `node_labels` carries each chain node's label set. An empty one marks a node the
+    query already bound - `MATCH (a) MERGE (a)-[:K]->(b:Bot)` - whose column comes in
+    through `bound_nodes` instead, in chain order; every other node is matched by its
+    labels (a superset match, as db.scan_nodes_by_label) and its `node_prop_names`
+    values, and written with exactly those when the pattern is missing. A node the
+    op writes needs a label, so a node with neither labels nor a bound column is
+    rejected.
+
+    `bound_pending` is empty, or holds one boolean column per bound node saying which
+    of its rows are entities this change has written but not committed - what an
+    earlier db.merge or db.create_node produced. Such a row is in no graph the match
+    reads, so the pattern under it can never be found and is written instead.
+
+    `edge_types`, `edge_prop_names` and `edge_directions` carry one entry per hop,
+    each hop joining the chain node ahead of it to the one behind. A hop's direction
+    is read from the query; `undirected` matches a hop either way round and writes a
+    forward one.
+
+    The results pair each entity the op looks up with a boolean mask, nodes in chain
+    order then hops: the entity's ID column, then the rows of it that are pending -
+    written by this change and not committed, so an offset into the write buffer rather
+    than an ID the graph holds. A bound node has no pair of its own: its rows came in
+    through `bound_nodes` and come back through the carry set, re-indexed like every
+    other column in flight. After those pairs comes the boolean column saying which rows
+    the op wrote the whole pattern for - what ON CREATE and ON MATCH select on - then the
+    carry set.
+    `carried_columns` mirrors db.get_out_edges': the columns in flight, handed back
+    re-indexed onto the rows the merge emitted, so a row the op emitted twice repeats
+    them and one it emitted nothing for drops them.
+  }];
+
+  let arguments = (ins LabelRefArrayArrayAttr:$node_labels,
+                       StrArrayArrayAttr:$node_prop_names,
+                       EdgeTypeRefArrayAttr:$edge_types,
+                       StrArrayArrayAttr:$edge_prop_names,
+                       DenseI64ArrayAttr:$edge_directions,
+                       DenseI64ArrayAttr:$pending_nodes,
+                       Variadic<Column>:$bound_nodes,
+                       Variadic<Column>:$bound_pending,
+                       Variadic<Column>:$node_prop_values,
+                       Variadic<Column>:$edge_prop_values,
+                       Variadic<Column>:$carried_columns);
+
+  let results = (outs Variadic<Column>:$results);
+
+  let hasVerifier = 1;
+
+  // The five attribute lists print ahead of the operands, each under the keyword
+  // naming what it describes, so a chain reads left to right. The directions go
+  // through the shared custom directive so they print as keywords rather than as
+  // the raw integers the DenseI64ArrayAttr stores.
+  let assemblyFormat = [{
+    `nodes` $node_labels `props` $node_prop_names
+    `edges` $edge_types `props` $edge_prop_names `dirs` custom<EdgeDirections>($edge_directions)
+    `bound` `{` $bound_nodes `}` `pending` custom<ColumnIndices>($pending_nodes) `{` $bound_pending `}`
+    `values` `{` $node_prop_values `}` `{` $edge_prop_values `}`
+    `carrying` `{` $carried_columns `}`
+    attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def SetNodeProperty : TuringOp<"set_node_property", [AttrSizedOperandSegments]> {
+  let summary = "Set one named property on each input node to a row-aligned value";
+
+  let description = [{
+      %n   = db.scan_nodes_by_label(["Person"]) : !db.column<!storage.node_id>
+      %val = db.constant(5 : i64)
+      db.set_node_property(%n, "age", %val)
+        : (!db.column<!storage.node_id>, !db.column<i64>) -> ()
+
+    Node variable keeps its existing column.
+  }];
+
+  let arguments = (ins Column:$input_nodes,
+                       StrAttr:$property,
+                       Column:$value,
+                       Optional<Column>:$pending,
+                       Optional<Column>:$rows,
+                       UnitAttr:$all_pending);
+
+  // `pending` says, row by row, which entities this change wrote and has not committed -
+  // those are written in the write buffer rather than recorded as an update to a
+  // committed entity, and `all_pending` says it of every row without a mask. `rows`
+  // narrows which rows are written at all: Cypher's ON CREATE passes the merge's created
+  // mask, ON MATCH its negation, and a plain SET passes none.
+  let assemblyFormat = [{
+    `(` $input_nodes `,` $property `,` $value `)` (`pending` $pending^)? (`rows` $rows^)?
+    (`all_pending` $all_pending^)? attr-dict `:` functional-type(operands, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
+def SetEdgeProperty : TuringOp<"set_edge_property", [AttrSizedOperandSegments]> {
+  let summary = "Set one named property on each input edge to a row-aligned value";
+
+  let description = [{
+      db.set_edge_property(%e, "weight", %val)
+        : (!db.column<!storage.edge_id>, !db.column<f64>) -> ()
+
+    Edge variable keeps its existing column.
+  }];
+
+  let arguments = (ins Column:$input_edges,
+                       StrAttr:$property,
+                       Column:$value,
+                       Optional<Column>:$pending,
+                       Optional<Column>:$rows,
+                       UnitAttr:$all_pending);
+
+  let assemblyFormat = [{
+    `(` $input_edges `,` $property `,` $value `)` (`pending` $pending^)? (`rows` $rows^)?
+    (`all_pending` $all_pending^)? attr-dict `:` functional-type(operands, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
+def DeleteNode : TuringOp<"delete_node"> {
+  let summary = "Delete each input node, optionally detaching its incident edges";
+
+  let description = [{
+    `detach` carries the DETACH keyword
+
+      db.delete_node(%n) detach : (!db.column<!storage.node_id>) -> ()
+
+    `pending` is the mask a db.merge produced beside its node column: those rows
+    hold an offset into the change's write buffer rather than an ID the graph
+    knows, so the change drops the write instead of tombstoning an ID.
+    `all_pending` says that of every row, which a db.create_node's column is.
+  }];
+
+  let arguments = (ins Column:$input_nodes,
+                       UnitAttr:$detach,
+                       Optional<Column>:$pending,
+                       UnitAttr:$all_pending);
+
+  let assemblyFormat = [{
+    `(` $input_nodes `)` (`detach` $detach^)? (`pending` $pending^)?
+    (`all_pending` $all_pending^)? attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def DeleteEdge : TuringOp<"delete_edge"> {
+  let summary = "Delete each input edge";
+
+  let description = [{
+      db.delete_edge(%e) : (!db.column<!storage.edge_id>) -> ()
+
+    `pending` is delete_node's mask, over edges, and `all_pending` its maskless form.
+  }];
+
+  let arguments = (ins Column:$input_edges, Optional<Column>:$pending, UnitAttr:$all_pending);
+
+  let assemblyFormat = [{
+    `(` $input_edges `)` (`pending` $pending^)? (`all_pending` $all_pending^)? attr-dict `:`
     functional-type(operands, results)
   }];
 }
@@ -935,21 +3709,26 @@ def GroupAggregate : TuringOp<"group_aggregate", [Pure]> {
     The operands are the grouping-key columns first, then the aggregate-input
     columns; `keys` is how many leading operands are keys (so the rest are the
     aggregate inputs, one per aggregate). `aggregates` names the reduction of each
-    aggregate input as GroupAggregateKind keywords (count, sum, min, max, avg), so
-    its length is the number of aggregate inputs.
+    aggregate input as GroupAggregateKind keywords (count, count_distinct, sum,
+    sum_distinct, min, max, avg, avg_distinct), so its length is the number of
+    aggregate inputs. The distinct kinds are Cypher's DISTINCT aggregates: each
+    reduces a group's distinct non-null values rather than all of its rows, and keeps
+    the result type of the kind it mirrors. min/max have no distinct kind, since
+    dropping repeated values cannot move an extremum.
 
       %a     = db.scan_nodes() : !db.column<!storage.node_id>
-      %city  = db.get_node_properties(%a, "city")  : (!db.column<!storage.node_id>) -> !db.column<none>
-      %score = db.get_node_properties(%a, "score") : (!db.column<!storage.node_id>) -> !db.column<none>
+      %city  = db.get_node_properties(%a, "city")  : (!db.column<!storage.node_id>) -> !db.column<!storage.nullable<!storage.string>>
+      %score = db.get_node_properties(%a, "score") : (!db.column<!storage.node_id>) -> !db.column<!storage.nullable<i64>>
       %gcity, %total = db.group_aggregate(%city, %score) keys 1 aggregates [sum]
-                         : (!db.column<none>, !db.column<none>) -> (!db.column<none>, !db.column<none>)
-      db.output(%gcity, %total) : !db.column<none>, !db.column<none>
+                         : (!db.column<!storage.nullable<!storage.string>>, !db.column<!storage.nullable<i64>>) -> (!db.column<!storage.nullable<!storage.string>>, !db.column<none>)
+      db.output(%gcity, %total) : !db.column<!storage.nullable<!storage.string>>, !db.column<none>
 
     The results are the grouping-key columns (in operand order, same types) then
-    one column per aggregate: count is a ui64 count, sum/min/max keep the input's
-    value type and avg widens to f64 - all resolved during lowering, so - like
-    db.count - the aggregate result types are unconstrained here. count(*) is
-    expressed by a count over a never-null column (node IDs).
+    one column per aggregate: count and count_distinct are ui64 counts, sum/min/max
+    keep the input's value type and avg widens to f64 - all resolved during lowering,
+    the distinct kinds exactly as the kinds they mirror,
+    so - like db.count - the aggregate result types are unconstrained here. count(*)
+    is expressed by a count over a never-null column (node IDs).
 
     Grouped aggregation is a pipeline breaker: it must see every row before it can
     emit any, so - like db.sort - it lowers to a hoisted accumulator
@@ -995,21 +3774,43 @@ def Collect : TuringOp<"collect", [Pure]> {
     tuple: the key values then a list of the group's non-null collected values.
 
       %gcity, %names = db.collect(%city, %name) keys 1
-                         : (!db.column<none>, !db.column<none>) -> (!db.column<none>, !db.column<!storage.list<none>>)
+                         : (!db.column<!storage.nullable<!storage.string>>, !db.column<!storage.nullable<!storage.string>>) -> (!db.column<!storage.nullable<!storage.string>>, !db.column<!storage.list<!storage.nullable<!storage.string>>>)
 
-    keyCount is how many leading columns are keys (0 = ungrouped); exactly one value
-    column follows. Results are the keys (unchanged) then one list column.
+    keyCount is how many leading columns are keys (0 = ungrouped); the collected value
+    columns follow, one per list the projection returns, and then one input per aggregate
+    `aggregates` names - the reductions taken over the same groups, as db.group_aggregate
+    takes them. Results are the keys (unchanged), one list column per value, then one
+    column per aggregate. The value count is what is left over: columns minus the keys
+    and the aggregate inputs.
+
+      %gcity, %names, %n = db.collect(%city, %name, %score) keys 1 aggregates [count]
+                             : (...) -> (...)
+
+      %names, %ages = db.collect(%name, %age) keys 0
+                        : (...) -> (!db.column<!storage.list<!storage.nullable<!storage.string>>>, !db.column<!storage.list<!storage.nullable<i64>>>)
+
+    `distinct` is Cypher's collect(DISTINCT x): a value repeated in a group is collected
+    once, so the list holds each of the group's distinct values. It names the value
+    columns that dedupe by index, since one projection may collect a column both ways.
+
+      %names = db.collect(%name) keys 0 distinct [0] : (!db.column<!storage.nullable<!storage.string>>) -> !db.column<!storage.list<!storage.nullable<!storage.string>>>
   }];
 
-  // keyCount grouping-key columns then one collected column; unsigned (never negative).
-  let arguments = (ins Variadic<Column>:$columns, UI64Attr:$keyCount);
+  // keyCount grouping-key columns, one or more collected columns, then one input per
+  // aggregate kinds names; keyCount is unsigned (never negative).
+  let arguments = (ins Variadic<Column>:$columns,
+                       UI64Attr:$keyCount,
+                       OptionalAttr<DenseI64ArrayAttr>:$kinds,
+                       OptionalAttr<DenseI64ArrayAttr>:$distinctValues);
   let results   = (outs Variadic<Column>:$results);
 
   let assemblyFormat = [{
-    `(` $columns `)` `keys` $keyCount attr-dict `:` functional-type(operands, results)
+    `(` $columns `)` `keys` $keyCount (`aggregates` custom<GroupAggregateKinds>($kinds)^)?
+    (`distinct` custom<ColumnIndices>($distinctValues)^)? attr-dict `:` functional-type(operands, results)
   }];
 
-  // keyCount + 1 columns; key results pass through; trailing result is a list column.
+  // At least one value column after the keys; key results pass through; one list result
+  // per value column.
   let hasVerifier = 1;
 }
 
@@ -1024,7 +3825,7 @@ def UnwindCollect : TuringOp<"unwind_collect", [Pure]> {
     the key values (repeated) then that value.
 
       %gcity, %y = db.unwind_collect(%city, %name) keys 1
-                     : (!db.column<none>, !db.column<none>) -> (!db.column<none>, !db.column<none>)
+                     : (!db.column<!storage.nullable<!storage.string>>, !db.column<!storage.nullable<!storage.string>>) -> (!db.column<!storage.nullable<!storage.string>>, !db.column<!storage.nullable<!storage.string>>)
 
     Same operands as db.collect (keyCount keys, one value column); results are the keys
     (unchanged) then one scalar value column of the unwound elements.
@@ -1039,6 +3840,403 @@ def UnwindCollect : TuringOp<"unwind_collect", [Pure]> {
 
   // keyCount + 1 columns; key results pass through; trailing result is the value column.
   let hasVerifier = 1;
+}
+
+/**
+* ShortestPath
+*/
+def ShortestPath : TuringOp<"shortest_path", [Pure]> {
+  let summary = "Weighted shortest path from a source node set to a target node set";
+  let description = [{
+    TuringDB's `SHORTESTPATH(source, target, edgeProperty, distVar, pathVar)`: the
+    minimum-weight directed path from any source node to any target node
+
+      %dist, %path = db.shortest_path(%a, %b) weight "cost"
+                       : (!db.column<!storage.node_id>, !db.column<!storage.node_id>)
+                         -> (!db.column<none>, !db.column<!storage.path>)
+
+    Pipeline breaker as both node columns are consumed in full. The distance column
+    is typed `none` here and resolved to the weight property's value type at lowering.
+  }];
+
+  let arguments = (ins ColumnNodeIDs:$source, ColumnNodeIDs:$target, StrAttr:$edgeProperty);
+  let results   = (outs Column:$distance, ColumnPath:$path);
+
+  let assemblyFormat = [{
+    `(` $source `,` $target `)` `weight` $edgeProperty attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* OptionalMatch
+*/
+def OptionalMatch : TuringOp<"optional_match", [Pure]> {
+  let summary = "Match a pattern against the rows in flight, keeping the rows it does not match";
+
+  let description = [{
+    Models Cypher's OPTIONAL MATCH: a left outer join of the rows in flight
+    against a pattern. A row the pattern matches fans out exactly as a MATCH
+    would; a row it matches not at all survives once, with the pattern's own
+    variables null. The pattern matches whole or not at all - a second hop that
+    finds nothing nulls the first hop's variables too - so it cannot be modelled
+    by making each traversal optional, and lives in a region of its own.
+
+    `input_columns` are the columns the pattern joins onto - every named column
+    the query holds at this point. The region's entry block takes one argument
+    per input column, so the pattern walks the rows in flight rather than the
+    whole graph, plus a trailing `!db.column<ui64>` row tag: the position of each
+    input row, carried through the pattern the way any other column is, so the
+    rows that matched are known once the pattern is walked. A query opening on
+    OPTIONAL MATCH has no input column and so no tag either - the rows it joins
+    onto are the single empty row Cypher starts from, which any match marks.
+
+      %p2, %e, %f = db.optional_match(%p) ({
+        ^bb0(%pIn: !db.column<!storage.node_id>, %tag: !db.column<ui64>):
+          %s, %e, %et, %t, %tag2 = db.get_out_edges(%pIn, {%tag}) : ...
+          db.optional_yield %tag2, {%s, %e, %t} : !db.column<ui64>, {...}
+      }) : (!db.column<!storage.node_id>) -> (...)
+
+    The db.optional_yield names the tag as the pattern left it, then the columns
+    the region contributes: one per input column first, in operand order - these
+    are the input rows as the pattern filtered and repeated them - then one per
+    variable the pattern binds of its own. The op's results line up with those
+    columns, so the results past the input count are the pattern's variables, and
+    those are the ones a row the pattern missed comes back with null. A null node
+    or edge is an invalid ID (`ID::isValid()`), which reads as null through a
+    property fetch and renders as null, so no column type changes here.
+
+    Reading the graph is deterministic and the op writes nothing, so it is Pure -
+    which says nothing about the row count, and this op changes it.
+  }];
+
+  let arguments = (ins Variadic<Column>:$input_columns);
+
+  // One per column the region yields: the input columns as the pattern left
+  // them, then the variables the pattern binds.
+  let results = (outs Variadic<Column>:$results);
+
+  // Exactly one block, ending in a db.optional_yield.
+  let regions = (region SizedRegion<1>:$pattern);
+
+  let assemblyFormat = [{
+    `(` $input_columns `)` $pattern attr-dict `:` functional-type($input_columns, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* OptionalYield
+*/
+def OptionalYield : TuringOp<"optional_yield", [Pure, Terminator, AttrSizedOperandSegments, HasParent<"OptionalMatch">]> {
+  let summary = "Name the row tag and the columns a db.optional_match's pattern contributes";
+
+  let description = [{
+    Terminates a db.optional_match's pattern region. `tag` is the row tag as the
+    pattern left it - the input row each matched row came from, absent when the
+    op has no input column - and `columns` are the columns the region
+    contributes, one per input column in operand order followed by the pattern's
+    own variables. The enclosing op's results are exactly those columns.
+  }];
+
+  let arguments = (ins Optional<ColumnRowTags>:$tag, Variadic<Column>:$columns);
+
+  // The tag's type is buildable and so left out; only the contributed column types
+  // are spelled, in braces as db.cross_product spells a factor's.
+  let assemblyFormat = [{
+    ($tag^ `,`)? `{` $columns `}` attr-dict `:` `{` qualified(type($columns)) `}`
+  }];
+}
+
+/**
+* CallSubquery
+*/
+def CallSubquery : TuringOp<"call_subquery", []> {
+  let summary = "Run a query of its own once per row in flight";
+
+  let description = [{
+    Models Cypher's CALL { ... } subquery. `input_columns` are every column the
+    query holds at this point, and the body region takes one argument per input
+    column - the imported ones read through their own names, the rest carried past
+    the body - plus a trailing `!db.column<ui64>` row tag when the op is `optional`
+    and the body carries its scope over input rows it has, as db.optional_match
+    takes one. The body is a self-contained db dataflow ending in a
+    db.subquery_yield.
+
+    The body runs once per input row. For each row a returning body yields, the op
+    produces that row's input columns beside the yielded ones: the results are one
+    per input column, in operand order, then one per yielded column. A body the row
+    yields nothing for drops the row, unless the op is `optional`, which keeps it
+    once with the yielded columns null.
+
+      %p2, %x = db.call_subquery(%p) carries_scope ({
+        ^bb0(%pIn: !db.column<!storage.node_id>):
+          %s, %e, %et, %x = db.get_out_edges(%pIn, {}) : ...
+          db.subquery_yield %s, %x : !db.column<!storage.node_id>, !db.column<!storage.node_id>
+      }) : (!db.column<!storage.node_id>) -> (!db.column<!storage.node_id>, !db.column<!storage.node_id>)
+
+    `carries_scope` says the body's own dataflow keeps every input row paired with
+    what the body made of it, so it runs over a whole chunk of input rows at once. A
+    returning body that carries the scope hands the input columns back itself: it
+    yields them first, as its dataflow left them - filtered and repeated by its hops -
+    then its own columns, and the results line up with that yield. A body whose rows
+    cannot carry the inputs through - one that aggregates, sorts, cuts or dedups - is
+    run one input row at a time instead: a returning one yields its own columns alone
+    and the lowering pairs each row it yields with the input row it came from, a unit
+    one writes over one input row per step.
+
+    A `unit` body ends on an updating clause rather than a RETURN. It yields nothing
+    and the op has no results, whether or not it carries the scope: the rows in flight
+    are the operands still, however many rows the body walked or wrote for each of
+    them. A unit body is never `optional` - it yields no row for OPTIONAL to pad.
+
+    The body may write to the graph, so the op is not Pure.
+  }];
+
+  let arguments = (ins Variadic<Column>:$input_columns,
+                       UnitAttr:$unit,
+                       UnitAttr:$carries_scope,
+                       UnitAttr:$optional);
+
+  let results = (outs Variadic<Column>:$results);
+
+  // Exactly one block, ending in a db.subquery_yield.
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = [{
+    `(` $input_columns `)` (`unit` $unit^)? (`carries_scope` $carries_scope^)? (`optional` $optional^)?
+    $body attr-dict `:` functional-type($input_columns, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* SubqueryYield
+*/
+def SubqueryYield : TuringOp<"subquery_yield", [Pure, Terminator, AttrSizedOperandSegments, HasParent<"CallSubquery">]> {
+  let summary = "Name the row tag and the columns a db.call_subquery's body contributes";
+
+  let description = [{
+    Terminates a db.call_subquery's body region. `tag` is the row tag as the body
+    left it, present exactly when the body takes one, and `columns` are the columns
+    the body contributes: the input columns as the body left them when the op
+    carries its scope, then the columns the body's RETURN publishes. A unit body
+    yields no column.
+  }];
+
+  let arguments = (ins Optional<ColumnRowTags>:$tag, Variadic<Column>:$columns);
+
+  let assemblyFormat = [{
+    ($tag^ `,`)? `{` $columns `}` attr-dict `:` `{` qualified(type($columns)) `}`
+  }];
+}
+
+/**
+* ExistsSubquery
+*/
+def ExistsSubquery : TuringOp<"exists_subquery", [Pure]> {
+  let summary = "Answer, per row in flight, whether a body produces a row of its own for it";
+
+  let description = [{
+    Models Cypher's `EXISTS { ... }`: a semi-join of the rows in flight against a
+    read-only body. The result is one boolean per input row - true exactly when the
+    body produced at least one row for it - so the op changes no row count, which is
+    what lets it stand in an expression.
+
+    `input_columns` are every named column the query holds at this point, and the body
+    region takes one argument per input column - the body reads the scope around it
+    through them, EXISTS being correlated - plus a trailing `!db.column<ui64>` row tag:
+    the position of each input row, carried through the body the way any other column
+    is, so the rows that produced one are known once the body is walked. An EXISTS over
+    no input column joins onto the single empty row Cypher starts from and takes no tag.
+
+      %b = db.exists_subquery(%p) carries_scope ({
+        ^bb0(%pIn: !db.column<!storage.node_id>, %tag: !db.column<ui64>):
+          %s, %e, %et, %k, %tag2 = db.get_out_edges(%pIn, {%tag}) : ...
+          db.exists_yield %tag2, {}
+      }) : (!db.column<!storage.node_id>) -> !db.column<!storage.bool>
+
+    `carries_scope` says the body's own dataflow keeps every input row paired with what
+    it made of it, so it runs over a whole chunk of input rows at once and the tag comes
+    back naming the rows that survived. A body that aggregates, sorts, cuts or dedups
+    cannot: it is run one input row at a time instead, and the row is marked when the
+    body yielded anything at all for it.
+
+    The db.exists_yield names the tag as the body left it, which is all a tagged body is
+    answered from. A body with no tag names the columns it holds instead, which carry the
+    row count it answers from.
+
+    Reading the graph is deterministic and an EXISTS body writes nothing, so it is Pure.
+  }];
+
+  let arguments = (ins Variadic<Column>:$input_columns, UnitAttr:$carries_scope);
+
+  let results = (outs ColumnBools:$result);
+
+  // Exactly one block, ending in a db.exists_yield.
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = [{
+    `(` $input_columns `)` (`carries_scope` $carries_scope^)? $body attr-dict
+    `:` functional-type($input_columns, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* ExistsYield
+*/
+def ExistsYield : TuringOp<"exists_yield", [Pure, Terminator, AttrSizedOperandSegments, HasParent<"ExistsSubquery">]> {
+  let summary = "Name the row tag and the columns a db.exists_subquery's body holds";
+
+  let description = [{
+    Terminates a db.exists_subquery's body region. `tag` is the row tag as the body left
+    it - the input row each surviving row came from, absent when the op has no input
+    column. A body with no tag names in `columns` the columns it holds there, which it
+    reads its row count off; a tagged body names none.
+  }];
+
+  let arguments = (ins Optional<ColumnRowTags>:$tag, Variadic<Column>:$columns);
+
+  // The tag's type is buildable and so left out; only the held column types are spelled,
+  // in braces as db.optional_yield spells the ones its pattern contributes.
+  let assemblyFormat = [{
+    ($tag^ `,`)? `{` $columns `}` attr-dict (`:` `{` qualified(type($columns))^ `}`)?
+  }];
+}
+
+/**
+* CountSubquery
+*/
+def CountSubquery : TuringOp<"count_subquery", [Pure]> {
+  let summary = "Answer, per row in flight, how many rows a body produces for it";
+
+  let description = [{
+    Models Cypher's `COUNT { ... }`. The result is one count per input row - the number
+    of rows the body produced for it, 0 where it produced none - so the op changes no row
+    count, which is what lets it stand in an expression.
+
+    Its operands, body and paths are db.exists_subquery's: the body reads the scope around
+    it through one block argument per input column, and a body carrying the scope takes a
+    trailing `!db.column<ui64>` row tag and is run over a whole chunk of input rows at
+    once, each row it yields counted toward the input row its tag names. A body that
+    aggregates, sorts, cuts, dedups or is a UNION is run one input row at a time instead,
+    and the rows it yields are counted toward that row.
+
+      %n = db.count_subquery(%p) carries_scope ({
+        ^bb0(%pIn: !db.column<!storage.node_id>, %tag: !db.column<ui64>):
+          %s, %e, %et, %k, %tag2 = db.get_out_edges(%pIn, {%tag}) : ...
+          db.count_subquery_yield %tag2, {}
+      }) : (!db.column<!storage.node_id>) -> !db.column<ui64>
+
+    Reading the graph is deterministic and a COUNT body writes nothing, so it is Pure.
+  }];
+
+  let arguments = (ins Variadic<Column>:$input_columns, UnitAttr:$carries_scope);
+
+  let results = (outs ColumnCounts:$result);
+
+  // Exactly one block, ending in a db.count_subquery_yield.
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = [{
+    `(` $input_columns `)` (`carries_scope` $carries_scope^)? $body attr-dict
+    `:` functional-type($input_columns, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* CountSubqueryYield
+*/
+def CountSubqueryYield : TuringOp<"count_subquery_yield", [Pure, Terminator, AttrSizedOperandSegments, HasParent<"CountSubquery">]> {
+  let summary = "Name the row tag and the columns a db.count_subquery's body holds";
+
+  let description = [{
+    Terminates a db.count_subquery's body region. `tag` is the row tag as the body left
+    it, absent when the body takes none. A body with no tag names in `columns` the columns
+    it holds there, which it counts its rows off; a tagged body names none.
+  }];
+
+  let arguments = (ins Optional<ColumnRowTags>:$tag, Variadic<Column>:$columns);
+
+  let assemblyFormat = [{
+    ($tag^ `,`)? `{` $columns `}` attr-dict (`:` `{` qualified(type($columns))^ `}`)?
+  }];
+}
+
+/**
+* CollectSubquery
+*/
+def CollectSubquery : TuringOp<"collect_subquery", [Pure]> {
+  let summary = "Build, per row in flight, the list of what a body returns for it";
+
+  let description = [{
+    Models Cypher's `COLLECT { ... }`. The result is one list per input row - the values
+    of the one column the body returns for it, in the order the body produced them, and
+    the empty list where it produced none - so the op changes no row count, which is what
+    lets it stand in an expression.
+
+    Its operands, body and paths are db.count_subquery's: the body reads the scope around
+    it through one block argument per input column, and a body carrying the scope takes a
+    trailing `!db.column<ui64>` row tag and is run over a whole chunk of input rows at
+    once, each value it yields going into the list of the input row its tag names. A body
+    that aggregates, sorts, cuts, dedups or is a UNION is run one input row at a time
+    instead, and every value it yields goes into that row's list.
+
+      %names = db.collect_subquery(%p) carries_scope ({
+        ^bb0(%pIn: !db.column<!storage.node_id>, %tag: !db.column<ui64>):
+          %s, %e, %et, %k, %tag2 = db.get_out_edges(%pIn, {%tag}) : ...
+          %name = db.get_node_properties(%k) {property = "name"} : ...
+          db.collect_subquery_yield %tag2, %name, {} : !db.column<none>
+      }) : (!db.column<!storage.node_id>) -> !db.column<none>
+
+    The result's type is the body's to decide and is resolved during lowering, as
+    db.pattern_comprehension's is: the list is of whatever the body yields. A null the
+    body returns is an element of the list, as it is in Neo4j.
+
+    Reading the graph is deterministic and a COLLECT body writes nothing, so it is Pure.
+  }];
+
+  let arguments = (ins Variadic<Column>:$input_columns, UnitAttr:$carries_scope);
+
+  let results = (outs Column:$result);
+
+  // Exactly one block, ending in a db.collect_subquery_yield.
+  let regions = (region SizedRegion<1>:$body);
+
+  let assemblyFormat = [{
+    `(` $input_columns `)` (`carries_scope` $carries_scope^)? $body attr-dict
+    `:` functional-type($input_columns, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
+/**
+* CollectSubqueryYield
+*/
+def CollectSubqueryYield : TuringOp<"collect_subquery_yield", [Pure, Terminator, AttrSizedOperandSegments, HasParent<"CollectSubquery">]> {
+  let summary = "Name the row tag, the value and the columns a db.collect_subquery's body holds";
+
+  let description = [{
+    Terminates a db.collect_subquery's body region. `tag` is the row tag as the body left
+    it, absent when the body takes none, and `value` is the one column the body returns,
+    which each row it produced contributes to a list. A body with no tag names in
+    `columns` the columns it holds there, which its row count is read off; a tagged body
+    names none.
+  }];
+
+  let arguments = (ins Optional<ColumnRowTags>:$tag, Column:$value, Variadic<Column>:$columns);
+
+  let assemblyFormat = [{
+    ($tag^ `,`)? $value `,` `{` $columns `}` attr-dict `:` qualified(type($value))
+    (`,` `{` qualified(type($columns))^ `}`)?
+  }];
 }
 
 #endif //TURINGDB_OPS

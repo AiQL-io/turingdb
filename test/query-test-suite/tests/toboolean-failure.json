@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "RETURN toBoolean(\"notabool\")",
+  "expect": {
+    "result": "\"toBoolean(\"\"notabool\"\")\"\nnull",
+    "resultJson": "{\"header\":{\"column_names\":[\"toBoolean(\\\"notabool\\\")\"],\"column_types\":[\"Bool\"]},\"data\":[[[null]]]}"
+  },
+  "tags": [
+    "conversion",
+    "functions",
+    "literals"
+  ],
+  "write-required": false
+}

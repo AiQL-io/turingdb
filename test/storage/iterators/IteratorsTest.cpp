@@ -548,13 +548,13 @@ TEST_F(IteratorsTest, ScanNodesByLabelIteratorTest) {
     ASSERT_EQ(count, compareSet.size());
 }
 
-TEST_F(IteratorsTest, ScanOutEdgesByLabelIteratorTest) {
+TEST_F(IteratorsTest, ScanOutEdgesBySourceLabelIteratorTest) {
     const FrozenCommitTx transaction = _graph->openTransaction();
     const GraphReader reader = transaction.readGraph();
     std::map<EdgeID, const EdgeRecord*> byScanNodesRecords;
     std::map<EdgeID, const EdgeRecord*> byScanEdgesRecords;
 
-    // For each existing labelset compare scanOutEdgesByLabel to scanNodesByLabel -> getOutEdges
+    // For each existing labelset compare scanOutEdgesBySourceLabel to scanNodesByLabel -> getOutEdges
     for (const auto& [lsetID, labelset] : reader.getMetadata().labelsets()) {
         ColumnNodeIDs nodeIDs;
         for (const NodeID nodeID : reader.scanNodesByLabel(labelset->handle())) {
@@ -564,7 +564,7 @@ TEST_F(IteratorsTest, ScanOutEdgesByLabelIteratorTest) {
             }
         }
 
-        for (const EdgeRecord& edge : reader.scanOutEdgesByLabel(labelset->handle())) {
+        for (const EdgeRecord& edge : reader.scanOutEdgesBySourceLabel(labelset->handle())) {
             byScanEdgesRecords.emplace(edge._edgeID, &edge);
         }
     }
@@ -582,7 +582,7 @@ TEST_F(IteratorsTest, ScanOutEdgesByLabelIteratorTest) {
     }
 }
 
-TEST_F(IteratorsTest, ScanInEdgesByLabelIteratorTest) {
+TEST_F(IteratorsTest, ScanInEdgesByTargetLabelIteratorTest) {
     const FrozenCommitTx transaction = _graph->openTransaction();
     const GraphReader reader = transaction.readGraph();
     std::map<EdgeID, const EdgeRecord*> byScanNodesRecords;
@@ -591,7 +591,7 @@ TEST_F(IteratorsTest, ScanInEdgesByLabelIteratorTest) {
     const auto& labelsets = reader.getMetadata().labelsets();
     const size_t labelsetCount = labelsets.getCount();
 
-    // For each existing labelset compare scanInEdgesByLabel to scanNodesByLabel -> getInEdges
+    // For each existing labelset compare scanInEdgesByTargetLabel to scanNodesByLabel -> getInEdges
     for (LabelSetID lid = 0; lid != labelsetCount - 1; ++lid) {
         const auto labelset = labelsets.getValue(lid);
         ASSERT_TRUE(labelset);
@@ -610,7 +610,7 @@ TEST_F(IteratorsTest, ScanInEdgesByLabelIteratorTest) {
         }
 
         fmt::print("Scanning nodes from labelset {}: [{}]\n", lid, fmt::join(labelIDs, ", "));
-        for (const EdgeRecord& edge : reader.scanInEdgesByLabel(labelset.value())) {
+        for (const EdgeRecord& edge : reader.scanInEdgesByTargetLabel(labelset.value())) {
             fmt::print("   Edge {}: {}->{}\n", edge._edgeID.getValue(), edge._nodeID.getValue(), edge._otherID.getValue());
             byScanEdgesRecords.emplace(edge._edgeID, &edge);
         }
@@ -867,17 +867,18 @@ TEST_F(IteratorsTest, GetNodeViewsIteratorTest) {
     }
 }
 
-TEST_F(IteratorsTest, GetNodePropertiesIteratorTest) {
+TEST_F(IteratorsTest, GetNodePropertiesWithNullIteratorTest) {
     const FrozenCommitTx transaction = _graph->openTransaction();
     const GraphReader reader = transaction.readGraph();
     ColumnNodeIDs inputNodeIDs = {1, 3, 8};
 
     {
-        std::vector<uint64_t> compareSet = {1, 4, 5};
+        std::vector<std::optional<uint64_t>> compareSet = {1, 4, 5};
         auto it = compareSet.begin();
         size_t count = 0;
-        for (const uint64_t v : reader.getNodeProperties<types::UInt64>(0, &inputNodeIDs)) {
-            fmt::print("v={}\n", v);
+        const auto range = reader.getNodePropertiesWithNull<types::UInt64>(0, &inputNodeIDs);
+        for (auto valueIt = range.begin(); valueIt.isValid(); valueIt.next()) {
+            const std::optional<uint64_t> v = valueIt.get();
             ASSERT_EQ(*it, v);
             count++;
             it++;
@@ -886,15 +887,18 @@ TEST_F(IteratorsTest, GetNodePropertiesIteratorTest) {
     }
 
     {
-        std::vector<std::string_view> compareSet = {
+        // Node 3 carries a UIntProp but no StringProp
+        std::vector<std::optional<std::string_view>> compareSet = {
             "TmpID1",
+            std::nullopt,
             "TmpID5",
         };
         auto it = compareSet.begin();
         size_t count = 0;
-        for (std::string_view v : reader.getNodeProperties<types::String>(1, &inputNodeIDs)) {
-            spdlog::info("{} ?= {}", *it, v);
-            ASSERT_TRUE(*it == v);
+        const auto range = reader.getNodePropertiesWithNull<types::String>(1, &inputNodeIDs);
+        for (auto valueIt = range.begin(); valueIt.isValid(); valueIt.next()) {
+            const std::optional<std::string_view> v = valueIt.get();
+            ASSERT_EQ(*it, v);
             count++;
             it++;
         }
@@ -903,7 +907,5 @@ TEST_F(IteratorsTest, GetNodePropertiesIteratorTest) {
 }
 
 int main(int argc, char** argv) {
-    return turing::test::turingTestMain(argc, argv, [] {
-        testing::GTEST_FLAG(repeat) = 1;
-    });
+    return turing::test::turingTestMain(argc, argv);
 }

@@ -78,7 +78,10 @@ These are structural properties of the graph model, not validation rules layered
 
 - **Every node has at least one label.** An empty label set is not representable; there is no "unlabeled node". An import file with a node whose label list is empty/null is malformed input, not a node to be created label-less.
 - **Every edge has exactly one edge type.** A null/empty edge type is not representable; an edge cannot exist without a type. A null `__type` in an import file is malformed input.
-- **Properties are scalar-valued; there is no list/array property container.** Property values are single scalars (see `ValueType`: Int64, Double, Bool, String, …). **Lists exist only in the query language**, never as a stored node/edge property. A LIST-typed column in an import file is unsupported input, not a property to ingest.
+- **A property value is a scalar, a list or a map.** The scalar types are `ValueType`'s Int64, UInt64, Double, Bool, String, Embedding, DateTime and Duration; `ValueType::List` is the list one, held by `TypedPropertyContainer<types::List>` over a `ListContainer` that owns its elements (see `docs/lists.md`). A stored list may be heterogeneous and may hold nested lists, so a LIST-typed column in an import file is a property to ingest, not unsupported input. `ValueType::Map` is the map one, held by `TypedPropertyContainer<types::Map>` over a `MapContainer` (see `docs/maps.md`): string keys, stored sorted, over values that may be scalars, lists or nested maps. A stored list may hold maps too, owned by its `ListContainer`'s own `MapContainer`.
+- **`ValueType`, `ListBufferTypeTag` and `MapBufferTypeTag` are append-only.** All three are written to disk as their raw ordinals — the property tag in `PropertyTypeMapDumper`, the element tag inside an `EncodedList`, the value tag inside an `EncodedMap` — with no format version beside them. A new member goes immediately before the sentinel; inserting one anywhere else silently reinterprets every datapart already written. The same holds for `net::proto::ColumnInternalKind` on the wire.
+- **`DateTime` is microseconds since the Unix epoch, UTC** (`storage/metadata/DateTime.h`). `datetime("...")` parses ISO-8601 and spends any offset on the instant, so `...T16:05:00+02:00` and `...T14:05:00Z` are one value and both render as `Z`. One int64 carries no zone; a zoned datetime would be a second type, not a widening of this one.
+- **`Duration` is a signed count of microseconds** (`storage/metadata/Duration.h`). It has no month component, because a month has no fixed length; a calendar duration would be a second type. `duration(<integer>)` reads the count as microseconds, and a duration renders as ISO-8601 hours, minutes and seconds (`PT25H1M1S`).
 
 ### Server (`server/`, `net/`)
 - Single TCP listener with two response strategies selected at startup by `USE_TURING_PROTO`:
@@ -94,6 +97,181 @@ These are structural properties of the graph model, not validation rules layered
 - `jobs/` - Job/task system
 - `memory/` - Memory management
 - `vector/` - Vector search with Faiss
+
+## Fix the root cause, in its most general form
+
+**Every bug fix and every improvement goes to the root cause and takes the most general
+form that fits. Never patch the symptom.** A tactical fix makes the reported query pass
+and leaves the defect in place for the next query of the same shape. It also adds one
+more special case that every later reader has to learn. A fix is judged by the class of
+inputs it repairs, not by the one reported.
+
+Before writing any fix:
+- Name the invariant that broke and the layer that owns it, then fix it in that layer. A
+  lowering crash on an op that should not have verified is a verifier or codegen bug. Wrong
+  rows produced by a bad rewrite are a pass bug, not an executor bug.
+- Find the class, not the instance. List the other queries, types, operators and code paths
+  that reach the same defect, and probe them. The fix covers the whole class, and the tests
+  show it does.
+- Look for siblings. If one helper recurses once per op, check every helper in the file. If
+  one switch is missing an enum member, check every switch over that enum.
+- Change the abstraction, not the call site. An `if (kind == X)` next to the failing line is
+  the tactical shape. A missing concept - a type, an op, an interface, a trait, one helper
+  shared by N callers - is the general shape.
+- Refactor when the fix needs it. Do not bend a fix around a bad abstraction to keep the
+  diff small. Splitting a class, adding an op or an interface, moving logic to the layer
+  that owns it, renaming what the new design makes wrong: all are part of the fix.
+
+A fix is tactical if it: special-cases a name or a literal; rejects input it should handle;
+adds a flag parameter to route around one case; catches an exception to hide it; raises a
+limit (stack size, buffer size, timeout) instead of removing the dependency on it; copies
+logic that already exists elsewhere; or is exercised only by the reported query.
+
+Worked examples:
+- TUR-183. An UNWIND of ~5,500 ids folded into a 5,500-deep OR chain and
+  `collectNodeIDDisjunction` overflowed the 512 KB macOS thread stack. Tactical: raise the
+  stack size, or convert that one helper. Root cause: IR walks that recurse once per op.
+  Fix: all six recursive helpers in `DBPasses.cpp` became worklists, and the rule went into
+  "Optimisation passes" below.
+- Cross product OOM. Two 64Ki-row sides laid out 4.29e9 rows (64 GiB) in one step.
+  Tactical: cap the side sizes or reject large products. Root cause: an op whose output
+  outgrows its inputs was a straight-line op. Fix: `nl.cross_product` became an iterator
+  driven like a scan. Peak memory is one chunk per product, and LIMIT works through the
+  ordinary loop exit with no extra operand.
+- Analyzer rejections. A valid query that fails downstream is fixed by making the engine
+  run it, not by an analyzer rule that turns it away (see "Cypher language support").
+
+If the general fix is much larger than the request, say so: give the tactical and the
+general option and recommend the general one. Never ship the tactical one silently.
+
+### Engineer the query engine like a compiler
+
+The query engine is a compiler: parser, AST, analyzer, IR dialects, passes, lowering,
+interpreter. Before choosing a design, look at how LLVM, MLIR and GCC, and the query
+compilers (HyPer/Umbra, DuckDB, Calcite), solve the same problem. Follow their practice
+unless there is a stated reason not to.
+- One job per phase. The frontend checks and translates, passes optimise, lowering
+  translates, the runtime executes. Do not move work across those lines to save effort
+  (see "No optimisation in codegen").
+- Invariants live in the IR and are checked once, by the op's verifier. Do not re-check
+  them in every consumer. Where the type system allows, make the invalid state
+  unrepresentable instead of checking for it.
+- Canonicalise early, then match. Passes match one canonical shape, not N variants of it.
+- Passes are small, composable, and driven by a worklist to a fixed point (see
+  "Optimisation passes").
+- Analyses run on IR values - use-def chains, dominance, dataflow - not on Cypher names or
+  on the AST.
+- Lowering is total: every op that verifies lowers. A verified op that fails to lower is a
+  lowering bug.
+- Reduce before fixing. Shrink a failing query to the smallest IR or Cypher that still
+  fails, and make that the test.
+
+## Design choices: build what the field builds, and ask first
+
+**Hold every design to the standard of a professional engine, and put the choice to the
+user before building it.** Reusing an existing structure for a job it was not made for
+looks minimal: no new type, no new op, a small diff. That minimality is not an argument.
+The borrowed structure carries the wrong meaning, every later feature has to work around
+it, and every reader has to learn why it is there.
+
+This applies to any choice that others will build on: a representation, a type, an IR op,
+a data structure, an interface, a wire or file format, a module boundary. Before proposing
+one, answer these:
+- Is it proper? Each concept gets a representation that names it. If the case for a
+  design is that an existing type or container "already handles it", it is borrowed.
+- How do mature systems do it? Postgres, DuckDB, SQLite, Neo4j and HyPer/Umbra for
+  databases; LLVM, MLIR and GCC for compilers; the spec or RFC for a format or protocol.
+  Name the system and its mechanism. If no mature system does it your way, find out why.
+- What does the folklore say? Most problems in this field have a standard answer and
+  known pitfalls, in textbooks, papers and the source of those systems. Use the standard
+  answer unless there is a stated reason not to.
+- Then ask the user. Give the canonical option, any alternative, what each costs, and a
+  recommendation. Do not implement a design choice the user has not seen.
+
+Implementation details inside a design already agreed, or that follow a pattern the
+codebase already has, need no question.
+
+Worked example: query parameters (`$name`). Suggested: use a list element as the untyped
+value that carries a parameter, since a list already holds values of any type. A parameter
+is an expression whose value arrives with the query. A list element is part of a stored
+property value. The suggestion used one for the other because it fit. The field's answer:
+a parameter is its own node in the AST and the IR, its type is resolved at analysis or
+bind time, and at execution it is bound to a value of the engine's own tagged value type.
+Postgres has `Param` and `ParamListInfo` (a Datum and a type OID), DuckDB
+`BoundParameterExpression` and `Value`, Neo4j a parameter map of `AnyValue`. The lesson is
+not about parameters. It is about any design whose main virtue is that it needed nothing
+new.
+
+## Cypher language support
+
+**If a query is valid openCypher, implement it. Do not reject it in the analyzer.** An
+analyzer error is for queries that are genuinely ill-formed; it is never a shortcut around
+a gap in codegen. When a valid query fails somewhere downstream — a lowering assert, an
+invalid-IR error, wrong rows — the fix is to make the engine execute it. Adding a rule that
+turns it away is a regression dressed as validation: it closes the door on the feature and
+hides the gap behind a message that blames the user's query.
+
+Before writing any new analyzer rejection, establish which side of the line the query is on:
+- **Valid Cypher** → implement it. Judge by the language's semantics, not by how far the
+  current implementation happens to reach. Reference points: openCypher, Neo4j's behaviour,
+  and SQL where the construct is shared (`GROUP BY` / `ORDER BY` / `DISTINCT` scoping).
+- **Invalid Cypher** → reject it, with a message naming what is wrong with the query.
+
+Worked example — `ORDER BY` over an aggregating projection:
+- `RETURN n.age, count(n.name) ORDER BY n.age + 1` is **valid**: `n.age + 1` is functionally
+  determined by the grouping key `n.age`, exactly as SQL allows `GROUP BY age ... ORDER BY
+  age + 1`. So grouping keys are substituted into the key expression at any depth
+  (`DBProgramGenerator::bindOrderByKeyColumns`), and the key is computed over the grouped
+  column.
+- `RETURN n, count(b) ORDER BY b.name` is **invalid**: `b` is neither a grouping key nor
+  determined by one, so `b.name` has no single value per group to order on. That one is
+  rejected (`CypherAnalyzer::analyzeAggregateOrderBy`).
+
+Corollary: a rejection rule must reject *exactly* the invalid set. Probe the engine with
+the shapes on both sides of the line before writing the check, so a rule aimed at the
+invalid ones does not also turn away queries that already work.
+
+## Optimisation passes: ALWAYS use a worklist
+
+**Every optimisation pass over the db or nl dialect drives its rewrites from a worklist.
+Never restart a walk of the whole function after each rewrite.** This is the standard
+design from decades of compiler work (LLVM's InstCombine, MLIR's greedy pattern driver,
+the classic dataflow solvers), and it applies to every new pass and every pass you touch.
+
+Forbidden shape:
+
+```cpp
+while (true) {
+    Match match;
+    const WalkResult walked = getOperation()->walk([&match](FilterOp filter) {
+        return matchX(filter, match) ? WalkResult::interrupt() : WalkResult::advance();
+    });
+    if (!walked.wasInterrupted()) {
+        return;
+    }
+    rewriteX(match);
+}
+```
+
+Each rewrite re-walks and re-matches every op, so K rewrites over F candidates cost K × F
+match attempts: quadratic. Required shape:
+- Seed the worklist once with every candidate op.
+- Pop an op, skip it if a rewrite erased it, match it, rewrite it.
+- After a rewrite, push only the ops it can have changed the answer for: the users of the
+  values it replaced and the ops it created. Nothing else is re-matched.
+- Track erased ops (an erased set, or an `mlir::RewriterBase` listener) so the worklist
+  never touches a freed op. Every erase in the rewrite goes through `rewriter.eraseOp`,
+  which also reports the ops nested in the erased one; a bare `op->erase()` is invisible
+  to the listener.
+- A match that reads IR far above its op (a use-def chain, a factor's shape) can start to
+  hold after a rewrite elsewhere. Run the worklist in rounds until a round rewrites
+  nothing, as `applyPatternsGreedily` does. The cost is rounds × candidates, not
+  rewrites × candidates.
+
+When a rewrite fits `mlir::RewritePattern`, use `mlir::applyPatternsGreedily`, which is
+this worklist already. For a pass over filters, use `runFilterWorklist` in
+`query/ir/dialect/db/DBPasses.cpp`. Collecting all matches first and then rewriting them
+is fine only when no rewrite can touch another's match.
 
 ## C++ Coding Style
 
@@ -116,7 +294,7 @@ Key points:
 - Private members prefixed with underscore: `_member`
 - Methods use lowerCamelCase: `myFunction`
 - No abbreviations in identifiers — spell them out (`rowGroup`, not `rg`; `column`, not `col`; `index`, not `idx`). Applies to locals, parameters, members, and comments.
-- No Google-style `k`-prefix on constants. Use descriptive names: `previewRowsCount`, not `kPreviewRows`; `batchSize`, not `kBatch`.
+- `constexpr` constants are written in uppercase with underscores: `DB_PASS_COUNT`, not `dbPassCount`; `PREVIEW_ROWS_COUNT`, not `kPreviewRows`. Never use the Google-style `k`-prefix. Plain `const` locals and parameters stay lowerCamelCase.
 - Helpers that unconditionally throw use a `throw`-prefix: `throwError`, `throwIfError` — not `raise`, `bail`, or `fail`. C++ uses `throw` as the language keyword, so the name should match.
 - Area-local classes take a domain prefix matching their directory. Types under `io/parquet/`, `tools/turing-parquet/`, `dump/`, `import/`, etc. are written `ParquetReader`, `ParquetSchema`, `GraphLoader`, not unqualified `Reader`/`Schema`/`Loader`. Everything lives in `namespace db`, so unqualified names shadow generic ones and read ambiguously. Match file names to class names (`ParquetSchema.h` for `class ParquetSchema`).
 
@@ -155,6 +333,19 @@ Key points:
 - Use the layer-appropriate exception type: `FatalException` in `storage/` code (available via `common`), `PipelineException` in `query/pipeline/`. Storage cannot include pipeline headers (would create a circular dependency).
 - In `main()`, return `EXIT_SUCCESS` / `EXIT_FAILURE` (from `<stdlib.h>`), not literal `0` / `1`.
 
+**Comments — write as few as possible:**
+- **The default is no comment at all.** Code that needs a comment to be understood usually needs a better name or a smaller function — fix that instead of narrating it.
+- Never restate what the code already says (`// increment the counter`, `// loop over the rows`, `// return the result`), never add section banners (`// ---- helpers ----`), and never add a doc block on top of every function/class/member just because it's public.
+- When a comment is genuinely warranted, it explains a **why** that the code cannot: a non-obvious invariant, or a workaround for an external bug whose cause is off-screen. **Hard cap: 2-4 lines.** If it doesn't fit, the explanation belongs in the commit message, the PR, or a design doc — not in the source.
+- That bar is high, and "it explains a why" is not self-justifying — it is the excuse every unwanted comment comes with. Before writing one, name the specific wrong conclusion a teammate would reach without it. If you cannot, there is no comment to write. **When in doubt, leave it out** — a reviewer asking for one comment is cheap, deleting the ones nobody asked for is not.
+- **Never explain where a statement sits.** A comment justifying that a call runs after (or before) some other code — "runs once X has populated Y", "must come before Z" — is narration: the order is in the source, and a reader who moves the call finds out from the tests. Ordering rationale goes in the commit message. This is the clause that gets abused most, so it is not a why that earns a comment.
+- **A comment is not part of implementing a change.** Finishing an edit is not an occasion to annotate it. If you find yourself writing prose about code you just wrote or just moved, that is the reflex this section exists to stop — delete it and move on.
+- **Never annotate the conventions in this file.** Several rules here mandate constructs that look odd out of context — the unreachable `break;` after a `return` in a `case`, unused parameters left plainly named, no `= default` in headers, `bioassert` in place of a check. They are house style and every reader knows them; `// unreachable`, `// intentionally unused`, `// see CLAUDE.md` is precisely the noise this section forbids.
+- Don't leave behind change-log narration (`// was previously X`, `// NEW:`, `// fixed bug where...`) — git history holds that.
+- Do not re-add comments a reviewer deleted, and don't add comments to untouched code you happen to be editing near.
+- `CODING_STYLE.md`'s snippets carry `//` markers (`// Good:`, `// Bad:`, `// Do something` bodies) to label the *examples*. They are not a model for how much to comment real code.
+- The one standing exception is the free-function layer at the top of `tools/*` drivers with a `main()`: one single-line description per helper. It does not extend to class methods, to library code under `storage/`, `query/`, `net/`, or to any file outside `tools/`.
+
 **Other rules:**
 - Never `using namespace` in headers
 - Never `using namespace std`
@@ -177,23 +368,26 @@ Key points:
 - Embedding operations (cosine_similarity, euclidean_distance) are implemented as functions through the EvalFunction path, not as binary operators. New computation operations on embeddings should follow the function pattern (Functions.h, EvalFunction, ColumnFunctions).
 - **Extract-then-render for inspection tools.** When building tools that consume a streaming/SAX source (e.g. `ParquetSaxVisitor` driving `ParquetReader`), don't print or serialize directly inside the visitor callbacks. Define a high-level, source-independent data structure (e.g. `ParquetSchema` with `ParquetSchemaField`), have the visitor populate it, and render in a separate step. The high-level object stays decoupled from the source format and can be queried, transformed, or rendered multiple ways.
 - **Visitor shared state lives in the caller.** For SAX-style visitors that produce or mutate a shared output object — including pipelines where one visitor extracts and a later visitor enriches (e.g., `ParquetSchemaExtractor` then `ParquetJsonDetector`) — construct the output in the caller and pass it to each visitor's constructor by reference. The visitor stores `T&` and mutates the shared object in callbacks; it does NOT own the object and does NOT expose a `getX()` accessor. The caller's flow then reads as one object flowing through a series of visitors.
+- **No optimisation in codegen.** `DBProgramGenerator` emits the straightforward, obviously-correct db-dialect form and nothing cleverer. Liveness / dead-column elimination, "is this variable read later", CSE, reordering, pushdown — all of it belongs in a dedicated MLIR pass over the emitted dialect, where the analysis runs on MLIR values, is reusable, and has one source of truth. Concretely: codegen may only ask questions about what it has already built ("which columns are bound and row-aligned at this insertion point" — `collectInFlightColumns`), never forward-looking ones ("will anyone read this again"), which would mean walking the AST ahead of the insertion point and maintaining a parallel dead-set beside the IR. Emit every column in flight and let a pass prune it. A straightforward emission that is wasteful is the correct output — note the pass that should improve it instead of improving it here. Avoid `live`/`dead` naming in codegen too; it implies an analysis that should not be there.
 
 ## Build/iteration workflow
 
 - During multi-turn iteration on a change (style feedback, API shape, refactors), **don't build after each edit**. Just write the edits and stop. Builds are slow and noisy; running them every micro-revision burns time. Only build when the user explicitly asks ("build" / "compile" / "run it") or signals the design is settled.
+- **Build only the affected target, never the whole tree for a test.** When the change is one unit test — writing it, fixing it, adding a case to it — build and run that test's target alone: `make -j8 test_query_ir_<name>`, then `./test/query/ir/<feature>/test_query_ir_<name>`. Do not run a bare `make -j8`. The same holds for any single binary you are fixing: name its target. A bare `make -j8` rebuilds the whole engine and every test binary for nothing.
 - Don't preface `make` with `cmake ..`. `make` already re-runs cmake when any tracked `CMakeLists.txt` has changed. Only run `cmake ..` after editing `CMakeLists.txt` / `dependencies.sh`, or when resetting the build directory.
-- **Make minimal, targeted edits — fix exactly what's asked.** When the request is narrow (a comment, a wording, one line), change only that and leave surrounding working code alone. Don't refactor an adjacent loop or rename things just because you're nearby (e.g. asked to fix a confusing comment over a loop, rewrite the comment — don't also convert the loop to `all_of`). It keeps diffs small and reviewable and respects the existing structure. If a larger refactor seems worthwhile, propose it separately and let the user decide rather than bundling it in.
+- **Make minimal, targeted edits — fix exactly what's asked.** When the request is narrow (a comment, a wording, one line), change only that and leave surrounding working code alone. Don't refactor an adjacent loop or rename things just because you're nearby (e.g. asked to fix a confusing comment over a loop, rewrite the comment — don't also convert the loop to `all_of`). It keeps diffs small and reviewable and respects the existing structure. If a larger refactor seems worthwhile, propose it separately and let the user decide rather than bundling it in. This rule is about *unrelated* changes. A refactor that the root-cause fix needs is part of the fix, not scope creep (see "Fix the root cause, in its most general form").
 
 ## Project context
 
 - **Partitioning** is on the near-term roadmap (as of 2026-05-04). Some customers have specifically asked for **METIS-style structural partitioning** (edge-cut minimization), not hash partitioning. Treat partitioning as a near-term constraint when discussing scale-out, not a future-optional.
 - The **replication / distribution** initiative is motivated by *both* (a) scaling beyond single-node memory (which forces partitioning) and (b) write availability across network partitions / regions (which motivates CRDT-style merge). The realistic landing point is a layered hybrid; evaluate any proposal against both goals.
 
-## CI / self-hosted runners
+## CI runners
 
-- macOS CI runs on a few **self-hosted minis that share one filesystem** (`/Users/m1`) across several runner instances (`actions-runner`, `actions-runner-2`, ...), with **no isolation** beyond each instance's own `_work` checkout. Linux self-hosted runners are containerized.
-- The `external/dependencies` build is cached on local disk and **shared across those instances** (`scripts/dep_cache.sh`, base `/Users/m1/actions-local-cache`). The dependency build bakes **absolute paths into the installed CMake/pkg-config files** (e.g. faiss's `BLAS_LIBRARIES=…/external/dependencies/lib/libopenblas.a`, LLVM/MLIR configs) pointing into the *building* instance's checkout. Each instance `git clean -ffdx`s its own checkout between jobs, so a consumer on a *different* instance imports a path that a concurrent checkout deletes mid-build — surfacing as `make: No rule to make target '…/libopenblas.a'`, and downstream as a misleading `delocate … FileNotFoundError: dist/turingdb-*.whl`. `scripts/dep_cache.sh publish` rewrites those baked paths to the canonical, never-git-cleaned cache location. The bug is non-deterministic (depends on whether a concurrent job on the publishing instance cleans during your build window), so reproductions need overlapping runs. Bump the macOS dependency cache key when changing how deps are built/cached, or stale poisoned entries persist.
-- Per-host serialization (port 6666, host-wide `pkill turingdb`, the shared dep cache) uses a kernel `flock` via `scripts/with_host_lock.py`, which the OS releases on process exit.
+- Linux x86 CI runs on **self-hosted runner containers** (`ubuntu-22.04-turing`, `ubuntu-24.04-turing`), several per host. The containers of a host share one cache directory, mounted at `/opt/actions-local-cache`, where `scripts/ci_cache.py` restores and saves `external/dependencies` and the reactome dataset. Bump the key's salt when changing how deps are built, or stale entries persist.
+- macOS CI runs on **GitHub-hosted larger runners** (`macos15`, `macos26`), one job at a time each. They cache `external/dependencies` with `actions/cache`, whose repo limit is 10 GB. Linux ARM runs on GitHub-hosted `ubuntu-*-arm` and caches `external/dependencies` with `actions/cache` the same way.
+- The dependency build bakes **absolute paths into its installed CMake/pkg-config files** (e.g. faiss's `BLAS_LIBRARIES=…/external/dependencies/lib/libopenblas.a`, the LLVM/MLIR configs). A cached tree is only valid at the checkout path it was built at.
+- Per-host serialization (port 6666, host-wide `pkill turingdb`) uses a kernel `flock` via `scripts/with_host_lock.py`, which the OS releases on process exit.
 
 ## Commit style
 
@@ -204,3 +398,26 @@ Commit messages are one short area-prefixed line, no body — e.g. `MLIR: implem
 ## PR style
 
 PR descriptions are one short sentence. Do not use the default `## Summary` / `## Test plan` template — no headers, no bullets, no checklists, no "Generated with Claude Code" footer. The title carries the detail; the body just states the intent in a sentence.
+
+### Explain the PRs you open
+
+**When you open a pull request, run `/pr-explain` on it before you hand it back.** The body
+stays the one sentence above. The explanation goes in a comment, so the two rules do not
+fight: the author's sentence says what the PR is for, and the comment gives a reviewer the
+shape of the change before they read a line of the diff.
+
+`/pr-explain` writes the comment in Matt Pocock's `pr` shape — Summary, Evidence, Merge
+Danger — over a PR Lens diagram of the change, and opens it with an `AI-generated summary`
+note. All three skills are vendored under `.claude/skills/`, so this needs nothing
+installed. It does need node 20.11 or later for the diagram; the skill finds one or says so
+and carries on without it.
+
+The diagram posts as a GitHub attachment. PR Lens can also publish an explorable canvas on
+`prlens.dev`, which is a third party, so the skill asks before every push and never pushes
+on its own. Say no and the comment keeps the attached diagrams.
+
+Two things it never does: it does not touch the PR body or title, and it posts nothing
+without a yes.
+
+For a stack of PRs, explain the ones a reviewer has to understand on their own. A stack
+of near-identical mechanical changes does not need one comment each.

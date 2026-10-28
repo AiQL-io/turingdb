@@ -11,11 +11,15 @@ target_link_libraries(fuzz_query_engine PRIVATE
     turing_db_parser_s
     turing_db_ast_s
     turing_db_analyzer_s
-    turing_db_plan_s
-    turing_db_optimizer_s
-    turing_db_pipeline_s
-    turing_db_interpreter_s
+    turing_db_ir_common_s
+    turing_db_ir_dbdialect_s
+    turing_db_ir_nldialect_s
+    turing_db_ir_storagedialect_s
+    turing_db_ir_exec_s
+    turing_db_ir_codegen_s
+    turing_db_frontend_cypher_s
     turing_db_query_common_s)
+target_include_directories(fuzz_query_engine PRIVATE ${MLIR_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS})
 
 add_executable(fuzz_csv_parser fuzz_csv_parser.cpp)
 target_link_libraries(fuzz_csv_parser PRIVATE
@@ -24,17 +28,23 @@ target_link_libraries(fuzz_csv_parser PRIVATE
     turing_db_memory_s
     turing_common_s)
 
-add_executable(fuzz_gml_importer fuzz_gml_importer.cpp)
-target_link_libraries(fuzz_gml_importer PRIVATE
-    turing_db_import_gml_s
-    turing_db_storage_s
-    turing_db_jobs_s
-    turing_common_s)
-
 add_executable(fuzz_http_parser fuzz_http_parser.cpp)
 target_link_libraries(fuzz_http_parser PRIVATE
+    turing_db_examples_s
+    turing_db_server_s
+    turing_db_tcp_server_s
+    turing_testenv_s
     turing_db_http_common_s
     turing_db_http_parser_s
+    nlohmann_json
+    turing_common_s)
+
+add_executable(fuzz_proto_parser fuzz_proto_parser.cpp)
+target_link_libraries(fuzz_proto_parser PRIVATE
+    turing_db_examples_s
+    turing_db_server_s
+    turing_db_proto_client_s
+    turing_testenv_s
     turing_common_s)
 
 endif() # NOT APPLE

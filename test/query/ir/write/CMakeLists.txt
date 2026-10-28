@@ -1,0 +1,62 @@
+add_ir_tests(test_query_ir_create_node_edge CreateNodeEdgeTest.cpp)
+
+add_call_v3_test(test_query_ir_create_with CreateWithTest.cpp)
+
+add_call_v3_test(test_query_ir_create_edge_property CreateEdgePropertyTest.cpp)
+
+add_call_v3_test(test_query_ir_match_created_edge MatchCreatedEdgeTest.cpp)
+
+add_call_v3_test(test_query_ir_match_created_edge_by_label MatchCreatedEdgeByLabelTest.cpp)
+
+add_call_v3_test(test_query_ir_match_created_edge_by_type_and_label MatchCreatedEdgeByTypeAndLabelTest.cpp)
+
+add_call_v3_test(test_query_ir_scan_created_entity ScanCreatedEntityTest.cpp)
+
+add_call_v3_test(test_query_ir_explore_created_edge ExploreCreatedEdgeTest.cpp)
+
+add_call_v3_test(test_query_ir_write_pattern_inline_where WritePatternInlineWhereTest.cpp)
+
+add_turing_test(test_query_ir_create_equivalence CreateEquivalenceTest.cpp)
+target_include_directories(test_query_ir_create_equivalence PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_delete_equivalence DeleteEquivalenceTest.cpp)
+target_include_directories(test_query_ir_delete_equivalence PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_optional_match_write OptionalMatchWriteTest.cpp)
+target_include_directories(test_query_ir_optional_match_write PRIVATE ${IR_TEST_DIR})
+
+# What a merge keys its entities on: the properties one spec names, told apart from
+# another's, and compared against the type the schema holds them as.
+add_turing_test(test_query_ir_union_write UnionWriteTest.cpp)
+
+add_turing_test(test_query_ir_create_return CreateReturnTest.cpp)
+
+# The ends each hop of a CREATE chain is written between.
+add_turing_test(test_query_ir_create_chain CreateChainTest.cpp)
+
+# DELETE of an entity the same query wrote, which the change holds as a pending write.
+add_turing_test(test_query_ir_delete_written DeleteWrittenTest.cpp)
+
+# The pending edges a submit checks its ends for, and the deleted ones it must not.
+add_turing_test(test_query_ir_deleted_pending_edge_conflict DeletedPendingEdgeConflictTest.cpp)
+
+add_turing_test(test_query_ir_written_list_property WrittenListPropertyTest.cpp)
+
+add_turing_test(test_query_ir_with_write WithWriteTest.cpp)
+
+add_turing_test(test_query_ir_create_then_delete CreateThenDeleteTest.cpp)
+target_include_directories(test_query_ir_create_then_delete PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_comprehension_created_entity ListComprehensionCreatedEntityTest.cpp)
+
+add_turing_test(test_query_ir_count_after_write CountAfterWriteTest.cpp)
+
+add_turing_test(test_query_ir_carry_created_entity CarryCreatedEntityTest.cpp)
+
+add_turing_test(test_query_ir_create_set CreateSetTest.cpp)
+
+add_turing_test(test_query_ir_uncommitted_write_count UncommittedWriteCountTest.cpp)
+
+add_turing_test(test_query_ir_match_after_delete MatchAfterDeleteTest.cpp)
+
+add_turing_test(test_query_ir_created_property_lookup CreatedPropertyLookupTest.cpp)

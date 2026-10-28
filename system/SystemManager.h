@@ -6,6 +6,8 @@
 #include <unordered_map>
 #include <vector>
 
+#include "DateTimeSpec.h"
+#include "DurationSpec.h"
 #include "EmbeddingsSpec.h"
 #include "GraphManager.h"
 
@@ -103,7 +105,9 @@ private:
     // Import graph from file
     Graph* importGraph(const fs::Path& path,
                        std::string_view graphName,
-                       const EmbeddingsSpec& embeddingSpecs);
+                       const EmbeddingsSpec& embeddingSpecs,
+                       const DateTimeSpec& dateTimeSpecs,
+                       const DurationSpec& durationSpecs);
 
     GraphFileType getGraphFileType(const fs::Path& graphPath) const;
 
@@ -119,10 +123,11 @@ private:
     ChangeResult<Change*> newChange(std::string_view graphName,
                                     CommitHash baseHash = CommitHash::head());
     ChangeResult<Change*> getChange(const Graph* graph, ChangeID changeID);
-    ChangeResult<void> submitChange(ChangeAccessor& accessor);
+    ChangeResult<void> submitChange(ChangeAccessor& accessor, SubmitMode mode = SubmitMode::MERGE);
     CommitResult<void> commitChange(ChangeAccessor& accessor);
     ChangeResult<void> deleteChange(ChangeAccessor& accessor, ChangeID changeID);
     void listChanges(std::vector<const Change*>& changes, const Graph* graph) const;
+    bool hasChanges() const;
 
     // DataPart merge
     DataPartMergeResult<void> mergeDataParts(Graph* graph);

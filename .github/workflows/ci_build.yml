@@ -22,8 +22,20 @@ on:
   workflow_dispatch:
 
 
+# PR runs and main pushes each share a group, so a new commit supersedes the run
+# still holding a runner. The run_id fallback gives every other run (release tags,
+# the nightlies calling this via workflow_call) a unique group, so they neither
+# cancel each other nor queue behind one another.
+concurrency:
+  group: ci-build-${{ github.workflow }}-${{ github.event.pull_request.number || (github.event_name == 'push' && github.ref) || github.run_id }}
+  cancel-in-progress: true
+
+
 jobs:
   build:
+    # GitHub runs pull_request workflows for every PR of a stack as if it targeted main. The
+    # top PR's tree holds every commit below it, so only the top one builds.
+    if: github.event.pull_request.stack == null || github.event.pull_request.stack.position == github.event.pull_request.stack.size
     strategy:
       # Don't cancel the whole matrix when one job fails: on the shared
       # self-hosted runners a single transient flake would otherwise cancel the
@@ -31,23 +43,40 @@ jobs:
       # trees and poison the per-OS cache. Letting jobs finish keeps caches clean.
       fail-fast: false
       matrix:
-        os: ${{ fromJson(inputs.os_list || '["ubuntu-24.04-turing", "macos15-turing"]') }}
+        # PR and main-push builds are Linux-only: macOS is the slow half of the
+        # matrix and has not caught a Linux-clean regression. macOS is still a
+        # shipped platform, built by the release matrix in ci_release.yml and by
+        # ci_full_matrix_build.yml, the pre-tag check to run before a release.
+        os: ${{ fromJson(inputs.os_list || '["ubuntu-24.04-turing"]') }}
         python_version: ${{ fromJson(inputs.python_version_list || '["3.14"]') }}
 
     # Each matrix.os value is the literal runner label it dispatches to: the ubuntu-*-turing
-    # and macos*-turing labels are self-hosted runners; ubuntu-*-arm are GitHub-hosted.
+    # and macos* labels are self-hosted runners; ubuntu-*-arm are GitHub-hosted.
     runs-on: ${{ matrix.os }}
 
-    # Cap build parallelism at 4 across every step. The shared self-hosted runners
-    # share host memory across instances, so -j nproc on the heavy LLVM/MLIR (and
-    # wheel) compiles trips the OOM killer ("Killed signal terminated program
-    # cc1plus"). BUILD_JOBS feeds dependencies.sh; CMAKE_BUILD_PARALLEL_LEVEL caps
-    # the scikit-build-core wheel build.
+    # Cap parallelism at 4 for the dependency build and the tests. The shared
+    # self-hosted runners share host memory across instances, so -j nproc on the
+    # heavy LLVM/MLIR compiles trips the OOM killer ("Killed signal terminated
+    # program cc1plus"). BUILD_JOBS feeds dependencies.sh; CTEST_PARALLEL_LEVEL
+    # caps the test run. The wheel build ignores CMAKE_BUILD_PARALLEL_LEVEL and
+    # runs make -j nproc.
     env:
       BUILD_JOBS: 4
       CMAKE_BUILD_PARALLEL_LEVEL: 4
+      CTEST_PARALLEL_LEVEL: 4
 
     steps:
+    # A runner with a host to itself sets HOST_BUILD_JOBS in its container
+    # environment, which replaces the cap above for the rest of the job.
+    - name: Use the host's build parallelism
+      if: runner.os == 'Linux'
+      run: |
+        if [ -n "${HOST_BUILD_JOBS:-}" ]; then
+          echo "BUILD_JOBS=$HOST_BUILD_JOBS" >> "$GITHUB_ENV"
+          echo "CMAKE_BUILD_PARALLEL_LEVEL=$HOST_BUILD_JOBS" >> "$GITHUB_ENV"
+          echo "CTEST_PARALLEL_LEVEL=$HOST_BUILD_JOBS" >> "$GITHUB_ENV"
+        fi
+
     # Only the disk-constrained GitHub-hosted Linux runners (the -arm labels)
     # need this. The self-hosted -turing containers are lean images that never
     # shipped the android/dotnet/haskell bloat this action strips, so it frees
@@ -95,7 +124,7 @@ jobs:
     # The GitHub-hosted ubuntu-*-arm runner images don't ship git-lfs, so the
     # lfs: true checkout below fails with "Unable to locate executable file:
     # git-lfs". Install it before checkout. The self-hosted ubuntu-*-turing and
-    # macos*-turing runners already have git-lfs, so scope this to the ARM labels.
+    # macos* runners already have git-lfs, so scope this to the ARM labels.
     - name: Install git-lfs (GitHub-hosted ARM)
       if: contains(matrix.os, 'arm')
       run: |
@@ -112,14 +141,17 @@ jobs:
     - name: Fetch tags
       run: git fetch --tags --force
 
+    # --force always checks the submodules out. A failed update leaves the ones it
+    # already cloned without a working tree, and on the persistent self-hosted
+    # workspaces a later plain update skips any whose HEAD is the recorded commit.
     - name: Checkout submodules (shallow)
       run: |
         attempt=1
         max_attempts=3
-        until git submodule update --init --depth 1 && \
+        until git submodule update --init --force --depth 1 && \
               git submodule foreach '
                 if [ "$name" != "external/AFLplusplus" ]; then
-                    git submodule update --init --recursive --depth 1
+                    git submodule update --init --force --recursive --depth 1
                 fi
               '; do
             if [ "$attempt" -ge "$max_attempts" ]; then
@@ -134,38 +166,37 @@ jobs:
     - name: Install uv
       uses: astral-sh/setup-uv@v3
 
-    # Both the self-hosted Linux runner containers and the macOS minis use a
-    # local on-disk cache instead of the GitHub-hosted cache (no cache egress).
-    # The cache dir is pre-provisioned per runner: /opt/actions-local-cache in
-    # the Linux runner containers, /Users/m1/actions-local-cache on the minis.
-    - name: Cache dependencies (Linux)
-      id: cache-dependencies-linux
-      if: runner.os == 'Linux'
-      uses: corca-ai/local-cache@v2
-      with:
-        base: /opt/actions-local-cache
-        path: external/dependencies
-        # The salt busts poisoned entries: fail-fast-cancelled jobs saved
-        # partial external/dependencies trees (e.g. missing curl) under this
-        # per-OS key, which later cache-hit jobs then restored and failed on at
-        # find_package. Bump the salt to discard them and re-save a clean tree
-        # (with fail-fast disabled, jobs now run to completion so caches stay clean).
-        key: ${{ matrix.os }}-dependencies-v3-${{ hashFiles('install_build_tools.sh', 'dependencies.sh', '.gitmodules', 'build.sh') }}
+    # hashFiles does not see submodule bumps, and the dependencies are built from the submodules.
+    - name: Hash submodule commits
+      id: submodules
+      run: echo "hash=$(git ls-tree -r HEAD | awk '$2 == "commit"' | git hash-object --stdin)" >> "$GITHUB_OUTPUT"
 
-    # The macOS minis share one cache base across several runner instances, and
-    # corca-ai/local-cache symlinks external/dependencies straight into that
-    # shared base while populating it with a non-atomic mv. A job could thus link
-    # against a half-published tree and fail (e.g. a missing libopenblas.a).
-    # Serialize restore and publish under the same per-host flock the regress
-    # step uses, so a job never symlinks into an in-progress publish.
-    - name: Restore dependency cache (macOS)
-      id: cache-dependencies-macos
-      if: runner.os == 'macOS'
-      run: |
-        python3 scripts/with_host_lock.py /tmp/turingdb-depcache.lock \
-          bash scripts/dep_cache.sh restore \
-          /Users/m1/actions-local-cache \
-          "${{ matrix.os }}-dependencies-${{ hashFiles('install_build_tools.sh', 'dependencies.sh', '.gitmodules', 'build.sh', 'scripts/dep_cache.sh') }}"
+    # The self-hosted Linux runner containers of a host share one cache directory
+    # on its disk, mounted at /opt/actions-local-cache (no cache egress), so a key
+    # one of them saves is restored by all of them. The macOS and -arm runners use
+    # the GitHub-hosted cache.
+    - name: Restore dependencies (self-hosted Linux)
+      id: cache-dependencies-self-hosted
+      if: runner.os == 'Linux' && contains(matrix.os, 'turing')
+      # The salt busts poisoned entries: fail-fast-cancelled jobs saved
+      # partial external/dependencies trees (e.g. missing curl) under this
+      # per-OS key, which later cache-hit jobs then restored and failed on at
+      # find_package. Bump the salt to discard them and re-save a clean tree
+      # (with fail-fast disabled, jobs now run to completion so caches stay clean).
+      run: >-
+        python3 scripts/ci_cache.py restore
+        --base /opt/actions-local-cache
+        --path external/dependencies
+        --clean-key ${{ matrix.os }}-dependencies-
+        --key ${{ matrix.os }}-dependencies-v5-${{ hashFiles('install_build_tools.sh', 'dependencies.sh', '.gitmodules') }}-${{ steps.submodules.outputs.hash }}
+
+    - name: Restore dependencies (GitHub-hosted)
+      id: cache-dependencies-github-hosted
+      if: ${{ !(runner.os == 'Linux' && contains(matrix.os, 'turing')) }}
+      uses: actions/cache/restore@v4
+      with:
+        path: external/dependencies
+        key: ${{ matrix.os }}-dependencies-${{ hashFiles('install_build_tools.sh', 'dependencies.sh', '.gitmodules') }}-${{ steps.submodules.outputs.hash }}
 
     - name: Install build tools
       run: ./install_build_tools.sh
@@ -173,15 +204,23 @@ jobs:
     - name: Build dependencies
       run: ./dependencies.sh
       env:
-        SKIP_BUILD_IF_CACHED: ${{ steps.cache-dependencies-linux.outputs.cache-hit || steps.cache-dependencies-macos.outputs.cache-hit }}
+        SKIP_BUILD_IF_CACHED: ${{ steps.cache-dependencies-self-hosted.outputs.cache-hit || steps.cache-dependencies-github-hosted.outputs.cache-hit }}
 
-    - name: Publish dependency cache (macOS)
-      if: runner.os == 'macOS' && steps.cache-dependencies-macos.outputs.cache-hit != 'true'
-      run: |
-        python3 scripts/with_host_lock.py /tmp/turingdb-depcache.lock \
-          bash scripts/dep_cache.sh publish \
-          /Users/m1/actions-local-cache \
-          "${{ matrix.os }}-dependencies-${{ hashFiles('install_build_tools.sh', 'dependencies.sh', '.gitmodules', 'build.sh', 'scripts/dep_cache.sh') }}"
+    - name: Save dependencies (self-hosted Linux)
+      if: steps.cache-dependencies-self-hosted.outputs.cache-hit == 'false'
+      run: >-
+        python3 scripts/ci_cache.py save
+        --base /opt/actions-local-cache
+        --path external/dependencies
+        --key ${{ steps.cache-dependencies-self-hosted.outputs.key }}
+
+    # actions/cache only saves in its post step, and only when the whole job succeeds.
+    - name: Save dependencies (GitHub-hosted)
+      if: steps.cache-dependencies-github-hosted.outcome == 'success' && steps.cache-dependencies-github-hosted.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: external/dependencies
+        key: ${{ steps.cache-dependencies-github-hosted.outputs.cache-primary-key }}
 
     - name: Setup Python
       run: uv python install ${{ matrix.python_version }}
@@ -211,18 +250,20 @@ jobs:
       env:
         PYTHON_VERSION: ${{ matrix.python_version }}
         VERSION_OVERRIDE: ${{ steps.version.outputs.version }}
-
-    - name: Prepare SimpleDB
-      run: |
-        cd build/samples/simpledb
-        ./simpledb
-        mkdir -p $HOME/.turing/graphs
-        cp -r simpledb.out/simpledb $HOME/.turing/graphs
+        # setuptools_scm's `git describe --dirty` scans every submodule work tree. It takes
+        # 8-20 s on the macOS runners and has crossed the 40 s default there.
+        SETUPTOOLS_SCM_SUBPROCESS_TIMEOUT: 300
 
     - name: Run unit tests
       run: |
         cd build
         make test ARGS="--output-on-failure"
+
+    # Every unit test binary links the engine and MLIR statically, about 130 MB each:
+    # the 631 of them take 63 GB, and no later step runs them. Keeping them through
+    # regress filled the 150 GB disk of ubuntu-runner-aws1.
+    - name: Delete unit test binaries
+      run: find build/test -type f -perm -u+x -delete
 
     - name: Verify wheel installation
       run: |
@@ -245,16 +286,39 @@ jobs:
         aws-region: eu-west-2
 
     # The reactome regress test runs on Linux only (load_jsonl_reactome/run.sh
-    # skips on macOS), so reactome.jsonl is only ever downloaded on the Linux
-    # runners. Cache it there; there is nothing to cache on macOS. This stays on
-    # the GitHub-hosted cache (not the local on-disk cache used for deps above)
-    # because corca-ai/local-cache is directory-only and hard-fails on a
-    # single-file path like this one.
-    - name: Cache reactome dataset (Linux)
-      if: runner.os == 'Linux'
+    # skips on macOS). The self-hosted runners cache the dataset on local disk
+    # like the dependencies above, where a hit is a symlink rather than a 1.1 GB
+    # pull expanded to 14.9 GB. It gets its own directory because
+    # scripts/ci_cache.py caches directories.
+    - name: Restore reactome dataset (self-hosted Linux)
+      id: cache-reactome-self-hosted
+      if: runner.os == 'Linux' && contains(matrix.os, 'turing')
+      run: >-
+        python3 scripts/ci_cache.py restore
+        --base /opt/actions-local-cache
+        --path external/datasets/reactome
+        --key dataset-reactome-v1
+
+    - name: Download reactome dataset (self-hosted Linux)
+      if: steps.cache-reactome-self-hosted.outputs.cache-hit == 'false'
+      run: |
+        mkdir -p external/datasets/reactome
+        uv run --no-project --with boto3 python -c "import boto3; boto3.client('s3').download_file('turingdb-public', 'data/reactome.jsonl', 'external/datasets/reactome/reactome.jsonl')"
+
+    - name: Save reactome dataset (self-hosted Linux)
+      if: steps.cache-reactome-self-hosted.outputs.cache-hit == 'false'
+      run: >-
+        python3 scripts/ci_cache.py save
+        --base /opt/actions-local-cache
+        --path external/datasets/reactome
+        --key dataset-reactome-v1
+
+    # The GitHub-hosted ARM runners are ephemeral and have no local cache base.
+    - name: Cache reactome dataset (GitHub-hosted Linux)
+      if: runner.os == 'Linux' && !contains(matrix.os, 'turing')
       uses: actions/cache@v4
       with:
-        path: external/datasets/reactome.jsonl
+        path: external/datasets/reactome
         key: dataset-reactome-v1
 
     - name: Disk usage (before regress)
@@ -293,7 +357,7 @@ jobs:
     # .cache, .turing and /tmp) accumulate until the host disk fills. Reclaim
     # them at the end of every job, as if the container had been recreated.
     # Runs before the cache actions' post-steps, so it must never touch
-    # external/ (corca-ai/local-cache and actions/cache save it there).
+    # external/ (actions/cache saves it there).
     - name: Reclaim disk (self-hosted)
       if: always() && runner.os == 'Linux' && contains(matrix.os, 'turing')
       uses: ./.github/actions/clean-self-hosted-runner

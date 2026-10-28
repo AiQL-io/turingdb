@@ -66,8 +66,10 @@ DumpResult<void> SystemAccessor::loadCommit(std::string_view name, CommitHash ha
 
 Graph* SystemAccessor::importGraph(const fs::Path& path,
                                    std::string_view name,
-                                   const EmbeddingsSpec& embeddingSpecs) {
-    return _sysMan->importGraph(path, name, embeddingSpecs);
+                                   const EmbeddingsSpec& embeddingSpecs,
+                                   const DateTimeSpec& dateTimeSpecs,
+                                   const DurationSpec& durationSpecs) {
+    return _sysMan->importGraph(path, name, embeddingSpecs, dateTimeSpecs, durationSpecs);
 }
 
 GraphFileType SystemAccessor::getGraphFileType(const fs::Path& path) const {
@@ -86,8 +88,8 @@ ChangeResult<Change*> SystemAccessor::getChange(const Graph* graph, ChangeID cha
     return _sysMan->getChange(graph, changeID);
 }
 
-ChangeResult<void> SystemAccessor::submitChange(ChangeAccessor& accessor) {
-    return _sysMan->submitChange(accessor);
+ChangeResult<void> SystemAccessor::submitChange(ChangeAccessor& accessor, SubmitMode mode) {
+    return _sysMan->submitChange(accessor, mode);
 }
 
 CommitResult<void> SystemAccessor::commitChange(ChangeAccessor& accessor) {
@@ -100,6 +102,10 @@ ChangeResult<void> SystemAccessor::deleteChange(ChangeAccessor& accessor, Change
 
 void SystemAccessor::listChanges(std::vector<const Change*>& changes, const Graph* graph) const {
     _sysMan->listChanges(changes, graph);
+}
+
+bool SystemAccessor::hasChanges() const {
+    return _sysMan->hasChanges();
 }
 
 DataPartMergeResult<void> SystemAccessor::mergeDataParts(Graph* graph) {

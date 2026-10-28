@@ -1,0 +1,14 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "MATCH (n:Person) WITH n, 'x' AS k RETURN n.nosuchprop[k]",
+  "expect": {
+    "result": "n.nosuchprop[k]\nnull\nnull\nnull\nnull\nnull\nnull\nnull\nnull"
+  },
+  "tags": [
+    "map",
+    "key",
+    "dynamic"
+  ],
+  "write-required": false
+}

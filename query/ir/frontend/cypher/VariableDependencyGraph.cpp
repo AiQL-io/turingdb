@@ -3,22 +3,23 @@
 #include <algorithm>
 #include <ranges>
 #include <set>
+#include <span>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
-#include <spdlog/spdlog.h>
-
 #include "EdgePattern.h"
 #include "EntityPattern.h"
+#include "NodePattern.h"
 #include "VariableDependencyGraphDumper.h"
-#include "CypherAST.h"
-#include "SinglePartQuery.h"
 #include "Pattern.h"
 #include "PatternElement.h"
+#include "QuantifiedPath.h"
 #include "stmt/MatchStmt.h"
-#include "stmt/StmtContainer.h"
+#include "stmt/UnwindStmt.h"
+#include "decl/PatternData.h"
 #include "decl/VarDecl.h"
 
 #include "DependencyEdge.h"
@@ -26,6 +27,7 @@
 #include "VariableDependency.h"
 
 #include "BioAssert.h"
+#include "DiagnosticsManager.h"
 #include "FatalException.h"
 
 using namespace db;
@@ -50,47 +52,77 @@ static EdgeMetadata::EdgeType edgeTypeToNodeType(EdgeMetadata::EdgeType t) {
         return EdgeMetadata::EdgeType::GET_EDGE_TGT;
     } else if (t == EdgeMetadata::EdgeType::GET_IN_EDGES) {
         return EdgeMetadata::EdgeType::GET_EDGE_SRC;
+    } else if (t == EdgeMetadata::EdgeType::GET_EDGES) {
+        return EdgeMetadata::EdgeType::GET_EDGE_TGT;
     }
     throw FatalException(
         fmt::format("Unsure how to get node type for {}", EdgeTypeName::value(t)));
+}
+
+// The merge edges into one variable join its sources as a single variable, so a walk for
+// cycles takes the first of them as an edge and leaves the others out
+static bool standsForItsMerge(const DependencyEdge* edge) {
+    const VariableDependency::Edges& incoming = edge->tgt()->incoming();
+    const auto firstMerge = std::ranges::find_if(incoming, [](const DependencyEdge* e) { return e->isMetaEdge(); });
+
+    return *firstMerge == edge;
+}
+
+static bool joinsOverMerge(const VariableDependency* var, const VariableDependency* other) {
+    return std::ranges::any_of(var->edges(), [other](const DependencyEdge* e) {
+        return e->isMetaEdge() && (e->src() == other || e->tgt() == other);
+    });
 }
 
 VariableDependencyGraph::VariableDependencyGraph()
 {
 }
 
+void VariableDependencyGraph::setDiagnosticsManager(const DiagnosticsManager* diagnostics) {
+    _diagnostics = diagnostics;
+}
+
+void VariableDependencyGraph::throwError(std::string_view msg, const void* obj) const {
+    _diagnostics->throwError(msg, obj);
+}
+
 VariableDependencyGraph::~VariableDependencyGraph() {
 }
 
-void VariableDependencyGraph::buildFromAST(const CypherAST* ast) {
-    bioassert(ast->queries().size() == 1, "Single queries only.");
+VariableDependencyGraph::VariableDependencyGraph(VariableDependencyGraph&& other) = default;
 
-    const QueryCommand* query = ast->queries().front();
-    const auto* spq = dynamic_cast<const SinglePartQuery*>(query);
-    bioassert(spq, "Non-SinglePartQueries are not yet supported.");
+VariableDependencyGraph& VariableDependencyGraph::operator=(VariableDependencyGraph&& other) = default;
 
-    const StmtContainer* stmtsContainer = spq->getReadStmts();
-    if (!stmtsContainer) {
-        return;
-    }
-
-    const StmtContainer::Stmts& stmts = stmtsContainer->stmts();
-
+void VariableDependencyGraph::build(std::span<Stmt* const> stmts) {
     for (const Stmt* stmt : stmts) {
-        const auto* match = dynamic_cast<const MatchStmt*>(stmt);
-        if (!match) {
-            spdlog::warn("Non-match statement: skipped");
-            continue;
-        }
-
-        const Pattern* pattern = match->getPattern();
-        const Pattern::PatternElements& elements = pattern->elements();
-        for (const PatternElement* element : elements) {
-            registerPatternElement(element);
+        if (const MatchStmt* match = dynamic_cast<const MatchStmt*>(stmt)) {
+            const Pattern* pattern = match->getPattern();
+            const Pattern::PatternElements& elements = pattern->elements();
+            for (const PatternElement* element : elements) {
+                registerPatternElement(element);
+            }
+        } else if (const UnwindStmt* unwind = dynamic_cast<const UnwindStmt*>(stmt)) {
+            registerUnwindStmt(unwind);
         }
     }
 
     eliminateCycles();
+}
+
+VariableDependency* VariableDependencyGraph::registerBoundVariable(std::string_view name, const VarDecl* decl) {
+    VariableDependency* boundVar = &_vars.emplace_back(name, decl);
+    _boundVars.push_back(boundVar);
+
+    return boundVar;
+}
+
+void VariableDependencyGraph::clear() {
+    _vars.clear();
+    _edges.clear();
+    _anonymised.clear();
+    _edgeIdentities.clear();
+    _unwindSources.clear();
+    _boundVars.clear();
 }
 
 const DependencyEdge* VariableDependencyGraph::addDirected(VariableDependency* src,
@@ -127,8 +159,39 @@ void VariableDependencyGraph::registerPatternElement(const PatternElement* ptn) 
 
     const auto& chain = ptn->getElementChain();
 
+    // Two patterns sharing an edge variable are joined on identity; one element naming it
+    // twice is rejected instead, as no edge is two hops of one element.
+    std::vector<const VarDecl*> edgesInElement;
+
     VariableDependency* prev = originVar;
     for (const auto& [edge, tgtPtn] : chain) {
+        const VarDecl* edgeDecl = edge->getDecl();
+        bioassert(edgeDecl, "Edge pattern without declaration.");
+
+        const auto addEdgeInElement = [this, &edgesInElement](const EdgePattern* relationship) {
+            const VarDecl* relationshipDecl = relationship->getDecl();
+            if (!relationshipDecl) {
+                return;
+            }
+
+            const bool alreadyInElement =
+                std::ranges::find(edgesInElement, relationshipDecl) != edgesInElement.end();
+            if (alreadyInElement) {
+                throwError("Re-using the same edge variable in a single pattern is not supported", relationship);
+            }
+
+            edgesInElement.push_back(relationshipDecl);
+        };
+
+        if (edge->getQuantifiedPath()) {
+            const size_t hopCount = edge->getHopCount();
+            for (size_t hopIndex = 0; hopIndex < hopCount; hopIndex++) {
+                addEdgeInElement(edge->getHop(hopIndex));
+            }
+        } else {
+            addEdgeInElement(edge);
+        }
+
         VariableDependency* tgtVar = getOrCreateVariable(tgtPtn);
 
         const EdgePattern::Direction direction = edge->getDirection();
@@ -141,152 +204,199 @@ void VariableDependencyGraph::registerPatternElement(const PatternElement* ptn) 
         src = prev;
         tgt = tgtVar;
 
-        bioassert(edge->getDecl(), "Edge pattern without declaration.");
-        const std::string_view cypherEdgeName = edge->getDecl()->getName();
-        std::vector<VariableDependency*>& edgeOccurrences = _edgeIdentities[std::string(cypherEdgeName)];
-        std::string anonymousName;
-        anonymousName += cypherEdgeName;
-        anonymousName += '\'';
-        anonymousName += std::to_string(edgeOccurrences.size());
-        VariableDependency* edgeVar = newVariable(anonymousName);
-        edgeOccurrences.push_back(edgeVar);
+        const std::string_view cypherEdgeName = edgeDecl->getName();
 
-        addDirected(src, edgeVar, EdgeMetadata {edgeType});
+        // An edge the pattern leaves anonymous is one occurrence of one variable, so it
+        // joins nothing: only a variable the query named gets an identity, whose
+        // occurrences the code generator equates
+        VariableDependency* edgeVar = nullptr;
+        if (edgeDecl->isUnnamed()) {
+            edgeVar = newAnonymousVariable(edgeDecl);
+        } else {
+            std::vector<VariableDependency*>& edgeOccurrences = _edgeIdentities[edgeDecl];
+            std::string occurrenceName;
+            occurrenceName += cypherEdgeName;
+            occurrenceName += '\'';
+            occurrenceName += std::to_string(edgeOccurrences.size());
+            edgeVar = newVariable(occurrenceName);
+            edgeOccurrences.push_back(edgeVar);
+        }
+
+        const EdgePatternData* edgeData = edge->getData();
+        if (edgeData) {
+            edgeVar->setEdgeTypeConstraint(edgeData->edgeTypeConstraints());
+            edgeVar->addEdgeTypeExprConstraints(edgeData->edgeTypeExprConstraints());
+        }
+
+        // The quantifier rides the edge-producing dependency: the node it lands on is
+        // the end of the whole path, reached like the far end of any hop
+        const QuantifiedPath* quantified = edge->getQuantifiedPath();
+        if (quantified) {
+            const uint64_t minHops = static_cast<uint64_t>(quantified->getLhs());
+            const uint64_t maxHops = quantified->isRhsUnbounded()
+                                       ? EdgeMetadata::UNBOUNDED_HOPS
+                                       : static_cast<uint64_t>(quantified->getRhs());
+            addDirected(src, edgeVar, EdgeMetadata {edgeType, minHops, maxHops});
+        } else {
+            addDirected(src, edgeVar, EdgeMetadata {edgeType});
+        }
+
         addDirected(edgeVar, tgt, EdgeMetadata {otherType});
 
         prev = tgt;
     }
 }
 
-VariableDependency* VariableDependencyGraph::newVariable(const EntityPattern* entity) {
-    bioassert(entity->getDecl(), "Variable without declaration.");
-    return &_vars.emplace_back(std::string(entity->getDecl()->getName()));
+void VariableDependencyGraph::registerUnwindStmt(const UnwindStmt* stmt) {
+    const VarDecl* decl = stmt->getDecl();
+    bioassert(decl, "UNWIND without a declaration.");
+
+    // An UNWIND over an expression evaluated per row expands the rows already in flight,
+    // so its variable is bound where the statement is written rather than by a dataflow
+    // of its own - it is no root, and the graph does not carry it.
+    if (!stmt->unwindsLiteral()) {
+        return;
+    }
+
+    // A literal list depends on no other variable and enters the graph isolated - a root
+    // of its own connected component, whose dataflow the code generator opens from the
+    // list. The lookup is what registerPatternElement does: two variables of one
+    // declaration would leave every resolver picking one of them by container order.
+    VariableDependency* unwindVar = findVariable(decl);
+    if (!unwindVar) {
+        unwindVar = newVariable(decl);
+    }
+
+    _unwindSources[unwindVar] = stmt;
+}
+
+VariableDependency* VariableDependencyGraph::newVariable(const VarDecl* decl) {
+    return &_vars.emplace_back(decl->getName(), decl);
 }
 
 VariableDependency* VariableDependencyGraph::newVariable(std::string_view name) {
     return &_vars.emplace_back(name);
 }
 
-VariableDependency* VariableDependencyGraph::getOrCreateVariable(const EntityPattern* entity) {
-    bioassert(entity->getDecl(), "Variable with null declaration.");
-    const auto match = [entity](const VariableDependency& dep) {
-        return entity->getDecl()->getName() == dep.getName();
-    };
-    const auto foundIt = std::ranges::find_if(_vars, match);
-    const bool exists  = foundIt != _vars.end();
+VariableDependency* VariableDependencyGraph::newAnonymousVariable(const VarDecl* decl) {
+    std::string name;
+    name += decl->getName();
+    name += '\'';
 
-    return exists ? &*foundIt : newVariable(entity);
+    return &_vars.emplace_back(name, decl);
 }
 
-void VariableDependencyGraph::computeCycleBasis(std::vector<Cycle>& cycles) {
-    using VarSet = std::unordered_set<VariableDependency*>;
-    using PredMap = std::unordered_map<VariableDependency*, VariableDependency*>;
-    using VarToVarSet = std::unordered_map<VariableDependency*, VarSet>;
+VariableDependency* VariableDependencyGraph::findVariable(const VarDecl* decl) {
+    const auto match = [decl](const VariableDependency& dep) {
+        return dep.getDecl() == decl;
+    };
+    const auto foundIt = std::ranges::find_if(_vars, match);
 
-    cycles.clear();
+    return foundIt != _vars.end() ? &*foundIt : nullptr;
+}
 
-    if (_vars.empty()) {
-        return;
+VariableDependency* VariableDependencyGraph::getOrCreateVariable(const EntityPattern* entity) {
+    const VarDecl* decl = entity->getDecl();
+    bioassert(decl, "Variable with null declaration.");
+
+    // The name of an entity the pattern leaves anonymous is generated, and a Cypher alias
+    // can carry that spelling too - `WITH p AS v0` beside a `MATCH (v0)-->()` - so it is
+    // given a name of the graph's own, which no Cypher identifier can be
+    VariableDependency* var = findVariable(decl);
+    if (!var) {
+        var = decl->isUnnamed() ? newAnonymousVariable(decl) : newVariable(decl);
     }
 
-    // Persistent across iterations of outer loop
-    VarSet visited;
+    const NodePattern* node = dynamic_cast<const NodePattern*>(entity);
+    if (node) {
+        const NodePatternData* data = node->getData();
+        if (data) {
+            var->addLabelConstraints(data->labelConstraints());
+            var->addLabelExprConstraints(data->labelExprConstraints());
+        }
+    }
 
-    // @ref {pred, discovered, stack} are unique to each outer iteration
+    return var;
+}
 
-    PredMap pred; // Records spanning tree from its key
-    // If v is present in this map, then v is discovered.
-    // For a pair [v, set] in this map, the set used as value contains 2 types of vars:
-    // 1. The variable that "discovered" v
-    // 2. For a cycle v, ..., w, the set contains the other end of the
-    // cycle, w, stored to prevent reporting the same cycle twice at both ends
-    VarToVarSet discovered;
-    std::vector<VariableDependency*> stack;
+bool VariableDependencyGraph::findCycle(Cycle& cycle) {
+    struct Frame {
+        VariableDependency* _var {nullptr};
+        const DependencyEdge* _via {nullptr};
+        VariableDependency* _from {nullptr};
+    };
 
-    Cycle cycle;
+    std::unordered_map<const VariableDependency*, VariableDependency*> parents;
+    std::unordered_map<const VariableDependency*, size_t> depths;
 
-    // Outer loop ensures all connected components are traversed
-    for (VariableDependency& v : _vars) {
-        VariableDependency* root = &v;
-        if (visited.contains(root)) {
+    std::vector<Frame> stack;
+
+    for (VariableDependency& rootVar : _vars) {
+        VariableDependency* root = &rootVar;
+        if (depths.contains(root)) {
             continue;
         }
 
-        pred.clear();
-        discovered.clear();
-        stack.clear();
+        stack.push_back({root, nullptr, nullptr});
 
-        // Register this node as the root of the spanning tree
-        pred[root] = root;
-        // Register this node as being discovered, but by nothing since it is root
-        discovered[root] = {};
-
-        stack.push_back(root);
-
-        // DFS from the root of this connected component
         while (!stack.empty()) {
-            VariableDependency* u = stack.back();
+            const Frame frame = stack.back();
             stack.pop_back();
 
-            for (DependencyEdge* edge : u->edges()) {
-                VariableDependency* adj = edge->_src == u ? edge->_tgt : edge->_src;
-                bioassert(adj != u, "Invalid self loop.");
+            VariableDependency* var = frame._var;
+            if (depths.contains(var)) {
+                continue;
+            }
 
-                const bool encountered = discovered.contains(adj);
-                if (!encountered) {
-                    stack.push_back(adj);
-                    pred[adj] = u;
-                    discovered[adj] = {u};
+            parents[var] = frame._from;
+            depths[var] = frame._from ? depths[frame._from] + 1 : 0;
+
+            for (DependencyEdge* edge : var->edges()) {
+                const bool leftOut = edge->isMetaEdge() && !standsForItsMerge(edge);
+                if (leftOut || edge == frame._via) {
                     continue;
                 }
 
-                // Otherwise, already encountered: found a cycle.
-
-                const bool cycleAlreadyLogged = discovered[u].contains(adj);
-                if (cycleAlreadyLogged) {
+                VariableDependency* other = edge->_src == var ? edge->_tgt : edge->_src;
+                if (!depths.contains(other)) {
+                    stack.push_back({other, edge, var});
                     continue;
                 }
 
-                // Check for edge case for 2-element cycle, e.g. in (x)-->(x)
-                const bool parallelEdge = pred[adj] == u && pred.contains(adj);
-                if (parallelEdge) {
-                    cycles.push_back({u, adj});
-                    discovered[u].insert(adj);
-                    continue;
+                // The edge joins var to a variable the tree already holds: the cycle is the
+                // two tree paths up to where they meet, closed by this edge
+                std::vector<VariableDependency*> fromVar;
+                std::vector<VariableDependency*> fromOther;
+                VariableDependency* up = var;
+                VariableDependency* down = other;
+
+                while (depths[up] > depths[down]) {
+                    fromVar.push_back(up);
+                    up = parents[up];
                 }
 
-                cycle.clear();
-
-                // We have an edge (u, adj) such that adj was already
-                // discovered. discovered[adj] contains the node which first
-                // discovered adj.
-                const VarSet& adjDiscoverers = discovered[adj];
-                cycle.push_back(adj);
-                cycle.push_back(u);
-
-                // Trace back the predecessors in the spanning tree from the parent of u.
-                // Any node not in adjDiscoverers is part of the cycle. First node
-                // encountered in adjDiscoverers is the end of the cycle, as it is a
-                // node which leads to adj, just as u does.
-                VariableDependency* p = pred[u];
-                while (!adjDiscoverers.contains(p)) {
-                    cycle.push_back(p); // Element in the cycle
-                    p = pred[p];
+                while (depths[down] > depths[up]) {
+                    fromOther.push_back(down);
+                    down = parents[down];
                 }
-                // Add the element included in adjDiscoverers, the end of the cycle
-                cycle.push_back(p);
 
-                cycles.push_back(cycle);
-                // Record u as the cycle partner of adj to prevent reporting this
-                // cycle again
-                discovered[adj].insert(u);
+                while (up != down) {
+                    fromVar.push_back(up);
+                    fromOther.push_back(down);
+                    up = parents[up];
+                    down = parents[down];
+                }
+
+                cycle.assign(fromVar.begin(), fromVar.end());
+                cycle.push_back(up);
+                cycle.insert(cycle.end(), fromOther.rbegin(), fromOther.rend());
+
+                return true;
             }
         }
-
-        for (const auto& entry : pred) {
-            visited.insert(entry.first);
-        }
     }
+
+    return false;
 }
 
 void VariableDependencyGraph::detachCycle(const Cycle& cyc) {
@@ -301,9 +411,44 @@ void VariableDependencyGraph::detachCycle(const Cycle& cyc) {
     VariableDependency* u = *next(begin(cyc));
     VariableDependency* v = *prev(end(cyc));
 
+    const bool reachesUOverAHop = !joinsOverMerge(head, u);
+    const bool reachesVOverAHop = !joinsOverMerge(head, v);
+
     // Break the cycle by subdividing with a merge edge
-    subdivideWithMerge(u, head);
-    subdivideWithMerge(v, head);
+    if (reachesUOverAHop && reachesVOverAHop) {
+        const VariableDependency* uCopy = subdivideWithMerge(u, head);
+        const VariableDependency* vCopy = subdivideWithMerge(v, head);
+        bioassert(uCopy && vCopy, "Cycle through {} was not detached.", head->getName());
+
+        return;
+    }
+
+    // A merge edge is never split, so only the hop moves onto a copy, and the copy merges
+    // into what the head merges into: a copy of a copy would be a merge of one source
+    bioassert(reachesUOverAHop || reachesVOverAHop, "Cycle through {} has no hop at its head.", head->getName());
+    VariableDependency* hopEnd = reachesUOverAHop ? u : v;
+
+    VariableDependency* mergeTarget = head;
+    for (DependencyEdge* edge = findOutgoingMerge(mergeTarget); edge; edge = findOutgoingMerge(mergeTarget)) {
+        mergeTarget = edge->_tgt;
+    }
+
+    VariableDependency* copy = subdivideWithMerge(hopEnd, head);
+    bioassert(copy, "Cycle through {} was not detached.", head->getName());
+
+    if (mergeTarget != head) {
+        DependencyEdge* toHead = findOutgoingMerge(copy);
+        std::erase_if(copy->_outgoing, [toHead](DependencyEdge* e) { return e == toHead; });
+        std::erase_if(head->_incoming, [toHead](DependencyEdge* e) { return e == toHead; });
+
+        addDirected(copy, mergeTarget, EdgeMetadata(EdgeMetadata::EdgeType::MERGE));
+    }
+}
+
+DependencyEdge* VariableDependencyGraph::findOutgoingMerge(VariableDependency* var) {
+    const auto findIt = std::ranges::find_if(var->_outgoing, [](const DependencyEdge* e) { return e->isMetaEdge(); });
+
+    return findIt == var->_outgoing.end() ? nullptr : *findIt;
 }
 
 void VariableDependencyGraph::subdivideWithMergeOutImpl(VariableDependency* s,
@@ -330,6 +475,9 @@ void VariableDependencyGraph::subdivideWithMergeIncImpl(VariableDependency* s,
     addDirected(mid, t, EdgeMetadata(EdgeMetadata::EdgeType::MERGE));
 }
 
+// Both ends the subdivision leaves behind are merged into @param t and so hold exactly the
+// nodes it does: whatever constrains it constrains them, and constraining the end the walk
+// opens on is what lets that end be scanned by label rather than read off the whole graph
 VariableDependency* VariableDependencyGraph::subdivideWithMerge(VariableDependency* s,
                                                                 VariableDependency* t) {
     std::string buf;
@@ -339,6 +487,7 @@ VariableDependency* VariableDependencyGraph::subdivideWithMerge(VariableDependen
         if (findOut != end(s->_outgoing)) {
             getNextAnonymisation(t, buf);
             VariableDependency* mid = newVariable(buf);
+            mid->_constraints = t->_constraints;
             subdivideWithMergeOutImpl(s, mid, t, *findOut);
             return mid;
         }
@@ -350,6 +499,7 @@ VariableDependency* VariableDependencyGraph::subdivideWithMerge(VariableDependen
         if (findIn != end(s->_incoming)) {
             getNextAnonymisation(t, buf);
             VariableDependency* mid = newVariable(buf);
+            mid->_constraints = t->_constraints;
             subdivideWithMergeIncImpl(s, mid, t, *findIn);
             return mid;
         }
@@ -377,40 +527,54 @@ void VariableDependencyGraph::canonicaliseCycle(Cycle& cyc) {
         return std::ranges::any_of(v->incoming(), [](const DependencyEdge* e) {
             const EdgeMetadata::EdgeType type = e->data().type();
             return type == EdgeMetadata::EdgeType::GET_OUT_EDGES
-                || type == EdgeMetadata::EdgeType::GET_IN_EDGES;
+                || type == EdgeMetadata::EdgeType::GET_IN_EDGES
+                || type == EdgeMetadata::EdgeType::GET_EDGES;
         });
     };
     const auto inDegree = [](const VariableDependency* v) {
         return v->incoming().size();
     };
 
-    // Node variables must always rank above edge variables as the merge target.
-    // Within the same category, prefer higher in-degree.
-    const auto pivot = std::ranges::max_element(
-        cyc,
-        [&isEdgeVariable, &inDegree](auto&& a, auto&& b) {
-            const bool aIsEdge = isEdgeVariable(a);
-            const bool bIsEdge = isEdgeVariable(b);
-            if (aIsEdge != bIsEdge) {
-                return aIsEdge; // edge < node, so node wins max_element
-            }
-            return inDegree(a) < inDegree(b);
-        });
+    // A merge edge is never split into copies, so the merge target is the node with the
+    // most hops around the cycle, then the higher in-degree
+    const size_t cycleSize = cyc.size();
+    const auto rank = [&](size_t index) {
+        const VariableDependency* var = cyc[index];
+        const VariableDependency* before = cyc[(index + cycleSize - 1) % cycleSize];
+        const VariableDependency* after = cyc[(index + 1) % cycleSize];
 
+        const bool isNode = !isEdgeVariable(var);
+        const size_t hops = isNode ? !joinsOverMerge(var, before) + !joinsOverMerge(var, after) : 0;
+
+        return std::tuple(hops, isNode, inDegree(var));
+    };
+
+    size_t pivotIndex = 0;
+    for (size_t index = 1; index < cycleSize; index++) {
+        if (rank(pivotIndex) < rank(index)) {
+            pivotIndex = index;
+        }
+    }
+
+    const auto pivot = cyc.begin() + pivotIndex;
     std::ranges::rotate(cyc, pivot);
 }
 
 void VariableDependencyGraph::eliminateCycles() {
-    std::vector<Cycle> cycles;
-    computeCycleBasis(cycles);
-    if (cycles.empty()) {
-        return;
+    Cycle cycle;
+    bool detachedACycle = false;
+
+    // Detaching a cycle moves edges onto the merge copies it creates, so cycles sharing an
+    // edge are found one at a time in the graph the previous detach left
+    while (findCycle(cycle)) {
+        canonicaliseCycle(cycle);
+        detachCycle(cycle);
+        detachedACycle = true;
     }
 
-    std::ranges::for_each(cycles, [](auto& c) { canonicaliseCycle(c); });
-    std::ranges::for_each(cycles, [this](auto& c) { detachCycle(c); });
-
-    cascadeMerges();
+    if (detachedACycle) {
+        cascadeMerges();
+    }
 }
 
 void VariableDependencyGraph::cascadeMerges() {
@@ -441,7 +605,10 @@ void VariableDependencyGraph::cascadeMerges() {
     const auto isMeta = [](const DependencyEdge* e) { return e->isMetaEdge(); };
 
     std::string nameBuf;
-    for (VariableDependency& v : _vars) {
+
+    // newVariable appends to the deque, which invalidates its iterators but not its elements
+    for (size_t varIndex = 0; varIndex < _vars.size(); varIndex++) {
+        VariableDependency& v = _vars[varIndex];
         // For a variable which has more than 2 meta-edges, merge pairs into intermediate
         // nodes until every node has at exactly 0 or 2 incoming merge edges.
         while (std::ranges::count_if(v._incoming, isMeta) > 2) {

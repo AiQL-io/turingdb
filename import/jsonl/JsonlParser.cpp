@@ -1,16 +1,23 @@
 #include "JsonlParser.h"
 
+#include <stdint.h>
+
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <unordered_map>
 
 #include "ID.h"
 #include "JsonlImportResult.h"
+#include "list/ListContainer.h"
+#include "list/ListView.h"
+#include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
 #include "versioning/ChangeAccessor.h"
 #include "versioning/CommitBuilder.h"
 #include "writers/DataPartBuilder.h"
 
+#include "DateTimeSpec.h"
+#include "DurationSpec.h"
 #include "EmbeddingsSpec.h"
 
 #include "Profiler.h"
@@ -53,6 +60,36 @@ namespace {
     }
 }
 
+JsonlImportResult<NodeID> tryResolveEndpoint(const json& endpoint,
+                                             const std::unordered_map<uint64_t, NodeID>& nodeIDs,
+                                             bool isSource,
+                                             size_t lineNumber) {
+    const json* id = &endpoint;
+    if (endpoint.is_object()) {
+        const auto idIt = endpoint.find("id");
+        if (idIt == endpoint.end()) {
+            const JsonlImportErrorType missingIDError =
+                isSource ? JsonlImportErrorType::MISSING_EDGE_SRC_ID
+                         : JsonlImportErrorType::MISSING_EDGE_TGT_ID;
+            return JsonlImportError::result(missingIDError, lineNumber);
+        }
+
+        id = &*idIt;
+    }
+
+    const uint64_t fileID = parseEntityID(*id);
+    const auto nodeIt = nodeIDs.find(fileID);
+    if (nodeIt == nodeIDs.end()) {
+        const JsonlImportErrorType unknownIDError =
+            isSource ? JsonlImportErrorType::UNKNOWN_EDGE_SRC_ID
+                     : JsonlImportErrorType::UNKNOWN_EDGE_TGT_ID;
+        return JsonlImportError::result(unknownIDError, lineNumber,
+                                        fmt::format("node id {}", fileID));
+    }
+
+    return nodeIt->second;
+}
+
 JsonlImportResult<void> tryFillEmbedding(const json& arr,
                                          std::vector<float>& storage,
                                          size_t expectedDim,
@@ -77,6 +114,88 @@ JsonlImportResult<void> tryFillEmbedding(const json& arr,
     return {};
 }
 
+// Copies a JSON array into @param lists as a list value, nested arrays and all. An element
+// with no list counterpart - an object - is stored as its JSON text, the fallback a
+// property of that shape already takes.
+ListView fillList(const json& array, ListContainer& lists) {
+    std::vector<ListContainer::ListItemVariant> elements;
+    elements.reserve(array.size());
+
+    // The views above name characters this owns, and the reservation keeps them put until
+    // the container copies them in.
+    std::vector<std::string> dumped;
+    dumped.reserve(array.size());
+
+    for (const json& element : array) {
+        if (element.is_array()) {
+            elements.push_back(fillList(element, lists));
+        } else if (element.is_null()) {
+            elements.push_back(PropertyNull {});
+        } else if (element.is_number_float()) {
+            elements.push_back(element.get<double>());
+        } else if (element.is_boolean()) {
+            elements.push_back(types::Bool::Primitive(element.get<bool>()));
+        } else if (element.is_number()) {
+            elements.push_back(element.get<int64_t>());
+        } else if (element.is_string()) {
+            elements.push_back(element.get<std::string_view>());
+        } else {
+            elements.push_back(types::String::Primitive {dumped.emplace_back(element.dump())});
+        }
+    }
+
+    return lists.insert(elements);
+}
+
+// The instant a property the query named as a datetime holds. A name it did not is left
+// alone, so a string that happens to read as a date stays the text it was written as.
+JsonlImportResult<std::optional<DateTime>> tryGetDateTime(std::string_view name,
+                                                          const json& value,
+                                                          const DateTimeSpec& dateTimeSpecs,
+                                                          size_t lineNo) {
+    if (!dateTimeSpecs.contains(name)) {
+        return std::optional<DateTime> {};
+    }
+
+    // The query said this property holds an instant, so a value that names none is the
+    // malformed input it reports rather than a property silently written as something
+    // else. A null is not such a value - the caller drops it before reaching here.
+    if (!value.is_string()) {
+        return JsonlImportError::result(JsonlImportErrorType::NON_DATETIME_VALUE,
+                                        lineNo,
+                                        fmt::format("property '{}' is not a string", name));
+    }
+
+    const std::string_view text = value.get<std::string_view>();
+    const std::optional<DateTime> instant = DateTime::parse(text);
+    if (!instant) {
+        return JsonlImportError::result(JsonlImportErrorType::NON_DATETIME_VALUE,
+                                        lineNo,
+                                        fmt::format("property '{}' reads '{}'", name, text));
+    }
+
+    return instant;
+}
+
+JsonlImportResult<std::optional<Duration>> tryGetDuration(std::string_view name,
+                                                          const json& value,
+                                                          const DurationSpec& durationSpecs,
+                                                          size_t lineNumber) {
+    if (!durationSpecs.contains(name)) {
+        return std::optional<Duration> {};
+    }
+
+    const bool isUnsignedPastInt64 = value.is_number_unsigned()
+                                  && value.get<uint64_t>() > static_cast<uint64_t>(INT64_MAX);
+    if (!value.is_number_integer() || isUnsignedPastInt64) {
+        return JsonlImportError::result(JsonlImportErrorType::NON_DURATION_VALUE,
+                                        lineNumber,
+                                        fmt::format("property '{}' reads '{}'", name, value.dump()));
+    }
+
+    return std::optional<Duration> {Duration(value.get<int64_t>())};
+}
+
 std::optional<size_t> tryGetEmbDim(std::string_view name,
                                    const json& value,
                                    const EmbeddingsSpec& embeddingSpecs) {
@@ -95,7 +214,9 @@ std::optional<size_t> tryGetEmbDim(std::string_view name,
 
 JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                                            std::istream& stream,
-                                           const EmbeddingsSpec& embeddingSpecs) {
+                                           const EmbeddingsSpec& embeddingSpecs,
+                                           const DateTimeSpec& dateTimeSpecs,
+                                           const DurationSpec& durationSpecs) {
     Profile profile("JsonlParser::parse");
 
     std::string line;
@@ -109,9 +230,16 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
     LabelSet labelset;
 
     std::vector<float> embBacking;
+    ListContainer listBacking;
 
     while (std::getline(stream, line)) {
         ++lineNumber;
+
+        // Each list the last line built has been copied into the datapart, so the scratch
+        // is released here rather than growing into a second copy of the whole file.
+        if (listBacking.size() > 0) {
+            listBacking.clear();
+        }
 
         // If empty line, skip
         if (line.empty()) {
@@ -170,7 +298,30 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                         }
                         const bool valueIsEmbedding = embDim.has_value();
 
-                        if (value.is_number_float()) {
+                        if (value.is_null()) {
+                            continue;
+                        }
+
+                        const JsonlImportResult<std::optional<DateTime>> instant =
+                            tryGetDateTime(ptName, value, dateTimeSpecs, lineNumber);
+                        if (!instant) {
+                            return instant.get_unexpected();
+                        }
+
+                        const JsonlImportResult<std::optional<Duration>> duration =
+                            tryGetDuration(ptName, value, durationSpecs, lineNumber);
+                        if (!duration) {
+                            return duration.get_unexpected();
+                        }
+
+                        const bool valueIsDateTime = instant.value().has_value();
+                        const bool valueIsDuration = duration.value().has_value();
+
+                        if (valueIsDateTime) {
+                            vt = ValueType::DateTime;
+                        } else if (valueIsDuration) {
+                            vt = ValueType::Duration;
+                        } else if (value.is_number_float()) {
                             vt = ValueType::Double;
                         } else if (value.is_boolean()) {
                             vt = ValueType::Bool;
@@ -178,6 +329,8 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                             vt = ValueType::Int64;
                         } else if (valueIsEmbedding) {
                             vt = ValueType::Embedding;
+                        } else if (value.is_array()) {
+                            vt = ValueType::List;
                         } else {
                             vt = ValueType::String;
                         }
@@ -188,7 +341,11 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                             pt = metadataBuilder.getOrCreatePropertyType(ptName, vt);
                         }
 
-                        if (value.is_number_float()) {
+                        if (valueIsDateTime) {
+                            builder.addNodeProperty<types::DateTime>(nodeID, pt._id, *instant.value());
+                        } else if (valueIsDuration) {
+                            builder.addNodeProperty<types::Duration>(nodeID, pt._id, *duration.value());
+                        } else if (value.is_number_float()) {
                             builder.addNodeProperty<types::Double>(nodeID, pt._id, value.get<double>());
                         } else if (value.is_boolean()) {
                             builder.addNodeProperty<types::Bool>(nodeID, pt._id, value.get<bool>());
@@ -204,6 +361,8 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                             }
 
                             builder.addNodeProperty<types::Embedding>(nodeID, pt._id, embBacking);
+                        } else if (value.is_array()) {
+                            builder.addNodeProperty<types::List>(nodeID, pt._id, fillList(value, listBacking));
                         } else {
                             builder.addNodeProperty<types::String>(nodeID, pt._id, value.dump());
                         }
@@ -230,34 +389,17 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
 
                 EdgeTypeID edgeTypeID = metadataBuilder.getOrCreateEdgeType(edgeType->get<std::string_view>());
 
-                NodeID srcNodeID;
-                NodeID tgtNodeID;
-
-                if (start->is_object()) {
-                    const auto srcIDIt = start->find("id");
-
-                    if (srcIDIt == start->end()) {
-                        return JsonlImportError::result(JsonlImportErrorType::MISSING_EDGE_SRC_ID, lineNumber);
-                    }
-
-                    srcNodeID = nodeIDs.at(parseEntityID(*srcIDIt));
-                } else {
-                    srcNodeID = parseEntityID(*start);
+                const JsonlImportResult<NodeID> srcNodeID = tryResolveEndpoint(*start, nodeIDs, true, lineNumber);
+                if (!srcNodeID) {
+                    return srcNodeID.get_unexpected();
                 }
 
-                if (end->is_object()) {
-                    const auto tgtIDIt = end->find("id");
-
-                    if (tgtIDIt == end->end()) {
-                        return JsonlImportError::result(JsonlImportErrorType::MISSING_EDGE_TGT_ID, lineNumber);
-                    }
-
-                    tgtNodeID = nodeIDs.at(parseEntityID(*tgtIDIt));
-                } else {
-                    tgtNodeID = parseEntityID(*end);
+                const JsonlImportResult<NodeID> tgtNodeID = tryResolveEndpoint(*end, nodeIDs, false, lineNumber);
+                if (!tgtNodeID) {
+                    return tgtNodeID.get_unexpected();
                 }
 
-                const EdgeRecord& edge = builder.addEdge(edgeTypeID, srcNodeID, tgtNodeID);
+                const EdgeRecord& edge = builder.addEdge(edgeTypeID, srcNodeID.value(), tgtNodeID.value());
 
                 if (properties != obj.end()) {
                     for (const auto& [key, value] : properties->items()) {
@@ -271,7 +413,30 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                         }
                         const bool valueIsEmbedding = embDim.has_value();
 
-                        if (value.is_number_float()) {
+                        if (value.is_null()) {
+                            continue;
+                        }
+
+                        const JsonlImportResult<std::optional<DateTime>> instant =
+                            tryGetDateTime(ptName, value, dateTimeSpecs, lineNumber);
+                        if (!instant) {
+                            return instant.get_unexpected();
+                        }
+
+                        const JsonlImportResult<std::optional<Duration>> duration =
+                            tryGetDuration(ptName, value, durationSpecs, lineNumber);
+                        if (!duration) {
+                            return duration.get_unexpected();
+                        }
+
+                        const bool valueIsDateTime = instant.value().has_value();
+                        const bool valueIsDuration = duration.value().has_value();
+
+                        if (valueIsDateTime) {
+                            vt = ValueType::DateTime;
+                        } else if (valueIsDuration) {
+                            vt = ValueType::Duration;
+                        } else if (value.is_number_float()) {
                             vt = ValueType::Double;
                         } else if (value.is_boolean()) {
                             vt = ValueType::Bool;
@@ -279,6 +444,8 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                             vt = ValueType::Int64;
                         } else if (valueIsEmbedding) {
                             vt = ValueType::Embedding;
+                        } else if (value.is_array()) {
+                            vt = ValueType::List;
                         } else {
                             vt = ValueType::String;
                         }
@@ -289,7 +456,11 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                             pt = metadataBuilder.getOrCreatePropertyType(ptName, vt);
                         }
 
-                        if (value.is_number_float()) {
+                        if (valueIsDateTime) {
+                            builder.addEdgeProperty<types::DateTime>(edge, pt._id, *instant.value());
+                        } else if (valueIsDuration) {
+                            builder.addEdgeProperty<types::Duration>(edge, pt._id, *duration.value());
+                        } else if (value.is_number_float()) {
                             builder.addEdgeProperty<types::Double>(edge, pt._id, value.get<double>());
                         } else if (value.is_boolean()) {
                             builder.addEdgeProperty<types::Bool>(edge, pt._id, value.get<bool>());
@@ -305,6 +476,8 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                             }
 
                             builder.addEdgeProperty<types::Embedding>(edge, pt._id, embBacking);
+                        } else if (value.is_array()) {
+                            builder.addEdgeProperty<types::List>(edge, pt._id, fillList(value, listBacking));
                         } else {
                             builder.addEdgeProperty<types::String>(edge, pt._id, value.dump());
                         }

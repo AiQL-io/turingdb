@@ -13,6 +13,12 @@ enum class ListBufferTypeTag : uint8_t {
     String,
     Embedding,
     ListView,
+    Null,
+    NodeID,
+    EdgeID,
+    DateTime,
+    MapView,
+    Duration,
 
     INVALID,
 };

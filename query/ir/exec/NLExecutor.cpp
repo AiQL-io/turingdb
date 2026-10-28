@@ -1,0 +1,13264 @@
+#include "NLExecutor.h"
+
+#include <stdint.h>
+#include <algorithm>
+#include <bit>
+#include <cmath>
+#include <functional>
+#include <limits>
+#include <numeric>
+#include <queue>
+#include <span>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
+
+#include <spdlog/fmt/bundled/format.h>
+#include <llvm/Support/MathExtras.h>
+
+#include "TypeUtils.h"
+#include "columns/ContainerKind.h"
+#include "iterators/GetEdgesIterator.h"
+#include "ID.h"
+#include "iterators/GetEdgeTypesIterator.h"
+#include "iterators/GetInEdgesIterator.h"
+#include "iterators/GetInEdgesByTypeIterator.h"
+#include "iterators/GetInEdgesByLabelIterator.h"
+#include "iterators/GetInEdgesByTypeAndLabelIterator.h"
+#include "iterators/GetNodeLabelSetIterator.h"
+#include "iterators/GetOutEdgesIterator.h"
+#include "iterators/GetOutEdgesByTypeIterator.h"
+#include "iterators/GetOutEdgesByLabelIterator.h"
+#include "iterators/GetOutEdgesByTypeAndLabelIterator.h"
+#include "iterators/GetPropertiesWithNullIterator.h"
+#include "iterators/PathDistanceIndex.h"
+#include "iterators/PathExplorator.h"
+#include "iterators/PathTargetIndex.h"
+#include "iterators/PathHopFilter.h"
+#include "iterators/PathLabelHopFilter.h"
+#include "iterators/ReversedPathExplorator.h"
+#include "iterators/ScanEdgesByEndpointLabelsChunkWriter.h"
+#include "iterators/ScanEdgesByTypeIterator.h"
+#include "iterators/ScanEdgesIterator.h"
+#include "iterators/ScanInEdgesByTargetLabelIterator.h"
+#include "iterators/ScanOutEdgesBySourceLabelIterator.h"
+#include "iterators/ScanNodesIterator.h"
+#include "iterators/ScanNodesByLabelIterator.h"
+#include "columns/ColumnOptVector.h"
+#include "columns/ColumnMask.h"
+#include "columns/ColumnConst.h"
+#include "columns/ColumnCombinations.h"
+#include "columns/ColumnOperator.h"
+#include "columns/ColumnOperators.h"
+#include "columns/ColumnOperatorDispatcher.h"
+#include "columns/AllowedKinds.h"
+#include "columns/Functions.h"
+#include "columns/UnaryPredicates.h"
+#include "list/ListElementOrder.h"
+#include "list/ListUtils.h"
+#include "map/MapHash.h"
+#include "map/MapUtils.h"
+#include "list/PathTrie.h"
+#include "metadata/PropertyNull.h"
+#include "metadata/PropertyType.h"
+
+#include "reader/GraphReader.h"
+#include "versioning/CommitWriteBuffer.h"
+#include "versioning/PendingAdjacency.h"
+#include "views/GraphView.h"
+
+#include "CSVParser.h"
+
+#include "SystemAccessor.h"
+#include "SystemManager.h"
+#include "TuringConfig.h"
+#include "VecLibAccessor.h"
+#include "VectorDatabase.h"
+#include "VectorSearchQuery.h"
+#include "VectorSearchResult.h"
+
+#include "NLSystemContext.h"
+
+#include "NLProgram.h"
+#include "NLMergeExecutor.h"
+#include "NLPendingEdges.h"
+#include "NLPendingNodes.h"
+#include "NLPropertyValueScan.h"
+#include "NLWriteProperties.h"
+#include "NLWrittenValues.h"
+#include "NLPropertyFunctions.h"
+#include "NLMergeWorkingSet.h"
+#include "NLOutputSink.h"
+
+#include "LocalMemory.h"
+#include "IRException.h"
+#include "IRRange.h"
+#include "BioAssert.h"
+
+using namespace db;
+
+namespace {
+
+template <typename Handler>
+void dispatchIDChunkKind(NLChunkKind kind, Handler&& handler) {
+    switch (kind) {
+        case NLChunkKind::NodeID:
+            return handler.template operator()<NodeID>();
+        break;
+
+        case NLChunkKind::EdgeID:
+            return handler.template operator()<EdgeID>();
+        break;
+
+        case NLChunkKind::EdgeTypeID:
+            return handler.template operator()<EdgeTypeID>();
+        break;
+
+        case NLChunkKind::LabelID:
+            return handler.template operator()<LabelID>();
+        break;
+
+        case NLChunkKind::PropertyTypeID:
+            return handler.template operator()<PropertyTypeID>();
+        break;
+
+        case NLChunkKind::ValueTypeCode:
+            return handler.template operator()<ValueType>();
+        break;
+
+        default:
+            throw IRException("A nullable chunk of this element type is not an ID column");
+        break;
+    }
+}
+
+// The cursor an unwind loop and a list comprehension both walk: every (row, element) pair
+// of a source column in row order. A cell contributing nothing - a null, an empty list -
+// is skipped, so it emits no row. The cursor is local to the walk, so one nested in an
+// outer loop restarts on every one of its steps.
+class NLElementCursor {
+public:
+    NLElementCursor(const Column* source, NLUnwindElementCountFunction elementCount)
+        : _source(source),
+        _elementCount(elementCount),
+        _sourceRows(source->size())
+    {
+        openNextRow();
+    }
+
+    bool exhausted() const { return _sourceRow >= _sourceRows; }
+    size_t getRow() const { return _sourceRow; }
+    size_t getSourceRows() const { return _sourceRows; }
+
+    // Takes the next @param chunkSize pairs, or what is left of them: the source row each
+    // pair came from, and - for a source whose cells hold more than the element - which
+    // element of its cell the pair took, which the emit handler reads.
+    void fillChunk(size_t chunkSize, std::vector<size_t>& rows, std::vector<size_t>* positions) {
+        rows.clear();
+        if (positions) {
+            positions->clear();
+        }
+
+        while (rows.size() < chunkSize && !exhausted()) {
+            rows.push_back(_sourceRow);
+
+            if (positions) {
+                positions->push_back(_elementIndex);
+            }
+
+            _elementIndex++;
+
+            if (_elementIndex == _rowElements) {
+                skipRow();
+            }
+        }
+    }
+
+    void skipRow() {
+        _elementIndex = 0;
+        _sourceRow++;
+        openNextRow();
+    }
+
+private:
+    const Column* _source {nullptr};
+    NLUnwindElementCountFunction _elementCount {nullptr};
+    size_t _sourceRows {0};
+    size_t _sourceRow {0};
+    size_t _elementIndex {0};
+    size_t _rowElements {0};
+
+    void openNextRow() {
+        while (_sourceRow < _sourceRows) {
+            _rowElements = _elementCount(_source, _sourceRow);
+            if (_rowElements > 0) {
+                return;
+            }
+
+            _sourceRow++;
+        }
+    }
+};
+
+// The integers one row's range bounds span. A row with a null bound spans no list at all,
+// and one whose step walks away from its end spans the empty list.
+class NLRangeSpan {
+public:
+    // Returns false where a bound of @param row holds no value
+    bool read(const NLRangeBound& start, const NLRangeBound& end, const NLRangeBound& step, size_t row) {
+        const std::optional<types::Int64::Primitive> from = start._read(start._column, row);
+        const std::optional<types::Int64::Primitive> to = end._read(end._column, row);
+        const std::optional<types::Int64::Primitive> by =
+            step._column ? step._read(step._column, row) : std::optional<types::Int64::Primitive> {1};
+
+        const bool boundsPresent = from.has_value() && to.has_value() && by.has_value();
+        if (!boundsPresent) {
+            return false;
+        }
+
+        if (*by == 0) {
+            throw IRException("range() cannot count by a step of 0");
+        }
+
+        _windowFirst = 0;
+        _reversed = false;
+        _ascending = *by > 0;
+        _empty = _ascending ? *from > *to : *from < *to;
+        _first = static_cast<uint64_t>(*from);
+        _stride = _ascending ? static_cast<uint64_t>(*by) : 0 - static_cast<uint64_t>(*by);
+        _steps = countRangeSteps(*from, *to, *by);
+
+        return true;
+    }
+
+    // Narrows the span to the run a slice of its list keeps, as runListSlice cuts it, and
+    // counts that run out backwards where @param window is reversed. Returns false where a
+    // slice bound of @param row holds no value.
+    bool keepWindow(const NLRangeWindowBounds& window, size_t row) {
+        const NLRangeBound& from = window._from;
+        const NLRangeBound& to = window._to;
+
+        const std::optional<types::Int64::Primitive> lower =
+            from._column ? from._read(from._column, row) : std::optional<types::Int64::Primitive> {0};
+        const std::optional<types::Int64::Primitive> upper =
+            to._column ? to._read(to._column, row) : std::optional<types::Int64::Primitive> {};
+
+        const bool boundsPresent = lower.has_value() && (!to._column || upper.has_value());
+        if (!boundsPresent) {
+            return false;
+        }
+
+        _reversed = window._reversed;
+
+        if (_empty) {
+            return true;
+        }
+
+        // The list holds _steps + 1 integers, up to 2^64, so the run is located by its first
+        // and last positions, and a bound counting from the end by how far it stops short of it
+        uint64_t first = 0;
+        if (*lower >= 0) {
+            first = static_cast<uint64_t>(*lower);
+        } else {
+            const uint64_t shortOfLast = static_cast<uint64_t>(-(*lower + 1));
+            first = shortOfLast >= _steps ? 0 : _steps - shortOfLast;
+        }
+
+        const types::Int64::Primitive upperBound = upper.value_or(0);
+
+        uint64_t last = 0;
+        bool upperKeepsAny = true;
+        if (!to._column) {
+            last = _steps;
+        } else if (upperBound > 0) {
+            last = std::min(static_cast<uint64_t>(upperBound) - 1, _steps);
+        } else if (upperBound == 0) {
+            upperKeepsAny = false;
+        } else {
+            const uint64_t shortOfLast = static_cast<uint64_t>(-(upperBound + 1));
+            upperKeepsAny = shortOfLast < _steps;
+            last = upperKeepsAny ? _steps - shortOfLast - 1 : 0;
+        }
+
+        _empty = !upperKeepsAny || first > last;
+        _windowFirst = first;
+        _steps = _empty ? 0 : last - first;
+
+        return true;
+    }
+
+    bool isEmpty() const { return _empty; }
+    uint64_t getSteps() const { return _steps; }
+
+    // The stride can be wider than an int64 holds, so every integer is offset from the
+    // first unsigned
+    types::Int64::Primitive at(uint64_t position) const {
+        const uint64_t listPosition = _reversed ? _windowFirst + _steps - position : _windowFirst + position;
+        const uint64_t offset = listPosition * _stride;
+        return static_cast<types::Int64::Primitive>(_ascending ? _first + offset : _first - offset);
+    }
+
+private:
+    uint64_t _first {0};
+    uint64_t _stride {0};
+    uint64_t _steps {0};
+    uint64_t _windowFirst {0};
+    bool _ascending {true};
+    bool _empty {true};
+    bool _reversed {false};
+};
+
+// The cursor an unwind_range loop walks: every (row, integer) pair the bounds span, in row
+// order. It is local to the walk, so one nested in an outer loop restarts on every one of
+// its steps.
+class NLRangeCursor {
+public:
+    explicit NLRangeCursor(const NLUnwindRangeLoopData* loopData)
+        : _start(loopData->getStart()),
+        _end(loopData->getEnd()),
+        _step(loopData->getStep()),
+        _window(loopData->getWindow()),
+        _rowCount(_start._column->size())
+    {
+        const auto isRowAligned = [this](const NLRangeBound& bound) {
+            return !bound._column || bound._column->size() == _rowCount;
+        };
+
+        const bool boundsRowAligned = isRowAligned(_end) && isRowAligned(_step)
+                                   && isRowAligned(_window._from) && isRowAligned(_window._to);
+        bioassert(boundsRowAligned, "Bound columns of an unwind_range are not row-aligned.");
+
+        openNextRow();
+    }
+
+    bool exhausted() const { return _row >= _rowCount; }
+
+    // Takes the next @param chunkSize integers, or what is left of them, with the row each
+    // one came from. @param values is null where nothing reads the integers.
+    void fillChunk(size_t chunkSize, std::vector<std::optional<types::Int64::Primitive>>* values, std::vector<size_t>& rows) {
+        rows.resize(chunkSize);
+
+        size_t filled = 0;
+        while (filled < chunkSize && !exhausted()) {
+            const size_t room = chunkSize - filled;
+            const uint64_t remainingSteps = _span.getSteps() - _position;
+            const bool finishesRow = remainingSteps < room;
+            const size_t count = finishesRow ? static_cast<size_t>(remainingSteps) + 1 : room;
+
+            if (values) {
+                values->resize(filled + count);
+
+                for (size_t index = 0; index < count; index++) {
+                    (*values)[filled + index] = _span.at(_position + index);
+                }
+            }
+
+            std::fill_n(rows.begin() + filled, count, _row);
+            filled += count;
+
+            if (finishesRow) {
+                _row++;
+                openNextRow();
+            } else {
+                _position += count;
+            }
+        }
+
+        rows.resize(filled);
+    }
+
+private:
+    NLRangeBound _start;
+    NLRangeBound _end;
+    NLRangeBound _step;
+    NLRangeWindowBounds _window;
+    size_t _rowCount {0};
+    size_t _row {0};
+    uint64_t _position {0};
+    NLRangeSpan _span;
+
+    void openNextRow() {
+        _position = 0;
+
+        while (_row < _rowCount) {
+            const bool spansIntegers = _span.read(_start, _end, _step, _row)
+                                    && _span.keepWindow(_window, _row)
+                                    && !_span.isEmpty();
+            if (spansIntegers) {
+                return;
+            }
+
+            _row++;
+        }
+    }
+};
+
+// Copy a slice of a ListView's tagged scalars straight into a
+// ColumnVector<ListElementView> - the heterogeneous unwind's type-erased column.
+void fillListElementChunk(Column* output, const ListView list, size_t offset, size_t rows) {
+    ColumnVector<ListElementView>* typed = static_cast<ColumnVector<ListElementView>*>(output);
+    const std::span<const ListElementView> elements = list.elements();
+
+    std::vector<ListElementView>& raw = typed->getRaw();
+    raw.assign(elements.begin() + offset, elements.begin() + offset + rows);
+}
+
+// Fill a slice of a ListView into a nullable value column, extracting each element as
+// the homogeneous primitive. The homogeneous unwind's fast path, ported from
+// UnwindProcessor::fillHomogeneous onto the ColumnOptVector every other value-chunk
+// consumer reads; a null element names no type of its own and rides the column as an
+// absent cell.
+void fillHomogeneousChunk(Column* output, ValueType valueType, const ListView list, size_t offset, size_t rows) {
+    const std::span<const ListElementView> elements = list.elements();
+
+    const auto fill = [&]<SupportedType T>() {
+        using Primitive = typename T::Primitive;
+
+        ColumnOptVector<Primitive>* typed = static_cast<ColumnOptVector<Primitive>*>(output);
+
+        std::vector<std::optional<Primitive>>& raw = typed->getRaw();
+        raw.resize(rows);
+
+        // ListElementView::getAs reinterprets the element's bytes as the primitive
+        // without consulting its type tag, so check the tag against the one the
+        // primitive is stored under: a homogeneous unwind whose column type disagrees
+        // with its literals would otherwise read a value of the wrong type.
+        constexpr ListBufferTypeTag expectedTag = TypeToListBufferTag<Primitive>::Tag;
+
+        for (size_t index = 0; index < rows; index++) {
+            const ListElementView element = elements[offset + index];
+            const ListBufferTypeTag tag = element.getTag();
+
+            if (tag == ListBufferTypeTag::Null) {
+                raw[index] = std::nullopt;
+                continue;
+            }
+
+            bioassert(tag == expectedTag, "Unwound element does not have the unwind's value type.");
+
+            raw[index] = element.getAs<Primitive>();
+        }
+    };
+
+    ValueTypeDispatcher {valueType}.execute(fill);
+}
+
+// The list one row of an unwind source holds. A plain list column has one in every row; a
+// nullable one - a list read back out of a property - has none where the property is
+// absent, and those rows never reach an emit because the count function skips them.
+ListView sourceList(const ColumnVector<ListView>* source, size_t row) {
+    return source->getRaw()[row];
+}
+
+ListView sourceList(const ColumnOptVector<ListView>* source, size_t row) {
+    return *source->getRaw()[row];
+}
+
+// The rows one cell of a list column unwinds into: one per element, so an empty list
+// contributes none.
+size_t unwindListElementCount(const Column* source, size_t row) {
+    const auto* lists = static_cast<const ColumnVector<ListView>*>(source);
+    return (*lists)[row].size();
+}
+
+// The nullable sibling: an absent list unwinds into no row at all, as a null value does.
+size_t unwindOptListElementCount(const Column* source, size_t row) {
+    const std::optional<ListView>& list = static_cast<const ColumnOptVector<ListView>*>(source)->getRaw()[row];
+    return list.has_value() ? list->size() : 0;
+}
+
+// The rows one cell of a nullable value column unwinds into: the single row a present
+// value is, and none for a null - Cypher's UNWIND of a null.
+template <typename Primitive>
+size_t unwindOptElementCount(const Column* source, size_t row) {
+    const auto* values = static_cast<const ColumnOptVector<Primitive>*>(source);
+    return (*values)[row].has_value() ? 1 : 0;
+}
+
+// The rows one cell of a column holding a value in every row unwinds into: the single
+// row that value is.
+size_t unwindValueElementCount(const Column* source, size_t row) {
+    return 1;
+}
+
+// Copy the tagged elements one step covers out of a list column into the type-erased
+// element column: each output row is the element at its position in the list its source
+// row holds.
+template <typename SourceColumn>
+void unwindListElementEmit(const Column* source,
+                           const ColumnVector<size_t>* rows,
+                           const ColumnVector<size_t>* positions,
+                           Column* output) {
+    const SourceColumn* lists = static_cast<const SourceColumn*>(source);
+    const std::vector<size_t>& rowsRaw = rows->getRaw();
+    const std::vector<size_t>& positionsRaw = positions->getRaw();
+
+    std::vector<ListElementView>& outputRaw = static_cast<ColumnVector<ListElementView>*>(output)->getRaw();
+    outputRaw.resize(rowsRaw.size());
+
+    for (size_t index = 0; index < rowsRaw.size(); index++) {
+        outputRaw[index] = sourceList(lists, rowsRaw[index]).elements()[positionsRaw[index]];
+    }
+}
+
+// Copy the elements one step covers out of a list column into a typed value column: each
+// output row is the element at its position in the list its source row holds. The list's
+// element type is the column's, so every element either carries that type or is the null
+// a list built out of a column with an absent cell holds - the tag check is what holds a
+// list whose elements disagree with both to that promise.
+template <typename SourceColumn, typename Primitive>
+void unwindListValueEmit(const Column* source,
+                         const ColumnVector<size_t>* rows,
+                         const ColumnVector<size_t>* positions,
+                         Column* output) {
+    const SourceColumn* lists = static_cast<const SourceColumn*>(source);
+    const std::vector<size_t>& rowsRaw = rows->getRaw();
+    const std::vector<size_t>& positionsRaw = positions->getRaw();
+
+    std::vector<std::optional<Primitive>>& outputRaw = static_cast<ColumnOptVector<Primitive>*>(output)->getRaw();
+    outputRaw.resize(rowsRaw.size());
+
+    constexpr ListBufferTypeTag expectedTag = TypeToListBufferTag<Primitive>::Tag;
+
+    for (size_t index = 0; index < rowsRaw.size(); index++) {
+        const ListElementView element = sourceList(lists, rowsRaw[index]).elements()[positionsRaw[index]];
+        const ListBufferTypeTag tag = element.getTag();
+
+        if (tag == ListBufferTypeTag::Null) {
+            outputRaw[index] = std::nullopt;
+            continue;
+        }
+
+        bioassert(tag == expectedTag, "Unwound element does not have the unwound list's value type.");
+
+        outputRaw[index] = element.getAs<Primitive>();
+    }
+}
+
+// The entity sibling of unwindListValueEmit: an ID column spells a null entity as an
+// invalid ID, so the tagged null a list holds drains back into one rather than tripping
+// the tag check.
+template <typename SourceColumn, typename IDType>
+void unwindListValidIDEmit(const Column* source,
+                           const ColumnVector<size_t>* rows,
+                           const ColumnVector<size_t>* positions,
+                           Column* output) {
+    const SourceColumn* lists = static_cast<const SourceColumn*>(source);
+    const std::vector<size_t>& rowsRaw = rows->getRaw();
+    const std::vector<size_t>& positionsRaw = positions->getRaw();
+
+    std::vector<IDType>& outputRaw = static_cast<ColumnVector<IDType>*>(output)->getRaw();
+    outputRaw.resize(rowsRaw.size());
+
+    constexpr ListBufferTypeTag expectedTag = TypeToListBufferTag<IDType>::Tag;
+
+    for (size_t index = 0; index < rowsRaw.size(); index++) {
+        const ListElementView element = sourceList(lists, rowsRaw[index]).elements()[positionsRaw[index]];
+        const ListBufferTypeTag tag = element.getTag();
+
+        if (tag == ListBufferTypeTag::Null) {
+            outputRaw[index] = IDType {};
+            continue;
+        }
+
+        bioassert(tag == expectedTag, "Unwound element does not have the unwound list's entity type.");
+
+        outputRaw[index] = element.getAs<IDType>();
+    }
+}
+
+// The rows one tagged cell unwinds into: a tagged list its elements, a tagged null none,
+// and any other tagged scalar the single row it is.
+size_t taggedCellRowCount(const ListElementView element) {
+    const ListBufferTypeTag tag = element.getTag();
+
+    if (tag == ListBufferTypeTag::ListView) {
+        return element.getAs<ListView>().size();
+    }
+
+    return tag == ListBufferTypeTag::Null ? 0 : 1;
+}
+
+// The element one tagged cell gives up at @param position: that of the list it holds, or
+// the cell itself where it holds anything else.
+ListElementView taggedCellElement(const ListElementView element, size_t position) {
+    if (element.getTag() != ListBufferTypeTag::ListView) {
+        return element;
+    }
+
+    return element.getAs<ListView>().elements()[position];
+}
+
+size_t unwindTaggedElementCount(const Column* source, size_t row) {
+    const auto* elements = static_cast<const ColumnVector<ListElementView>*>(source);
+
+    return taggedCellRowCount((*elements)[row]);
+}
+
+// The nullable sibling: an absent cell contributes no row, as the tagged null it stands
+// for does.
+size_t unwindOptTaggedElementCount(const Column* source, size_t row) {
+    const auto* elements = static_cast<const ColumnOptVector<ListElementView>*>(source);
+    const std::optional<ListElementView>& element = (*elements)[row];
+
+    if (!element.has_value()) {
+        return 0;
+    }
+
+    return taggedCellRowCount(*element);
+}
+
+// Fill the element chunk from a type-erased column: a cell holding a nested list gives up
+// the element at this row's position, and any other cell is itself the element.
+void unwindTaggedElementEmit(const Column* source,
+                             const ColumnVector<size_t>* rows,
+                             const ColumnVector<size_t>* positions,
+                             Column* output) {
+    const std::vector<ListElementView>& elements = static_cast<const ColumnVector<ListElementView>*>(source)->getRaw();
+    const std::vector<size_t>& rowsRaw = rows->getRaw();
+    const std::vector<size_t>& positionsRaw = positions->getRaw();
+
+    std::vector<ListElementView>& outputRaw = static_cast<ColumnVector<ListElementView>*>(output)->getRaw();
+    outputRaw.resize(rowsRaw.size());
+
+    for (size_t index = 0; index < rowsRaw.size(); index++) {
+        outputRaw[index] = taggedCellElement(elements[rowsRaw[index]], positionsRaw[index]);
+    }
+}
+
+// The nullable sibling: only a present cell is drained, so every row the step covers holds
+// one and the element column carries no absent value.
+void unwindOptTaggedElementEmit(const Column* source,
+                                const ColumnVector<size_t>* rows,
+                                const ColumnVector<size_t>* positions,
+                                Column* output) {
+    const std::vector<std::optional<ListElementView>>& elements =
+        static_cast<const ColumnOptVector<ListElementView>*>(source)->getRaw();
+    const std::vector<size_t>& rowsRaw = rows->getRaw();
+    const std::vector<size_t>& positionsRaw = positions->getRaw();
+
+    std::vector<ListElementView>& outputRaw = static_cast<ColumnVector<ListElementView>*>(output)->getRaw();
+    outputRaw.resize(rowsRaw.size());
+
+    for (size_t index = 0; index < rowsRaw.size(); index++) {
+        outputRaw[index] = taggedCellElement(*elements[rowsRaw[index]], positionsRaw[index]);
+    }
+}
+
+template <typename Functor>
+Functor makeFunctor(NLExecutionContext* context, NLStepBuffers* memory) {
+    if constexpr (std::is_constructible_v<Functor, NLExecutionContext*, NLStepBuffers*>) {
+        return Functor(context, memory);
+    } else if constexpr (std::is_constructible_v<Functor, GraphView, QueryListBuffer*, const CommitWriteBuffer*>) {
+        return Functor(*context->getView(), &memory->listBuffer(), context->getWriteBuffer());
+    } else if constexpr (std::is_constructible_v<Functor, GraphView, StringBuffer*, const CommitWriteBuffer*>) {
+        return Functor(*context->getView(), &memory->stringBuffer(), context->getWriteBuffer());
+    } else if constexpr (std::is_constructible_v<Functor, GraphView, const CommitWriteBuffer*>) {
+        return Functor(*context->getView(), context->getWriteBuffer());
+    } else if constexpr (std::is_constructible_v<Functor, GraphView>) {
+        return Functor(*context->getView());
+    } else if constexpr (std::is_constructible_v<Functor, QueryListBuffer*, StringBuffer*>) {
+        return Functor(&memory->listBuffer(), &memory->stringBuffer());
+    } else if constexpr (std::is_constructible_v<Functor, QueryListBuffer*>) {
+        return Functor(&memory->listBuffer());
+    } else if constexpr (std::is_constructible_v<Functor, StringBuffer*>) {
+        return Functor(&memory->stringBuffer());
+    } else {
+        return Functor {};
+    }
+}
+
+template <typename Functor>
+void functionConstKernel(NLExecutionContext* context, Column* result, const Column* input, NLStepBuffers* memory) {
+    using Arg = typename Functor::ArgType;
+    using Res = typename Functor::ResultType;
+
+    auto* output = static_cast<ColumnConst<Res>*>(result);
+    Functor functor = makeFunctor<Functor>(context, memory);
+
+    if (const auto* typedInput = dynamic_cast<const ColumnConst<Arg>*>(input)) {
+        output->set(functor(typedInput->getRaw()));
+        return;
+    }
+
+    bioassert(false, "Function operand has an unexpected column type.");
+}
+
+// The constant whose single cell can be absent: the functor is handed the optional and
+// answers the absence itself, as functionNullReadingKernel hands it one per row.
+template <typename Functor>
+void functionOptConstKernel(NLExecutionContext* context, Column* result, const Column* input, NLStepBuffers* memory) {
+    using Arg = typename Functor::ArgType;
+    using Res = typename Functor::ResultType;
+
+    const auto* typedInput = dynamic_cast<const ColumnConst<std::optional<Arg>>*>(input);
+    bioassert(typedInput, "Function operand has an unexpected column type.");
+    auto* output = static_cast<ColumnConst<Res>*>(result);
+
+    Functor functor = makeFunctor<Functor>(context, memory);
+    output->set(functor(typedInput->getRaw()));
+}
+
+template <typename Functor, typename Element>
+void applyFunctionOverNullableConst(Functor& functor,
+                                    const ColumnConst<std::optional<Element>>* input,
+                                    ColumnConst<std::optional<TypeUtils::unwrap_optional_t<typename Functor::ResultType>>>* output) {
+    const std::optional<Element>& value = input->getRaw();
+    if (!value.has_value()) {
+        output->set(std::nullopt);
+        return;
+    }
+
+    output->set(functor(*value));
+}
+
+// The same constant for a function that does not read its own nulls: an absent cell
+// answers null, as functionOptKernel answers one per row.
+template <typename Functor>
+void functionNullableConstKernel(NLExecutionContext* context, Column* result, const Column* input, NLStepBuffers* memory) {
+    using Arg = typename Functor::ArgType;
+    using JustRes = TypeUtils::unwrap_optional_t<typename Functor::ResultType>;
+
+    auto* output = static_cast<ColumnConst<std::optional<JustRes>>*>(result);
+    Functor functor = makeFunctor<Functor>(context, memory);
+
+    if (const auto* typedInput = dynamic_cast<const ColumnConst<std::optional<Arg>>*>(input)) {
+        applyFunctionOverNullableConst(functor, typedInput, output);
+        return;
+    }
+
+    bioassert(false, "Function operand has an unexpected column type.");
+}
+
+template <typename Arg>
+bool isNullableConstantOf(const Column* input) {
+    return input->getKind() == ColumnConst<std::optional<Arg>>::staticKind();
+}
+
+// A null constant argument converts to a null result whatever the function; the
+// ColumnConst<PropertyNull> result already reads as null, so nothing is computed.
+void functionNullKernel(NLExecutionContext*, Column*, const Column*, NLStepBuffers*) {
+}
+
+template <typename Functor, typename Element>
+void applyFunctionOverVector(Functor& functor,
+                             const ColumnVector<Element>* input,
+                             ColumnVector<typename Functor::ResultType>* output) {
+    const auto& inputRaw = input->getRaw();
+    const size_t size = inputRaw.size();
+
+    output->resize(size);
+    auto& outputRaw = output->getRaw();
+
+    for (size_t row = 0; row < size; row++) {
+        outputRaw[row] = functor(inputRaw[row]);
+    }
+}
+
+// Whether a column holds one type-erased cell per row, which a list function reads
+// through its tagged counterpart rather than as the list column it was written against.
+bool readsTaggedCells(const Column* input) {
+    const ColumnKind::Code kind = input->getKind();
+
+    return kind == ColumnVector<ListElementView>::staticKind()
+        || kind == ColumnConst<ListElementView>::staticKind()
+        || kind == ColumnOptVector<ListElementView>::staticKind()
+        || kind == ColumnConst<std::optional<ListElementView>>::staticKind();
+}
+
+template <typename Functor>
+void functionVectorKernel(NLExecutionContext* context, Column* result, const Column* input, NLStepBuffers* memory) {
+    using Arg = typename Functor::ArgType;
+    using Res = typename Functor::ResultType;
+
+    auto* output = static_cast<ColumnVector<Res>*>(result);
+    Functor functor = makeFunctor<Functor>(context, memory);
+
+    if (const auto* typedInput = dynamic_cast<const ColumnVector<Arg>*>(input)) {
+        applyFunctionOverVector(functor, typedInput, output);
+        return;
+    }
+
+    bioassert(false, "Function operand has an unexpected column type.");
+}
+
+// A boolean chunk with no null is a mask, whose rows are the booleans the functor reads
+template <typename Functor>
+void functionMaskKernel(NLExecutionContext* context, Column* result, const Column* input, NLStepBuffers* memory) {
+    using Res = typename Functor::ResultType;
+
+    const std::vector<ColumnMask::Bool_t>& inputRaw = static_cast<const ColumnMask*>(input)->getRaw();
+    const size_t size = inputRaw.size();
+
+    ColumnVector<Res>* output = static_cast<ColumnVector<Res>*>(result);
+    output->resize(size);
+    auto& outputRaw = output->getRaw();
+
+    Functor functor = makeFunctor<Functor>(context, memory);
+    for (size_t row = 0; row < size; row++) {
+        outputRaw[row] = functor(types::Bool::Primitive {static_cast<bool>(inputRaw[row])});
+    }
+}
+
+// The nullable-input kernel of a function that reads its own nulls: the absent value goes
+// to the functor as it is, so the result rides the plain column its answers always fill.
+template <typename Functor>
+void functionNullReadingKernel(NLExecutionContext* context, Column* result, const Column* input, NLStepBuffers* memory) {
+    using Arg = typename Functor::ArgType;
+    using Res = typename Functor::ResultType;
+
+    const auto* typedInput = dynamic_cast<const ColumnOptVector<Arg>*>(input);
+    bioassert(typedInput, "Function operand has an unexpected column type.");
+    auto* output = static_cast<ColumnVector<Res>*>(result);
+
+    const auto& inputRaw = typedInput->getRaw();
+    const size_t size = inputRaw.size();
+
+    output->resize(size);
+    auto& outputRaw = output->getRaw();
+
+    Functor functor = makeFunctor<Functor>(context, memory);
+    for (size_t row = 0; row < size; row++) {
+        outputRaw[row] = functor(inputRaw[row]);
+    }
+}
+
+// The kernel serving a column of type-erased cells: a cell per row, the single cell a
+// constant is, or - what an index of a stored list answers, where the row may hold no
+// element at all - a cell that can be absent. The functor reads that absence itself, as it
+// reads the null a cell's own tag carries, so its answer fills a plain column either way.
+template <typename Functor>
+NLUnaryFunctionKernel selectTaggedCellFunction(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    using Arg = typename Functor::ArgType;
+    using Res = typename Functor::ResultType;
+
+    if (input->getKind() == ColumnConst<std::optional<Arg>>::staticKind()) {
+        result = memory->alloc<ColumnConst<Res>>();
+        return &functionOptConstKernel<Functor>;
+    }
+
+    if (input->getContainerKind() == ContainerKind::code<ColumnConst>()) {
+        result = memory->alloc<ColumnConst<Res>>();
+        return &functionConstKernel<Functor>;
+    }
+
+    if (inputNullable) {
+        result = memory->alloc<ColumnVector<Res>>();
+        return &functionNullReadingKernel<Functor>;
+    }
+
+    result = memory->alloc<ColumnVector<Res>>();
+    return &functionVectorKernel<Functor>;
+}
+
+// A value read out of a map carries its null in its own tag, so its column is never a
+// nullable one: a row per entry, or the single entry a constant is
+bool readsMapValues(const Column* input) {
+    const ColumnKind::Code kind = input->getKind();
+
+    return kind == ColumnVector<MapEntryView>::staticKind()
+        || kind == ColumnConst<MapEntryView>::staticKind();
+}
+
+template <typename Functor>
+NLUnaryFunctionKernel selectMapValueFunction(const Column* input, LocalMemory* memory, Column*& result) {
+    using Res = typename Functor::ResultType;
+
+    if (input->getContainerKind() == ContainerKind::code<ColumnConst>()) {
+        result = memory->alloc<ColumnConst<Res>>();
+        return &functionConstKernel<Functor>;
+    }
+
+    result = memory->alloc<ColumnVector<Res>>();
+    return &functionVectorKernel<Functor>;
+}
+
+// A node or edge an OPTIONAL MATCH did not match is an invalid ID, so a function reading
+// one produces a null rather than reading the graph at an ID that is not in it. The
+// entity sibling of functionOptKernel: the input is a plain ID column, which carries its
+// null in the ID itself instead of in an optional.
+template <typename Functor>
+void functionEntityKernel(NLExecutionContext* context, Column* result, const Column* input, NLStepBuffers* memory) {
+    using Arg = typename Functor::ArgType;
+    using Res = typename Functor::ResultType;
+    using JustRes = TypeUtils::unwrap_optional_t<Res>;
+
+    const auto* typedInput = dynamic_cast<const ColumnVector<Arg>*>(input);
+    bioassert(typedInput, "Function operand has an unexpected column type.");
+    auto* output = static_cast<ColumnOptVector<JustRes>*>(result);
+
+    const std::vector<Arg>& inputRaw = typedInput->getRaw();
+    const size_t size = inputRaw.size();
+
+    output->resize(size);
+    auto& outputRaw = output->getRaw();
+
+    Functor functor = makeFunctor<Functor>(context, memory);
+    for (size_t row = 0; row < size; row++) {
+        if (inputRaw[row].isValid()) {
+            outputRaw[row] = functor(inputRaw[row]);
+        } else {
+            outputRaw[row] = std::nullopt;
+        }
+    }
+}
+
+// The sibling of functionEntityKernel for a function whose answer is an entity too: a node
+// column spells its null as an invalid ID, so an unmatched edge writes one straight out
+// rather than needing a nullable column to hold it.
+template <typename Functor>
+void functionEntityToEntityKernel(NLExecutionContext* context, Column* result, const Column* input, NLStepBuffers* memory) {
+    using Arg = typename Functor::ArgType;
+    using Res = typename Functor::ResultType;
+
+    const auto* typedInput = dynamic_cast<const ColumnVector<Arg>*>(input);
+    bioassert(typedInput, "Function operand has an unexpected column type.");
+    auto* output = static_cast<ColumnVector<Res>*>(result);
+
+    const std::vector<Arg>& inputRaw = typedInput->getRaw();
+    const size_t size = inputRaw.size();
+
+    output->resize(size);
+    auto& outputRaw = output->getRaw();
+
+    Functor functor = makeFunctor<Functor>(context, memory);
+    for (size_t row = 0; row < size; row++) {
+        if (inputRaw[row].isValid()) {
+            outputRaw[row] = functor(inputRaw[row]);
+        } else {
+            outputRaw[row] = Res {};
+        }
+    }
+}
+
+template <typename Functor, typename Element>
+void applyFunctionOverOptVector(Functor& functor,
+                                const ColumnOptVector<Element>* input,
+                                ColumnOptVector<TypeUtils::unwrap_optional_t<typename Functor::ResultType>>* output) {
+    const auto& inputRaw = input->getRaw();
+    const size_t size = inputRaw.size();
+
+    output->resize(size);
+    auto& outputRaw = output->getRaw();
+
+    for (size_t row = 0; row < size; row++) {
+        if (inputRaw[row].has_value()) {
+            outputRaw[row] = functor(inputRaw[row].value());
+        } else {
+            outputRaw[row] = std::nullopt;
+        }
+    }
+}
+
+template <typename Functor>
+void functionOptKernel(NLExecutionContext* context, Column* result, const Column* input, NLStepBuffers* memory) {
+    using Arg = typename Functor::ArgType;
+    using Res = typename Functor::ResultType;
+    using JustRes = TypeUtils::unwrap_optional_t<Res>;
+
+    auto* output = static_cast<ColumnOptVector<JustRes>*>(result);
+    Functor functor = makeFunctor<Functor>(context, memory);
+
+    if (const auto* typedInput = dynamic_cast<const ColumnOptVector<Arg>*>(input)) {
+        applyFunctionOverOptVector(functor, typedInput, output);
+        return;
+    }
+
+    bioassert(false, "Function operand has an unexpected column type.");
+}
+
+// Whether a column holds this element, in any of the shapes a chunk column takes: a plain
+// vector, a nullable one, or a constant of either.
+template <typename Element>
+bool columnHoldsElement(const Column* column) {
+    return dynamic_cast<const ColumnVector<Element>*>(column)
+           || dynamic_cast<const ColumnVector<std::optional<Element>>*>(column)
+           || dynamic_cast<const ColumnConst<Element>*>(column)
+           || dynamic_cast<const ColumnConst<std::optional<Element>>*>(column);
+}
+
+// A conversion of a boolean reads a mask too, the chunk a boolean with no null is
+template <typename Element>
+bool columnHoldsConvertible(const Column* column) {
+    if constexpr (std::is_same_v<Element, types::Bool::Primitive>) {
+        if (column->getContainerKind() == ContainerKind::code<ColumnMask>()) {
+            return true;
+        }
+    }
+
+    return columnHoldsElement<Element>(column);
+}
+
+template <ColumnOperator Op>
+struct BinaryOpTraits;
+
+template <>
+struct BinaryOpTraits<OP_ADD> {
+    using Functor = Add;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryOperators::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_CONCAT> {
+    using Functor = Concat;
+};
+
+template <>
+struct BinaryOpTraits<OP_INDEX> {
+    using Functor = ListIndex;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryOperators::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_SUB> {
+    using Functor = Sub;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryOperators::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_MUL> {
+    using Functor = Mul;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryOperators::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_EQUAL> {
+    using Functor = Eq;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_NOT_EQUAL> {
+    using Functor = Ne;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_DIV> {
+    using Functor = Div;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryOperators::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_MOD> {
+    using Functor = Mod;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryOperators::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_POW> {
+    using Functor = Pow;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryOperators::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_GREATER_THAN> {
+    using Functor = Gt;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_LESS_THAN> {
+    using Functor = Lt;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_GREATER_THAN_OR_EQUAL> {
+    using Functor = Gte;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_LESS_THAN_OR_EQUAL> {
+    using Functor = Lte;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_AND> {
+    using Functor = And;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_OR> {
+    using Functor = Or;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_XOR> {
+    using Functor = Xor;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_STARTS_WITH> {
+    using Functor = StartsWith;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_ENDS_WITH> {
+    using Functor = EndsWith;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_CONTAINS> {
+    using Functor = Contains;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_IN> {
+    using Functor = In;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryPredicates::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_FUNC_COSINE_SIMILARITY> {
+    using Functor = CosineSimilarityFunction;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        ColumnFunctions::exec<CosineSimilarity>(result, lhs, rhs);
+    }
+};
+
+template <>
+struct BinaryOpTraits<OP_FUNC_EUCLIDEAN_DISTANCE> {
+    using Functor = EuclideanDistanceFunction;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        ColumnFunctions::exec<EuclideanDistance>(result, lhs, rhs);
+    }
+};
+
+template <ColumnOperator Op, typename ResCol, typename LhsCol, typename RhsCol>
+struct BinaryOpKernel {
+    static void run(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers*) {
+        BinaryOpTraits<Op>::exec(static_cast<ResCol*>(result),
+                                 static_cast<const LhsCol*>(lhs),
+                                 static_cast<const RhsCol*>(rhs));
+    }
+};
+
+template <typename ResCol, typename LhsCol, typename RhsCol>
+struct BinaryOpKernel<OP_CONCAT, ResCol, LhsCol, RhsCol> {
+    static void run(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers* mem) {
+        BinaryOperators::exec<Concat>(static_cast<ResCol*>(result),
+                                      static_cast<const LhsCol*>(lhs),
+                                      static_cast<const RhsCol*>(rhs),
+                                      Concat {&mem->stringBuffer(), &mem->listBuffer()});
+    }
+};
+
+template <typename Op, typename ResCol, typename LhsCol, typename RhsCol>
+void runArithmeticOp(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers* mem) {
+    BinaryOperators::exec<Op>(static_cast<ResCol*>(result),
+                              static_cast<const LhsCol*>(lhs),
+                              static_cast<const RhsCol*>(rhs),
+                              Op {&mem->listBuffer(), &mem->stringBuffer()});
+}
+
+template <typename ResCol, typename LhsCol, typename RhsCol>
+struct BinaryOpKernel<OP_ADD, ResCol, LhsCol, RhsCol> {
+    static void run(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers* mem) {
+        runArithmeticOp<Add, ResCol, LhsCol, RhsCol>(result, lhs, rhs, mem);
+    }
+};
+
+template <typename ResCol, typename LhsCol, typename RhsCol>
+struct BinaryOpKernel<OP_SUB, ResCol, LhsCol, RhsCol> {
+    static void run(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers* mem) {
+        runArithmeticOp<Sub, ResCol, LhsCol, RhsCol>(result, lhs, rhs, mem);
+    }
+};
+
+template <typename ResCol, typename LhsCol, typename RhsCol>
+struct BinaryOpKernel<OP_MUL, ResCol, LhsCol, RhsCol> {
+    static void run(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers* mem) {
+        runArithmeticOp<Mul, ResCol, LhsCol, RhsCol>(result, lhs, rhs, mem);
+    }
+};
+
+template <typename ResCol, typename LhsCol, typename RhsCol>
+struct BinaryOpKernel<OP_DIV, ResCol, LhsCol, RhsCol> {
+    static void run(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers* mem) {
+        runArithmeticOp<Div, ResCol, LhsCol, RhsCol>(result, lhs, rhs, mem);
+    }
+};
+
+template <typename ResCol, typename LhsCol, typename RhsCol>
+struct BinaryOpKernel<OP_MOD, ResCol, LhsCol, RhsCol> {
+    static void run(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers* mem) {
+        runArithmeticOp<Mod, ResCol, LhsCol, RhsCol>(result, lhs, rhs, mem);
+    }
+};
+
+template <ColumnOperator Op, typename ResCol, typename LhsCol, typename RhsCol>
+void applyBinaryOp(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers* mem) {
+    BinaryOpKernel<Op, ResCol, LhsCol, RhsCol>::run(result, lhs, rhs, mem);
+}
+
+template <ColumnOperator Op>
+struct BinaryOpSelector {
+    LocalMemory* _memory {nullptr};
+    Column* _result {nullptr};
+    NLBinaryFn _fn {nullptr};
+
+    template <typename LhsCol, typename RhsCol>
+    void operator()(const LhsCol*, const RhsCol*) {
+        using OpType = typename BinaryOpTraits<Op>::Functor;
+        using ResCol = ColumnCombination<OpType, LhsCol, RhsCol>;
+        using ResColType = ResCol::ResultColumnType;
+
+        _result = _memory->alloc<ResColType>();
+        _fn = &applyBinaryOp<Op, ResColType, LhsCol, RhsCol>;
+    }
+};
+
+template <typename Primitive, typename ResCol, typename LhsCol, typename RhsCol>
+void applyValueListIndex(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers* memory) {
+    BinaryOperators::exec<ValueListIndex<Primitive>>(static_cast<ResCol*>(result),
+                                                     static_cast<const LhsCol*>(lhs),
+                                                     static_cast<const RhsCol*>(rhs));
+}
+
+template <typename Primitive>
+struct ValueListIndexSelector {
+    LocalMemory* _memory {nullptr};
+    Column* _result {nullptr};
+    NLBinaryFn _fn {nullptr};
+
+    template <typename LhsCol, typename RhsCol>
+    void operator()(const LhsCol*, const RhsCol*) {
+        using ResCol = ColumnCombination<ValueListIndex<Primitive>, LhsCol, RhsCol>;
+        using ResColType = ResCol::ResultColumnType;
+
+        _result = _memory->alloc<ResColType>();
+        _fn = &applyValueListIndex<Primitive, ResColType, LhsCol, RhsCol>;
+    }
+};
+
+// The entity sibling of applyValueListIndex: an ID column spells a null entity as an
+// invalid ID, so a position past the end - or the tagged null a list holds for an entity
+// an OPTIONAL MATCH did not match - reads back as one rather than as an absent optional.
+template <typename IDType, typename LhsCol, typename RhsCol>
+void applyEntityListIndex(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers*) {
+    const auto& lists = static_cast<const LhsCol*>(lhs)->getRaw();
+    const RhsCol* indices = static_cast<const RhsCol*>(rhs);
+
+    std::vector<IDType>& ids = static_cast<ColumnVector<IDType>*>(result)->getRaw();
+    ids.assign(lists.size(), IDType {});
+
+    for (size_t row = 0; row < lists.size(); row++) {
+        std::optional<IDType> id;
+        if constexpr (std::is_same_v<LhsCol, ColumnOptVector<ListView>>) {
+            if (lists[row].has_value()) {
+                id = ValueListIndex<IDType> {}(*lists[row], (*indices)[row]);
+            }
+        } else {
+            id = ValueListIndex<IDType> {}(lists[row], (*indices)[row]);
+        }
+
+        if (id.has_value()) {
+            ids[row] = *id;
+        }
+    }
+}
+
+// A collect over a pattern variable gathers into a plain list column, and nodes() and
+// relationships() read a path into a nullable one: those are the shapes an entity is read
+// out of, and any other leaves the kernel unselected.
+template <typename IDType>
+struct EntityListIndexSelector {
+    LocalMemory* _memory {nullptr};
+    Column* _result {nullptr};
+    NLBinaryFn _fn {nullptr};
+
+    template <typename LhsCol, typename RhsCol>
+    void operator()(const LhsCol*, const RhsCol*) {
+        constexpr bool readsAListColumn = std::is_same_v<LhsCol, ColumnVector<ListView>>
+                                       || std::is_same_v<LhsCol, ColumnOptVector<ListView>>;
+        if constexpr (readsAListColumn) {
+            _result = _memory->alloc<ColumnVector<IDType>>();
+            _fn = &applyEntityListIndex<IDType, LhsCol, RhsCol>;
+        }
+    }
+};
+
+template <typename IDType>
+NLBinaryFn selectEntityListIndexOf(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result) {
+    using Pairs = PairRestrictions<OP_INDEX>;
+
+    EntityListIndexSelector<IDType> selector {._memory = memory};
+    ColumnDoubleDispatcher<typename Pairs::Allowed,
+                           typename Pairs::AllowedMixed,
+                           EntityListIndexSelector<IDType>,
+                           typename Pairs::Excluded>::dispatch(lhs, rhs, selector);
+
+    result = selector._result;
+    return selector._fn;
+}
+
+// Execute a body of statements
+void runBody(NLExecutionContext* context, const NLStmtContainer* body) {
+    for (const NLFunctionDescriptor& descriptor : body->stmts()) {
+        const auto func = descriptor.getFunction();
+        NLFunctionData* funcData = descriptor.getData();
+        func(context, funcData);
+    }
+}
+
+template <SupportedType T>
+typename T::Primitive propertyScanLiteralAs(const NLScanByPropertyValueLoopData::Literal& literal) {
+    if constexpr (std::same_as<T, types::String>) {
+        return std::get<std::string>(literal);
+    } else {
+        return std::get<typename T::Primitive>(literal);
+    }
+}
+
+// The position of each field a CSV load produces, in field order: the one it named, or
+// the one its header sits at in the file's header line. A position past the file's last
+// field, or a header the file does not carry, is a query naming a field that is not
+// there, so it is reported rather than left to read an absent column.
+void resolveCSVFieldIndices(const NLLoadCSVLoopData& loopData,
+                            const CSVFileInfo& fileInfo,
+                            std::vector<size_t>& indices) {
+    const std::vector<std::string>& headers = fileInfo._headers;
+
+    indices.reserve(loopData.fields().size());
+
+    for (const NLLoadCSVLoopData::Field& field : loopData.fields()) {
+        if (field._byHeader) {
+            const auto foundIt = std::ranges::find(headers, field._header);
+            if (foundIt == end(headers)) {
+                throw IRException(fmt::format("CSV header '{}' not found in '{}'",
+                                              field._header,
+                                              loopData.getPath()));
+            }
+
+            indices.push_back(static_cast<size_t>(std::distance(begin(headers), foundIt)));
+        } else {
+            if (field._index >= fileInfo._fieldCount) {
+                throw IRException(fmt::format("CSV field {} is out of range: '{}' carries {} fields",
+                                              field._index,
+                                              loopData.getPath(),
+                                              fileInfo._fieldCount));
+            }
+
+            indices.push_back(field._index);
+        }
+    }
+}
+
+// Gather rows of a carried column by applying indices
+template <typename ElementType, typename ColumnType = ColumnVector<ElementType>>
+void gatherColumn(const Column* input,
+                  const ColumnVector<size_t>* indices,
+                  Column* output) {
+    const ColumnType* typedInput = static_cast<const ColumnType*>(input);
+    ColumnType* typedOutput = static_cast<ColumnType*>(output);
+
+    typedOutput->resize(indices->size());
+    const auto& indicesRaw = indices->getRaw();
+    auto& typedInputRaw = typedInput->getRaw();
+    auto& typedOutputRaw = typedOutput->getRaw();
+
+    for (size_t row = 0; row < indicesRaw.size(); row++) {
+        typedOutputRaw[row] = typedInputRaw[indicesRaw[row]];
+    }
+}
+
+// Fill a chunk with a run of null rows. Every element type reads its own
+// default-constructed value as null: an ID defaults to the invalid ID that ID::isValid
+// rejects, which is how an entity an OPTIONAL MATCH did not match is spelled.
+template <typename ElementType, typename ColumnType = ColumnVector<ElementType>>
+void fillNullColumn(Column* output, size_t rowCount) {
+    ColumnType* typedOutput = static_cast<ColumnType*>(output);
+
+    typedOutput->getRaw().assign(rowCount, ElementType {});
+}
+
+void collectMaskSurvivors(const Column* mask, ColumnVector<size_t>* indices) {
+    const ColumnMask* typedMask = static_cast<const ColumnMask*>(mask);
+    const std::vector<ColumnMask::Bool_t>& maskRaw = typedMask->getRaw();
+    std::vector<size_t>& survivingRaw = indices->getRaw();
+
+    for (size_t row = 0; row < maskRaw.size(); row++) {
+        if (maskRaw[row]) {
+            survivingRaw.push_back(row);
+        }
+    }
+}
+
+void collectOptMaskSurvivors(const Column* mask, ColumnVector<size_t>* indices) {
+    const ColumnOptMask* typedMask = static_cast<const ColumnOptMask*>(mask);
+    const std::vector<std::optional<CustomBool>>& maskRaw = typedMask->getRaw();
+    std::vector<size_t>& survivingRaw = indices->getRaw();
+
+    for (size_t row = 0; row < maskRaw.size(); row++) {
+        if (maskRaw[row].has_value() && maskRaw[row].value()) {
+            survivingRaw.push_back(row);
+        }
+    }
+}
+
+// A null mask holds for no row, so a filter on one keeps nothing
+void collectNoSurvivors(const Column*, ColumnVector<size_t>*) {
+}
+
+// The truth value a type-erased cell holds: its boolean, or null where it holds a null
+std::optional<bool> cellTruth(ListElementView cell) {
+    switch (cell.getTag()) {
+        case ListBufferTypeTag::Bool:
+            return static_cast<bool>(cell.getAs<types::Bool::Primitive>());
+        break;
+
+        case ListBufferTypeTag::Null:
+            return std::nullopt;
+        break;
+
+        default:
+            throw IRException("A condition reads a value that is not a boolean");
+        break;
+    }
+}
+
+void collectTaggedCellSurvivors(const Column* mask, ColumnVector<size_t>* indices) {
+    const std::vector<ListElementView>& cells = static_cast<const ColumnVector<ListElementView>*>(mask)->getRaw();
+    std::vector<size_t>& survivingRaw = indices->getRaw();
+
+    for (size_t row = 0; row < cells.size(); row++) {
+        if (cellTruth(cells[row]).value_or(false)) {
+            survivingRaw.push_back(row);
+        }
+    }
+}
+
+void collectOptTaggedCellSurvivors(const Column* mask, ColumnVector<size_t>* indices) {
+    const std::vector<std::optional<ListElementView>>& cells =
+        static_cast<const ColumnOptVector<ListElementView>*>(mask)->getRaw();
+    std::vector<size_t>& survivingRaw = indices->getRaw();
+
+    for (size_t row = 0; row < cells.size(); row++) {
+        if (cells[row].has_value() && cellTruth(*cells[row]).value_or(false)) {
+            survivingRaw.push_back(row);
+        }
+    }
+}
+
+std::optional<NodeID> namedNode(NodeID node) {
+    return node;
+}
+
+std::optional<NodeID> namedNode(types::Int64::Primitive id) {
+    if (id < 0) {
+        return std::nullopt;
+    }
+
+    return NodeID(static_cast<uint64_t>(id));
+}
+
+std::optional<NodeID> namedNode(types::UInt64::Primitive id) {
+    return NodeID(id);
+}
+
+std::optional<NodeID> namedNode(ListElementView cell) {
+    switch (cell.getTag()) {
+        case ListBufferTypeTag::Int:
+            return namedNode(cell.getAs<types::Int64::Primitive>());
+        break;
+
+        case ListBufferTypeTag::UInt:
+            return namedNode(cell.getAs<types::UInt64::Primitive>());
+        break;
+
+        case ListBufferTypeTag::NodeID:
+            return cell.getAs<NodeID>();
+        break;
+
+        default:
+            return std::nullopt;
+        break;
+    }
+}
+
+template <typename Cell>
+std::optional<NodeID> namedNode(const std::optional<Cell>& cell) {
+    if (!cell.has_value()) {
+        return std::nullopt;
+    }
+
+    return namedNode(*cell);
+}
+
+// The nodes a node scan produces: the ones the view holds and did not delete, and the ones
+// the running query created and did not delete
+class ScannedNodes {
+public:
+    explicit ScannedNodes(const NLExecutionContext* context)
+        : _reader(context->getView()->read()),
+        _writeBuffer(context->getWriteBuffer()),
+        _committedCount(committedNodeCount(context->getView())),
+        _firstQueryNode(context->getFirstQueryNode()),
+        _pendingCount(_writeBuffer ? _writeBuffer->numPendingNodes() : 0)
+    {
+    }
+
+    bool contains(NodeID node) const {
+        const uint64_t id = node.getValue();
+        if (id < _committedCount) {
+            return !_reader.nodeIsDeleted(node);
+        }
+
+        const uint64_t offset = id - _committedCount;
+        const bool createdByThisQuery = offset >= _firstQueryNode && offset < _pendingCount;
+
+        return createdByThisQuery && !_writeBuffer->deletedPendingNodes().contains(offset);
+    }
+
+private:
+    const GraphReader _reader;
+    const CommitWriteBuffer* _writeBuffer {nullptr};
+    size_t _committedCount {0};
+    size_t _firstQueryNode {0};
+    size_t _pendingCount {0};
+};
+
+template <typename Cell>
+void fetchNamedNodes(const Column* ids, const NLExecutionContext* context, ColumnVector<size_t>* indices, ColumnNodeIDs* nodes) {
+    const std::vector<Cell>& cells = static_cast<const ColumnVector<Cell>*>(ids)->getRaw();
+    std::vector<size_t>& rows = indices->getRaw();
+    std::vector<NodeID>& fetched = nodes->getRaw();
+
+    const ScannedNodes scanned(context);
+
+    for (size_t row = 0; row < cells.size(); row++) {
+        const std::optional<NodeID> node = namedNode(cells[row]);
+
+        if (node.has_value() && scanned.contains(*node)) {
+            rows.push_back(row);
+            fetched.push_back(*node);
+        }
+    }
+}
+
+bool isMaskConstant(const Column* mask) {
+    return mask->getKind() == ColumnConst<CustomBool>::staticKind();
+}
+
+void applyNotOnMask(Column* result, const Column* operand) {
+    UnaryPredicateExecutor<Not, ColumnMask::Bool_t>::apply(static_cast<ColumnMask*>(result),
+                                                          static_cast<const ColumnMask*>(operand));
+}
+
+void applyNotOnOptMask(Column* result, const Column* operand) {
+    using OptBool = std::optional<CustomBool>;
+    UnaryPredicateExecutor<Not, OptBool>::apply(static_cast<ColumnOptMask*>(result),
+                                               static_cast<const ColumnOptMask*>(operand));
+}
+
+std::optional<CustomBool> negatedTruth(const auto& cell) {
+    const std::optional<CustomBool> truth = truthValue(cell);
+    if (!truth.has_value()) {
+        return std::nullopt;
+    }
+
+    return CustomBool {!truth->_boolean};
+}
+
+void applyNotOnTaggedCells(Column* result, const Column* operand) {
+    const std::vector<ListElementView>& operandRaw = static_cast<const ColumnVector<ListElementView>*>(operand)->getRaw();
+    std::vector<std::optional<CustomBool>>& resultRaw = static_cast<ColumnOptMask*>(result)->getRaw();
+
+    resultRaw.resize(operandRaw.size());
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](ListElementView cell) {
+        return negatedTruth(cell);
+    });
+}
+
+void applyNotOnOptTaggedCells(Column* result, const Column* operand) {
+    const std::vector<std::optional<ListElementView>>& operandRaw =
+        static_cast<const ColumnOptVector<ListElementView>*>(operand)->getRaw();
+    std::vector<std::optional<CustomBool>>& resultRaw = static_cast<ColumnOptMask*>(result)->getRaw();
+
+    resultRaw.resize(operandRaw.size());
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](const std::optional<ListElementView>& cell) {
+        return negatedTruth(cell);
+    });
+}
+
+void applyNotOnConstTaggedCell(Column* result, const Column* operand) {
+    const ListElementView cell = static_cast<const ColumnConst<ListElementView>*>(operand)->getRaw();
+    static_cast<ColumnConst<std::optional<CustomBool>>*>(result)->set(negatedTruth(cell));
+}
+
+void applyNotOnOptConstTaggedCell(Column* result, const Column* operand) {
+    const std::optional<ListElementView>& cell = static_cast<const ColumnConst<std::optional<ListElementView>>*>(operand)->getRaw();
+    static_cast<ColumnConst<std::optional<CustomBool>>*>(result)->set(negatedTruth(cell));
+}
+
+void applyNotOnConst(Column* result, const Column* operand) {
+    const ColumnConst<CustomBool>* typedOperand = static_cast<const ColumnConst<CustomBool>*>(operand);
+    ColumnConst<CustomBool>* typedResult = static_cast<ColumnConst<CustomBool>*>(result);
+    UnaryPredicateExecutor<Not, CustomBool>::apply(typedResult, typedOperand);
+}
+
+void applyNotOnOptConst(Column* result, const Column* operand) {
+    using OptBool = std::optional<CustomBool>;
+    UnaryPredicateExecutor<Not, OptBool>::apply(static_cast<ColumnConst<OptBool>*>(result),
+                                               static_cast<const ColumnConst<OptBool>*>(operand));
+}
+
+// NOT of an unknown truth value is unknown; the ColumnConst<PropertyNull> result already
+// reads as null, so nothing is computed.
+void applyNotOnNullConst(Column*, const Column*) {
+}
+
+// Block-repeat: the outer column of a cross product, where each outer row pairs
+// with the whole inner chunk, so pair p takes input row p/factor. Fills the
+// `rowCount` pairs from `position` on, which may start partway into one input
+// row's block and end partway into another's.
+template <typename ElementType, typename ColumnType = ColumnVector<ElementType>>
+void blockRepeatColumn(const Column* input, size_t factor, size_t position, size_t rowCount, Column* output) {
+    const ColumnType* typedInput = static_cast<const ColumnType*>(input);
+    ColumnType* typedOutput = static_cast<ColumnType*>(output);
+
+    const auto& inputRaw = typedInput->getRaw();
+    auto& outputRaw = typedOutput->getRaw();
+    outputRaw.resize(rowCount);
+
+    auto outputIt = outputRaw.begin();
+    size_t rowsLeft = rowCount;
+    size_t inputIndex = position / factor;
+    size_t doneInBlock = position % factor;
+
+    while (rowsLeft > 0 && inputIndex < inputRaw.size()) {
+        const size_t count = std::min(factor - doneInBlock, rowsLeft);
+        std::fill_n(outputIt, count, inputRaw[inputIndex]);
+
+        outputIt += count;
+        rowsLeft -= count;
+        inputIndex++;
+        doneInBlock = 0;
+    }
+}
+
+void blockRepeatConstColumn(const Column* input, size_t factor, size_t position, size_t rowCount, Column* output) {
+    output->assignFromLine(input, 0, rowCount);
+}
+
+// Tile: the inner column of a cross product, where the inner chunk repeats once
+// per outer row, so pair p takes input row p % M. Fills the `rowCount` pairs from
+// `position` on, which may start partway into one tile and end partway into
+// another. M is the tile's own length, which is what the enclosing product passes
+// as the factor.
+template <typename ElementType, typename ColumnType = ColumnVector<ElementType>>
+void tileColumn(const Column* input, size_t factor, size_t position, size_t rowCount, Column* output) {
+    const ColumnType* typedInput = static_cast<const ColumnType*>(input);
+    ColumnType* typedOutput = static_cast<ColumnType*>(output);
+
+    const auto& inputRaw = typedInput->getRaw();
+    auto& outputRaw = typedOutput->getRaw();
+    outputRaw.resize(rowCount);
+
+    const size_t tileLength = inputRaw.size();
+    if (tileLength == 0) {
+        return;
+    }
+
+    auto outputIt = outputRaw.begin();
+    size_t rowsLeft = rowCount;
+    size_t inputIndex = position % tileLength;
+
+    while (rowsLeft > 0) {
+        const size_t count = std::min(tileLength - inputIndex, rowsLeft);
+        outputIt = std::copy(inputRaw.begin() + inputIndex, inputRaw.begin() + inputIndex + count, outputIt);
+
+        rowsLeft -= count;
+        inputIndex = 0;
+    }
+}
+
+// Constant broadcast: the one value a ColumnConst holds is laid out over every row
+// of the step, as a present value. The two broadcasts above repeat the several
+// values of a chunk; a constant column has no rows of its own to repeat, so its row
+// count comes from the driving relation and its value from the column itself.
+template <typename Primitive>
+void broadcastConstantColumn(const Column* value, size_t rowCount, Column* output) {
+    const ColumnConst<Primitive>* typedValue = static_cast<const ColumnConst<Primitive>*>(value);
+    ColumnOptVector<Primitive>* typedOutput = static_cast<ColumnOptVector<Primitive>*>(output);
+
+    auto& outputRaw = typedOutput->getRaw();
+    outputRaw.resize(rowCount);
+
+    std::fill_n(outputRaw.begin(), rowCount, std::optional<Primitive>(typedValue->getRaw()));
+}
+
+template <typename Primitive>
+void broadcastNullableConstantColumn(const Column* value, size_t rowCount, Column* output) {
+    const auto* typedValue = static_cast<const ColumnConst<std::optional<Primitive>>*>(value);
+    ColumnOptVector<Primitive>* typedOutput = static_cast<ColumnOptVector<Primitive>*>(output);
+
+    auto& outputRaw = typedOutput->getRaw();
+    outputRaw.resize(rowCount);
+
+    std::fill_n(outputRaw.begin(), rowCount, typedValue->getRaw());
+}
+
+// A constant chunk is not always a ColumnConst: a kernel computing over literals writes
+// its one row into an ordinary column. That row is the one every row of the step reads.
+template <typename Primitive>
+void broadcastSingleRowColumn(const Column* value, size_t rowCount, Column* output) {
+    const auto& valueRaw = static_cast<const ColumnOptVector<Primitive>*>(value)->getRaw();
+    ColumnOptVector<Primitive>* typedOutput = static_cast<ColumnOptVector<Primitive>*>(output);
+
+    if (valueRaw.empty()) {
+        typedOutput->getRaw().assign(rowCount, std::optional<Primitive> {});
+        return;
+    }
+
+    typedOutput->getRaw().assign(rowCount, valueRaw.front());
+}
+
+// The null literal laid out over every row of the step: it holds no value to repeat, so
+// each row is the absent value. An untyped null is carried as a null integer, which is
+// the column the layout fills.
+void broadcastNullColumn(const Column* value, size_t rowCount, Column* output) {
+    ColumnOptVector<int64_t>* typedOutput = static_cast<ColumnOptVector<int64_t>*>(output);
+
+    auto& outputRaw = typedOutput->getRaw();
+    outputRaw.assign(rowCount, std::optional<int64_t> {});
+}
+
+// The view sibling of broadcastConstantColumn: a list, a map or a map entry is a view over
+// the query's buffers and carries no absence of its own, so the rows are a plain column of
+// that one view.
+template <typename View>
+void broadcastConstantViewColumn(const Column* value, size_t rowCount, Column* output) {
+    const ColumnConst<View>* typedValue = static_cast<const ColumnConst<View>*>(value);
+    ColumnVector<View>* typedOutput = static_cast<ColumnVector<View>*>(output);
+
+    auto& outputRaw = typedOutput->getRaw();
+    outputRaw.resize(rowCount);
+
+    std::fill_n(outputRaw.begin(), rowCount, typedValue->getRaw());
+}
+
+// The one row a computation over constants wrote, held as the constant it stands for
+template <typename Element>
+void readSingleRowAsConstant(Column* result, const Column* row) {
+    const std::vector<Element>& rowRaw = static_cast<const ColumnVector<Element>*>(row)->getRaw();
+    bioassert(rowRaw.size() == 1, "A computation over constants did not write a single row.");
+
+    static_cast<ColumnConst<Element>*>(result)->set(rowRaw.front());
+}
+
+// Range copy: rows [inputOffset, inputOffset + rowCount) of the input land at
+// output indices [0, rowCount). This lifts a skip's surviving suffix to the front
+// of a fresh chunk - nl.skip_truncate passes inputOffset = skipThisStep and
+// rowCount = emitThisStep. std::copy of a contiguous range is lowered to memcpy.
+template <typename ElementType, typename ColumnType = ColumnVector<ElementType>>
+void copyRangeColumn(const Column* input, size_t inputOffset, size_t rowCount, Column* output) {
+    const ColumnType* typedInput = static_cast<const ColumnType*>(input);
+    ColumnType* typedOutput = static_cast<ColumnType*>(output);
+
+    const auto& inputRaw = typedInput->getRaw();
+    auto& outputRaw = typedOutput->getRaw();
+    outputRaw.resize(rowCount);
+
+    const auto first = inputRaw.begin() + inputOffset;
+    std::copy(first, first + rowCount, outputRaw.begin());
+}
+
+void copyRangeConstColumn(const Column* input, size_t inputOffset, size_t rowCount, Column* output) {
+    output->assignFromLine(input, inputOffset, rowCount);
+}
+
+void gatherConstColumn(const Column* input, const ColumnVector<size_t>* indices, Column* output) {
+    output->assignFromLine(input, 0, indices->size());
+}
+
+// Append every row of an input chunk onto the tail of a growing buffer of the
+// same element type. nl.sort_collect calls this once per producing-loop step, so
+// the buffer accumulates every row across all chunks, row-aligned with the other
+// buffers of the same accumulator.
+template <typename ElementType, typename ColumnType = ColumnVector<ElementType>>
+void appendColumn(const Column* input, Column* buffer) {
+    const ColumnType* typedInput = static_cast<const ColumnType*>(input);
+    ColumnType* typedBuffer = static_cast<ColumnType*>(buffer);
+
+    const auto& inputRaw = typedInput->getRaw();
+    auto& bufferRaw = typedBuffer->getRaw();
+
+    bufferRaw.insert(bufferRaw.end(), inputRaw.begin(), inputRaw.end());
+}
+
+// The append of a column of views, for a buffer that outlives the loop filling it: the
+// views a chunk carries point into the buffers that built them, which the producing step
+// empties when it comes round again, so the values themselves go into the accumulator's own.
+template <typename ElementType>
+void appendOwnedColumn(const Column* input, Column* buffer, NLValueStore& values) {
+    const ColumnVector<ElementType>* typedInput = static_cast<const ColumnVector<ElementType>*>(input);
+    ColumnVector<ElementType>* typedBuffer = static_cast<ColumnVector<ElementType>*>(buffer);
+
+    const auto& inputRaw = typedInput->getRaw();
+    auto& bufferRaw = typedBuffer->getRaw();
+
+    const size_t firstRow = bufferRaw.size();
+    bufferRaw.resize(firstRow + inputRaw.size());
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        bufferRaw[firstRow + row] = values.ownElement(inputRaw[row]);
+    }
+}
+
+void appendCollectedChunk(const NLSortCollectData::Append& append, NLValueStore& values) {
+    if (append._appendOwned) {
+        append._appendOwned(append._input, append._buffer, values);
+    } else {
+        append._append(append._input, append._buffer);
+    }
+}
+
+template <typename Primitive>
+bool sortsBefore(const Primitive& lhs, const Primitive& rhs) {
+    return lhs < rhs;
+}
+
+// Cypher orders a NaN after every number, where < answers false against it
+bool sortsBefore(double lhs, double rhs) {
+    if (std::isnan(lhs)) {
+        return false;
+    }
+
+    return std::isnan(rhs) || lhs < rhs;
+}
+
+// 3-way compare two rows of a non-null orderable column (an ID column, or a plain scalar
+// a procedure yielded): negative if row a sorts before row b, positive if after, zero if
+// they are equal.
+template <typename ElementType, typename ColumnType = ColumnVector<ElementType>>
+int compareColumn(const Column* column, size_t a, size_t b) {
+    const auto& raw = static_cast<const ColumnType*>(column)->getRaw();
+    const ElementType& valueA = raw[a];
+    const ElementType& valueB = raw[b];
+
+    if (sortsBefore(valueA, valueB)) {
+        return -1;
+    } else if (sortsBefore(valueB, valueA)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+// 3-way compare two rows of a nullable value column. A null sorts after every
+// value, so an ascending order places nulls last (matching Cypher's ORDER BY),
+// and two nulls tie; non-null values compare by their natural order.
+template <typename Primitive>
+int compareOptColumn(const Column* column, size_t a, size_t b) {
+    const auto& raw = static_cast<const ColumnVector<std::optional<Primitive>>*>(column)->getRaw();
+    const std::optional<Primitive>& valueA = raw[a];
+    const std::optional<Primitive>& valueB = raw[b];
+
+    const bool aNull = !valueA.has_value();
+    const bool bNull = !valueB.has_value();
+    if (aNull || bNull) {
+        if (aNull && bNull) {
+            return 0;
+        }
+
+        return aNull ? 1 : -1;
+    }
+
+    if (sortsBefore(*valueA, *valueB)) {
+        return -1;
+    } else if (sortsBefore(*valueB, *valueA)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+// Copy a plain value column into a nullable one with every row present (nl.to_nullable),
+// so a kernel reading a nullable value column takes a column a procedure yielded.
+template <typename Primitive, typename ColumnType = ColumnVector<Primitive>>
+void toNullableColumn(Column* result, const Column* operand) {
+    const auto& values = static_cast<const ColumnType*>(operand)->getRaw();
+    auto& nullables = static_cast<ColumnOptVector<Primitive>*>(result)->getRaw();
+
+    nullables.resize(values.size());
+    std::copy(values.begin(), values.end(), nullables.begin());
+}
+
+// Read an entity column as a nullable column of its IDs' integers: a node or an edge an
+// OPTIONAL MATCH did not match carries an invalid ID, which is the null. The entity
+// sibling of toNullableColumn, for the column family whose null is not an absent optional.
+template <typename ID>
+void entityToNullableColumn(Column* result, const Column* operand) {
+    const std::vector<ID>& ids = static_cast<const ColumnVector<ID>*>(operand)->getRaw();
+    auto& nullables = static_cast<ColumnOptVector<types::UInt64::Primitive>*>(result)->getRaw();
+
+    nullables.resize(ids.size());
+    for (size_t row = 0; row < ids.size(); row++) {
+        if (ids[row].isValid()) {
+            nullables[row] = ids[row].getValue();
+        } else {
+            nullables[row] = std::nullopt;
+        }
+    }
+}
+
+// A path an OPTIONAL MATCH did not match is empty, where any other holds at least the node
+// it starts on, so the empty path is the null and every other reads as its entry count
+void pathToNullableColumn(Column* result, const Column* operand) {
+    const std::vector<EntityList>& paths = static_cast<const ColumnVector<EntityList>*>(operand)->getRaw();
+    auto& nullables = static_cast<ColumnOptVector<types::UInt64::Primitive>*>(result)->getRaw();
+
+    nullables.resize(paths.size());
+    for (size_t row = 0; row < paths.size(); row++) {
+        if (paths[row].empty()) {
+            nullables[row] = std::nullopt;
+        } else {
+            nullables[row] = paths[row].size();
+        }
+    }
+}
+
+template <typename Primitive>
+void toNullableConst(Column* result, const Column* operand) {
+    const auto* constant = static_cast<const ColumnConst<Primitive>*>(operand);
+    auto* nullable = static_cast<ColumnConst<std::optional<Primitive>>*>(result);
+
+    if (constant->empty()) {
+        nullable->clear();
+        return;
+    }
+
+    *nullable = std::optional<Primitive>((*constant)[0]);
+}
+
+template <typename Primitive>
+NLUnaryFn selectToNullableOf(const Column* operand, LocalMemory* memory, Column*& result) {
+    if (operand->getContainerKind() == ContainerKind::code<ColumnConst>()) {
+        result = memory->alloc<ColumnConst<std::optional<Primitive>>>();
+        return &toNullableConst<Primitive>;
+    }
+
+    result = memory->alloc<ColumnOptVector<Primitive>>();
+    return &toNullableColumn<Primitive>;
+}
+
+bool caseTestMask(const Column* condition, size_t row) {
+    return static_cast<const ColumnMask*>(condition)->getRaw()[row];
+}
+
+bool caseTestOptMask(const Column* condition, size_t row) {
+    return static_cast<const ColumnOptMask*>(condition)->getRaw()[row].value_or(false);
+}
+
+bool caseTestBoolColumn(const Column* condition, size_t row) {
+    return static_cast<const ColumnVector<types::Bool::Primitive>*>(condition)->getRaw()[row];
+}
+
+// A null is not true, so a branch whose condition is the null literal never fires and its
+// rows fall through to the next one
+bool caseTestNever(const Column* condition, size_t row) {
+    return false;
+}
+
+void applyIsNotTrueOnMask(Column* result, const Column* operand) {
+    const std::vector<ColumnMask::Bool_t>& operandRaw = static_cast<const ColumnMask*>(operand)->getRaw();
+    std::vector<ColumnMask::Bool_t>& resultRaw = static_cast<ColumnMask*>(result)->getRaw();
+
+    resultRaw.resize(operandRaw.size());
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](ColumnMask::Bool_t value) {
+        return ColumnMask::Bool_t {!value};
+    });
+}
+
+void applyIsNotTrueOnOptMask(Column* result, const Column* operand) {
+    const std::vector<std::optional<CustomBool>>& operandRaw = static_cast<const ColumnOptMask*>(operand)->getRaw();
+    std::vector<ColumnMask::Bool_t>& resultRaw = static_cast<ColumnMask*>(result)->getRaw();
+
+    resultRaw.resize(operandRaw.size());
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](std::optional<CustomBool> value) {
+        return ColumnMask::Bool_t {!value.value_or(false)};
+    });
+}
+
+void applyIsNotTrueOnBoolColumn(Column* result, const Column* operand) {
+    const std::vector<types::Bool::Primitive>& operandRaw =
+        static_cast<const ColumnVector<types::Bool::Primitive>*>(operand)->getRaw();
+    std::vector<ColumnMask::Bool_t>& resultRaw = static_cast<ColumnMask*>(result)->getRaw();
+
+    resultRaw.resize(operandRaw.size());
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](types::Bool::Primitive value) {
+        return ColumnMask::Bool_t {!value};
+    });
+}
+
+void applyIsNotTrueOnTaggedCells(Column* result, const Column* operand) {
+    const std::vector<ListElementView>& operandRaw = static_cast<const ColumnVector<ListElementView>*>(operand)->getRaw();
+    std::vector<ColumnMask::Bool_t>& resultRaw = static_cast<ColumnMask*>(result)->getRaw();
+
+    resultRaw.resize(operandRaw.size());
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](ListElementView cell) {
+        return ColumnMask::Bool_t {!cellTruth(cell).value_or(false)};
+    });
+}
+
+void applyIsNotTrueOnOptTaggedCells(Column* result, const Column* operand) {
+    const std::vector<std::optional<ListElementView>>& operandRaw =
+        static_cast<const ColumnOptVector<ListElementView>*>(operand)->getRaw();
+    std::vector<ColumnMask::Bool_t>& resultRaw = static_cast<ColumnMask*>(result)->getRaw();
+
+    resultRaw.resize(operandRaw.size());
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](std::optional<ListElementView> cell) {
+        return ColumnMask::Bool_t {!(cell.has_value() && cellTruth(*cell).value_or(false))};
+    });
+}
+
+void applyIsNotTrueOnNull(Column* result, const Column* operand) {
+    static_cast<ColumnMask*>(result)->getRaw().assign(operand->size(), ColumnMask::Bool_t {true});
+}
+
+std::optional<bool> readMaskTruth(const Column* mask, size_t row) {
+    return static_cast<bool>(static_cast<const ColumnMask*>(mask)->getRaw()[row]);
+}
+
+std::optional<bool> readOptMaskTruth(const Column* mask, size_t row) {
+    const std::optional<CustomBool>& value = static_cast<const ColumnOptMask*>(mask)->getRaw()[row];
+    if (!value.has_value()) {
+        return std::nullopt;
+    }
+
+    return static_cast<bool>(*value);
+}
+
+std::optional<bool> readNullTruth(const Column* mask, size_t row) {
+    return std::nullopt;
+}
+
+std::optional<bool> readTaggedCellTruth(const Column* cells, size_t row) {
+    return cellTruth(static_cast<const ColumnVector<ListElementView>*>(cells)->getRaw()[row]);
+}
+
+std::optional<bool> readOptTaggedCellTruth(const Column* cells, size_t row) {
+    const std::optional<ListElementView>& cell = static_cast<const ColumnOptVector<ListElementView>*>(cells)->getRaw()[row];
+    if (!cell.has_value()) {
+        return std::nullopt;
+    }
+
+    return cellTruth(*cell);
+}
+
+bool caseTestTaggedCell(const Column* condition, size_t row) {
+    return readTaggedCellTruth(condition, row).value_or(false);
+}
+
+bool caseTestOptTaggedCell(const Column* condition, size_t row) {
+    return readOptTaggedCellTruth(condition, row).value_or(false);
+}
+
+EntityID pathEntityAt(const EntityList& path, size_t index) {
+    return path.getEntries()[index]._id;
+}
+
+EntityID pathEntityAt(const Path& path, size_t index) {
+    return path[index];
+}
+
+// The entities of one kind a path runs through, in the order the path holds them. A path
+// alternates node and edge from its first node, so they are every other entry from @param first
+template <typename IDType, typename PathType>
+ListView listPathEntities(const PathType& path, size_t first, ListBufferTypeTag tag, QueryListBuffer& buffer) {
+    const size_t count = (path.size() - first + 1) / 2;
+    ListWriteCursor cursor = buffer.reserveList(count, count * sizeof(IDType));
+
+    for (size_t index = 0; index < count; index++) {
+        cursor.writeValueAt(index, tag, IDType(pathEntityAt(path, first + 2 * index).getValue()));
+    }
+
+    return cursor.getView();
+}
+
+// A path an OPTIONAL MATCH missed is an empty sequence; every path found runs
+// through at least one node
+template <typename PathType>
+void readPathElements(const std::vector<PathType>& paths,
+                      PathElementsKind kind,
+                      Column* output,
+                      QueryListBuffer& listBuffer) {
+    if (kind == PathElementsKind::Length) {
+        std::vector<std::optional<uint64_t>>& lengths = static_cast<ColumnOptVector<uint64_t>*>(output)->getRaw();
+        lengths.resize(paths.size());
+
+        for (size_t row = 0; row < paths.size(); row++) {
+            const PathType& path = paths[row];
+            if (path.empty()) {
+                lengths[row] = std::nullopt;
+            } else {
+                lengths[row] = path.size() / 2;
+            }
+        }
+
+        return;
+    }
+
+    std::vector<std::optional<ListView>>& lists = static_cast<ColumnOptVector<ListView>*>(output)->getRaw();
+    lists.resize(paths.size());
+
+    for (size_t row = 0; row < paths.size(); row++) {
+        const PathType& path = paths[row];
+        if (path.empty()) {
+            lists[row] = std::nullopt;
+        } else if (kind == PathElementsKind::Nodes) {
+            lists[row] = listPathEntities<NodeID>(path, 0, ListBufferTypeTag::NodeID, listBuffer);
+        } else {
+            lists[row] = listPathEntities<EdgeID>(path, 1, ListBufferTypeTag::EdgeID, listBuffer);
+        }
+    }
+}
+
+// The truth value a list predicate holds for a row, from how many of its elements held,
+// failed or answered null: an unknown element leaves the answer unknown unless the known
+// ones already decide it
+std::optional<bool> decideListPredicate(ListPredicateKind kind, size_t trues, size_t falses, size_t nulls) {
+    switch (kind) {
+        case ListPredicateKind::All:
+            if (falses > 0) {
+                return false;
+            } else if (nulls > 0) {
+                return std::nullopt;
+            }
+
+            return true;
+        break;
+
+        case ListPredicateKind::Any:
+            if (trues > 0) {
+                return true;
+            } else if (nulls > 0) {
+                return std::nullopt;
+            }
+
+            return false;
+        break;
+
+        case ListPredicateKind::None:
+            if (trues > 0) {
+                return false;
+            } else if (nulls > 0) {
+                return std::nullopt;
+            }
+
+            return true;
+        break;
+
+        case ListPredicateKind::Single:
+            if (trues > 1) {
+                return false;
+            } else if (nulls > 0) {
+                return std::nullopt;
+            }
+
+            return trues == 1;
+        break;
+    }
+
+    return std::nullopt;
+}
+
+bool isListPredicateDecided(ListPredicateKind kind, size_t trues, size_t falses) {
+    switch (kind) {
+        case ListPredicateKind::All:
+            return falses > 0;
+        break;
+
+        case ListPredicateKind::Any:
+            return trues > 0;
+        break;
+
+        case ListPredicateKind::None:
+            return trues > 0;
+        break;
+
+        case ListPredicateKind::Single:
+            return trues > 1;
+        break;
+    }
+
+    return false;
+}
+
+// Runs the body of an op over the elements of one row's list a chunk of (row, element)
+// pairs at a time, and hands @param takeYield the tags of the elements each chunk yielded
+template <typename TakeYield>
+void runElementBody(NLExecutionContext* context, NLElementBodyData* data, NLElementCursor& cursor, TakeYield takeYield) {
+    const Column* source = data->getSource();
+    const NLStmtContainer* body = data->getStmts();
+    const NLUnwindElementEmitFunction elementEmit = data->getElementEmitFunc();
+    const size_t chunkSize = context->getChunkSize();
+
+    ColumnVector<size_t>* rows = data->getRows();
+    ColumnVector<size_t>* positions = data->getPositions();
+    ColumnVector<uint64_t>* rowTags = data->getRowTags();
+
+    while (!cursor.exhausted()) {
+        cursor.fillChunk(chunkSize, rows->getRaw(), elementEmit ? &positions->getRaw() : nullptr);
+
+        // The tag of an element is the row the pair came from: the body hands back the
+        // tags of the elements its WHERE kept
+        const std::vector<size_t>& rowsRaw = rows->getRaw();
+        std::vector<uint64_t>& rowTagsRaw = rowTags->getRaw();
+        rowTagsRaw.assign(rowsRaw.begin(), rowsRaw.end());
+
+        if (elementEmit) {
+            elementEmit(source, rows, positions, data->getElementOutput());
+        }
+
+        for (const NLCarriedColumn& carriedColumn : data->carriedColumns()) {
+            const auto gatherFunc = carriedColumn.getGatherFunc();
+            gatherFunc(carriedColumn.getInput(), rows, carriedColumn.getOutput());
+        }
+
+        runBody(context, body);
+
+        const std::vector<uint64_t>& yieldedRaw =
+            static_cast<const ColumnVector<uint64_t>*>(data->getYieldedRowTags())->getRaw();
+
+        bioassert(data->getValue()->size() == yieldedRaw.size(),
+                  "Yielded value of an op over list elements is not row-aligned with its row tags.");
+
+        takeYield(yieldedRaw);
+    }
+}
+
+template <typename Primitive>
+void caseWriteOptCell(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
+    std::vector<std::optional<Primitive>>& results = static_cast<ColumnOptVector<Primitive>*>(result)->getRaw();
+    results[resultRow] = static_cast<const ColumnOptVector<Primitive>*>(value)->getRaw()[valueRow];
+}
+
+template <typename Primitive>
+void caseWritePlainCell(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
+    std::vector<std::optional<Primitive>>& results = static_cast<ColumnOptVector<Primitive>*>(result)->getRaw();
+    results[resultRow] = static_cast<const ColumnVector<Primitive>*>(value)->getRaw()[valueRow];
+}
+
+void caseWriteMaskCell(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
+    std::vector<std::optional<CustomBool>>& results = static_cast<ColumnOptMask*>(result)->getRaw();
+    results[resultRow] = CustomBool {static_cast<const ColumnMask*>(value)->getRaw()[valueRow]};
+}
+
+template <typename Primitive>
+void caseWriteNull(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
+    static_cast<ColumnOptVector<Primitive>*>(result)->getRaw()[resultRow] = std::nullopt;
+}
+
+template <typename ID>
+void caseWriteNullEntity(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
+    static_cast<ColumnVector<ID>*>(result)->getRaw()[resultRow] = ID {};
+}
+
+void caseWriteNullTaggedCell(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
+    static_cast<ColumnVector<ListElementView>*>(result)->getRaw()[resultRow] = ListElementView::nullElement();
+}
+
+template <typename ID>
+void caseWriteEntityCell(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
+    std::vector<ID>& results = static_cast<ColumnVector<ID>*>(result)->getRaw();
+    results[resultRow] = static_cast<const ColumnVector<ID>*>(value)->getRaw()[valueRow];
+}
+
+void writeCell(Column* result,
+               size_t resultRow,
+               const NLCellWrite& write,
+               const Column* value,
+               size_t valueRow,
+               NLStepBuffers* stepBuffers,
+               NLValueStore& values) {
+    if (write._write) {
+        write._write(result, resultRow, value, valueRow);
+        return;
+    }
+
+    ListBuffer<>::ListItemVariant item = write._taggedRead(value, valueRow, stepBuffers);
+    static_cast<ColumnVector<ListElementView>*>(result)->getRaw()[resultRow] = values.ownCell(item);
+}
+
+void resetTaggedCells(Column* result, size_t rowCount) {
+    std::vector<ListElementView>& results = static_cast<ColumnVector<ListElementView>*>(result)->getRaw();
+    results.assign(rowCount, ListElementView::nullElement());
+}
+
+template <typename Primitive>
+void caseResetColumn(Column* result, size_t rowCount) {
+    std::vector<std::optional<Primitive>>& results = static_cast<ColumnOptVector<Primitive>*>(result)->getRaw();
+    results.assign(rowCount, std::optional<Primitive> {});
+}
+
+// A default-constructed ID is the invalid one, which is how an entity column spells an
+// absent row: the reset leaves every row null, as the optional one above does
+template <typename ID>
+void caseResetEntityColumn(Column* result, size_t rowCount) {
+    std::vector<ID>& results = static_cast<ColumnVector<ID>*>(result)->getRaw();
+    results.assign(rowCount, ID {});
+}
+
+// 3-way compare two rows of a type-erased column of tagged scalars. Cells need not share
+// a type, so a pair of different types compares by the order those types sort in; nulls
+// tie and sort after every value, as they do in a nullable value column.
+int compareListElementColumn(const Column* column, size_t a, size_t b) {
+    const auto& raw = static_cast<const ColumnVector<ListElementView>*>(column)->getRaw();
+    const std::strong_ordering order = raw[a] <=> raw[b];
+
+    if (order == std::strong_ordering::less) {
+        return -1;
+    } else if (order == std::strong_ordering::greater) {
+        return 1;
+    }
+
+    return 0;
+}
+
+int compareOptListElementColumn(const Column* column, size_t a, size_t b) {
+    const std::vector<std::optional<ListElementView>>& raw =
+        static_cast<const ColumnOptVector<ListElementView>*>(column)->getRaw();
+
+    const auto isNull = [](const std::optional<ListElementView>& element) {
+        return !element.has_value() || element->getTag() == ListBufferTypeTag::Null;
+    };
+
+    const bool aNull = isNull(raw[a]);
+    const bool bNull = isNull(raw[b]);
+
+    if (aNull || bNull) {
+        if (aNull && bNull) {
+            return 0;
+        }
+
+        return aNull ? 1 : -1;
+    }
+
+    const std::strong_ordering order = *raw[a] <=> *raw[b];
+
+    if (order == std::strong_ordering::less) {
+        return -1;
+    } else if (order == std::strong_ordering::greater) {
+        return 1;
+    }
+
+    return 0;
+}
+
+// 3-way compare two rows of a list or a map column. Two lists order lexicographically
+// on the element order above, and two maps by size, then keys, then values, so either can
+// be the key the rows are sorted on.
+template <typename View>
+int compareContainerColumn(const Column* column, size_t a, size_t b) {
+    const auto& raw = static_cast<const ColumnVector<View>*>(column)->getRaw();
+    const std::strong_ordering order = raw[a] <=> raw[b];
+
+    if (order == std::strong_ordering::less) {
+        return -1;
+    } else if (order == std::strong_ordering::greater) {
+        return 1;
+    }
+
+    return 0;
+}
+
+// The nullable sibling, for a list or a map read out of a property: a row holding none
+// sorts after every value, as compareOptColumn places a null after every value.
+template <typename View>
+int compareOptContainerColumn(const Column* column, size_t a, size_t b) {
+    const auto& raw = static_cast<const ColumnOptVector<View>*>(column)->getRaw();
+    const std::optional<View>& valueA = raw[a];
+    const std::optional<View>& valueB = raw[b];
+
+    const bool aNull = !valueA.has_value();
+    const bool bNull = !valueB.has_value();
+    if (aNull || bNull) {
+        if (aNull && bNull) {
+            return 0;
+        }
+
+        return aNull ? 1 : -1;
+    }
+
+    const std::strong_ordering order = *valueA <=> *valueB;
+
+    if (order == std::strong_ordering::less) {
+        return -1;
+    } else if (order == std::strong_ordering::greater) {
+        return 1;
+    }
+
+    return 0;
+}
+
+// Append the raw bytes of a present property value to a distinct row key. The key
+// is a std::string used purely as a growable byte buffer - not text - so the value
+// is appended verbatim: a trivially-copyable primitive copies its object bytes; a
+// string copies a length prefix then its characters, so two rows never collide by
+// concatenation (so "a"+"b" and "ab"+"" get distinct keys).
+template <typename Primitive>
+void distinctAppendValueBytes(std::string& key, const Primitive& value) {
+    key.append(reinterpret_cast<const char*>(&value), sizeof(Primitive));
+}
+
+// A double is normalized before its bytes are appended so keys compare by Cypher
+// value equality, not bit pattern: -0.0 collapses to +0.0 (0.0 == -0.0 in Cypher)
+// and every NaN payload maps to one canonical NaN, so two distinct bit patterns of
+// the same value never split into separate groups (or survive DISTINCT as two rows).
+void distinctAppendValueBytes(std::string& key, double value) {
+    double normalized = value;
+
+    if (normalized == 0.0) {
+        // -0.0 == +0.0, so assigning +0.0 canonicalizes the sign of zero.
+        normalized = 0.0;
+    } else if (std::isnan(normalized)) {
+        normalized = std::numeric_limits<double>::quiet_NaN();
+    }
+
+    key.append(reinterpret_cast<const char*>(&normalized), sizeof(normalized));
+}
+
+void distinctAppendValueBytes(std::string& key, std::string_view value) {
+    const size_t length = value.size();
+    key.append(reinterpret_cast<const char*>(&length), sizeof(length));
+    key.append(value.data(), value.size());
+}
+
+// Serialize one row of an ID column (node/edge/edge-type IDs) into the row key -
+// a std::string used as a byte buffer, not text - as the ID's underlying integer
+// value, byte for byte.
+template <typename ElementType>
+void distinctKeyAppendColumn(const Column* column, size_t row, std::string& key) {
+    const auto& raw = static_cast<const ColumnVector<ElementType>*>(column)->getRaw();
+    const auto value = raw[row].getValue();
+    distinctAppendValueBytes(key, value);
+}
+
+// Serialize one row of a chunk that holds its values plainly - a column a procedure
+// yielded, a tally, an expression over one - into the row key. The ID sibling reads
+// through the ID's integer; here the element is the value, and no row of such a chunk is
+// null, so the key carries no tag byte to tell a null from a value.
+template <typename ElementType, typename ColumnType = ColumnVector<ElementType>>
+void distinctKeyAppendPlainColumn(const Column* column, size_t row, std::string& key) {
+    const auto& raw = static_cast<const ColumnType*>(column)->getRaw();
+    distinctAppendValueBytes(key, raw[row]);
+}
+
+// Serialize one row of a nullable value column into the row key - a std::string
+// used as a byte buffer, not text - as a tag byte telling null from present, then,
+// when present, the value's bytes. A null serializes to the tag alone, so all
+// nulls share a key and DISTINCT dedups them together, matching Cypher.
+template <typename Primitive>
+void distinctKeyAppendOptColumn(const Column* column, size_t row, std::string& key) {
+    const auto& raw = static_cast<const ColumnVector<std::optional<Primitive>>*>(column)->getRaw();
+    const std::optional<Primitive>& value = raw[row];
+
+    if (!value.has_value()) {
+        key.push_back('\0');
+        return;
+    }
+
+    key.push_back('\1');
+    distinctAppendValueBytes(key, *value);
+}
+
+void distinctAppendElementBytes(std::string& key, ListElementView element);
+
+// Serialize a nested list into the row key as its length then its elements, so a list
+// never keys the same as the concatenation of its neighbours.
+void distinctAppendListBytes(std::string& key, const ListView list) {
+    const size_t size = list.size();
+    key.append(reinterpret_cast<const char*>(&size), sizeof(size));
+
+    for (const ListElementView element : list) {
+        distinctAppendElementBytes(key, element);
+    }
+}
+
+// A list would otherwise pick the trivially-copyable template and key on the view's own
+// bytes - a pointer into its buffer - so two equal lists held in different buffers, as a
+// property's and a literal's are, would count as two.
+void distinctAppendValueBytes(std::string& key, const ListView value) {
+    distinctAppendListBytes(key, value);
+}
+
+// Serialize a number by its value rather than by the type it is tagged with: an integer
+// and a float holding the same value are one Cypher value, so a float with no fractional
+// part keys as that integer and only a fractional one keys as a double.
+// A number keys under the Int tag whenever it holds one, so 1, 1.0 and a small unsigned 1
+// all key alike - which is what makes the key agree with numeric equality.
+void distinctAppendIntegerKey(std::string& key, const types::Int64::Primitive value) {
+    key.push_back(static_cast<char>(ListBufferTypeTag::Int));
+    distinctAppendValueBytes(key, value);
+}
+
+void distinctAppendNumberKey(std::string& key, const types::Int64::Primitive value) {
+    distinctAppendIntegerKey(key, value);
+}
+
+void distinctAppendNumberKey(std::string& key, const types::UInt64::Primitive value) {
+    if (value <= static_cast<types::UInt64::Primitive>(std::numeric_limits<types::Int64::Primitive>::max())) {
+        distinctAppendIntegerKey(key, static_cast<types::Int64::Primitive>(value));
+        return;
+    }
+
+    key.push_back(static_cast<char>(ListBufferTypeTag::UInt));
+    distinctAppendValueBytes(key, value);
+}
+
+void distinctAppendNumberKey(std::string& key, const types::Double::Primitive value) {
+    constexpr types::Double::Primitive integerBound = 9223372036854775808.0;
+    constexpr types::Double::Primitive unsignedBound = 18446744073709551616.0;
+
+    const bool holdsAWholeNumber = std::isfinite(value) && std::trunc(value) == value;
+    const bool holdsAnInteger = holdsAWholeNumber && value >= -integerBound && value < integerBound;
+    const bool holdsAnUnsigned = holdsAWholeNumber && value >= integerBound && value < unsignedBound;
+
+    if (holdsAnInteger) {
+        distinctAppendIntegerKey(key, static_cast<types::Int64::Primitive>(value));
+    } else if (holdsAnUnsigned) {
+        distinctAppendNumberKey(key, static_cast<types::UInt64::Primitive>(value));
+    } else {
+        key.push_back(static_cast<char>(ListBufferTypeTag::Double));
+        distinctAppendValueBytes(key, value);
+    }
+}
+
+void distinctAppendNumberBytes(std::string& key, const ListElementView element) {
+    switch (element.getTag()) {
+        case ListBufferTypeTag::Int:
+            return distinctAppendNumberKey(key, element.getAs<types::Int64::Primitive>());
+        break;
+
+        case ListBufferTypeTag::UInt:
+            return distinctAppendNumberKey(key, element.getAs<types::UInt64::Primitive>());
+        break;
+
+        case ListBufferTypeTag::Double:
+            return distinctAppendNumberKey(key, element.getAs<types::Double::Primitive>());
+        break;
+
+        default:
+            bioassert(false, "Keying a non-numeric element as a number");
+        break;
+    }
+}
+
+// Serialize one tagged scalar into the row key: its tag, then its value's bytes. Cells of
+// two types never collide because the tag leads, and a null is the tag alone, so all
+// nulls dedup together as they do in a nullable value column.
+void distinctAppendMapBytes(std::string& key, MapView map);
+
+// Serialize one map value into the row key the way a list element is serialized: a number
+// normalised first, then the tag and the value's bytes.
+void distinctAppendMapValueBytes(std::string& key, const MapEntryView entry) {
+    const MapBufferTypeTag tag = entry.getValueTag();
+
+    switch (tag) {
+        case MapBufferTypeTag::Int:
+            distinctAppendNumberKey(key, entry.getValueAs<types::Int64::Primitive>());
+            return;
+        break;
+
+        case MapBufferTypeTag::UInt:
+            distinctAppendNumberKey(key, entry.getValueAs<types::UInt64::Primitive>());
+            return;
+        break;
+
+        case MapBufferTypeTag::Double:
+            distinctAppendNumberKey(key, entry.getValueAs<types::Double::Primitive>());
+            return;
+        break;
+
+        case MapBufferTypeTag::Bool:
+            key.push_back(static_cast<char>(ListBufferTypeTag::Bool));
+            distinctAppendValueBytes(key, static_cast<bool>(entry.getValueAs<types::Bool::Primitive>()));
+            return;
+        break;
+
+        case MapBufferTypeTag::String:
+            key.push_back(static_cast<char>(ListBufferTypeTag::String));
+            distinctAppendValueBytes(key, entry.getValueAs<types::String::Primitive>());
+            return;
+        break;
+
+        case MapBufferTypeTag::ListView:
+            key.push_back(static_cast<char>(ListBufferTypeTag::ListView));
+            distinctAppendListBytes(key, entry.getValueAs<ListView>());
+            return;
+        break;
+
+        case MapBufferTypeTag::MapView:
+            key.push_back(static_cast<char>(ListBufferTypeTag::MapView));
+            distinctAppendMapBytes(key, entry.getValueAs<MapView>());
+            return;
+        break;
+
+        case MapBufferTypeTag::Null:
+            key.push_back(static_cast<char>(ListBufferTypeTag::Null));
+            return;
+        break;
+
+        case MapBufferTypeTag::NodeID:
+            key.push_back(static_cast<char>(ListBufferTypeTag::NodeID));
+            distinctAppendValueBytes(key, entry.getValueAs<NodeID>().getValue());
+            return;
+        break;
+
+        case MapBufferTypeTag::EdgeID:
+            key.push_back(static_cast<char>(ListBufferTypeTag::EdgeID));
+            distinctAppendValueBytes(key, entry.getValueAs<EdgeID>().getValue());
+            return;
+        break;
+
+        case MapBufferTypeTag::DateTime:
+            key.push_back(static_cast<char>(ListBufferTypeTag::DateTime));
+            distinctAppendValueBytes(key, entry.getValueAs<types::DateTime::Primitive>().getMicroseconds());
+            return;
+        break;
+
+        case MapBufferTypeTag::Duration:
+            key.push_back(static_cast<char>(ListBufferTypeTag::Duration));
+            distinctAppendValueBytes(key, entry.getValueAs<types::Duration::Primitive>().getMicroseconds());
+            return;
+        break;
+
+        case MapBufferTypeTag::Embedding:
+            throw IRException("cannot dedup by an embedding map value");
+        break;
+
+        case MapBufferTypeTag::INVALID:
+            throw IRException("cannot dedup by an untagged map value");
+        break;
+    }
+
+    bioassert(false, "Unknown MapBufferTypeTag");
+}
+
+// Serialize a map into the row key as its size, then each entry's key length, key bytes and
+// value. Both producers store entries in key order, so equal maps serialize alike.
+void distinctAppendMapBytes(std::string& key, const MapView map) {
+    const size_t size = map.size();
+    key.append(reinterpret_cast<const char*>(&size), sizeof(size));
+
+    for (const MapEntryView entry : map) {
+        const std::string_view entryKey = entry.getKey();
+        const size_t keySize = entryKey.size();
+        key.append(reinterpret_cast<const char*>(&keySize), sizeof(keySize));
+        key.append(entryKey);
+
+        distinctAppendMapValueBytes(key, entry);
+    }
+}
+
+void distinctAppendElementBytes(std::string& key, const ListElementView element) {
+    const ListBufferTypeTag tag = element.getTag();
+
+    switch (tag) {
+        case ListBufferTypeTag::Int:
+        case ListBufferTypeTag::UInt:
+        case ListBufferTypeTag::Double:
+            return distinctAppendNumberBytes(key, element);
+        break;
+
+        case ListBufferTypeTag::Bool:
+            key.push_back(static_cast<char>(tag));
+            distinctAppendValueBytes(key, static_cast<bool>(element.getAs<types::Bool::Primitive>()));
+            return;
+        break;
+
+        case ListBufferTypeTag::String:
+            key.push_back(static_cast<char>(tag));
+            distinctAppendValueBytes(key, element.getAs<types::String::Primitive>());
+            return;
+        break;
+
+        case ListBufferTypeTag::ListView:
+            key.push_back(static_cast<char>(tag));
+            distinctAppendListBytes(key, element.getAs<ListView>());
+            return;
+        break;
+
+        case ListBufferTypeTag::Null:
+            key.push_back(static_cast<char>(tag));
+            return;
+        break;
+
+        case ListBufferTypeTag::NodeID:
+            key.push_back(static_cast<char>(tag));
+            distinctAppendValueBytes(key, element.getAs<NodeID>().getValue());
+            return;
+        break;
+
+        case ListBufferTypeTag::EdgeID:
+            key.push_back(static_cast<char>(tag));
+            distinctAppendValueBytes(key, element.getAs<EdgeID>().getValue());
+            return;
+        break;
+
+        case ListBufferTypeTag::DateTime:
+            key.push_back(static_cast<char>(tag));
+            distinctAppendValueBytes(key, element.getAs<types::DateTime::Primitive>().getMicroseconds());
+            return;
+        break;
+
+        case ListBufferTypeTag::Duration:
+            key.push_back(static_cast<char>(tag));
+            distinctAppendValueBytes(key, element.getAs<types::Duration::Primitive>().getMicroseconds());
+            return;
+        break;
+
+        case ListBufferTypeTag::Embedding:
+            throw IRException("cannot dedup by an embedding element");
+        break;
+
+        case ListBufferTypeTag::MapView:
+            key.push_back(static_cast<char>(tag));
+            distinctAppendMapBytes(key, element.getAs<MapView>());
+            return;
+        break;
+
+        case ListBufferTypeTag::INVALID:
+            throw IRException("cannot dedup by an untagged element");
+        break;
+    }
+
+    bioassert(false, "Unknown ListBufferTypeTag");
+}
+
+// A chunk of this kind holds neither a null nor a NaN - an ID column, a plainly-held
+// value of any other type - so every row of it carries a key a join can match on.
+bool everyRowMatchable(const Column* column, size_t row) {
+    return true;
+}
+
+// Whether one row of a nullable value column carries a key a join can match. A null does
+// not: `=` against a null gives null, and the filter this join replaces kept only the
+// true rows.
+template <typename Primitive>
+bool optColumnRowMatchable(const Column* column, size_t row) {
+    const auto& raw = static_cast<const ColumnVector<std::optional<Primitive>>*>(column)->getRaw();
+
+    return raw[row].has_value();
+}
+
+// The double sibling, which rejects a NaN as well: NaN = NaN is false, so a NaN key
+// matches nothing - not even another NaN. The key bytes cannot say so, since the
+// serializer maps every NaN payload to one canonical NaN so that DISTINCT groups them.
+bool optDoubleColumnRowMatchable(const Column* column, size_t row) {
+    const auto& raw = static_cast<const ColumnVector<std::optional<types::Double::Primitive>>*>(column)->getRaw();
+    const std::optional<types::Double::Primitive>& value = raw[row];
+
+    return value.has_value() && !std::isnan(*value);
+}
+
+// The plainly-held double sibling: no row of such a column is null, so only a NaN keeps
+// one out of the join.
+bool plainDoubleColumnRowMatchable(const Column* column, size_t row) {
+    const auto& raw = static_cast<const ColumnVector<types::Double::Primitive>*>(column)->getRaw();
+
+    return !std::isnan(raw[row]);
+}
+
+// Whether one row of a nullable embedding column carries a key a join can match. A null
+// does not, and neither does a vector holding a NaN: TuringEqual compares two embeddings
+// element by element, so such a row equals nothing - not even itself.
+bool optEmbeddingColumnRowMatchable(const Column* column, size_t row) {
+    const auto& raw = static_cast<const ColumnVector<std::optional<types::Embedding::Primitive>>*>(column)->getRaw();
+    const std::optional<types::Embedding::Primitive>& embedding = raw[row];
+    if (!embedding.has_value()) {
+        return false;
+    }
+
+    const auto isNaN = [](float value) { return std::isnan(value); };
+
+    return std::none_of(embedding->begin(), embedding->end(), isNaN);
+}
+
+// Whether one row of a type-erased column of tagged scalars carries a matchable key - the
+// cell's own tag says whether it is null, where a nullable column has a present flag.
+bool listElementColumnRowMatchable(const Column* column, size_t row) {
+    const auto& raw = static_cast<const ColumnVector<ListElementView>*>(column)->getRaw();
+
+    return raw[row].getTag() != ListBufferTypeTag::Null;
+}
+
+// Serialize one row of a type-erased column of tagged scalars into the row key.
+void distinctKeyAppendListElementColumn(const Column* column, size_t row, std::string& key) {
+    const auto& raw = static_cast<const ColumnVector<ListElementView>*>(column)->getRaw();
+    distinctAppendElementBytes(key, raw[row]);
+}
+
+void distinctKeyAppendOptListElementColumn(const Column* column, size_t row, std::string& key) {
+    const std::vector<std::optional<ListElementView>>& raw =
+        static_cast<const ColumnOptVector<ListElementView>*>(column)->getRaw();
+    const std::optional<ListElementView>& element = raw[row];
+
+    if (!element.has_value()) {
+        key.push_back(static_cast<char>(ListBufferTypeTag::Null));
+        return;
+    }
+
+    distinctAppendElementBytes(key, *element);
+}
+
+// Serialize one row of a list column into the row key, so two rows key alike when their
+// lists hold equal elements - the equality Cypher gives two lists.
+void distinctKeyAppendListColumn(const Column* column, size_t row, std::string& key) {
+    const auto& raw = static_cast<const ColumnVector<ListView>*>(column)->getRaw();
+    distinctAppendListBytes(key, raw[row]);
+}
+
+void distinctKeyAppendMapColumn(const Column* column, size_t row, std::string& key) {
+    const auto& raw = static_cast<const ColumnVector<MapView>*>(column)->getRaw();
+    distinctAppendMapBytes(key, raw[row]);
+}
+
+// A null path is an empty one, so it keys as length 0, apart from every path
+void distinctKeyAppendEntityListColumn(const Column* column, size_t row, std::string& key) {
+    const std::vector<EntityList>& raw = static_cast<const ColumnVector<EntityList>*>(column)->getRaw();
+    const EntityList& path = raw[row];
+
+    const size_t size = path.size();
+    key.append(reinterpret_cast<const char*>(&size), sizeof(size));
+
+    for (const EntityList::Entry& entry : path) {
+        key.push_back(static_cast<char>(entry._type));
+        distinctAppendValueBytes(key, entry._id.getValue());
+    }
+}
+
+void distinctKeyAppendOptListColumn(const Column* column, size_t row, std::string& key) {
+    const std::vector<std::optional<ListView>>& raw =
+        static_cast<const ColumnOptVector<ListView>*>(column)->getRaw();
+    const std::optional<ListView>& list = raw[row];
+
+    if (!list.has_value()) {
+        key.push_back(static_cast<char>(ListBufferTypeTag::Null));
+        return;
+    }
+
+    distinctAppendListBytes(key, *list);
+}
+
+void distinctKeyAppendOptMapColumn(const Column* column, size_t row, std::string& key) {
+    const std::vector<std::optional<MapView>>& raw =
+        static_cast<const ColumnOptVector<MapView>*>(column)->getRaw();
+    const std::optional<MapView>& map = raw[row];
+
+    if (!map.has_value()) {
+        key.push_back(static_cast<char>(ListBufferTypeTag::Null));
+        return;
+    }
+
+    distinctAppendMapBytes(key, *map);
+}
+
+// The 64-bit finalizer of MurmurHash3, so a key's bits spread over every bucket
+uint64_t mixKeyBits(uint64_t bits) {
+    bits ^= bits >> 33;
+    bits *= 0xff51afd7ed558ccdULL;
+    bits ^= bits >> 33;
+    bits *= 0xc4ceb9fe1a85ec53ULL;
+    bits ^= bits >> 33;
+
+    return bits;
+}
+
+template <typename Integral>
+    requires std::is_integral_v<Integral> || std::is_enum_v<Integral>
+uint64_t hashKeyValue(Integral value) {
+    return mixKeyBits(static_cast<uint64_t>(value));
+}
+
+template <IntegralType T, int I>
+uint64_t hashKeyValue(ID<T, I> id) {
+    return hashKeyValue(id.getValue());
+}
+
+uint64_t hashKeyValue(CustomBool value) {
+    return mixKeyBits(value._boolean);
+}
+
+uint64_t hashKeyValue(types::DateTime::Primitive value) {
+    return mixKeyBits(static_cast<uint64_t>(value.getMicroseconds()));
+}
+
+uint64_t hashKeyValue(types::Duration::Primitive value) {
+    return mixKeyBits(static_cast<uint64_t>(value.getMicroseconds()));
+}
+
+// -0.0 hashes as +0.0, the one value it equals; a NaN never reaches a lookup
+uint64_t hashKeyValue(double value) {
+    const double normalized = (value == 0.0) ? 0.0 : value;
+    return mixKeyBits(std::bit_cast<uint64_t>(normalized));
+}
+
+uint64_t hashKeyValue(std::string_view value) {
+    return std::hash<std::string_view> {}(value);
+}
+
+uint64_t hashKeyValue(MapView map) {
+    return mixKeyBits(hashMap(map));
+}
+
+uint64_t hashKeyValue(types::Embedding::Primitive embedding) {
+    uint64_t hash = mixKeyBits(embedding.size());
+
+    for (const float value : embedding) {
+        const float normalized = (value == 0.0f) ? 0.0f : value;
+        hash = mixKeyBits(hash ^ std::bit_cast<uint32_t>(normalized));
+    }
+
+    return hash;
+}
+
+template <typename ElementType>
+void hashKeyColumn(const Column* column, std::vector<uint64_t>& hashes) {
+    const auto& raw = static_cast<const ColumnVector<ElementType>*>(column)->getRaw();
+    hashes.resize(raw.size());
+
+    std::transform(raw.begin(), raw.end(), hashes.begin(), [](const ElementType& value) {
+        return hashKeyValue(value);
+    });
+}
+
+template <typename Primitive>
+void hashOptKeyColumn(const Column* column, std::vector<uint64_t>& hashes) {
+    const auto& raw = static_cast<const ColumnVector<std::optional<Primitive>>*>(column)->getRaw();
+    hashes.resize(raw.size());
+
+    std::transform(raw.begin(), raw.end(), hashes.begin(), [](const std::optional<Primitive>& value) {
+        return value.has_value() ? hashKeyValue(*value) : uint64_t {0};
+    });
+}
+
+// A tagged scalar hashes through the bytes DISTINCT keys it by, so an integer and a float
+// holding one value hash alike, as they compare equal
+void hashListElementKeyColumn(const Column* column, std::vector<uint64_t>& hashes) {
+    const auto& raw = static_cast<const ColumnVector<ListElementView>*>(column)->getRaw();
+    hashes.resize(raw.size());
+
+    std::string bytes;
+    std::transform(raw.begin(), raw.end(), hashes.begin(), [&bytes](const ListElementView element) {
+        bytes.clear();
+        distinctAppendElementBytes(bytes, element);
+        return hashKeyValue(std::string_view(bytes));
+    });
+}
+
+void hashListKeyColumn(const Column* column, std::vector<uint64_t>& hashes) {
+    const auto& raw = static_cast<const ColumnVector<ListView>*>(column)->getRaw();
+    hashes.resize(raw.size());
+
+    std::string bytes;
+    std::transform(raw.begin(), raw.end(), hashes.begin(), [&bytes](const ListView list) {
+        bytes.clear();
+        distinctAppendListBytes(bytes, list);
+        return hashKeyValue(std::string_view(bytes));
+    });
+}
+
+// The nullable sibling, for a list read out of a property: an absent list hashes to the
+// zero a null key takes everywhere else, and a present one hashes as a plain column's does.
+void hashOptListKeyColumn(const Column* column, std::vector<uint64_t>& hashes) {
+    const auto& raw = static_cast<const ColumnOptVector<ListView>*>(column)->getRaw();
+    hashes.resize(raw.size());
+
+    std::string bytes;
+    std::transform(raw.begin(), raw.end(), hashes.begin(), [&bytes](const std::optional<ListView>& list) {
+        if (!list.has_value()) {
+            return uint64_t {0};
+        }
+
+        bytes.clear();
+        distinctAppendListBytes(bytes, *list);
+        return hashKeyValue(std::string_view(bytes));
+    });
+}
+
+template <typename ElementType>
+bool keyValuesEqual(const ElementType& probe, const ElementType& build) {
+    return probe == build;
+}
+
+bool keyValuesEqual(types::Embedding::Primitive probe, types::Embedding::Primitive build) {
+    return EmbeddingEqual {}(probe, build);
+}
+
+template <typename ElementType>
+bool keyEqualColumn(const Column* probe, size_t probeRow, const Column* build, size_t buildRow) {
+    const auto& probeRaw = static_cast<const ColumnVector<ElementType>*>(probe)->getRaw();
+    const auto& buildRaw = static_cast<const ColumnVector<ElementType>*>(build)->getRaw();
+
+    return keyValuesEqual(probeRaw[probeRow], buildRaw[buildRow]);
+}
+
+template <typename Primitive>
+bool keyEqualOptColumn(const Column* probe, size_t probeRow, const Column* build, size_t buildRow) {
+    const auto& probeRaw = static_cast<const ColumnVector<std::optional<Primitive>>*>(probe)->getRaw();
+    const auto& buildRaw = static_cast<const ColumnVector<std::optional<Primitive>>*>(build)->getRaw();
+
+    return keyValuesEqual(*probeRaw[probeRow], *buildRaw[buildRow]);
+}
+
+template <typename ElementType>
+NLJoinKeyFunctions joinKeyFunctions() {
+    return {&hashKeyColumn<ElementType>, &keyEqualColumn<ElementType>};
+}
+
+template <typename Primitive>
+NLJoinKeyFunctions optJoinKeyFunctions() {
+    return {&hashOptKeyColumn<Primitive>, &keyEqualOptColumn<Primitive>};
+}
+
+template <>
+NLJoinKeyFunctions optJoinKeyFunctions<ListView>() {
+    return {&hashOptListKeyColumn, &keyEqualOptColumn<ListView>};
+}
+
+// The group of build rows carrying a key, or noRow when no indexed row carries it. One
+// bucket chains the groups of every key that falls in it, so a group's key is confirmed
+// by hash and then by value.
+size_t findKeyGroup(const NLHashJoinIndex& index,
+                    uint64_t hash,
+                    const Column* probeKey,
+                    size_t probeRow,
+                    const Column* buildKey,
+                    NLKeyEqualFunction keyEqual) {
+    for (size_t group = index.getFirstGroup(hash); group != NLHashJoinIndex::noRow; group = index.getNextGroup(group)) {
+        const bool sameHash = index.getHash(group) == hash;
+
+        if (sameHash && keyEqual(probeKey, probeRow, buildKey, group)) {
+            return group;
+        }
+    }
+
+    return NLHashJoinIndex::noRow;
+}
+
+// Count the non-null cells of a type-erased column of tagged scalars, so count(x) over a
+// heterogeneous unwind charges the same rows a nullable value column would.
+size_t countNonNullElementsColumn(const Column* column) {
+    const auto& raw = static_cast<const ColumnVector<ListElementView>*>(column)->getRaw();
+    return std::count_if(raw.begin(), raw.end(), [](const ListElementView element) {
+        return element.getTag() != ListBufferTypeTag::Null;
+    });
+}
+
+size_t countPresentElementsColumn(const Column* column) {
+    const std::vector<std::optional<ListElementView>>& raw =
+        static_cast<const ColumnOptVector<ListElementView>*>(column)->getRaw();
+
+    return std::count_if(raw.begin(), raw.end(), [](const std::optional<ListElementView>& element) {
+        return element.has_value() && element->getTag() != ListBufferTypeTag::Null;
+    });
+}
+
+size_t countPresentListsColumn(const Column* column) {
+    const std::vector<std::optional<ListView>>& raw =
+        static_cast<const ColumnOptVector<ListView>*>(column)->getRaw();
+
+    return std::count_if(raw.begin(), raw.end(), [](const std::optional<ListView>& list) {
+        return list.has_value();
+    });
+}
+
+// An entity an OPTIONAL MATCH did not match is an invalid ID, which is a null, so an ID
+// chunk charges only the rows holding a valid one - Cypher's count(x) counts the non-null
+// rows. The ID sibling of countPresentColumn, for the one column family whose null is not
+// a missing optional.
+template <typename ID>
+size_t countValidIDs(const Column* column) {
+    const std::vector<ID>& raw = static_cast<const ColumnVector<ID>*>(column)->getRaw();
+
+    return std::ranges::count_if(raw, [](const ID id) { return id.isValid(); });
+}
+
+size_t countPresentPaths(const Column* column) {
+    const std::vector<EntityList>& raw = static_cast<const ColumnVector<EntityList>*>(column)->getRaw();
+
+    return std::ranges::count_if(raw, [](const EntityList& path) { return !path.empty(); });
+}
+
+// Count the present (non-null) values of a nullable value column - a
+// ColumnVector<std::optional<Primitive>> - so Cypher count(x) charges only the
+// rows in which x is not null.
+template <typename OptType>
+size_t countPresentColumn(const Column* column) {
+    const auto& raw = static_cast<const ColumnVector<OptType>*>(column)->getRaw();
+    return std::count_if(raw.begin(), raw.end(), [](const OptType& value) {
+        return value.has_value();
+    });
+}
+
+// Reset a sum/avg accumulator to a present zero (its identity): a running sum
+// starts at zero and stays present regardless of nulls, so an empty input sums
+// to zero, matching Cypher.
+template <typename Primitive>
+void aggregateResetZero(NLAggregateState* state) {
+    auto* accumulator = static_cast<ColumnOptVector<Primitive>*>(state->getAccumulator());
+    accumulator->getRaw().assign(1, std::optional<Primitive>(Primitive {}));
+    state->setCount(0);
+}
+
+// Reset a min/max accumulator to null: with no non-null row seen yet there is no
+// extreme, and an all-null (or empty) input reduces to null, matching Cypher.
+template <typename Primitive>
+void aggregateResetNull(NLAggregateState* state) {
+    auto* accumulator = static_cast<ColumnOptVector<Primitive>*>(state->getAccumulator());
+    accumulator->getRaw().assign(1, std::nullopt);
+    state->setCount(0);
+    state->extremeValues().clear();
+}
+
+// Add two aggregate values with defined overflow. A signed integer sum wraps in
+// two's complement (matching Cypher's Java-long integer sum) rather than invoking
+// C++ signed-overflow undefined behavior; unsigned integers already wrap by the
+// language, and doubles use the built-in +.
+template <typename Primitive>
+Primitive numericAdd(Primitive accumulator, Primitive value) {
+    if constexpr (std::is_integral_v<Primitive> && std::is_signed_v<Primitive>) {
+        using Unsigned = std::make_unsigned_t<Primitive>;
+        return static_cast<Primitive>(static_cast<Unsigned>(accumulator) + static_cast<Unsigned>(value));
+    } else {
+        return accumulator + value;
+    }
+}
+
+// Fold a chunk's present values into a sum accumulator (same primitive as the
+// input). The accumulator is always present, so read-modify-write its one row.
+template <typename Primitive>
+void aggregateUpdateSum(NLAggregateState* state, const Column* input) {
+    auto* accumulator = static_cast<ColumnOptVector<Primitive>*>(state->getAccumulator());
+    std::optional<Primitive>& current = accumulator->getRaw().front();
+    const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
+
+    Primitive running = current.value();
+    for (const std::optional<Primitive>& value : inputRaw) {
+        if (value.has_value()) {
+            running = numericAdd(running, *value);
+        }
+    }
+
+    current = running;
+}
+
+std::optional<ListElementView> presentCell(const ListElementView element) {
+    if (element.getTag() == ListBufferTypeTag::Null) {
+        return std::nullopt;
+    }
+
+    return element;
+}
+
+std::optional<ListElementView> presentCell(const std::optional<ListElementView>& element) {
+    if (!element.has_value()) {
+        return std::nullopt;
+    }
+
+    return presentCell(*element);
+}
+
+template <typename Primitive>
+std::optional<Primitive> presentCell(const std::optional<Primitive>& value) {
+    return value;
+}
+
+template <typename Primitive, bool IsMax>
+bool replacesExtremum(const Primitive& current, const Primitive& value) {
+    if constexpr (IsMax) {
+        return sortsBefore(current, value);
+    } else {
+        return sortsBefore(value, current);
+    }
+}
+
+// Fold a chunk's present values into a min (IsMax false) or max (IsMax true)
+// accumulator. The first present value seeds the accumulator; later values
+// replace it when more extreme. Nulls are skipped, so an all-null input leaves
+// the accumulator null.
+template <typename Primitive, bool IsMax, typename Cell = std::optional<Primitive>>
+void aggregateUpdateMinMax(NLAggregateState* state, const Column* input) {
+    auto* accumulator = static_cast<ColumnOptVector<Primitive>*>(state->getAccumulator());
+    std::optional<Primitive>& current = accumulator->getRaw().front();
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    bool replaced = false;
+    for (const Cell& cell : inputRaw) {
+        const std::optional<Primitive> value = presentCell(cell);
+        if (!value.has_value()) {
+            continue;
+        }
+
+        if (!current.has_value() || replacesExtremum<Primitive, IsMax>(*current, *value)) {
+            current = *value;
+            replaced = true;
+        }
+    }
+
+    if (replaced) {
+        NLCompactingValueStore& extremes = state->extremeValues();
+        current = extremes.getSpare().ownElement(*current);
+        extremes.flip();
+    }
+}
+
+// The number a tagged cell holds, whatever numeric type its tag names. A reduction over
+// a type-erased column is defined over numbers only, so any other tag is a query error -
+// the check the static column types make for a typed column, made per row here.
+double taggedNumericValue(const ListElementView element) {
+    switch (element.getTag()) {
+        case ListBufferTypeTag::Int:
+            return static_cast<double>(element.getAs<types::Int64::Primitive>());
+        break;
+
+        case ListBufferTypeTag::UInt:
+            return static_cast<double>(element.getAs<types::UInt64::Primitive>());
+        break;
+
+        case ListBufferTypeTag::Double:
+            return element.getAs<types::Double::Primitive>();
+        break;
+
+        default:
+            throw IRException("sum/avg/stdev over type-erased cells requires a numeric column");
+        break;
+    }
+}
+
+// A standard deviation holds two doubles per group, side by side in its accumulator: the
+// mean of the values folded so far, then the sum of their squared deviations from it.
+// Welford's update keeps both accurate for values far from 0, where a sum of squares
+// minus a squared sum cancels to noise.
+constexpr size_t DEVIATION_SLOT_COUNT = 2;
+
+template <typename Primitive>
+double numberOf(const Primitive& value) {
+    return static_cast<double>(value);
+}
+
+double numberOf(const ListElementView element) {
+    return taggedNumericValue(element);
+}
+
+void foldDeviation(double value, double& mean, double& squaredDeviations, uint64_t& count) {
+    count++;
+
+    const double distanceToOldMean = value - mean;
+    mean += distanceToOldMean / static_cast<double>(count);
+    squaredDeviations += distanceToOldMean * (value - mean);
+}
+
+// Too few values to spread - none, or the one a sample has no second for - spread by 0
+template <bool Population>
+double deviation(double squaredDeviations, uint64_t count) {
+    if constexpr (Population) {
+        if (count == 0) {
+            return 0.0;
+        } else {
+            return std::sqrt(squaredDeviations / static_cast<double>(count));
+        }
+    } else {
+        if (count < 2) {
+            return 0.0;
+        } else {
+            return std::sqrt(squaredDeviations / static_cast<double>(count - 1));
+        }
+    }
+}
+
+void aggregateResetDeviation(NLAggregateState* state) {
+    auto* accumulator = static_cast<ColumnOptVector<double>*>(state->getAccumulator());
+    accumulator->getRaw().assign(DEVIATION_SLOT_COUNT, std::optional<double>(0.0));
+    state->setCount(0);
+}
+
+template <typename Cell>
+void aggregateUpdateDeviation(NLAggregateState* state, const Column* input) {
+    auto& slots = static_cast<ColumnOptVector<double>*>(state->getAccumulator())->getRaw();
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    double mean = slots[0].value();
+    double squaredDeviations = slots[1].value();
+    uint64_t count = state->getCount();
+
+    for (const Cell& cell : inputRaw) {
+        const auto value = presentCell(cell);
+        if (value.has_value()) {
+            foldDeviation(numberOf(*value), mean, squaredDeviations, count);
+        }
+    }
+
+    slots[0] = mean;
+    slots[1] = squaredDeviations;
+    state->setCount(count);
+}
+
+template <bool Population>
+void aggregateResultDeviation(const NLAggregateState* state, Column* output) {
+    const auto& slots = static_cast<const ColumnOptVector<double>*>(state->getAccumulator())->getRaw();
+    auto& outputRaw = static_cast<ColumnOptVector<double>*>(output)->getRaw();
+
+    outputRaw.assign(1, deviation<Population>(slots[1].value(), state->getCount()));
+}
+
+void groupGrowDeviation(Column* accumulator,
+                        std::vector<uint64_t>& counts,
+                        size_t groupCount) {
+    auto& raw = static_cast<ColumnOptVector<double>*>(accumulator)->getRaw();
+    raw.resize(groupCount * DEVIATION_SLOT_COUNT, std::optional<double>(0.0));
+    counts.resize(groupCount, 0);
+}
+
+// stDev(DISTINCT x) moves a group's slots once per distinct value it sees
+template <typename Cell, bool Distinct>
+void groupFoldDeviation(Column* accumulator,
+                        std::vector<uint64_t>& counts,
+                        const Column* input,
+                        const std::vector<size_t>& groups,
+                        NLGroupDistinctTally& distinct,
+                        NLValueStore& values) {
+    auto& raw = static_cast<ColumnOptVector<double>*>(accumulator)->getRaw();
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const auto value = presentCell(inputRaw[row]);
+        if (!value.has_value()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        if constexpr (Distinct) {
+            distinct.beginKey(group);
+
+            if constexpr (std::is_same_v<Cell, ListElementView> || std::is_same_v<Cell, std::optional<ListElementView>>) {
+                distinctAppendElementBytes(distinct.getKey(), *value);
+            } else {
+                distinctAppendValueBytes(distinct.getKey(), *value);
+            }
+
+            if (!distinct.insertIfNew()) {
+                continue;
+            }
+        }
+
+        std::optional<double>& mean = raw[group * DEVIATION_SLOT_COUNT];
+        std::optional<double>& squaredDeviations = raw[group * DEVIATION_SLOT_COUNT + 1];
+
+        double groupMean = mean.value();
+        double groupSquaredDeviations = squaredDeviations.value();
+        foldDeviation(numberOf(*value), groupMean, groupSquaredDeviations, counts[group]);
+
+        mean = groupMean;
+        squaredDeviations = groupSquaredDeviations;
+    }
+}
+
+template <bool Population>
+void groupEmitDeviation(const Column* accumulator,
+                        const std::vector<uint64_t>& counts,
+                        size_t begin,
+                        size_t count,
+                        Column* output) {
+    const auto& raw = static_cast<const ColumnOptVector<double>*>(accumulator)->getRaw();
+    auto& outputRaw = static_cast<ColumnOptVector<double>*>(output)->getRaw();
+    outputRaw.resize(count);
+
+    for (size_t index = 0; index < count; index++) {
+        const size_t group = begin + index;
+        const double squaredDeviations = raw[group * DEVIATION_SLOT_COUNT + 1].value();
+
+        outputRaw[index] = deviation<Population>(squaredDeviations, counts[group]);
+    }
+}
+
+// The fold of a standard deviation over a column of this value type: like avg's, a
+// numeric column only
+template <bool Distinct>
+NLGroupAggregateFoldFunction selectGroupDeviationFold(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &groupFoldDeviation<std::optional<types::Int64::Primitive>, Distinct>;
+        break;
+
+        case ValueType::UInt64:
+            return &groupFoldDeviation<std::optional<types::UInt64::Primitive>, Distinct>;
+        break;
+
+        case ValueType::Double:
+            return &groupFoldDeviation<std::optional<types::Double::Primitive>, Distinct>;
+        break;
+
+        default:
+            throw IRException("stdev requires a numeric column");
+        break;
+    }
+
+    return nullptr;
+}
+
+NLAggregateUpdateFunction selectDeviationUpdate(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &aggregateUpdateDeviation<std::optional<types::Int64::Primitive>>;
+        break;
+
+        case ValueType::UInt64:
+            return &aggregateUpdateDeviation<std::optional<types::UInt64::Primitive>>;
+        break;
+
+        case ValueType::Double:
+            return &aggregateUpdateDeviation<std::optional<types::Double::Primitive>>;
+        break;
+
+        default:
+            throw IRException("stdev requires a numeric column");
+        break;
+    }
+
+    return nullptr;
+}
+
+// Fold a chunk of tagged cells into a running f64 sum, counting the ones folded so avg
+// reads the same accumulator. A cell tagged null is skipped, as a null value column row
+// is. Mixed numeric tags are what makes a column type-erased, and Cypher sums those to a
+// float, so the accumulator is an f64 whichever tags turn up.
+template <typename Cell, bool CountsRows>
+void aggregateUpdateNumericTagged(NLAggregateState* state, const Column* input) {
+    auto* accumulator = static_cast<ColumnOptVector<double>*>(state->getAccumulator());
+    std::optional<double>& current = accumulator->getRaw().front();
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    double running = current.value();
+    size_t seen = 0;
+
+    for (const Cell& cell : inputRaw) {
+        const std::optional<ListElementView> element = presentCell(cell);
+        if (!element) {
+            continue;
+        }
+
+        running += taggedNumericValue(*element);
+        seen++;
+    }
+
+    current = running;
+
+    if constexpr (CountsRows) {
+        state->addCount(seen);
+    }
+}
+
+template <typename Cell>
+NLAggregateUpdateFunction taggedAggregateUpdateFor(AggregateKind kind) {
+    switch (kind) {
+        case AggregateKind::Sum:
+            return &aggregateUpdateNumericTagged<Cell, /*CountsRows=*/false>;
+        break;
+
+        case AggregateKind::Avg:
+            return &aggregateUpdateNumericTagged<Cell, /*CountsRows=*/true>;
+        break;
+
+        case AggregateKind::StDev:
+        case AggregateKind::StDevP:
+            return &aggregateUpdateDeviation<Cell>;
+        break;
+
+        case AggregateKind::Min:
+            return &aggregateUpdateMinMax<ListElementView, /*IsMax=*/false, Cell>;
+        break;
+
+        case AggregateKind::Max:
+            return &aggregateUpdateMinMax<ListElementView, /*IsMax=*/true, Cell>;
+        break;
+    }
+
+    bioassert(false, "Unhandled aggregate kind");
+    return nullptr;
+}
+
+// Fold a chunk's present values into an avg accumulator: a running f64 sum plus a
+// count of the non-null rows (the input primitive is widened to f64). avg divides
+// the two at the emit step, so both are accumulated here.
+template <typename Primitive>
+void aggregateUpdateAvg(NLAggregateState* state, const Column* input) {
+    auto* accumulator = static_cast<ColumnOptVector<double>*>(state->getAccumulator());
+    std::optional<double>& current = accumulator->getRaw().front();
+    const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
+
+    double running = current.value();
+    size_t seen = 0;
+    for (const std::optional<Primitive>& value : inputRaw) {
+        if (value.has_value()) {
+            running += static_cast<double>(*value);
+            seen++;
+        }
+    }
+
+    current = running;
+    state->addCount(seen);
+}
+
+// Emit a sum/min/max result: the accumulator already holds the reduced value in
+// the result's own type, so copy its single row into the output (a present sum,
+// or the extreme / null for min/max).
+template <typename Primitive>
+void aggregateResultCopy(const NLAggregateState* state, Column* output) {
+    const auto* accumulator = static_cast<const ColumnOptVector<Primitive>*>(state->getAccumulator());
+    auto* typedOutput = static_cast<ColumnOptVector<Primitive>*>(output);
+    typedOutput->getRaw().assign(1, accumulator->getRaw().front());
+}
+
+// Emit an avg result: divide the running f64 sum by the non-null count. With no
+// non-null row the average is null (division is undefined), matching Cypher.
+void aggregateResultAvg(const NLAggregateState* state, Column* output) {
+    const auto* accumulator = static_cast<const ColumnOptVector<double>*>(state->getAccumulator());
+    auto* typedOutput = static_cast<ColumnOptVector<double>*>(output);
+    std::vector<std::optional<double>>& outputRaw = typedOutput->getRaw();
+    const size_t count = state->getCount();
+
+    if (count == 0) {
+        outputRaw.assign(1, std::nullopt);
+    } else {
+        const double average = accumulator->getRaw().front().value() / static_cast<double>(count);
+        outputRaw.assign(1, std::optional<double>(average));
+    }
+}
+
+// The fold handler for a sum over a column of this value type. sum adds the
+// values, so only a numeric column is valid - a string or bool sum is rejected
+// (which also keeps aggregateUpdateSum from being instantiated for a type whose
+// operator+= would not compile).
+NLAggregateUpdateFunction selectSumUpdate(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &aggregateUpdateSum<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &aggregateUpdateSum<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &aggregateUpdateSum<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("sum requires a numeric column");
+        break;
+    }
+
+    return nullptr;
+}
+
+// The fold handler for an avg over a column of this value type. avg widens each
+// value to f64, so - like sum - only a numeric column is valid.
+NLAggregateUpdateFunction selectAvgUpdate(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &aggregateUpdateAvg<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &aggregateUpdateAvg<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &aggregateUpdateAvg<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("avg requires a numeric column");
+        break;
+    }
+
+    return nullptr;
+}
+
+// The fold handler for a min (IsMax false) or max (IsMax true) over a column of
+// this value type. min/max order the values, so any orderable type is valid -
+// numbers, bools, strings, lists and maps - but an embedding has no order (its <
+// would not compile), so it is rejected.
+template <bool IsMax>
+NLAggregateUpdateFunction selectMinMaxUpdate(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &aggregateUpdateMinMax<types::Int64::Primitive, IsMax>;
+        break;
+
+        case ValueType::UInt64:
+            return &aggregateUpdateMinMax<types::UInt64::Primitive, IsMax>;
+        break;
+
+        case ValueType::Double:
+            return &aggregateUpdateMinMax<types::Double::Primitive, IsMax>;
+        break;
+
+        case ValueType::Bool:
+            return &aggregateUpdateMinMax<types::Bool::Primitive, IsMax>;
+        break;
+
+        case ValueType::String:
+            return &aggregateUpdateMinMax<types::String::Primitive, IsMax>;
+        break;
+
+        case ValueType::DateTime:
+            return &aggregateUpdateMinMax<types::DateTime::Primitive, IsMax>;
+        break;
+
+        case ValueType::Duration:
+            return &aggregateUpdateMinMax<types::Duration::Primitive, IsMax>;
+        break;
+
+        case ValueType::List:
+            return &aggregateUpdateMinMax<types::List::Primitive, IsMax>;
+        break;
+
+        case ValueType::Map:
+            return &aggregateUpdateMinMax<types::Map::Primitive, IsMax>;
+        break;
+
+        default:
+            throw IRException("min/max requires an orderable column");
+        break;
+    }
+
+    return nullptr;
+}
+
+// Append the values of the given rows of an input chunk onto the tail of a key
+// buffer of the same element type. nl.group_aggregate_update passes the rows that
+// created a new group this step, so the buffer grows one key value per group in
+// creation order.
+template <typename ElementType, typename ColumnType = ColumnVector<ElementType>>
+void groupGatherAppendColumn(const Column* input,
+                             const std::vector<size_t>& rows,
+                             Column* buffer,
+                             NLValueStore& values) {
+    const auto& inputRaw = static_cast<const ColumnType*>(input)->getRaw();
+    auto& bufferRaw = static_cast<ColumnType*>(buffer)->getRaw();
+
+    for (const size_t row : rows) {
+        bufferRaw.push_back(values.ownElement(inputRaw[row]));
+    }
+}
+
+template <typename ElementType>
+void reownColumn(Column* column, NLValueStore& values) {
+    for (ElementType& element : static_cast<ColumnVector<ElementType>*>(column)->getRaw()) {
+        element = values.ownElement(element);
+    }
+}
+
+template <typename ElementType>
+void reownColumnRows(Column* column, const std::vector<size_t>& rows, NLValueStore& values) {
+    std::vector<ElementType>& raw = static_cast<ColumnVector<ElementType>*>(column)->getRaw();
+
+    for (const size_t row : rows) {
+        raw[row] = values.ownElement(raw[row]);
+    }
+}
+
+// Grow a sum accumulator to groupCount groups, initializing each new group to a
+// present zero (the additive identity). Existing groups keep their running sum. sum
+// keeps no per-group tally, so the counts vector is left untouched.
+template <typename Primitive>
+void groupGrowZero(Column* accumulator,
+                   std::vector<uint64_t>& counts,
+                   size_t groupCount) {
+    auto& raw = static_cast<ColumnOptVector<Primitive>*>(accumulator)->getRaw();
+    raw.resize(groupCount, std::optional<Primitive>(Primitive {}));
+}
+
+// Grow a min/max accumulator to groupCount groups, initializing each new group to
+// null (no extreme seen yet). Existing groups keep their running extreme. min/max
+// keeps no per-group tally, so the counts vector is left untouched.
+template <typename Primitive>
+void groupGrowNull(Column* accumulator,
+                   std::vector<uint64_t>& counts,
+                   size_t groupCount) {
+    auto& raw = static_cast<ColumnOptVector<Primitive>*>(accumulator)->getRaw();
+    raw.resize(groupCount);
+}
+
+// Grow an avg accumulator to groupCount groups: a running f64 sum initialized to a
+// present zero plus the per-group non-null tally zeroed for new groups. avg is the
+// only value reduction carried as (sum, count), so it is the only one that grows the
+// counts vector besides count itself.
+void groupGrowAvg(Column* accumulator,
+                  std::vector<uint64_t>& counts,
+                  size_t groupCount) {
+    auto& raw = static_cast<ColumnOptVector<double>*>(accumulator)->getRaw();
+    raw.resize(groupCount, std::optional<double>(0.0));
+    counts.resize(groupCount, 0);
+}
+
+// Grow a count accumulator: only the per-group tally, zeroed for new groups. count
+// keeps no reduced value, so there is no accumulator column to grow.
+void groupGrowCount(Column* accumulator,
+                    std::vector<uint64_t>& counts,
+                    size_t groupCount) {
+    counts.resize(groupCount, 0);
+}
+
+// Fold a chunk's present values into per-group sum accumulators. Each new group was
+// grown to a present zero, so read-modify-write its running sum.
+template <typename Primitive>
+void groupFoldSum(Column* accumulator,
+                  std::vector<uint64_t>& counts,
+                  const Column* input,
+                  const std::vector<size_t>& groups,
+                  NLGroupDistinctTally& distinct,
+                  NLValueStore& values) {
+    auto& raw = static_cast<ColumnOptVector<Primitive>*>(accumulator)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<Primitive>& value = inputRaw[row];
+        if (value.has_value()) {
+            std::optional<Primitive>& running = raw[groups[row]];
+            running = numericAdd(running.value(), *value);
+        }
+    }
+}
+
+// Fold a chunk's distinct present values into per-group sum accumulators
+// (sum(DISTINCT x)): a value its group has already been charged is skipped, so each
+// distinct value is added once however many rows carry it.
+template <typename Primitive>
+void groupFoldSumDistinct(Column* accumulator,
+                          std::vector<uint64_t>& counts,
+                          const Column* input,
+                          const std::vector<size_t>& groups,
+                          NLGroupDistinctTally& distinct,
+                          NLValueStore& values) {
+    auto& raw = static_cast<ColumnOptVector<Primitive>*>(accumulator)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<Primitive>& value = inputRaw[row];
+        if (!value.has_value()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendValueBytes(distinct.getKey(), *value);
+
+        if (!distinct.insertIfNew()) {
+            continue;
+        }
+
+        std::optional<Primitive>& running = raw[group];
+        running = numericAdd(running.value(), *value);
+    }
+}
+
+// Fold a group's tagged cells into its running f64 sum, tallying the ones folded so avg
+// divides by the same count. The type-erased sibling of groupFoldSum / groupFoldAvg: the
+// cells carry a type each, so the number each holds is read by its tag.
+template <typename Cell, bool CountsRows, bool Distinct>
+void groupFoldNumericTagged(Column* accumulator,
+                            std::vector<uint64_t>& counts,
+                            const Column* input,
+                            const std::vector<size_t>& groups,
+                            NLGroupDistinctTally& distinct,
+                            NLValueStore& values) {
+    auto& raw = static_cast<ColumnOptVector<double>*>(accumulator)->getRaw();
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<ListElementView> element = presentCell(inputRaw[row]);
+        if (!element) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        if constexpr (Distinct) {
+            distinct.beginKey(group);
+            distinctAppendElementBytes(distinct.getKey(), *element);
+
+            if (!distinct.insertIfNew()) {
+                continue;
+            }
+        }
+
+        std::optional<double>& running = raw[group];
+        running = running.value() + taggedNumericValue(*element);
+
+        if constexpr (CountsRows) {
+            counts[group]++;
+        }
+    }
+}
+
+// Fold a chunk's present values into per-group min (IsMax false) or max (IsMax
+// true) accumulators. The first present value of a group seeds it; a later value
+// replaces it when more extreme. A group with no present value stays null.
+template <typename Primitive, bool IsMax, typename Cell = std::optional<Primitive>>
+void groupFoldMinMax(Column* accumulator,
+                     std::vector<uint64_t>& counts,
+                     const Column* input,
+                     const std::vector<size_t>& groups,
+                     NLGroupDistinctTally& distinct,
+                     NLValueStore& values) {
+    auto& raw = static_cast<ColumnOptVector<Primitive>*>(accumulator)->getRaw();
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<Primitive> value = presentCell(inputRaw[row]);
+        if (!value.has_value()) {
+            continue;
+        }
+
+        std::optional<Primitive>& current = raw[groups[row]];
+        if (!current.has_value() || replacesExtremum<Primitive, IsMax>(*current, *value)) {
+            current = values.ownElement(*value);
+        }
+    }
+}
+
+// Fold a chunk's present values into per-group first accumulators: the first present
+// value of a group is kept and every later one passed over.
+template <typename Primitive, typename Cell = std::optional<Primitive>>
+void groupFoldFirst(Column* accumulator,
+                    std::vector<uint64_t>& counts,
+                    const Column* input,
+                    const std::vector<size_t>& groups,
+                    NLGroupDistinctTally& distinct,
+                    NLValueStore& values) {
+    auto& raw = static_cast<ColumnOptVector<Primitive>*>(accumulator)->getRaw();
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        std::optional<Primitive>& current = raw[groups[row]];
+        if (current.has_value()) {
+            continue;
+        }
+
+        const std::optional<Primitive> value = presentCell(inputRaw[row]);
+        if (value.has_value()) {
+            current = values.ownElement(*value);
+        }
+    }
+}
+
+template <typename Cell>
+NLGroupAggregateFoldFunction taggedGroupAggregateFoldFor(GroupAggregateKind kind) {
+    switch (kind) {
+        case GroupAggregateKind::Sum:
+            return &groupFoldNumericTagged<Cell, /*CountsRows=*/false, /*Distinct=*/false>;
+        break;
+
+        case GroupAggregateKind::SumDistinct:
+            return &groupFoldNumericTagged<Cell, /*CountsRows=*/false, /*Distinct=*/true>;
+        break;
+
+        case GroupAggregateKind::Avg:
+            return &groupFoldNumericTagged<Cell, /*CountsRows=*/true, /*Distinct=*/false>;
+        break;
+
+        case GroupAggregateKind::AvgDistinct:
+            return &groupFoldNumericTagged<Cell, /*CountsRows=*/true, /*Distinct=*/true>;
+        break;
+
+        case GroupAggregateKind::StDev:
+        case GroupAggregateKind::StDevP:
+            return &groupFoldDeviation<Cell, /*Distinct=*/false>;
+        break;
+
+        case GroupAggregateKind::StDevDistinct:
+        case GroupAggregateKind::StDevPDistinct:
+            return &groupFoldDeviation<Cell, /*Distinct=*/true>;
+        break;
+
+        case GroupAggregateKind::Min:
+            return &groupFoldMinMax<ListElementView, /*IsMax=*/false, Cell>;
+        break;
+
+        case GroupAggregateKind::Max:
+            return &groupFoldMinMax<ListElementView, /*IsMax=*/true, Cell>;
+        break;
+
+        case GroupAggregateKind::First:
+            return &groupFoldFirst<ListElementView, Cell>;
+        break;
+
+        case GroupAggregateKind::Count:
+        case GroupAggregateKind::CountDistinct:
+        case GroupAggregateKind::CountRows:
+            bioassert(false, "A tally of type-erased cells has its own fold");
+        break;
+    }
+
+    bioassert(false, "Unhandled group aggregate kind");
+    return nullptr;
+}
+
+// Fold a chunk's present values into per-group avg accumulators: a running f64 sum
+// (the accumulator, widened from the input) plus the per-group non-null count. avg
+// divides the two at the emit step.
+template <typename Primitive>
+void groupFoldAvg(Column* accumulator,
+                  std::vector<uint64_t>& counts,
+                  const Column* input,
+                  const std::vector<size_t>& groups,
+                  NLGroupDistinctTally& distinct,
+                  NLValueStore& values) {
+    auto& raw = static_cast<ColumnOptVector<double>*>(accumulator)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<Primitive>& value = inputRaw[row];
+        if (value.has_value()) {
+            const size_t group = groups[row];
+            std::optional<double>& running = raw[group];
+            running = running.value() + static_cast<double>(*value);
+            counts[group]++;
+        }
+    }
+}
+
+// Fold a chunk's distinct present values into per-group avg accumulators
+// (avg(DISTINCT x)): a value its group has already been charged moves neither the
+// running sum nor the count, so the mean is taken over the distinct values.
+template <typename Primitive>
+void groupFoldAvgDistinct(Column* accumulator,
+                          std::vector<uint64_t>& counts,
+                          const Column* input,
+                          const std::vector<size_t>& groups,
+                          NLGroupDistinctTally& distinct,
+                          NLValueStore& values) {
+    auto& raw = static_cast<ColumnOptVector<double>*>(accumulator)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<Primitive>& value = inputRaw[row];
+        if (!value.has_value()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendValueBytes(distinct.getKey(), *value);
+
+        if (!distinct.insertIfNew()) {
+            continue;
+        }
+
+        std::optional<double>& running = raw[group];
+        running = running.value() + static_cast<double>(*value);
+        counts[group]++;
+    }
+}
+
+// Tally every row into its group (count(*) over a never-null column): each row
+// charges its group regardless of value, so the input values are never read.
+void groupFoldCountAll(Column* accumulator,
+                       std::vector<uint64_t>& counts,
+                       const Column* input,
+                       const std::vector<size_t>& groups,
+                       NLGroupDistinctTally& distinct,
+                       NLValueStore& values) {
+    for (const size_t group : groups) {
+        counts[group]++;
+    }
+}
+
+// Tally each group's present (non-null) rows (count(x)): a null row is not charged,
+// matching Cypher's count(x).
+template <typename Primitive>
+void groupFoldCountPresent(Column* accumulator,
+                           std::vector<uint64_t>& counts,
+                           const Column* input,
+                           const std::vector<size_t>& groups,
+                           NLGroupDistinctTally& distinct,
+                           NLValueStore& values) {
+    const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        if (inputRaw[row].has_value()) {
+            counts[groups[row]]++;
+        }
+    }
+}
+
+// Tally each group's rows holding a valid ID (count(n) over a node/edge column): an
+// invalid ID is a null, so it is not charged - the ID sibling of groupFoldCountPresent.
+template <typename ID>
+void groupFoldCountValidID(Column* accumulator,
+                           std::vector<uint64_t>& counts,
+                           const Column* input,
+                           const std::vector<size_t>& groups,
+                           NLGroupDistinctTally& distinct,
+                           NLValueStore& values) {
+    const std::vector<ID>& inputRaw = static_cast<const ColumnVector<ID>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        if (inputRaw[row].isValid()) {
+            counts[groups[row]]++;
+        }
+    }
+}
+
+void groupFoldCountPresentPath(Column* accumulator,
+                               std::vector<uint64_t>& counts,
+                               const Column* input,
+                               const std::vector<size_t>& groups,
+                               NLGroupDistinctTally& distinct,
+                               NLValueStore& values) {
+    const std::vector<EntityList>& inputRaw = static_cast<const ColumnVector<EntityList>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        if (!inputRaw[row].empty()) {
+            counts[groups[row]]++;
+        }
+    }
+}
+
+// Tally each group's distinct IDs (count(DISTINCT n) over a node/edge column): an
+// invalid ID is a null, which count(DISTINCT x) does not charge, so only the valid ones
+// are keyed.
+template <typename ElementType>
+void groupFoldCountDistinctID(Column* accumulator,
+                              std::vector<uint64_t>& counts,
+                              const Column* input,
+                              const std::vector<size_t>& groups,
+                              NLGroupDistinctTally& distinct,
+                              NLValueStore& values) {
+    const auto& inputRaw = static_cast<const ColumnVector<ElementType>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        if (!inputRaw[row].isValid()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendValueBytes(distinct.getKey(), inputRaw[row].getValue());
+
+        if (distinct.insertIfNew()) {
+            counts[group]++;
+        }
+    }
+}
+
+// Tally each group's distinct values over a chunk holding them plainly - a column a
+// procedure yielded. No row of such a chunk is null, so every row is charged the first
+// time its value is seen in its group; the ID sibling keys on the ID's integer instead.
+template <typename ElementType>
+void groupFoldCountDistinctValue(Column* accumulator,
+                                 std::vector<uint64_t>& counts,
+                                 const Column* input,
+                                 const std::vector<size_t>& groups,
+                                 NLGroupDistinctTally& distinct,
+                                 NLValueStore& values) {
+    const auto& inputRaw = static_cast<const ColumnVector<ElementType>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendValueBytes(distinct.getKey(), inputRaw[row]);
+
+        if (distinct.insertIfNew()) {
+            counts[group]++;
+        }
+    }
+}
+
+// Tally each group's distinct present values (count(DISTINCT x)): a null row is not
+// charged, and a value repeated within its group is charged once. The value bytes are
+// the DISTINCT serializer's, so two rows count as one exactly when a whole-row DISTINCT
+// would fold them together.
+template <typename Primitive>
+void groupFoldCountDistinctPresent(Column* accumulator,
+                                   std::vector<uint64_t>& counts,
+                                   const Column* input,
+                                   const std::vector<size_t>& groups,
+                                   NLGroupDistinctTally& distinct,
+                                   NLValueStore& values) {
+    const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<Primitive>& value = inputRaw[row];
+        if (!value.has_value()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendValueBytes(distinct.getKey(), *value);
+
+        if (distinct.insertIfNew()) {
+            counts[group]++;
+        }
+    }
+}
+
+// Tally each group's present cells of a type-erased column of tagged scalars, so a
+// grouped count(x) over a heterogeneous unwind charges the same rows a nullable value
+// column would.
+template <typename Cell>
+void groupFoldCountPresentListElement(Column* accumulator,
+                                      std::vector<uint64_t>& counts,
+                                      const Column* input,
+                                      const std::vector<size_t>& groups,
+                                      NLGroupDistinctTally& distinct,
+                                      NLValueStore& values) {
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        if (presentCell(inputRaw[row])) {
+            counts[groups[row]]++;
+        }
+    }
+}
+
+// Tally each group's distinct present cells of a type-erased column of tagged scalars.
+// The key carries the tag as well as the value, so cells of different types are told
+// apart the way a whole-row DISTINCT tells them apart.
+template <typename Cell>
+void groupFoldCountDistinctListElement(Column* accumulator,
+                                       std::vector<uint64_t>& counts,
+                                       const Column* input,
+                                       const std::vector<size_t>& groups,
+                                       NLGroupDistinctTally& distinct,
+                                       NLValueStore& values) {
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<ListElementView> element = presentCell(inputRaw[row]);
+        if (!element) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendElementBytes(distinct.getKey(), *element);
+
+        if (distinct.insertIfNew()) {
+            counts[group]++;
+        }
+    }
+}
+
+// Tally each group's distinct present lists, keying on the elements rather than on the
+// view, so two rows count once when their lists are equal.
+void groupFoldCountDistinctPresentList(Column* accumulator,
+                                       std::vector<uint64_t>& counts,
+                                       const Column* input,
+                                       const std::vector<size_t>& groups,
+                                       NLGroupDistinctTally& distinct,
+                                       NLValueStore& values) {
+    const auto& inputRaw = static_cast<const ColumnOptVector<ListView>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<ListView>& value = inputRaw[row];
+        if (!value.has_value()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendListBytes(distinct.getKey(), *value);
+
+        if (distinct.insertIfNew()) {
+            counts[group]++;
+        }
+    }
+}
+
+void groupFoldCountDistinctList(Column* accumulator,
+                                std::vector<uint64_t>& counts,
+                                const Column* input,
+                                const std::vector<size_t>& groups,
+                                NLGroupDistinctTally& distinct,
+                                NLValueStore& values) {
+    const auto& inputRaw = static_cast<const ColumnVector<ListView>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendListBytes(distinct.getKey(), inputRaw[row]);
+
+        if (distinct.insertIfNew()) {
+            counts[group]++;
+        }
+    }
+}
+
+void groupFoldCountDistinctPresentMap(Column* accumulator,
+                                      std::vector<uint64_t>& counts,
+                                      const Column* input,
+                                      const std::vector<size_t>& groups,
+                                      NLGroupDistinctTally& distinct,
+                                      NLValueStore& values) {
+    const auto& inputRaw = static_cast<const ColumnOptVector<MapView>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<MapView>& value = inputRaw[row];
+        if (!value.has_value()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendMapBytes(distinct.getKey(), *value);
+
+        if (distinct.insertIfNew()) {
+            counts[group]++;
+        }
+    }
+}
+
+// Append a chunk's present values to the flat value buffer, recording each element's
+// position in its group's list. A null value is skipped (Cypher collect ignores
+// nulls). The flat buffer holds the collected type's primitive; the input is its
+// nullable value chunk.
+template <typename Primitive>
+void collectFold(Column* values,
+                 const Column* input,
+                 const std::vector<size_t>& groups,
+                 std::vector<std::vector<size_t>>& groupPositions,
+                 NLGroupDistinctTally& distinct,
+                 NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<Primitive>*>(values)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<Primitive>& value = inputRaw[row];
+        if (value.has_value()) {
+            const size_t position = valuesRaw.size();
+            valuesRaw.push_back(store.ownElement(*value));
+            groupPositions[groups[row]].push_back(position);
+        }
+    }
+}
+
+// Append this step's values a group has not collected yet - collect(DISTINCT x). A value
+// repeated within its group is dropped rather than buffered a second time, so the list is
+// the group's distinct values in first-seen order.
+template <typename Primitive>
+void collectFoldDistinct(Column* values,
+                         const Column* input,
+                         const std::vector<size_t>& groups,
+                         std::vector<std::vector<size_t>>& groupPositions,
+                         NLGroupDistinctTally& distinct,
+                         NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<Primitive>*>(values)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<Primitive>& value = inputRaw[row];
+        if (!value.has_value()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendValueBytes(distinct.getKey(), *value);
+
+        if (!distinct.insertIfNew()) {
+            continue;
+        }
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(store.ownElement(*value));
+        groupPositions[group].push_back(position);
+    }
+}
+
+// The cell sibling of collectFold, for a chunk holding a value in every row: every row of
+// the input joins its group's list.
+template <typename Cell>
+void collectCellFold(Column* values,
+                     const Column* input,
+                     const std::vector<size_t>& groups,
+                     std::vector<std::vector<size_t>>& groupPositions,
+                     NLGroupDistinctTally& distinct,
+                     NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<Cell>*>(values)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        groupPositions[groups[row]].push_back(valuesRaw.size());
+        valuesRaw.push_back(store.ownElement(inputRaw[row]));
+    }
+}
+
+// The ID sibling of collectFold: an entity an OPTIONAL MATCH did not match is an invalid
+// ID, which is how a null entity is spelled, so it is dropped the way collectFold drops an
+// absent optional rather than collected as the value 2^64-1.
+template <typename IDType>
+void collectValidIDFold(Column* values,
+                        const Column* input,
+                        const std::vector<size_t>& groups,
+                        std::vector<std::vector<size_t>>& groupPositions,
+                        NLGroupDistinctTally& distinct,
+                        NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<IDType>*>(values)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnVector<IDType>*>(input)->getRaw();
+
+    const size_t base = valuesRaw.size();
+    const auto isValid = [](const IDType id) { return id.isValid(); };
+
+    if (std::ranges::all_of(inputRaw, isValid)) {
+        valuesRaw.insert(valuesRaw.end(), inputRaw.begin(), inputRaw.end());
+
+        for (size_t row = 0; row < inputRaw.size(); row++) {
+            groupPositions[groups[row]].push_back(base + row);
+        }
+
+        return;
+    }
+
+    valuesRaw.reserve(base + inputRaw.size());
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        if (!inputRaw[row].isValid()) {
+            continue;
+        }
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(inputRaw[row]);
+        groupPositions[groups[row]].push_back(position);
+    }
+}
+
+template <typename IDType>
+void collectOptValidIDFold(Column* values,
+                           const Column* input,
+                           const std::vector<size_t>& groups,
+                           std::vector<std::vector<size_t>>& groupPositions,
+                           NLGroupDistinctTally& distinct,
+                           NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<IDType>*>(values)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnOptVector<IDType>*>(input)->getRaw();
+
+    valuesRaw.reserve(valuesRaw.size() + inputRaw.size());
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<IDType>& id = inputRaw[row];
+        if (!id.has_value() || !id->isValid()) {
+            continue;
+        }
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(*id);
+        groupPositions[groups[row]].push_back(position);
+    }
+}
+
+template <typename IDType>
+void collectOptValidIDFoldDistinct(Column* values,
+                                   const Column* input,
+                                   const std::vector<size_t>& groups,
+                                   std::vector<std::vector<size_t>>& groupPositions,
+                                   NLGroupDistinctTally& distinct,
+                                   NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<IDType>*>(values)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnOptVector<IDType>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<IDType>& id = inputRaw[row];
+        if (!id.has_value() || !id->isValid()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendValueBytes(distinct.getKey(), id->getValue());
+
+        if (!distinct.insertIfNew()) {
+            continue;
+        }
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(*id);
+        groupPositions[group].push_back(position);
+    }
+}
+
+// The ID sibling of collectFoldDistinct: an entity repeated within its group joins the
+// list once, keyed by the ID's underlying integer, and the null an unmatched pattern left
+// is no key of its own.
+template <typename IDType>
+void collectValidIDFoldDistinct(Column* values,
+                                const Column* input,
+                                const std::vector<size_t>& groups,
+                                std::vector<std::vector<size_t>>& groupPositions,
+                                NLGroupDistinctTally& distinct,
+                                NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<IDType>*>(values)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnVector<IDType>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        if (!inputRaw[row].isValid()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendValueBytes(distinct.getKey(), inputRaw[row].getValue());
+
+        if (!distinct.insertIfNew()) {
+            continue;
+        }
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(inputRaw[row]);
+        groupPositions[group].push_back(position);
+    }
+}
+
+// The list- or map-buffer value a tagged cell holds, read back as the type its tag names, so
+// a collect of type-erased cells buffers each one under the type it came in with.
+template <typename Item>
+Item taggedItem(const ListElementView element) {
+    const ListBufferTypeTag tag = element.getTag();
+
+    switch (tag) {
+        case ListBufferTypeTag::Int:
+            return Item {element.getAs<types::Int64::Primitive>()};
+        break;
+
+        case ListBufferTypeTag::UInt:
+            return Item {element.getAs<types::UInt64::Primitive>()};
+        break;
+
+        case ListBufferTypeTag::Double:
+            return Item {element.getAs<types::Double::Primitive>()};
+        break;
+
+        case ListBufferTypeTag::Bool:
+            return Item {element.getAs<types::Bool::Primitive>()};
+        break;
+
+        case ListBufferTypeTag::String:
+            return Item {element.getAs<types::String::Primitive>()};
+        break;
+
+        case ListBufferTypeTag::Embedding:
+            return Item {element.getAs<types::Embedding::Primitive>()};
+        break;
+
+        case ListBufferTypeTag::ListView:
+            return Item {element.getAs<ListView>()};
+        break;
+
+        case ListBufferTypeTag::Null:
+            return Item {element.getAs<PropertyNull>()};
+        break;
+
+        case ListBufferTypeTag::NodeID:
+            return Item {element.getAs<NodeID>()};
+        break;
+
+        case ListBufferTypeTag::EdgeID:
+            return Item {element.getAs<EdgeID>()};
+        break;
+
+        case ListBufferTypeTag::DateTime:
+            return Item {element.getAs<types::DateTime::Primitive>()};
+        break;
+
+        case ListBufferTypeTag::Duration:
+            return Item {element.getAs<types::Duration::Primitive>()};
+        break;
+
+        case ListBufferTypeTag::MapView:
+            return Item {element.getAs<MapView>()};
+        break;
+
+        case ListBufferTypeTag::INVALID:
+            throw IRException("cannot collect an untagged element");
+        break;
+    }
+
+    throw IRException("Unknown ListBufferTypeTag");
+}
+
+// The type-erased sibling of collectFold: a tagged cell is there in every row, but one
+// tagged null is the null Cypher's collect drops, so only the rest join the group's list.
+template <typename Cell>
+void collectTaggedFold(Column* values,
+                       const Column* input,
+                       const std::vector<size_t>& groups,
+                       std::vector<std::vector<size_t>>& groupPositions,
+                       NLGroupDistinctTally& distinct,
+                       NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<ListElementView>*>(values)->getRaw();
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<ListElementView> element = presentCell(inputRaw[row]);
+        if (!element) {
+            continue;
+        }
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(store.ownElement(*element));
+        groupPositions[groups[row]].push_back(position);
+    }
+}
+
+// The dedup sibling: a tagged cell keys by the value its tag names, so the same number
+// reached under two tags keys once - the ordering rules read these cells the same way.
+template <typename Cell>
+void collectTaggedFoldDistinct(Column* values,
+                               const Column* input,
+                               const std::vector<size_t>& groups,
+                               std::vector<std::vector<size_t>>& groupPositions,
+                               NLGroupDistinctTally& distinct,
+                               NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<ListElementView>*>(values)->getRaw();
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<ListElementView> element = presentCell(inputRaw[row]);
+        if (!element) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendElementBytes(distinct.getKey(), *element);
+
+        if (!distinct.insertIfNew()) {
+            continue;
+        }
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(store.ownElement(*element));
+        groupPositions[group].push_back(position);
+    }
+}
+
+// The type-erased sibling of collectListEmit: each buffered cell goes into the list
+// buffer as the value its own tag names, so the list keeps the types it gathered.
+void collectTaggedListEmit(const Column* values,
+                           const std::vector<std::vector<size_t>>& groupPositions,
+                           size_t begin,
+                           size_t count,
+                           ListBuffer<>& listBuffer,
+                           Column* output) {
+    const auto& valuesRaw = static_cast<const ColumnVector<ListElementView>*>(values)->getRaw();
+    auto& outputRaw = static_cast<ColumnVector<ListView>*>(output)->getRaw();
+
+    outputRaw.clear();
+    outputRaw.reserve(count);
+
+    std::vector<ListBuffer<>::ListItemVariant> elements;
+    for (size_t index = 0; index < count; index++) {
+        const std::vector<size_t>& positions = groupPositions[begin + index];
+
+        elements.clear();
+        elements.reserve(positions.size());
+        for (const size_t position : positions) {
+            elements.push_back(taggedItem<ListBuffer<>::ListItemVariant>(valuesRaw[position]));
+        }
+
+        outputRaw.push_back(listBuffer.insert(elements));
+    }
+}
+
+// The list sibling of collectValidIDFoldDistinct: two cells are the same value when their
+// elements are, so a cell keys by the list serialized element by element rather than by
+// the ListView's own span, which two equal lists never share.
+void collectListFoldDistinct(Column* values,
+                             const Column* input,
+                             const std::vector<size_t>& groups,
+                             std::vector<std::vector<size_t>>& groupPositions,
+                             NLGroupDistinctTally& distinct,
+                             NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<ListView>*>(values)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnVector<ListView>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendListBytes(distinct.getKey(), inputRaw[row]);
+
+        if (!distinct.insertIfNew()) {
+            continue;
+        }
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(store.ownElement(inputRaw[row]));
+        groupPositions[group].push_back(position);
+    }
+}
+
+// The nullable siblings of collectCellFold and collectListFoldDistinct for a list chunk: a
+// row an OPTIONAL MATCH left with no list is dropped, as collectFold drops an absent
+// optional, so the buffer they fill is a plain list column either way.
+void collectOptListFold(Column* values,
+                        const Column* input,
+                        const std::vector<size_t>& groups,
+                        std::vector<std::vector<size_t>>& groupPositions,
+                        NLGroupDistinctTally& distinct,
+                        NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<ListView>*>(values)->getRaw();
+    const std::vector<std::optional<ListView>>& inputRaw =
+        static_cast<const ColumnOptVector<ListView>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<ListView>& list = inputRaw[row];
+        if (!list.has_value()) {
+            continue;
+        }
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(store.ownElement(*list));
+        groupPositions[groups[row]].push_back(position);
+    }
+}
+
+void collectOptListFoldDistinct(Column* values,
+                                const Column* input,
+                                const std::vector<size_t>& groups,
+                                std::vector<std::vector<size_t>>& groupPositions,
+                                NLGroupDistinctTally& distinct,
+                                NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<ListView>*>(values)->getRaw();
+    const std::vector<std::optional<ListView>>& inputRaw =
+        static_cast<const ColumnOptVector<ListView>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<ListView>& list = inputRaw[row];
+        if (!list.has_value()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendListBytes(distinct.getKey(), *list);
+
+        if (!distinct.insertIfNew()) {
+            continue;
+        }
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(store.ownElement(*list));
+        groupPositions[group].push_back(position);
+    }
+}
+
+// Emit a chunk of unwound values (nl.unwind_collect): for each flat-buffer position this chunk
+// covers, write the present value into the nullable value output. collect dropped
+// nulls, so every emitted element is present.
+template <typename Primitive>
+void unwindCollectValueEmit(const Column* values,
+                     const ColumnVector<size_t>* positions,
+                     Column* output) {
+    const auto& valuesRaw = static_cast<const ColumnVector<Primitive>*>(values)->getRaw();
+    auto& outputRaw = static_cast<ColumnOptVector<Primitive>*>(output)->getRaw();
+    const auto& positionsRaw = positions->getRaw();
+
+    outputRaw.clear();
+    outputRaw.reserve(positionsRaw.size());
+
+    for (const size_t position : positionsRaw) {
+        outputRaw.push_back(std::optional<Primitive>(valuesRaw[position]));
+    }
+}
+
+// Emit a chunk of per-group lists (nl.collect): for each group in [begin, begin+count),
+// gather its elements from the flat buffer into the list buffer as one contiguous run
+// and store the resulting ListView in the list output.
+template <typename Primitive>
+void collectListEmit(const Column* values,
+                     const std::vector<std::vector<size_t>>& groupPositions,
+                     size_t begin,
+                     size_t count,
+                     ListBuffer<>& listBuffer,
+                     Column* output) {
+    const auto& valuesRaw = static_cast<const ColumnVector<Primitive>*>(values)->getRaw();
+    auto& outputRaw = static_cast<ColumnVector<ListView>*>(output)->getRaw();
+
+    outputRaw.clear();
+    outputRaw.reserve(count);
+
+    std::vector<ListBuffer<>::ListItemVariant> elements;
+    for (size_t index = 0; index < count; index++) {
+        const std::vector<size_t>& positions = groupPositions[begin + index];
+
+        elements.clear();
+        elements.reserve(positions.size());
+        for (const size_t position : positions) {
+            elements.push_back(ListBuffer<>::ListItemVariant {valuesRaw[position]});
+        }
+
+        outputRaw.push_back(listBuffer.insert(elements));
+    }
+}
+
+// Every cell of the column is a list of its own, so none of them is the null a
+// comprehension hands its row back.
+bool presentCell(const Column*, size_t) {
+    return false;
+}
+
+bool absentListCell(const Column* source, size_t row) {
+    return !(*static_cast<const ColumnOptVector<ListView>*>(source))[row].has_value();
+}
+
+template <typename Primitive>
+bool absentValueCell(const Column* source, size_t row) {
+    return !(*static_cast<const ColumnOptVector<Primitive>*>(source))[row].has_value();
+}
+
+// A cell of a type-erased column carries its own tag, so the null is the one that tag
+// names rather than a cell the column does not hold.
+bool absentTaggedCell(const Column* source, size_t row) {
+    const ListElementView element = (*static_cast<const ColumnVector<ListElementView>*>(source))[row];
+
+    return element.getTag() == ListBufferTypeTag::Null;
+}
+
+bool absentOptTaggedCell(const Column* source, size_t row) {
+    const std::optional<ListElementView>& element =
+        (*static_cast<const ColumnOptVector<ListElementView>*>(source))[row];
+
+    return !element.has_value() || element->getTag() == ListBufferTypeTag::Null;
+}
+
+// Read one cell of a nullable value column as the value it contributes to a list or a map:
+// the value it holds, or the tagged null Cypher leaves where the row has none.
+template <typename Item, typename Primitive>
+Item valueItem(const Column* input, size_t row, NLStepBuffers*) {
+    const std::optional<Primitive>& cell = (*static_cast<const ColumnOptVector<Primitive>*>(input))[row];
+    if (!cell.has_value()) {
+        return Item {PropertyNull {}};
+    }
+
+    return Item {*cell};
+}
+
+// Read one cell of a nullable integer column as a bound of a range: the number it holds,
+// or nothing where the row has none.
+std::optional<ListView> plainListRead(const Column* input, size_t row) {
+    return (*static_cast<const ColumnVector<ListView>*>(input))[row];
+}
+
+std::optional<ListView> optListRead(const Column* input, size_t row) {
+    return (*static_cast<const ColumnOptVector<ListView>*>(input))[row];
+}
+
+std::optional<ListView> constListRead(const Column* input, size_t) {
+    return static_cast<const ColumnConst<ListView>*>(input)->getRaw();
+}
+
+std::optional<ListView> optConstListRead(const Column* input, size_t) {
+    return static_cast<const ColumnConst<std::optional<ListView>>*>(input)->getRaw();
+}
+
+// The map sibling of the list reads above: one cell of a map column, or nothing where the
+// row holds no map.
+template <typename ColumnT>
+NLKeyedValue mapRead(const Column* input, size_t row) {
+    const std::optional<MapView> map = (*static_cast<const ColumnT*>(input))[row];
+    if (!map) {
+        return std::monostate {};
+    }
+
+    return *map;
+}
+
+// The map, the node or the edge a type-erased cell holds, nothing where it holds anything
+// else
+NLKeyedValue readKeyedCell(const ListElementView cell) {
+    switch (cell.getTag()) {
+        case ListBufferTypeTag::MapView:
+            return cell.getAs<MapView>();
+        break;
+        case ListBufferTypeTag::NodeID:
+            return cell.getAs<NodeID>();
+        break;
+        case ListBufferTypeTag::EdgeID:
+            return cell.getAs<EdgeID>();
+        break;
+        default:
+            return std::monostate {};
+        break;
+    }
+}
+
+NLKeyedValue readKeyedCell(const MapEntryView entry) {
+    switch (entry.getValueTag()) {
+        case MapBufferTypeTag::MapView:
+            return entry.getValueAs<MapView>();
+        break;
+        case MapBufferTypeTag::NodeID:
+            return entry.getValueAs<NodeID>();
+        break;
+        case MapBufferTypeTag::EdgeID:
+            return entry.getValueAs<EdgeID>();
+        break;
+        default:
+            return std::monostate {};
+        break;
+    }
+}
+
+NLKeyedValue readKeyedCell(const std::optional<ListElementView>& cell) {
+    if (!cell) {
+        return std::monostate {};
+    }
+
+    return readKeyedCell(*cell);
+}
+
+// One cell of a column of tagged cells, read as what its own tag says it holds: a map, a
+// node or an edge read out of a list or out of another map arrives as such a column
+template <typename ColumnT>
+NLKeyedValue readTaggedKeyed(const Column* input, size_t row) {
+    return readKeyedCell((*static_cast<const ColumnT*>(input))[row]);
+}
+
+// The value a map entry holds, as the item a list cell is written from
+QueryListBuffer::ListItemVariant entryItem(const MapEntryView entry) {
+    const auto read = []<typename T>(const MapEntryView view) -> QueryListBuffer::ListItemVariant {
+        if constexpr (std::is_same_v<T, PropertyNull>) {
+            return PropertyNull {};
+        } else {
+            return view.getValueAs<T>();
+        }
+    };
+
+    return dispatchMapEntry(read, entry);
+}
+
+// The entry @param keyed holds under @param key: the one its map holds, or its node's or
+// edge's property, written into @param mapBuffer as a map of that one entry. False where
+// it holds no such entry.
+bool findKeyedEntry(const NLKeyedValue& keyed,
+                    std::string_view key,
+                    NLEntityProperties& properties,
+                    MapBuffer<>& mapBuffer,
+                    MapEntryView& entry) {
+    MapBuffer<>::MapKeyValuePair property;
+
+    if (const MapView* map = std::get_if<MapView>(&keyed)) {
+        return findMapEntry(*map, key, entry);
+    } else if (const NodeID* node = std::get_if<NodeID>(&keyed)) {
+        if (!properties.readEntry(*node, key, property)) {
+            return false;
+        }
+    } else if (const EdgeID* edge = std::get_if<EdgeID>(&keyed)) {
+        if (!properties.readEntry(*edge, key, property)) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    entry = mapBuffer.insert(std::span<const MapBuffer<>::MapKeyValuePair> {&property, 1}).front();
+    return true;
+}
+
+// The key one column of a dynamic map key read holds at @param row, or nothing where the
+// row holds none.
+template <typename ColumnT>
+std::optional<types::String::Primitive> stringRead(const Column* input, size_t row) {
+    return (*static_cast<const ColumnT*>(input))[row];
+}
+
+template <typename ColumnT>
+std::optional<types::String::Primitive> stringValueArgument(const Column* input, size_t row, std::string_view) {
+    return (*static_cast<const ColumnT*>(input))[row];
+}
+
+template <typename ColumnT>
+std::optional<types::String::Primitive> cellStringArgument(const Column* input, size_t row, std::string_view functionName) {
+    const auto* col = static_cast<const ColumnT*>(input);
+    const std::optional<ListElementView> cell = col->operator[](row);
+    if (!cell.has_value()) {
+        return std::nullopt;
+    }
+
+    return cellString(*cell, functionName);
+}
+
+std::optional<types::Int64::Primitive> integerValueArgument(const Column* input, size_t row, std::string_view) {
+    return (*static_cast<const ColumnOptVector<types::Int64::Primitive>*>(input))[row];
+}
+
+std::optional<types::Int64::Primitive> unsignedValueArgument(const Column* input, size_t row, std::string_view functionName) {
+    const std::optional<types::UInt64::Primitive>& cell =
+        (*static_cast<const ColumnOptVector<types::UInt64::Primitive>*>(input))[row];
+    if (!cell.has_value()) {
+        return std::nullopt;
+    }
+
+    return unsignedCharacterArgument(*cell, functionName);
+}
+
+template <typename ColumnT>
+std::optional<types::Int64::Primitive> cellIntegerArgument(const Column* input, size_t row, std::string_view functionName) {
+    const std::optional<ListElementView> cell = (*static_cast<const ColumnT*>(input))[row];
+    if (!cell.has_value()) {
+        return std::nullopt;
+    }
+
+    return cellInteger(*cell, functionName);
+}
+
+// A key spelled null in the query holds no value to name an entry by, on any row
+std::optional<types::String::Primitive> nullStringRead(const Column*, size_t) {
+    return std::nullopt;
+}
+
+// The list a type-erased cell holds, absent where the cell holds anything else
+std::optional<ListView> cellListRead(const ListElementView cell) {
+    if (cell.getTag() != ListBufferTypeTag::ListView) {
+        return std::nullopt;
+    }
+
+    return cell.getAs<ListView>();
+}
+
+std::optional<ListView> taggedListRead(const Column* input, size_t row) {
+    return cellListRead((*static_cast<const ColumnVector<ListElementView>*>(input))[row]);
+}
+
+std::optional<ListView> optTaggedListRead(const Column* input, size_t row) {
+    const std::optional<ListElementView>& cell =
+        (*static_cast<const ColumnOptVector<ListElementView>*>(input))[row];
+
+    if (!cell) {
+        return std::nullopt;
+    }
+
+    return cellListRead(*cell);
+}
+
+std::optional<ListView> constTaggedListRead(const Column* input, size_t) {
+    return cellListRead(static_cast<const ColumnConst<ListElementView>*>(input)->getRaw());
+}
+
+std::optional<ListView> optConstTaggedListRead(const Column* input, size_t) {
+    const std::optional<ListElementView>& cell =
+        static_cast<const ColumnConst<std::optional<ListElementView>>*>(input)->getRaw();
+
+    if (!cell) {
+        return std::nullopt;
+    }
+
+    return cellListRead(*cell);
+}
+
+template <typename Primitive>
+std::optional<types::Int64::Primitive> rangeBound(const Column* input, size_t row) {
+    const std::optional<Primitive>& cell = (*static_cast<const ColumnOptVector<Primitive>*>(input))[row];
+    if (!cell.has_value()) {
+        return std::nullopt;
+    }
+
+    return static_cast<types::Int64::Primitive>(*cell);
+}
+
+template <typename Primitive>
+std::optional<types::Double::Primitive> percentileArgument(const Column* input, size_t row) {
+    const std::optional<Primitive>& cell = (*static_cast<const ColumnOptVector<Primitive>*>(input))[row];
+    if (!cell.has_value()) {
+        return std::nullopt;
+    }
+
+    return static_cast<types::Double::Primitive>(*cell);
+}
+
+// The numbers one row's list holds, sorted. A percentile is taken of numbers alone, so any
+// other element is the error the row raises.
+void sortListNumbers(const ListView list, std::vector<ListElementView>& numbers, std::string_view functionName) {
+    numbers.clear();
+
+    for (const ListElementView element : list) {
+        const ListBufferTypeTag tag = element.getTag();
+        const bool isNumber = tag == ListBufferTypeTag::Int
+                           || tag == ListBufferTypeTag::UInt
+                           || tag == ListBufferTypeTag::Double;
+
+        if (tag == ListBufferTypeTag::Null) {
+            continue;
+        } else if (!isNumber) {
+            throw IRException(fmt::format("{}() takes the percentile of numbers only", functionName));
+        }
+
+        numbers.push_back(element);
+    }
+
+    std::ranges::sort(numbers, std::less<> {});
+}
+
+void throwIfNotAPercentile(double percentile, std::string_view functionName) {
+    const bool isAFraction = percentile >= 0.0 && percentile <= 1.0;
+    if (!isAFraction) {
+        throw IRException(fmt::format("{}() takes a percentile between 0.0 and 1.0, not {}", functionName, percentile));
+    }
+}
+
+// The value at the percentile's position among the sorted numbers, interpolated between
+// the two around it where the position falls between them
+double continuousPercentile(const std::vector<ListElementView>& sorted, double percentile) {
+    const double position = percentile * static_cast<double>(sorted.size() - 1);
+    const size_t below = static_cast<size_t>(position);
+    const size_t above = static_cast<size_t>(std::ceil(position));
+
+    const double lower = taggedNumericValue(sorted[below]);
+    if (below == above) {
+        return lower;
+    }
+
+    const double upper = taggedNumericValue(sorted[above]);
+
+    return lower * (static_cast<double>(above) - position) + upper * (position - static_cast<double>(below));
+}
+
+// The first of the sorted numbers at or past the percentile's share of them
+size_t discretePercentilePosition(size_t count, double percentile) {
+    const size_t covering = static_cast<size_t>(std::ceil(percentile * static_cast<double>(count)));
+
+    return covering == 0 ? 0 : covering - 1;
+}
+
+template <typename Result>
+Result absentPercentile() {
+    if constexpr (std::is_same_v<Result, ListElementView>) {
+        return ListElementView::nullElement();
+    } else {
+        return std::nullopt;
+    }
+}
+
+template <typename Result>
+Result percentileElement(const ListElementView element) {
+    if constexpr (std::is_same_v<Result, ListElementView>) {
+        return element;
+    } else {
+        return element.getAs<typename Result::value_type>();
+    }
+}
+
+// Row r of the result is what @param percentileOf answers for the sorted numbers of row
+// r's list, or no value where the list holds none. The percentile is checked only beside
+// numbers, as Neo4j reads it only off a row holding one.
+template <typename Result, typename PercentileOf>
+void runPercentileRows(const NLPercentileData* data, std::string_view functionName, PercentileOf percentileOf) {
+    const Column* const list = data->getList();
+    const NLListReadFunction listRead = data->getListRead();
+    const Column* const percentile = data->getPercentile();
+    const NLPercentileReadFunction percentileRead = data->getPercentileRead();
+
+    const size_t rowCount = list->size();
+    bioassert(percentile->size() == rowCount, "Percentile column of a {}() is not row-aligned with its lists.", functionName);
+
+    std::vector<Result>& outputRaw = static_cast<ColumnVector<Result>*>(data->getResult())->getRaw();
+    outputRaw.resize(rowCount);
+
+    std::vector<ListElementView> numbers;
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        const std::optional<ListView> values = listRead(list, rowIndex);
+        if (values) {
+            sortListNumbers(*values, numbers, functionName);
+        } else {
+            numbers.clear();
+        }
+
+        if (numbers.empty()) {
+            outputRaw[rowIndex] = absentPercentile<Result>();
+            continue;
+        }
+
+        const std::optional<double> fraction = percentileRead(percentile, rowIndex);
+        if (!fraction) {
+            throw IRException(fmt::format("{}() takes a percentile between 0.0 and 1.0, not null", functionName));
+        }
+
+        throwIfNotAPercentile(*fraction, functionName);
+        outputRaw[rowIndex] = percentileOf(numbers, *fraction);
+    }
+}
+
+// The sibling of valueItem for a column whose cells are present in every row: a nested
+// list or map, held as the one value it is.
+template <typename Item, typename Element>
+Item plainItem(const Column* input, size_t row, NLStepBuffers*) {
+    return Item {(*static_cast<const ColumnVector<Element>*>(input))[row]};
+}
+
+template <typename Item, typename Element>
+Item optItem(const Column* input, size_t row, NLStepBuffers*) {
+    const std::optional<Element>& cell = (*static_cast<const ColumnOptVector<Element>*>(input))[row];
+    if (!cell.has_value()) {
+        return Item {PropertyNull {}};
+    }
+
+    return Item {*cell};
+}
+
+// The entity sibling of valueItem: an entity an OPTIONAL MATCH did not match is an invalid
+// ID, which is how a null entity is spelled, so it is stored as the tagged null rather than
+// as the value 2^64-1 - the null collectValidIDFold drops instead.
+template <typename Item, typename IDType>
+Item validIDItem(const Column* input, size_t row, NLStepBuffers*) {
+    const IDType id = (*static_cast<const ColumnVector<IDType>*>(input))[row];
+    if (!id.isValid()) {
+        return Item {PropertyNull {}};
+    }
+
+    return Item {id};
+}
+
+// The sibling of valueItem for a type-erased column: the cell already carries the tag its
+// value is stored under, so it is stored as the type that tag names.
+template <typename Item>
+Item taggedColumnItem(const Column* input, size_t row, NLStepBuffers*) {
+    return taggedItem<Item>((*static_cast<const ColumnVector<ListElementView>*>(input))[row]);
+}
+
+// The nullable sibling of taggedColumnItem: a column an OPTIONAL MATCH padded, or one an
+// index read off a list, has no cell in every row.
+template <typename Item>
+Item optTaggedColumnItem(const Column* input, size_t row, NLStepBuffers*) {
+    const std::optional<ListElementView>& element =
+        (*static_cast<const ColumnOptVector<ListElementView>*>(input))[row];
+    if (!element.has_value()) {
+        return Item {PropertyNull {}};
+    }
+
+    return taggedItem<Item>(*element);
+}
+
+// The fold and the list emit an entity collect of this ID reads. The list emits through
+// the value path's template - its elements are the IDs the fold appended - so there is
+// no entity emit of its own.
+template <typename IDType>
+void selectCollectIDHandlers(bool distinctValues,
+                             NLCollectFoldFunction& fold,
+                             NLCollectListEmitFunction& listEmit) {
+    fold = distinctValues ? &collectValidIDFoldDistinct<IDType> : &collectValidIDFold<IDType>;
+    listEmit = &collectListEmit<IDType>;
+}
+
+template <typename IDType>
+void selectCollectOptIDHandlers(bool distinctValues,
+                                NLCollectFoldFunction& fold,
+                                NLCollectListEmitFunction& listEmit) {
+    fold = distinctValues ? &collectOptValidIDFoldDistinct<IDType> : &collectOptValidIDFold<IDType>;
+    listEmit = &collectListEmit<IDType>;
+}
+
+// Emit a sum/min/max slice: the accumulator holds each group's reduced value in the
+// result's own type, so copy groups [begin, begin + count) into the output.
+template <typename Primitive>
+void groupEmitCopy(const Column* accumulator,
+                   const std::vector<uint64_t>& counts,
+                   size_t begin,
+                   size_t count,
+                   Column* output) {
+    const auto& raw = static_cast<const ColumnOptVector<Primitive>*>(accumulator)->getRaw();
+    auto& outputRaw = static_cast<ColumnOptVector<Primitive>*>(output)->getRaw();
+    outputRaw.assign(raw.begin() + begin, raw.begin() + begin + count);
+}
+
+// Emit an avg slice: divide each group's running f64 sum by its non-null count. A
+// group with no non-null row (count zero) averages to null, matching Cypher.
+void groupEmitAvg(const Column* accumulator,
+                  const std::vector<uint64_t>& counts,
+                  size_t begin,
+                  size_t count,
+                  Column* output) {
+    const auto& raw = static_cast<const ColumnOptVector<double>*>(accumulator)->getRaw();
+    auto& outputRaw = static_cast<ColumnOptVector<double>*>(output)->getRaw();
+    outputRaw.resize(count);
+
+    for (size_t index = 0; index < count; index++) {
+        const size_t group = begin + index;
+        if (counts[group] == 0) {
+            outputRaw[index] = std::nullopt;
+        } else {
+            outputRaw[index] = std::optional<double>(raw[group].value() / static_cast<double>(counts[group]));
+        }
+    }
+}
+
+// Emit a count slice: each group's tally is a present unsigned i64, so copy the
+// tallies of groups [begin, begin + count) into the ui64 output.
+void groupEmitCount(const Column* accumulator,
+                    const std::vector<uint64_t>& counts,
+                    size_t begin,
+                    size_t count,
+                    Column* output) {
+    auto& outputRaw = static_cast<ColumnVector<uint64_t>*>(output)->getRaw();
+    outputRaw.assign(counts.begin() + begin, counts.begin() + begin + count);
+}
+
+// The grouped sum fold for a column of this value type. sum adds the values, so
+// only a numeric column is valid - the same restriction as the scalar selectSumUpdate.
+NLGroupAggregateFoldFunction selectGroupSumFold(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &groupFoldSum<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &groupFoldSum<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &groupFoldSum<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("sum requires a numeric column");
+        break;
+    }
+
+    return nullptr;
+}
+
+// The grouped sum(DISTINCT x) fold for a column of this value type: sum's numeric
+// domain, reduced over each group's distinct values.
+NLGroupAggregateFoldFunction selectGroupSumDistinctFold(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &groupFoldSumDistinct<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &groupFoldSumDistinct<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &groupFoldSumDistinct<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("sum requires a numeric column");
+        break;
+    }
+
+    return nullptr;
+}
+
+// The grouped avg fold for a column of this value type. avg widens each value to
+// f64, so - like sum - only a numeric column is valid.
+NLGroupAggregateFoldFunction selectGroupAvgFold(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &groupFoldAvg<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &groupFoldAvg<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &groupFoldAvg<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("avg requires a numeric column");
+        break;
+    }
+
+    return nullptr;
+}
+
+// The grouped avg(DISTINCT x) fold for a column of this value type: avg's numeric
+// domain, averaged over each group's distinct values.
+NLGroupAggregateFoldFunction selectGroupAvgDistinctFold(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &groupFoldAvgDistinct<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &groupFoldAvgDistinct<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &groupFoldAvgDistinct<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("avg requires a numeric column");
+        break;
+    }
+
+    return nullptr;
+}
+
+// The grouped min (IsMax false) / max (IsMax true) fold for a column of this value
+// type. min/max order the values, so any orderable type is valid - numbers, bools,
+// strings, lists and maps - but an embedding has no order, so it is rejected.
+template <bool IsMax>
+NLGroupAggregateFoldFunction selectGroupMinMaxFold(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &groupFoldMinMax<types::Int64::Primitive, IsMax>;
+        break;
+
+        case ValueType::UInt64:
+            return &groupFoldMinMax<types::UInt64::Primitive, IsMax>;
+        break;
+
+        case ValueType::Double:
+            return &groupFoldMinMax<types::Double::Primitive, IsMax>;
+        break;
+
+        case ValueType::Bool:
+            return &groupFoldMinMax<types::Bool::Primitive, IsMax>;
+        break;
+
+        case ValueType::String:
+            return &groupFoldMinMax<types::String::Primitive, IsMax>;
+        break;
+
+        case ValueType::DateTime:
+            return &groupFoldMinMax<types::DateTime::Primitive, IsMax>;
+        break;
+
+        case ValueType::Duration:
+            return &groupFoldMinMax<types::Duration::Primitive, IsMax>;
+        break;
+
+        case ValueType::List:
+            return &groupFoldMinMax<types::List::Primitive, IsMax>;
+        break;
+
+        case ValueType::Map:
+            return &groupFoldMinMax<types::Map::Primitive, IsMax>;
+        break;
+
+        default:
+            throw IRException("min/max requires an orderable column");
+        break;
+    }
+
+    return nullptr;
+}
+
+// The grouped first fold for a column of this value type. The kept value outlives its
+// step as an extremum does, so first holds the types min/max hold.
+NLGroupAggregateFoldFunction selectGroupFirstFold(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &groupFoldFirst<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &groupFoldFirst<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &groupFoldFirst<types::Double::Primitive>;
+        break;
+
+        case ValueType::Bool:
+            return &groupFoldFirst<types::Bool::Primitive>;
+        break;
+
+        case ValueType::String:
+            return &groupFoldFirst<types::String::Primitive>;
+        break;
+
+        case ValueType::DateTime:
+            return &groupFoldFirst<types::DateTime::Primitive>;
+        break;
+
+        case ValueType::Duration:
+            return &groupFoldFirst<types::Duration::Primitive>;
+        break;
+
+        case ValueType::List:
+            return &groupFoldFirst<types::List::Primitive>;
+        break;
+
+        case ValueType::Map:
+            return &groupFoldFirst<types::Map::Primitive>;
+        break;
+
+        default:
+            throw IRException("first requires a column of scalars, lists or maps");
+        break;
+    }
+
+    return nullptr;
+}
+
+// Execute a scan loop: the rows the graph holds, then the ones this change has written,
+// which the pending step reads once the committed one is drained. @param rows is the chunk
+// a step fills that measures it - the node chunk of a node scan, the source chunk of an
+// edge scan.
+template <typename ChunkWriterType, typename PendingScanType>
+void runScanLoopSteps(NLExecutionContext* context,
+                      ChunkWriterType* chunkWriter,
+                      PendingScanType* pendingScan,
+                      const ColumnNodeIDs* rows,
+                      const NLStmtContainer* loopBody,
+                      const NLLimitState* limit) {
+    const auto hasStep = [&]() {
+        return chunkWriter->isValid() || pendingScan->isValid();
+    };
+
+    const auto runIteration = [&]() {
+        if (chunkWriter->isValid()) {
+            chunkWriter->fill(context->getChunkSize());
+        } else {
+            pendingScan->fill(context->getChunkSize());
+        }
+
+        if (rows->empty()) {
+            return;
+        }
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        while (hasStep() && limit->getRemaining() > 0) {
+            runIteration();
+        }
+    } else {
+        while (hasStep()) {
+            runIteration();
+        }
+    }
+}
+
+// Execute a get_out_edges/get_in_edges loop
+template <typename ChunkWriterType>
+void runEdgeLoopSteps(NLExecutionContext* context,
+                      NLExpansionLoopData* loopData,
+                      ChunkWriterType* chunkWriter,
+                      NLPendingEdgeHop* pendingEdges,
+                      ColumnNodeIDs* gatheredNodeIDs) {
+    const NLStmtContainer* loopBody = loopData->getStmts();
+
+    // Same early-exit as the scan loop: a null limit is unbounded, otherwise the
+    // loop stops once the budget is spent, and the break unwinds any enclosing
+    // loop carrying the same handle. The limit is fixed for the whole loop, so
+    // the null check is hoisted out of the per-iteration condition.
+    const NLLimitState* limit = loopData->getLimit();
+    const size_t chunkSize = context->getChunkSize();
+
+    const auto hasStep = [&]() {
+        return chunkWriter->isValid() || (pendingEdges && pendingEdges->isValid());
+    };
+
+    const auto runIteration = [&](size_t rowBudget) {
+        if (chunkWriter->isValid()) {
+            chunkWriter->fill(rowBudget);
+        } else {
+            pendingEdges->fill(rowBudget);
+        }
+
+        const ColumnVector<size_t>* indices = loopData->getIndices();
+        if (indices->empty()) {
+            return;
+        }
+
+        // Column many not have been allocated (=nullptr) if its var wasn't used
+        if (gatheredNodeIDs) {
+            gatherColumn<NodeID>(loopData->getInput(), indices, gatheredNodeIDs);
+        }
+
+        // Transform all the columns in the carried set according to indices
+        for (const NLCarriedColumn& carriedColumn : loopData->carriedColumns()) {
+            const auto gatherFunc = carriedColumn.getGatherFunc();
+            gatherFunc(carriedColumn.getInput(), indices, carriedColumn.getOutput());
+        }
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        // A body that filters keeps the budget unspent, so asking for exactly what the
+        // limit still needs would pay a chunk's fixed cost once per surviving row: the
+        // request doubles until it is back at a whole chunk.
+        size_t rowBudget = 0;
+
+        while (hasStep() && limit->getRemaining() > 0) {
+            rowBudget = std::min(chunkSize, std::max(rowBudget * 2, limit->getRemaining()));
+
+            runIteration(rowBudget);
+        }
+    } else {
+        while (hasStep()) {
+            runIteration(chunkSize);
+        }
+    }
+}
+
+// A column a merge produced mixes the two ID spaces, so its mask answers row by row;
+// one with no mask is pending in every row or in none.
+bool isPendingRow(const ColumnMask* pending, bool isPendingColumn, size_t row) {
+    if (pending) {
+        return (*pending)[row];
+    }
+
+    return isPendingColumn;
+}
+
+// Which rows of an ID column name an entity this change has written and not committed. A
+// column a write bound says so through the mask or the flag codegen put on the op; a hop
+// produces its own rows, and the ID is what tells the two spaces apart there - this
+// change's own start where the graph's end.
+class PendingRows {
+public:
+    PendingRows(const ColumnMask* pending, bool isPendingColumn, size_t committedCount, size_t pendingCount)
+        : _pending(pending),
+        _isPendingColumn(isPendingColumn),
+        _committedCount(committedCount),
+        _pendingCount(pendingCount)
+    {
+    }
+
+    bool has(size_t row, uint64_t id) const {
+        if (id == EntityID::max().getValue()) {
+            return false;
+        }
+
+        const bool marked = isPendingRow(_pending, _isPendingColumn, row);
+        const bool namesWritten = id >= _committedCount && id - _committedCount < _pendingCount;
+
+        return marked || namesWritten;
+    }
+
+private:
+    const ColumnMask* _pending {nullptr};
+    bool _isPendingColumn {false};
+    size_t _committedCount {0};
+    size_t _pendingCount {0};
+};
+
+// The write buffer knows a node this change wrote by its offset, so a row naming one is
+// resolved back to it; every other row names a node the graph holds.
+CommitWriteBuffer::ExistingOrPendingNode resolveNode(const ColumnNodeIDs* column,
+                                                     size_t row,
+                                                     const PendingRows& pendingRows,
+                                                     size_t firstPendingNodeID) {
+    const NodeID nodeID = (*column)[row];
+    if (pendingRows.has(row, nodeID.getValue())) {
+        return CommitWriteBuffer::PendingNodeOffset(nodeID.getValue() - firstPendingNodeID);
+    } else {
+        return nodeID;
+    }
+}
+
+// The write buffer builds one column per property of a pending entity, so a second entry
+// for the same property would be a second value for the same cell: ON CREATE writes over
+// the value the pattern wrote a moment earlier rather than beside it.
+void setPendingProperty(CommitWriteBuffer::UntypedProperties& properties,
+                        const CommitWriteBuffer::UntypedProperty& property) {
+    for (CommitWriteBuffer::UntypedProperty& held : properties) {
+        if (held.propertyID == property.propertyID) {
+            held.value = property.value;
+            return;
+        }
+    }
+
+    properties.push_back(property);
+}
+
+bool writeTouchesRow(const ColumnMask* rows, size_t row) {
+    return !rows || (*rows)[row];
+}
+
+// The searched value as the write buffer holds one, so a scan can compare it against what
+// a pending node was written with. A string the scan borrows is copied: the buffer's own
+// values are owning.
+template <typename T>
+CommitWriteBuffer::SupportedTypeVariant pendingValueOf(typename T::Primitive value) {
+    if constexpr (std::is_same_v<T, types::String>) {
+        return std::optional<std::string> {std::string(value)};
+    } else {
+        return std::optional<typename T::Primitive> {value};
+    }
+}
+
+template <typename T>
+std::optional<typename T::Primitive> readPendingProperty(NLWrittenValues& written,
+                                                         NLValueStore& values,
+                                                         const CommitWriteBuffer::UntypedProperties& properties,
+                                                         PropertyTypeID propertyTypeID) {
+    for (const CommitWriteBuffer::UntypedProperty& property : properties) {
+        if (property.propertyID == propertyTypeID) {
+            return written.read<T>(property.value, values);
+        }
+    }
+
+    return std::nullopt;
+}
+
+// A pending row names its entity by the ID it will commit as, so the write buffer is
+// indexed by what is left once the committed space is taken off
+template <typename ID, typename T>
+std::optional<typename T::Primitive> readPendingEntityProperty(CommitWriteBuffer* writeBuffer,
+                                                               NLWrittenValues& written,
+                                                               NLValueStore& values,
+                                                               const GraphView* view,
+                                                               uint64_t id,
+                                                               PropertyTypeID propertyTypeID) {
+    if constexpr (std::is_same_v<ID, NodeID>) {
+        const size_t offset = id - committedNodeCount(view);
+        return readPendingProperty<T>(written, values, writeBuffer->getPendingNode(offset).properties, propertyTypeID);
+    } else {
+        const size_t offset = id - committedEdgeCount(view);
+        return readPendingProperty<T>(written, values, writeBuffer->getPendingEdge(offset).properties, propertyTypeID);
+    }
+}
+
+// A node an OPTIONAL MATCH did not match is an invalid ID, and no edge can hang off one.
+// The whole column is read before anything is staged, so a CREATE naming a null endpoint
+// writes none of its edges rather than leaving the commit one it cannot resolve. A pending
+// endpoint is an offset into this change's new nodes rather than an ID, so only an existing
+// one can be null.
+void throwIfAnyNodeIsNull(const ColumnNodeIDs* column, bool isPending, std::string_view error) {
+    if (isPending) {
+        return;
+    }
+
+    for (const NodeID nodeID : column->getRaw()) {
+        if (!nodeID.isValid()) {
+            throw IRException(std::string(error));
+        }
+    }
+}
+
+void throwIfNodesHaveEdges(const GraphView& view, const ColumnNodeIDs* nodes) {
+    const GetOutEdgesRange outEdges(view, nodes);
+    for (const EdgeRecord& record : outEdges) {
+        if (!view.isDeleted(record._edgeID)) {
+            throw IRException("Cannot delete a node with relationships; use DETACH DELETE");
+        }
+    }
+
+    const GetInEdgesRange inEdges(view, nodes);
+    for (const EdgeRecord& record : inEdges) {
+        if (!view.isDeleted(record._edgeID)) {
+            throw IRException("Cannot delete a node with relationships; use DETACH DELETE");
+        }
+    }
+}
+
+// A merge keys the value a row asks for against the value the graph holds, and those
+// arrive in a plain and a nullable column respectively: the two have to serialize alike,
+// which is why a plain row writes the tag byte the nullable one writes for a value.
+template <typename ElementType, typename ColumnType = ColumnVector<ElementType>>
+void mergeKeyAppendPlainColumn(const Column* column, size_t row, std::string& key) {
+    const auto& raw = static_cast<const ColumnType*>(column)->getRaw();
+
+    key.push_back('\1');
+    distinctAppendValueBytes(key, raw[row]);
+}
+
+template <typename ElementType>
+void mergeKeyAppendConstColumn(const Column* column, size_t row, std::string& key) {
+    key.push_back('\1');
+    distinctAppendValueBytes(key, (*static_cast<const ColumnConst<ElementType>*>(column))[row]);
+}
+
+// The numeric siblings of the three above, keying the row's value in KeyType - the type
+// the schema holds the property as - rather than in the one its column holds. The
+// analyzer lets an integer constrain a double-typed property, and the graph side keys
+// the double it reads back, so the two only compare equal once the row's value is
+// converted to it.
+template <typename ElementType, typename KeyType>
+void mergeKeyAppendNumericPlainColumn(const Column* column, size_t row, std::string& key) {
+    const auto& raw = static_cast<const ColumnVector<ElementType>*>(column)->getRaw();
+
+    key.push_back('\1');
+    distinctAppendValueBytes(key, static_cast<KeyType>(raw[row]));
+}
+
+template <typename ElementType, typename KeyType>
+void mergeKeyAppendNumericConstColumn(const Column* column, size_t row, std::string& key) {
+    key.push_back('\1');
+    distinctAppendValueBytes(key, static_cast<KeyType>((*static_cast<const ColumnConst<ElementType>*>(column))[row]));
+}
+
+template <typename ElementType, typename KeyType>
+void mergeKeyAppendNumericOptColumn(const Column* column, size_t row, std::string& key) {
+    const auto& raw = static_cast<const ColumnVector<std::optional<ElementType>>*>(column)->getRaw();
+    const std::optional<ElementType>& value = raw[row];
+
+    if (!value.has_value()) {
+        key.push_back('\0');
+        return;
+    }
+
+    key.push_back('\1');
+    distinctAppendValueBytes(key, static_cast<KeyType>(*value));
+}
+
+// Keys the way a nullable column's null row does, so a merge on a null value binds the
+// nodes that lack the property
+void mergeKeyAppendConstNull(const Column* column, size_t row, std::string& key) {
+    key.push_back('\0');
+}
+
+// Which of the three shapes a merge property value column comes in, so one selector
+// serves all of them
+enum class MergeColumnShape {
+    Plain,
+    Const,
+    Opt,
+};
+
+template <typename ElementType, typename KeyType, MergeColumnShape Shape>
+NLKeyAppendFunction mergeKeyAppendFor() {
+    if constexpr (Shape == MergeColumnShape::Plain) {
+        return &mergeKeyAppendNumericPlainColumn<ElementType, KeyType>;
+    } else if constexpr (Shape == MergeColumnShape::Const) {
+        return &mergeKeyAppendNumericConstColumn<ElementType, KeyType>;
+    } else {
+        return &mergeKeyAppendNumericOptColumn<ElementType, KeyType>;
+    }
+}
+
+// The appender for a numeric value column, keying its rows in the type the schema holds
+// the property as. Identical types convert for free, so one path covers both.
+template <typename ElementType, MergeColumnShape Shape>
+NLKeyAppendFunction selectNumericMergeKeyAppend(ValueType keyType) {
+    switch (keyType) {
+        case ValueType::Int64:
+            return mergeKeyAppendFor<ElementType, types::Int64::Primitive, Shape>();
+        break;
+
+        case ValueType::UInt64:
+            return mergeKeyAppendFor<ElementType, types::UInt64::Primitive, Shape>();
+        break;
+
+        case ValueType::Double:
+            return mergeKeyAppendFor<ElementType, types::Double::Primitive, Shape>();
+        break;
+
+        default:
+            throw IRException("a MERGE pattern cannot constrain a non-numeric property to a number");
+        break;
+    }
+}
+
+// A non-numeric value converts to no other type the schema might hold the property as,
+// so it can only key against a property of its own type
+void throwUnlessKeyedAsItsOwnType(ValueType valueType, ValueType keyType) {
+    if (valueType != keyType) {
+        throw IRException("a MERGE pattern cannot constrain a property to a value of another type");
+    }
+}
+
+// Rebuild every column carried past a call from the input rows the procedure reported
+// for the rows it just emitted: an input row it emitted several rows for is repeated,
+// one it emitted none for is dropped - the gather an edge hop replicates its carry set
+// with, over a row map a callback filled rather than a chunk writer.
+//
+// Throws when the procedure reported no row for every row it emitted, or one outside
+// the chunk it was handed: either would leave the carried columns misaligned, silently
+// pairing the wrong rows in the projection, so it is caught at the step that did it.
+void gatherProcedureCarriedColumns(NLProcedureLoopData* loopData) {
+    NLProcedureState* state = loopData->getState();
+    ColumnIndices* indices = loopData->getIndices();
+
+    const size_t emittedRows = state->getRowCount();
+    const std::vector<size_t>& indicesRaw = indices->getRaw();
+    if (indicesRaw.size() != emittedRows) {
+        throw IRException(fmt::format("Procedure '{}' emitted {} rows but reported the input row of "
+                                      "{} of them, so the columns carried past the call cannot be "
+                                      "aligned with its result",
+                                      state->getProcedure()->getFullName(),
+                                      emittedRows,
+                                      indicesRaw.size()));
+    }
+
+    // Each index selects the input row a carried value is replicated from, so one out
+    // of range would read past the chunk the procedure was handed.
+    const size_t inputRows = state->getInputRowCount();
+    for (const size_t inputRow : indicesRaw) {
+        if (inputRow >= inputRows) {
+            throw IRException(fmt::format("Procedure '{}' reported input row {} for a chunk of {} "
+                                          "rows",
+                                          state->getProcedure()->getFullName(),
+                                          inputRow,
+                                          inputRows));
+        }
+    }
+
+    for (const NLCarriedColumn& carriedColumn : loopData->carriedColumns()) {
+        const NLGatherFunction gather = carriedColumn.getGatherFunc();
+        gather(carriedColumn.getInput(), indices, carriedColumn.getOutput());
+    }
+}
+
+// Drive a procedure through one loop: each step runs its execute callback once through
+// runStep, refilling the loop variables in place, then rebuilds any carried column and
+// runs the body. The loop ends when the procedure declares itself finished, so one entry
+// may cover as many chunks as it needs.
+//
+// The body sees only the steps that produced rows. A procedure declares itself finished
+// on the step that exhausts it - which may still carry rows - so the flag is read after
+// the call, not tested before it.
+template <typename StepFunction>
+void runProcedureDrive(NLExecutionContext* context,
+                       NLProcedureLoopData* loopData,
+                       StepFunction runStep) {
+    NLProcedureState* state = loopData->getState();
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    const NLProcedureLoopData::CarriedColumns& carriedColumns = loopData->carriedColumns();
+
+    // A null limit leaves the drive unbounded; otherwise it stops once the budget is
+    // spent, so a LIMIT ends the drive rather than running the procedure out. The limit
+    // is fixed for the whole loop, so the null check is hoisted out of the per-iteration
+    // condition, as the scan loops do.
+    const NLLimitState* limit = loopData->getLimit();
+
+    bool finished = false;
+    const auto runIteration = [&]() {
+        // The procedure reports the input row behind each row it emits, so clear the
+        // map before the call: what it appends is this step's mapping alone, as its
+        // result columns are.
+        if (!carriedColumns.empty()) {
+            loopData->getIndices()->clear();
+        }
+
+        runStep();
+        finished = state->isFinished();
+
+        if (state->getRowCount() == 0) {
+            return;
+        }
+
+        if (!carriedColumns.empty()) {
+            gatherProcedureCarriedColumns(loopData);
+        }
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        while (!finished && limit->getRemaining() > 0) {
+            runIteration();
+        }
+    } else {
+        while (!finished) {
+            runIteration();
+        }
+    }
+}
+
+template <SupportedType T>
+void shortestPathSearch(NLExecutionContext* context, NLShortestPathLoopData* loopData) {
+    using EdgePropType = typename T::Primitive;
+
+    const GraphView& view = *context->getView();
+    NLShortestPathStateImpl<T>* state = static_cast<NLShortestPathStateImpl<T>*>(loopData->getState());
+
+    ColumnNodeIDs* input = loopData->getExpansionInput();
+    ColumnEdgeIDs* outputEdges = loopData->getExpandedEdges();
+    ColumnNodeIDs* outputNodes = loopData->getExpandedTargets();
+    ColumnVector<size_t>* outputIndices = loopData->getExpandedIndices();
+    ColumnOptVector<EdgePropType>* properties =
+        static_cast<ColumnOptVector<EdgePropType>*>(loopData->getWeightValues());
+
+    GetOutEdgesChunkWriter getOutEdgesWriter(view, input);
+    getOutEdgesWriter.setIndices(outputIndices);
+    getOutEdgesWriter.setEdgeIDs(outputEdges);
+    getOutEdgesWriter.setTgtIDs(outputNodes);
+
+    const PropertyTypeID weightType = state->getPropertyType();
+    GetPropertiesWithNullChunkWriter<EdgeID, T> getPropertiesWriter(view, weightType, outputEdges);
+    getPropertiesWriter.setOutput(properties);
+
+    CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+    NLWrittenValues& written = context->getWrittenValues();
+    if (writeBuffer) {
+        written.indexUpdates(writeBuffer);
+    }
+
+    const bool hasUpdates = writeBuffer && written.hasUpdates();
+    NLValueStore weightValues;
+
+    const std::unordered_set<NodeID>& targetNodes = state->targets();
+
+    typename NLShortestPathStateImpl<T>::DjistrakaHeap& heap = state->heap();
+    typename NLShortestPathStateImpl<T>::DjistrakaValueMap& heapValueMap = state->heapValueMap();
+
+    while (!heap.empty()) {
+        const DjistrakaNode<EdgePropType> val = heap.top();
+
+        if (targetNodes.contains(val.id)) {
+            // target found
+            break;
+        }
+
+        heap.pop();
+
+        // We only need to confirm if the distance value is stale
+        // as we only add a new value to the heap when we find a shorter
+        // path to a node.
+        const auto it = heapValueMap.find(val.id);
+        if (it != heapValueMap.end() && it->second.distance != val.distance) {
+            // remove stale value
+            continue;
+        }
+
+        // Set up the input columns and iterators
+        input->clear();
+        input->push_back(val.id);
+        getOutEdgesWriter.reset();
+        // We set the chunk size to SIZE_MAX so that we expand the iterators
+        // completely in 1 chunk
+        getOutEdgesWriter.fill(std::numeric_limits<size_t>::max());
+
+        getPropertiesWriter.reset();
+        getPropertiesWriter.fill(std::numeric_limits<size_t>::max());
+
+        if (hasUpdates) {
+            for (size_t row = 0; row < properties->size(); row++) {
+                const CommitWriteBuffer::SupportedTypeVariant* update = written.findEdgeUpdate((*outputEdges)[row], weightType);
+                if (update) {
+                    (*properties)[row] = written.read<T>(*update, weightValues);
+                }
+            }
+        }
+
+        // loop over all the edge properties
+        for (size_t i = 0; i < properties->size(); ++i) {
+            const std::optional<EdgePropType>& weight = (*properties)[i];
+
+            if (!weight.has_value()) {
+                continue;
+            }
+
+            if constexpr (std::is_signed_v<EdgePropType>) {
+                if (*weight < 0) {
+                    throw IRException("Cannot Do Shortest Path With Negative Weights");
+                }
+            }
+
+            const auto outputNodeId = (*outputNodes)[i];
+            const auto outputEdgeId = (*outputEdges)[i];
+            const auto dist = val.distance + *weight;
+
+            const auto it = heapValueMap.find(outputNodeId);
+            if (it == heapValueMap.end()) {
+                // If the node is not in the heapValueMap
+                // then it is an unexplored node so we add it into heap
+                // directly
+                heap.push({outputNodeId, val.id, outputEdgeId, dist});
+                heapValueMap[outputNodeId] = {val.id, outputEdgeId, dist};
+            } else {
+                // If we have come across this nodeID before we check if the new path
+                // to the node is shorter than the current shortest path for the node
+                // If so we replace it by pushing the new djistraka node into the heap
+                // and changing the heapValueMap value to match the new shortest distance.
+                //
+                // The old path's node will still exist in the heap but if we ever pop
+                // it from the heap we can compare it to the latest value in the heapValueMap
+                // to invalidate it.
+                if (dist < it->second.distance) {
+                    heap.push({outputNodeId, val.id, outputEdgeId, dist});
+                    heapValueMap[outputNodeId] = {val.id, outputEdgeId, dist};
+                }
+            }
+        }
+    }
+
+    // Once we are out of the while loop if there are no values in the heap that means
+    // no path was found between the source and target sets.
+
+    if (heap.empty()) {
+        return;
+    }
+
+    // After the loop the top value in the heap is the target node with the shortest
+    // distance from the source set.
+
+    Column* dist = loopData->getDistanceOutput();
+    auto* distCol = static_cast<ColumnVector<EdgePropType>*>(dist);
+    ColumnVector<Path>* pathCol = loopData->getPathOutput();
+
+    distCol->clear();
+    pathCol->clear();
+
+    // Get the total length of the path
+    distCol->push_back(heap.top().distance);
+    auto& pathVec = pathCol->emplace_back();
+
+    // In the heap all the (non-stale) values represent the shortest path to that
+    // nodeID from the source set. So we can find the shortet path by following the
+    // previousNode back from the target node that we have found.
+    auto lastNode = heap.top().prevNode;
+    auto edge = heap.top().edge;
+    pathVec.push_back(heap.top().id.getValue());
+
+    while (lastNode.isValid()) {
+        pathVec.push_back(edge.getValue());
+        pathVec.push_back(lastNode.getValue());
+
+        const auto& pathInfo = heapValueMap[lastNode];
+        lastNode = pathInfo.prevNode;
+        edge = pathInfo.edge;
+    }
+
+    runBody(context, loopData->getStmts());
+}
+
+}
+
+NLExecutor::NLExecutor(const GraphView* view,
+                       const NLProgram* prog,
+                       NLOutputSink* sink,
+                       CommitWriteBuffer* writeBuffer,
+                       const NLSystemContext* system,
+                       const MetadataBuilder* metadataBuilder)
+    : _ctxt(view, sink, prog->getChunkSize(), writeBuffer, system, metadataBuilder),
+    _prog(prog)
+{
+}
+
+NLExecutor::~NLExecutor() {
+}
+
+void NLExecutor::run() {
+    NLOutputSink* const sink = _ctxt.getSink();
+    if (sink) {
+        NLOutputData* const outputData = _prog->getOutputData();
+        std::span<const Column* const> outputs;
+        if (outputData) {
+            outputs = outputData->outputs();
+        }
+
+        sink->declareOutput(_prog->columnNames(), outputs);
+    }
+
+    runBody(&_ctxt, _prog->getStmts());
+}
+
+void NLExecutor::runCreateNode(NLExecutionContext* context, NLFunctionData* data) {
+    NLCreateNodeData* createData = static_cast<NLCreateNodeData*>(data);
+    CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+    bioassert(writeBuffer, "nl.create_node requires an active write transaction");
+
+    const size_t rowCount = createData->getRowCount();
+    const LabelSetHandle labelsetHandle = createData->getLabelSetHandle();
+
+    // Must extract this value before adding in the loop
+    const size_t numPendingNodes = writeBuffer->numPendingNodes();
+
+    for (size_t row = 0; row < rowCount; row++) {
+        CommitWriteBuffer::PendingNode& node = writeBuffer->newPendingNode();
+        node.labelsetHandle = labelsetHandle;
+    }
+
+    CommitWriteBuffer::UntypedProperties propsBuffer;
+
+    for (const NLCreateNodeData::Property& prop : createData->properties()) {
+        extractColumnProperties(prop._values, rowCount, prop._propertyTypeID, propsBuffer);
+
+        for (size_t row = 0; row < rowCount; row++) {
+            CommitWriteBuffer::PendingNode& pendingNode =
+                writeBuffer->getPendingNode(numPendingNodes + row);
+            CommitWriteBuffer::UntypedProperties& properties = pendingNode.properties;
+            properties.push_back(propsBuffer[row]);
+        }
+    }
+
+    const GraphView* view = context->getView();
+    const NodeID nextNodeID = committedNodeCount(view) + numPendingNodes;
+
+    ColumnNodeIDs* result = createData->getResult();
+    result->resize(rowCount);
+    auto& raw = result->getRaw();
+    for (size_t row = 0; row < rowCount; row++) {
+        raw[row] = NodeID(nextNodeID + row);
+    }
+}
+
+void NLExecutor::runMerge(NLExecutionContext* context, NLFunctionData* data) {
+    NLMergeExecutor merge(context, static_cast<NLMergeData*>(data));
+    merge.run();
+}
+
+void NLExecutor::runCreateEdge(NLExecutionContext* context, NLFunctionData* data) {
+    NLCreateEdgeData* createData = static_cast<NLCreateEdgeData*>(data);
+    CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+    bioassert(writeBuffer, "nl.create_edge requires an active write transaction");
+
+    const ColumnNodeIDs* src = createData->getSrc();
+    const ColumnNodeIDs* tgt = createData->getTgt();
+    const bool srcIsPending = createData->isSrcPending();
+    const bool tgtIsPending = createData->isTgtPending();
+    const size_t rowCount = src->size();
+    const EdgeTypeID edgeTypeID = createData->getEdgeTypeID();
+
+    const ColumnMask* srcPending = createData->getSrcPendingMask();
+    const ColumnMask* tgtPending = createData->getTgtPendingMask();
+
+    throwIfAnyNodeIsNull(src, srcIsPending, "Cannot create an edge from a null node");
+    throwIfAnyNodeIsNull(tgt, tgtIsPending, "Cannot create an edge to a null node");
+
+    const GraphView* view = context->getView();
+    const size_t firstPendingNodeID = committedNodeCount(view);
+    const size_t numPendingNodes = writeBuffer->numPendingNodes();
+
+    const PendingRows srcRows(srcPending, srcIsPending, firstPendingNodeID, numPendingNodes);
+    const PendingRows tgtRows(tgtPending, tgtIsPending, firstPendingNodeID, numPendingNodes);
+
+    // Must extract this value before adding in the loop
+    const size_t numPendingEdges = writeBuffer->numPendingEdges();
+
+    for (size_t row = 0; row < rowCount; row++) {
+        const CommitWriteBuffer::ExistingOrPendingNode srcNode = resolveNode(src, row, srcRows, firstPendingNodeID);
+        const CommitWriteBuffer::ExistingOrPendingNode tgtNode = resolveNode(tgt, row, tgtRows, firstPendingNodeID);
+
+        CommitWriteBuffer::PendingEdge& edge = writeBuffer->newPendingEdge(srcNode, tgtNode);
+        edge.edgeType = edgeTypeID;
+    }
+
+    CommitWriteBuffer::UntypedProperties propsBuffer;
+
+    for (const NLCreateEdgeData::Property& prop : createData->properties()) {
+        extractColumnProperties(prop._values, rowCount, prop._propertyTypeID, propsBuffer);
+
+        for (size_t row = 0; row < rowCount; row++) {
+            writeBuffer->getPendingEdge(numPendingEdges + row).properties.push_back(propsBuffer[row]);
+        }
+    }
+
+    const EdgeID nextEdgeID = committedEdgeCount(view) + numPendingEdges;
+
+    ColumnEdgeIDs* result = createData->getResult();
+    result->resize(rowCount);
+    for (size_t row = 0; row < rowCount; row++) {
+        (*result)[row] = EdgeID(nextEdgeID + row);
+    }
+}
+
+void NLExecutor::runSetNodeProperty(NLExecutionContext* context, NLFunctionData* data) {
+    NLSetNodePropertyData* setData = static_cast<NLSetNodePropertyData*>(data);
+    CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+    bioassert(writeBuffer, "nl.set_node_property requires an active write transaction");
+
+    const ColumnNodeIDs* nodes = setData->getInput();
+    const size_t rowCount = nodes->size();
+
+    CommitWriteBuffer::UntypedProperties propsBuffer;
+    const PropertyTypeID propID = setData->getPropertyTypeID();
+    const ValueType nullValueType = setData->getNullValueType();
+    const ValueType listElementValueType = setData->getListElementValueType();
+
+    if (nullValueType != ValueType::Invalid) {
+        fillNullProperties(rowCount, propID, nullValueType, propsBuffer);
+    } else if (listElementValueType != ValueType::Invalid) {
+        extractListElementProperties(setData->getValue(), rowCount, propID, listElementValueType, propsBuffer);
+    } else {
+        extractColumnProperties(setData->getValue(), rowCount, propID, propsBuffer);
+    }
+
+    const ColumnMask* pending = setData->getPending();
+    const bool allPending = setData->isAllPending();
+    const ColumnMask* rows = setData->getRows();
+
+    const size_t firstPendingNodeID = committedNodeCount(context->getView());
+    const PendingRows pendingRows(pending, allPending, firstPendingNodeID, writeBuffer->numPendingNodes());
+    NLWrittenValues& written = context->getWrittenValues();
+
+    // A node an OPTIONAL MATCH did not match is an invalid ID, which Cypher writes nothing
+    // for: staging it would have the commit look the ID up among the nodes this change
+    // wrote, where it is not.
+    const auto& raw = nodes->getRaw();
+    for (size_t row = 0; row < rowCount; row++) {
+        if (!writeTouchesRow(rows, row) || !raw[row].isValid()) {
+            continue;
+        }
+
+        if (pendingRows.has(row, raw[row].getValue())) {
+            const size_t offset = raw[row].getValue() - firstPendingNodeID;
+            CommitWriteBuffer::PendingNode& node = writeBuffer->getPendingNode(offset);
+            setPendingProperty(node.properties, propsBuffer[row]);
+            written.addPendingNodeUpdate(offset, propID);
+        } else {
+            writeBuffer->addNodeUpdate(raw[row], propsBuffer[row]);
+        }
+    }
+}
+
+void NLExecutor::runSetEdgeProperty(NLExecutionContext* context, NLFunctionData* data) {
+    NLSetEdgePropertyData* setData = static_cast<NLSetEdgePropertyData*>(data);
+    CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+    bioassert(writeBuffer, "nl.set_edge_property requires an active write transaction");
+
+    const ColumnEdgeIDs* edges = setData->getInput();
+    const size_t rowCount = edges->size();
+    const PropertyTypeID propID = setData->getPropertyTypeID();
+    const ValueType nullValueType = setData->getNullValueType();
+    const ValueType listElementValueType = setData->getListElementValueType();
+
+    CommitWriteBuffer::UntypedProperties propsBuffer;
+
+    if (nullValueType != ValueType::Invalid) {
+        fillNullProperties(rowCount, propID, nullValueType, propsBuffer);
+    } else if (listElementValueType != ValueType::Invalid) {
+        extractListElementProperties(setData->getValue(), rowCount, propID, listElementValueType, propsBuffer);
+    } else {
+        extractColumnProperties(setData->getValue(), rowCount, propID, propsBuffer);
+    }
+
+    const ColumnMask* pending = setData->getPending();
+    const bool allPending = setData->isAllPending();
+    const ColumnMask* rows = setData->getRows();
+
+    const size_t firstPendingEdgeID = committedEdgeCount(context->getView());
+    const PendingRows pendingRows(pending, allPending, firstPendingEdgeID, writeBuffer->numPendingEdges());
+
+    const auto& raw = edges->getRaw();
+    for (size_t row = 0; row < rowCount; row++) {
+        if (!writeTouchesRow(rows, row) || !raw[row].isValid()) {
+            continue;
+        }
+
+        if (pendingRows.has(row, raw[row].getValue())) {
+            CommitWriteBuffer::PendingEdge& edge =
+                writeBuffer->getPendingEdge(raw[row].getValue() - firstPendingEdgeID);
+            setPendingProperty(edge.properties, propsBuffer[row]);
+        } else {
+            writeBuffer->addEdgeUpdate(raw[row], propsBuffer[row]);
+        }
+    }
+}
+
+void NLExecutor::runDeleteNode(NLExecutionContext* context, NLFunctionData* data) {
+    NLDeleteNodeData* deleteData = static_cast<NLDeleteNodeData*>(data);
+    CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+    bioassert(writeBuffer, "nl.delete_node requires an active write transaction");
+
+    const ColumnNodeIDs* nodes = deleteData->getInput();
+    const GraphView* view = context->getView();
+    const ColumnMask* pending = deleteData->getPending();
+    const bool allPending = deleteData->isAllPending();
+    const bool detaching = deleteData->isDetaching();
+
+    ColumnNodeIDs* committed = deleteData->getCommitted();
+    committed->clear();
+
+    const size_t firstPendingNodeID = committedNodeCount(view);
+    const PendingRows pendingRows(pending, allPending, firstPendingNodeID, writeBuffer->numPendingNodes());
+
+    const auto& raw = nodes->getRaw();
+
+    // A node an OPTIONAL MATCH did not match is an invalid ID, which Cypher deletes nothing
+    // for. Staging it would tombstone an ID the graph never held, and the node count reads
+    // the tombstones off what it allocated: it would report one node too few.
+    for (size_t row = 0; row < raw.size(); row++) {
+        if (!raw[row].isValid()) {
+            continue;
+        }
+
+        const CommitWriteBuffer::ExistingOrPendingNode node =
+            resolveNode(nodes, row, pendingRows, firstPendingNodeID);
+
+        // A relationship this query wrote counts as much as one the graph holds, whether
+        // it hangs off a node the query wrote or off one already committed
+        if (!detaching && writeBuffer->hasPendingEdgesOn(node)) {
+            throw IRException("Cannot delete a node with relationships; use DETACH DELETE");
+        }
+
+        if (std::holds_alternative<CommitWriteBuffer::PendingNodeOffset>(node)) {
+            writeBuffer->addDeletedPendingNode(std::get<CommitWriteBuffer::PendingNodeOffset>(node));
+        } else {
+            committed->push_back(raw[row]);
+        }
+    }
+
+    if (!detaching) {
+        throwIfNodesHaveEdges(*view, committed);
+    }
+
+    writeBuffer->addDeletedNodes(committed->getRaw());
+
+    if (!detaching) {
+        return;
+    }
+
+    writeBuffer->addHangingEdges(*view);
+    writeBuffer->addHangingPendingEdges();
+}
+
+void NLExecutor::runDeleteEdge(NLExecutionContext* context, NLFunctionData* data) {
+    NLDeleteEdgeData* deleteData = static_cast<NLDeleteEdgeData*>(data);
+    CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+    bioassert(writeBuffer, "nl.delete_edge requires an active write transaction");
+
+    const ColumnEdgeIDs* edges = deleteData->getInput();
+    const ColumnMask* pending = deleteData->getPending();
+    const bool allPending = deleteData->isAllPending();
+
+    ColumnEdgeIDs* committed = deleteData->getCommitted();
+    committed->clear();
+
+    const size_t firstPendingEdgeID = committedEdgeCount(context->getView());
+    const PendingRows pendingRows(pending, allPending, firstPendingEdgeID, writeBuffer->numPendingEdges());
+
+    const auto& raw = edges->getRaw();
+    for (size_t row = 0; row < raw.size(); row++) {
+        if (!raw[row].isValid()) {
+            continue;
+        }
+
+        if (pendingRows.has(row, raw[row].getValue())) {
+            writeBuffer->addDeletedPendingEdge(raw[row].getValue() - firstPendingEdgeID);
+        } else {
+            committed->push_back(raw[row]);
+        }
+    }
+
+    writeBuffer->addDeletedEdges(committed->getRaw());
+}
+
+void NLExecutor::runScanNodesLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLScanLoopData* loopData = static_cast<NLScanLoopData*>(data);
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    ColumnNodeIDs* nodeIDs = loopData->getNodeIDs();
+
+    // A null limit leaves the loop unbounded; otherwise it stops once the budget
+    // is spent. nl.limit_update inside runBody mutates remaining, so the next
+    // test breaks here, and an enclosing loop carrying the same handle breaks on
+    // its next test too - unwinding the whole nest. LIMIT 0 fails the guard on
+    // entry, so nothing is scanned. The limit is fixed for the whole loop, so
+    // the null check is hoisted out of the per-iteration condition.
+    const NLLimitState* limit = loopData->getLimit();
+
+    ScanNodesChunkWriter chunkWriter(*context->getView());
+    chunkWriter.setNodeIDs(nodeIDs);
+
+    NLPendingNodeScan pendingNodes(context, nodeIDs);
+
+    runScanLoopSteps(context, &chunkWriter, &pendingNodes, nodeIDs, loopBody, limit);
+}
+
+void NLExecutor::runScanNodesByLabelLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLScanByLabelLoopData* loopData = static_cast<NLScanByLabelLoopData*>(data);
+
+    // A requested label was absent from the schema, so no node carries the full
+    // conjunction: the scan matches nothing and the loop body never runs.
+    if (!loopData->isMatchable()) {
+        return;
+    }
+
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    ColumnNodeIDs* nodeIDs = loopData->getNodeIDs();
+
+    // A null limit leaves the loop unbounded, exactly as in runScanNodesLoop.
+    const NLLimitState* limit = loopData->getLimit();
+
+    // The LabelSetHandle borrows the loop data's owned LabelSet, which lives for
+    // the whole program, so the handle stays valid for every fill below.
+    const GraphView& view = *context->getView();
+    const LabelSetHandle labelset(loopData->getLabelSet());
+
+    ScanNodesByLabelChunkWriter chunkWriter(view, labelset);
+    chunkWriter.setNodeIDs(nodeIDs);
+
+    NLPendingNodeScan pendingNodes(context, nodeIDs);
+    pendingNodes.setLabelSet(loopData->getLabelSet());
+
+    runScanLoopSteps(context, &chunkWriter, &pendingNodes, nodeIDs, loopBody, limit);
+}
+
+template <SupportedType T>
+void NLExecutor::runScanNodesByPropertyValueLoopAs(NLExecutionContext* context, NLScanByPropertyValueLoopData* loopData) {
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    ColumnNodeIDs* nodeIDs = loopData->getNodeIDs();
+    const NLLimitState* limit = loopData->getLimit();
+
+    // The literal and the label set are owned by the loop data, which lives for the whole
+    // program, so a string view of the one and a handle on the other stay valid for
+    // every fill below.
+    const typename T::Primitive value = propertyScanLiteralAs<T>(loopData->getLiteral());
+    const LabelSetHandle labelset = loopData->isByLabel() ? LabelSetHandle(loopData->getLabelSet()) : LabelSetHandle();
+
+    NLPropertyValueScan<T> graphNodes(context, nodeIDs, loopData->getPropertyTypeID(), value, labelset);
+
+    NLPendingNodeScan pendingNodes(context, nodeIDs);
+    pendingNodes.setProperty(loopData->getPropertyTypeID(), pendingValueOf<T>(value));
+
+    if (loopData->isByLabel()) {
+        pendingNodes.setLabelSet(loopData->getLabelSet());
+    }
+
+    runScanLoopSteps(context, &graphNodes, &pendingNodes, nodeIDs, loopBody, limit);
+}
+
+void NLExecutor::runScanNodesByPropertyValueLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLScanByPropertyValueLoopData* loopData = static_cast<NLScanByPropertyValueLoopData*>(data);
+    if (!loopData->isMatchable()) {
+        return;
+    }
+
+    switch (loopData->getValueType()) {
+        case ValueType::Int64:
+            runScanNodesByPropertyValueLoopAs<types::Int64>(context, loopData);
+        break;
+        case ValueType::UInt64:
+            runScanNodesByPropertyValueLoopAs<types::UInt64>(context, loopData);
+        break;
+        case ValueType::Double:
+            runScanNodesByPropertyValueLoopAs<types::Double>(context, loopData);
+        break;
+        case ValueType::Bool:
+            runScanNodesByPropertyValueLoopAs<types::Bool>(context, loopData);
+        break;
+        case ValueType::String:
+            runScanNodesByPropertyValueLoopAs<types::String>(context, loopData);
+        break;
+        default:
+            throw IRException("scan_nodes_by_property_value cannot scan this property type");
+        break;
+    }
+}
+
+void NLExecutor::runConstScanNodesLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLConstScanLoopData* loopData = static_cast<NLConstScanLoopData*>(data);
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    ColumnNodeIDs* nodeIDs = loopData->getNodeIDs();
+    const std::span<const NodeID> constNodeIDs = loopData->getConstNodeIDs();
+    const size_t chunkSize = context->getChunkSize();
+    const size_t totalCount = constNodeIDs.size();
+    const GraphView* view = context->getView();
+
+    // A null limit leaves the loop unbounded, exactly as in runScanNodesLoop.
+    const NLLimitState* limit = loopData->getLimit();
+
+    // Emit the fixed node ID list one chunk at a time: each step copies the next
+    // slice into the loop's node chunk and runs the body over it. The cursor is
+    // local to this call, so a const scan nested in a cross product restarts from
+    // the first ID on every outer step, the same way runScanNodesLoop opens a
+    // fresh chunk writer each call.
+    size_t cursor = 0;
+
+    const auto runIteration = [&]() {
+        const size_t remaining = totalCount - cursor;
+        const size_t rows = std::min(chunkSize, remaining);
+
+        std::vector<NodeID>& raw = nodeIDs->getRaw();
+        raw.assign(constNodeIDs.begin() + cursor, constNodeIDs.begin() + cursor + rows);
+
+        cursor += rows;
+
+        // The translator dropped the IDs the graph had deleted, before any DELETE of this
+        // query ran
+        if (view->hasDeletedNodes()) {
+            std::erase_if(raw, [view](NodeID node) { return view->isDeleted(node); });
+        }
+
+        if (raw.empty()) {
+            return;
+        }
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        while (cursor < totalCount && limit->getRemaining() > 0) {
+            runIteration();
+        }
+    } else {
+        while (cursor < totalCount) {
+            runIteration();
+        }
+    }
+}
+
+void NLExecutor::runUnwindConstLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLUnwindConstLoopData* loopData = static_cast<NLUnwindConstLoopData*>(data);
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    const ListView list = loopData->getList();
+    Column* output = loopData->getOutput();
+    const bool heterogeneous = loopData->isHeterogeneous();
+    const ValueType valueType = loopData->getValueType();
+    const size_t chunkSize = context->getChunkSize();
+    const size_t totalCount = list.size();
+
+    // A null limit leaves the loop unbounded, exactly as in runConstScanNodesLoop.
+    const NLLimitState* limit = loopData->getLimit();
+
+    // Emit the fixed list one chunk at a time: each step fills the value chunk with the
+    // next slice and runs the body over it. The cursor is local to this call, so an
+    // unwind nested in a cross product restarts from the first element on every outer
+    // step - the same way runConstScanNodesLoop reopens its slice each call.
+    size_t cursor = 0;
+
+    const auto runIteration = [&]() {
+        const size_t remaining = totalCount - cursor;
+        const size_t rows = std::min(chunkSize, remaining);
+
+        if (heterogeneous) {
+            fillListElementChunk(output, list, cursor, rows);
+        } else {
+            fillHomogeneousChunk(output, valueType, list, cursor, rows);
+        }
+
+        cursor += rows;
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        while (cursor < totalCount && limit->getRemaining() > 0) {
+            runIteration();
+        }
+    } else {
+        while (cursor < totalCount) {
+            runIteration();
+        }
+    }
+}
+
+void NLExecutor::runLoadCSVLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLLoadCSVLoopData* loopData = static_cast<NLLoadCSVLoopData*>(data);
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    ColumnStringTable* row = loopData->getRow();
+    StringBuffer* const stringBuffer = loopData->getStringBuffer();
+    const size_t chunkSize = context->getChunkSize();
+
+    // A null limit leaves the loop unbounded, exactly as in runConstScanNodesLoop.
+    const NLLimitState* limit = loopData->getLimit();
+
+    const fs::Path* const dataDir = context->getDataDir();
+    if (!dataDir) {
+        throw IRException("Reading a CSV file needs a data directory, which this session has not opened");
+    }
+
+    fs::Path path;
+    NLSystemContext::resolveInDataDir(path, *dataDir, loopData->getPath());
+
+    // The file's shape decides what the fields the query named resolve to: a header line
+    // names them, and the first record fixes how many a record carries - which is also
+    // the count a malformed record is caught against.
+    CSVFileInfo fileInfo;
+    CSVParser::peekFileStructure(path, loopData->hasHeaders(), fileInfo);
+
+    // A file holding no record names no field, so there is nothing to resolve a position
+    // or a header against - and no row to run the body over either
+    if (fileInfo._fieldCount == 0) {
+        return;
+    }
+
+    std::vector<size_t> fieldIndices;
+    resolveCSVFieldIndices(*loopData, fileInfo, fieldIndices);
+
+    const CSVErrorMode errorMode = loopData->skipOnError() ? CSVErrorMode::Skip : CSVErrorMode::Fail;
+    CSVParser parser(path, loopData->hasHeaders(), errorMode, fileInfo._fieldCount);
+
+    // Parse the file one chunk of records at a time: each step fills the field columns
+    // with the next records and runs the body over them. The parser is local to this
+    // call, so a load nested in a cross product reopens the file on every outer step -
+    // the same way runScanNodesLoop opens a fresh chunk writer each call.
+    bool exhausted = false;
+
+    const auto runIteration = [&]() {
+        stringBuffer->clear();
+        const size_t rows = parser.readChunk(chunkSize, fieldIndices, row, stringBuffer);
+
+        if (rows == 0) {
+            exhausted = true;
+            return;
+        }
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        while (!exhausted && limit->getRemaining() > 0) {
+            runIteration();
+        }
+    } else {
+        while (!exhausted) {
+            runIteration();
+        }
+    }
+}
+
+void NLExecutor::searchVectorIndex(NLExecutionContext* context, NLVectorSearchLoopData* loopData) {
+    const std::string_view indexName = loopData->getIndexName();
+
+    vec::VectorDatabase* const vectorDatabase = context->getVectorDatabase();
+    if (!vectorDatabase) {
+        throw IRException("A vector search needs a vector database, which this session has not opened");
+    }
+
+    vec::VecLibAccessor accessor = vectorDatabase->getLibrary(indexName);
+    if (!accessor.isValid()) {
+        throw IRException(fmt::format("Vector index '{}' not found", indexName));
+    }
+
+    // The index reads the query vector as a flat span of exactly its dimension, so a
+    // shorter one would be read past its end rather than rejected further down.
+    const vec::Dimension dimension = accessor.metadata()->_dimension;
+    const std::span<const float> queryVector = loopData->getQueryVector();
+    if (queryVector.size() != dimension) {
+        throw IRException(fmt::format("Vector index '{}' holds vectors of dimension {}, but the "
+                                      "query searches for one of dimension {}",
+                                      indexName,
+                                      dimension,
+                                      queryVector.size()));
+    }
+
+    vec::VectorSearchQuery query(dimension);
+    query.setVector(queryVector);
+    query.setMaxResultCount(loopData->getNeighbourCount());
+
+    vec::VectorSearchResult result;
+    const vec::VectorResult<void> searched = accessor.search(&query, &result);
+    if (!searched.has_value()) {
+        throw IRException(fmt::format("Vector search in '{}' failed: {}",
+                                      indexName,
+                                      searched.error().fmtMessage()));
+    }
+
+    // The neighbours come back nearest first, the two spans row-aligned, so either one
+    // measures the result.
+    const std::span<const int64_t> ids = result.ids();
+    const std::span<const float> distances = result.distances();
+
+    // An ID naming no node is kept rather than dropped the way a const scan drops one: it
+    // matches no edge and holds no property, so an index whose IDs are not node IDs still
+    // reports every neighbour it found.
+    std::vector<NodeID>& neighbourIDs = loopData->neighbourIDs();
+    neighbourIDs.resize(ids.size());
+    std::transform(ids.begin(),
+                   ids.end(),
+                   neighbourIDs.begin(),
+                   [](int64_t id) { return NodeID {static_cast<uint64_t>(id)}; });
+
+    std::vector<std::optional<types::Double::Primitive>>& neighbourScores = loopData->neighbourScores();
+    neighbourScores.resize(distances.size());
+    std::copy(distances.begin(), distances.end(), neighbourScores.begin());
+
+    loopData->markSearched();
+}
+
+void NLExecutor::runVectorSearchLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLVectorSearchLoopData* loopData = static_cast<NLVectorSearchLoopData*>(data);
+    const NLStmtContainer* loopBody = loopData->getStmts();
+
+    // A null limit leaves the loop unbounded, exactly as in runUnwindConstLoop. A spent
+    // one emits nothing, so the neighbours it would report are never read: the index is
+    // asked for them only once the budget can take a row.
+    const NLLimitState* limit = loopData->getLimit();
+    if (limit && limit->getRemaining() == 0) {
+        return;
+    }
+
+    // The reader lock the accessor holds lives no longer than the search itself, so a
+    // concurrent LOAD VECTOR into this index waits for the search rather than for the
+    // whole query the neighbours feed.
+    if (!loopData->hasSearched()) {
+        searchVectorIndex(context, loopData);
+    }
+
+    const std::span<const NodeID> ids = loopData->neighbourIDs();
+    const std::span<const std::optional<types::Double::Primitive>> scores = loopData->neighbourScores();
+
+    using ScoreColumn = ColumnOptVector<types::Double::Primitive>;
+
+    ColumnNodeIDs* const idColumn = loopData->getIDs();
+    ScoreColumn* const scoreColumn = static_cast<ScoreColumn*>(loopData->getScores());
+
+    const size_t chunkSize = context->getChunkSize();
+    const size_t totalCount = ids.size();
+
+    // Emit the neighbours one chunk at a time: each step fills the two chunks with the
+    // next slice and runs the body over them. The cursor is local to this call, so a
+    // search nested in a cross product walks the neighbours again on every outer step -
+    // the way runScanNodesLoop reopens its chunk writer each call.
+    size_t cursor = 0;
+
+    const auto runIteration = [&]() {
+        const size_t remaining = totalCount - cursor;
+        const size_t rows = std::min(chunkSize, remaining);
+
+        std::vector<NodeID>& rawIDs = idColumn->getRaw();
+        rawIDs.resize(rows);
+        std::copy(ids.begin() + cursor, ids.begin() + cursor + rows, rawIDs.begin());
+
+        std::vector<std::optional<types::Double::Primitive>>& rawScores = scoreColumn->getRaw();
+        rawScores.resize(rows);
+        std::copy(scores.begin() + cursor, scores.begin() + cursor + rows, rawScores.begin());
+
+        cursor += rows;
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        while (cursor < totalCount && limit->getRemaining() > 0) {
+            runIteration();
+        }
+    } else {
+        while (cursor < totalCount) {
+            runIteration();
+        }
+    }
+}
+
+void NLExecutor::runUnwindLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLUnwindLoopData* loopData = static_cast<NLUnwindLoopData*>(data);
+    const Column* source = loopData->getSource();
+
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    const NLUnwindElementEmitFunction elementEmit = loopData->getElementEmitFunc();
+    const size_t chunkSize = context->getChunkSize();
+
+    // A null limit leaves the loop unbounded, exactly as in runUnwindConstLoop.
+    const NLLimitState* limit = loopData->getLimit();
+
+    ColumnVector<size_t>* rows = loopData->getRows();
+    ColumnVector<size_t>* positions = loopData->getPositions();
+
+    NLElementCursor cursor(source, loopData->getElementCountFunc());
+
+    const auto runIteration = [&]() {
+        cursor.fillChunk(chunkSize, rows->getRaw(), elementEmit ? &positions->getRaw() : nullptr);
+
+        // A source whose cells hold more than the element drains through its own emit;
+        // any other holds the elements already and rides the carry set, gathered by the
+        // source row like everything else in flight.
+        if (elementEmit) {
+            elementEmit(source, rows, positions, loopData->getElementOutput());
+        }
+
+        for (const NLCarriedColumn& carriedColumn : loopData->carriedColumns()) {
+            const auto gatherFunc = carriedColumn.getGatherFunc();
+            gatherFunc(carriedColumn.getInput(), rows, carriedColumn.getOutput());
+        }
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        while (!cursor.exhausted() && limit->getRemaining() > 0) {
+            runIteration();
+        }
+    } else {
+        while (!cursor.exhausted()) {
+            runIteration();
+        }
+    }
+}
+
+void NLExecutor::runUnwindRangeLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLUnwindRangeLoopData* loopData = static_cast<NLUnwindRangeLoopData*>(data);
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    const size_t chunkSize = context->getChunkSize();
+
+    // A null limit leaves the loop unbounded, exactly as in runUnwindLoop.
+    const NLLimitState* limit = loopData->getLimit();
+
+    using ElementColumn = ColumnOptVector<types::Int64::Primitive>;
+    ElementColumn* const elements = static_cast<ElementColumn*>(loopData->getElementOutput());
+    std::vector<std::optional<types::Int64::Primitive>>* const values = elements ? &elements->getRaw() : nullptr;
+    ColumnVector<size_t>* rows = loopData->getRows();
+
+    NLRangeCursor cursor(loopData);
+
+    const auto runIteration = [&]() {
+        cursor.fillChunk(chunkSize, values, rows->getRaw());
+
+        for (const NLCarriedColumn& carriedColumn : loopData->carriedColumns()) {
+            const auto gatherFunc = carriedColumn.getGatherFunc();
+            gatherFunc(carriedColumn.getInput(), rows, carriedColumn.getOutput());
+        }
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        while (!cursor.exhausted() && limit->getRemaining() > 0) {
+            runIteration();
+        }
+    } else {
+        while (!cursor.exhausted()) {
+            runIteration();
+        }
+    }
+}
+
+void NLExecutor::runUnwindComputedLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLUnwindComputedLoopData* loopData = static_cast<NLUnwindComputedLoopData*>(data);
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    const NLStmtContainer* sourceStmts = loopData->getSourceStmts();
+    const size_t chunkSize = context->getChunkSize();
+
+    // A null limit leaves the loop unbounded, exactly as in runUnwindLoop.
+    const NLLimitState* limit = loopData->getLimit();
+    const auto withinLimit = [limit]() {
+        return !limit || limit->getRemaining() > 0;
+    };
+
+    const NLUnwindElementCountFunction elementCount = loopData->getElementCountFunc();
+    const NLUnwindElementEmitFunction elementEmit = loopData->getElementEmitFunc();
+    const NLCarriedColumn* elementCell = loopData->getElementCell();
+    const Column* source = loopData->getSource();
+
+    ColumnVector<size_t>* runRows = loopData->getRunRows();
+    ColumnVector<size_t>* rows = loopData->getRows();
+    ColumnVector<size_t>* positions = loopData->getPositions();
+    std::vector<size_t>& runRaw = runRows->getRaw();
+    std::vector<size_t>& rowsRaw = rows->getRaw();
+
+    const size_t inputRows = loopData->getInputRows();
+
+    // A run of input rows holds about one chunk of elements once the first run has shown
+    // how many a row spans, so the source never holds the elements of a whole chunk of rows
+    size_t runStart = 0;
+    size_t runLength = 1;
+
+    while (runStart < inputRows && withinLimit()) {
+        runLength = std::min(runLength, inputRows - runStart);
+
+        runRaw.resize(runLength);
+        std::iota(runRaw.begin(), runRaw.end(), runStart);
+
+        for (const NLCarriedColumn& argument : loopData->sourceArguments()) {
+            const auto gatherFunc = argument.getGatherFunc();
+            gatherFunc(argument.getInput(), runRows, argument.getOutput());
+        }
+
+        runBody(context, sourceStmts);
+
+        NLElementCursor cursor(source, elementCount);
+        size_t elements = 0;
+
+        while (!cursor.exhausted() && withinLimit()) {
+            cursor.fillChunk(chunkSize, rowsRaw, elementEmit ? &positions->getRaw() : nullptr);
+            elements += rowsRaw.size();
+
+            if (elementEmit) {
+                elementEmit(source, rows, positions, loopData->getElementOutput());
+            } else if (elementCell) {
+                const auto gatherFunc = elementCell->getGatherFunc();
+                gatherFunc(elementCell->getInput(), rows, elementCell->getOutput());
+            }
+
+            std::ranges::transform(rowsRaw, rowsRaw.begin(), [runStart](size_t row) {
+                return row + runStart;
+            });
+
+            for (const NLCarriedColumn& carriedColumn : loopData->carriedColumns()) {
+                const auto gatherFunc = carriedColumn.getGatherFunc();
+                gatherFunc(carriedColumn.getInput(), rows, carriedColumn.getOutput());
+            }
+
+            runBody(context, loopBody);
+        }
+
+        runStart += runLength;
+        runLength = elements == 0 ? chunkSize : std::max<size_t>(1, chunkSize * runLength / elements);
+    }
+}
+
+void NLExecutor::runScanEdgesLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLScanEdgesLoopData* loopData = static_cast<NLScanEdgesLoopData*>(data);
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    ColumnNodeIDs* sources = loopData->getSources();
+
+    // A null limit leaves the loop unbounded; otherwise it stops once the budget
+    // is spent, exactly as in runScanNodesLoop.
+    const NLLimitState* limit = loopData->getLimit();
+
+    ScanEdgesChunkWriter chunkWriter(*context->getView());
+    chunkWriter.setSrcIDs(sources);
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setTgtIDs(loopData->getTargets());
+
+    NLPendingEdgeScan pendingEdges(context, loopData);
+
+    // The four columns are row-aligned, so the source column measures the step.
+    runScanLoopSteps(context, &chunkWriter, &pendingEdges, sources, loopBody, limit);
+}
+
+void NLExecutor::runScanEdgesByTypeLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLScanEdgesByTypeLoopData* loopData = static_cast<NLScanEdgesByTypeLoopData*>(data);
+
+    // No type the pattern named is in the schema, so no edge can match and the loop body never runs.
+    if (!loopData->isMatchable()) {
+        return;
+    }
+
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    ColumnNodeIDs* sources = loopData->getSources();
+
+    const NLLimitState* limit = loopData->getLimit();
+
+    ScanEdgesByTypeChunkWriter chunkWriter(*context->getView(), loopData->getRequestedTypes());
+    chunkWriter.setSrcIDs(sources);
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setTgtIDs(loopData->getTargets());
+
+    NLPendingEdgeScan pendingEdges(context, loopData);
+    pendingEdges.setEdgeTypes(loopData->getRequestedTypes());
+
+    runScanLoopSteps(context, &chunkWriter, &pendingEdges, sources, loopBody, limit);
+}
+
+void NLExecutor::runScanEdgesBySourceLabelLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLScanEdgesByLabelLoopData* loopData = static_cast<NLScanEdgesByLabelLoopData*>(data);
+
+    // A requested label was absent from the schema, so no node carries the full
+    // conjunction: the scan matches no edge and the loop body never runs.
+    if (!loopData->isMatchable()) {
+        return;
+    }
+
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    ColumnNodeIDs* sources = loopData->getSources();
+
+    const NLLimitState* limit = loopData->getLimit();
+
+    // The LabelSetHandle borrows the loop data's owned LabelSet, which lives for the
+    // whole program, so the handle stays valid for every fill below.
+    const LabelSetHandle labelset(loopData->getLabelSet());
+
+    ScanOutEdgesBySourceLabelChunkWriter chunkWriter(*context->getView(), labelset);
+    chunkWriter.setSrcIDs(sources);
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setTgtIDs(loopData->getTargets());
+
+    NLPendingEdgeScan pendingEdges(context, loopData);
+    pendingEdges.setSourceLabelSet(loopData->getLabelSet());
+
+    runScanLoopSteps(context, &chunkWriter, &pendingEdges, sources, loopBody, limit);
+}
+
+void NLExecutor::runScanEdgesByTargetLabelLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLScanEdgesByLabelLoopData* loopData = static_cast<NLScanEdgesByLabelLoopData*>(data);
+
+    if (!loopData->isMatchable()) {
+        return;
+    }
+
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    ColumnNodeIDs* sources = loopData->getSources();
+
+    const NLLimitState* limit = loopData->getLimit();
+
+    const LabelSetHandle labelset(loopData->getLabelSet());
+
+    // The writer names its two node columns after the walk rather than after the edge:
+    // the labelled end it hangs each edge off goes to setSrcIDs, and here that end is the
+    // edge's target. The chunks hold the edge as the graph stores it, the way
+    // nl.get_in_edges fills them, so the two are crossed here.
+    ScanInEdgesByTargetLabelChunkWriter chunkWriter(*context->getView(), labelset);
+    chunkWriter.setSrcIDs(loopData->getTargets());
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setTgtIDs(sources);
+
+    NLPendingEdgeScan pendingEdges(context, loopData);
+    pendingEdges.setTargetLabelSet(loopData->getLabelSet());
+
+    runScanLoopSteps(context, &chunkWriter, &pendingEdges, sources, loopBody, limit);
+}
+
+void NLExecutor::runScanEdgesByEndpointLabelsFromSourceLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLScanEdgesByEndpointLabelsLoopData* loopData = static_cast<NLScanEdgesByEndpointLabelsLoopData*>(data);
+
+    if (!loopData->isMatchable()) {
+        return;
+    }
+
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    ColumnNodeIDs* sources = loopData->getSources();
+
+    const NLLimitState* limit = loopData->getLimit();
+
+    const LabelSet& sourceLabelSet = loopData->getLabelSet();
+    const LabelSet& targetLabelSet = loopData->getOtherEndLabelSet();
+    const LabelSetHandle sourceLabels(sourceLabelSet);
+    const LabelSetHandle targetLabels(targetLabelSet);
+
+    ScanOutEdgesByBothLabelsChunkWriter chunkWriter(*context->getView(), sourceLabels, targetLabels);
+    chunkWriter.setSrcIDs(sources);
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setTgtIDs(loopData->getTargets());
+
+    NLPendingEdgeScan pendingEdges(context, loopData);
+    pendingEdges.setSourceLabelSet(sourceLabelSet);
+    pendingEdges.setTargetLabelSet(targetLabelSet);
+
+    runScanLoopSteps(context, &chunkWriter, &pendingEdges, sources, loopBody, limit);
+}
+
+void NLExecutor::runScanEdgesByEndpointLabelsFromTargetLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLScanEdgesByEndpointLabelsLoopData* loopData = static_cast<NLScanEdgesByEndpointLabelsLoopData*>(data);
+
+    if (!loopData->isMatchable()) {
+        return;
+    }
+
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    ColumnNodeIDs* sources = loopData->getSources();
+
+    const NLLimitState* limit = loopData->getLimit();
+
+    const LabelSet& targetLabelSet = loopData->getLabelSet();
+    const LabelSet& sourceLabelSet = loopData->getOtherEndLabelSet();
+    const LabelSetHandle targetLabels(targetLabelSet);
+    const LabelSetHandle sourceLabels(sourceLabelSet);
+
+    // The writer fills the indexed end through setSrcIDs, which here is the edge's target,
+    // so the two node columns cross as in runScanEdgesByTargetLabelLoop.
+    ScanInEdgesByBothLabelsChunkWriter chunkWriter(*context->getView(), targetLabels, sourceLabels);
+    chunkWriter.setSrcIDs(loopData->getTargets());
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setTgtIDs(sources);
+
+    NLPendingEdgeScan pendingEdges(context, loopData);
+    pendingEdges.setTargetLabelSet(targetLabelSet);
+    pendingEdges.setSourceLabelSet(sourceLabelSet);
+
+    runScanLoopSteps(context, &chunkWriter, &pendingEdges, sources, loopBody, limit);
+}
+
+void NLExecutor::runGetOutEdgesLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLEdgeLoopData* loopData = static_cast<NLEdgeLoopData*>(data);
+    const ColumnNodeIDs* inputNodeIDs = loopData->getInput();
+
+    if (inputNodeIDs->empty()) {
+        return;
+    }
+
+    GetOutEdgesChunkWriter chunkWriter(*context->getView(), inputNodeIDs);
+    chunkWriter.setIndices(loopData->getIndices());
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setTgtIDs(loopData->getTargets());
+
+    NLPendingEdgeHop pendingEdges(context, loopData, NLPendingEdgeHop::Direction::Out, loopData->getTargets());
+
+    runEdgeLoopSteps(context, loopData, &chunkWriter, &pendingEdges, loopData->getSources());
+}
+
+void NLExecutor::runGetInEdgesLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLEdgeLoopData* loopData = static_cast<NLEdgeLoopData*>(data);
+    const ColumnNodeIDs* inputNodeIDs = loopData->getInput();
+
+    if (inputNodeIDs->empty()) {
+        return;
+    }
+
+    GetInEdgesChunkWriter chunkWriter(*context->getView(), inputNodeIDs);
+    chunkWriter.setIndices(loopData->getIndices());
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setSrcIDs(loopData->getSources());
+
+    NLPendingEdgeHop pendingEdges(context, loopData, NLPendingEdgeHop::Direction::In, loopData->getSources());
+
+    runEdgeLoopSteps(context, loopData, &chunkWriter, &pendingEdges, loopData->getTargets());
+}
+
+void NLExecutor::runGetEdgesLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLEdgeLoopData* loopData = static_cast<NLEdgeLoopData*>(data);
+    const ColumnNodeIDs* inputNodeIDs = loopData->getInput();
+
+    if (inputNodeIDs->empty()) {
+        return;
+    }
+
+    GetEdgesChunkWriter chunkWriter(*context->getView(), inputNodeIDs);
+    chunkWriter.setIndices(loopData->getIndices());
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setOtherIDs(loopData->getTargets());
+
+    NLPendingEdgeHop pendingEdges(context, loopData, NLPendingEdgeHop::Direction::Either, loopData->getTargets());
+
+    runEdgeLoopSteps(context, loopData, &chunkWriter, &pendingEdges, loopData->getSources());
+}
+
+void NLExecutor::runGetOutEdgesByTypeLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLEdgeByTypeLoopData* loopData = static_cast<NLEdgeByTypeLoopData*>(data);
+    const ColumnNodeIDs* inputNodeIDs = loopData->getInput();
+
+    // No type the pattern named is in the schema, so no edge can match; and an empty
+    // input has no edges to walk. Either way the loop body never runs.
+    if (!loopData->isMatchable() || inputNodeIDs->empty()) {
+        return;
+    }
+
+    GetOutEdgesByTypeChunkWriter chunkWriter(*context->getView(), inputNodeIDs, loopData->getRequestedTypes());
+    chunkWriter.setIndices(loopData->getIndices());
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setTgtIDs(loopData->getTargets());
+
+    NLPendingEdgeHop pendingEdges(context, loopData, NLPendingEdgeHop::Direction::Out, loopData->getTargets());
+    pendingEdges.setEdgeTypes(loopData->getRequestedTypes());
+
+    runEdgeLoopSteps(context, loopData, &chunkWriter, &pendingEdges, loopData->getSources());
+}
+
+void NLExecutor::runGetInEdgesByTypeLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLEdgeByTypeLoopData* loopData = static_cast<NLEdgeByTypeLoopData*>(data);
+    const ColumnNodeIDs* inputNodeIDs = loopData->getInput();
+
+    if (!loopData->isMatchable() || inputNodeIDs->empty()) {
+        return;
+    }
+
+    GetInEdgesByTypeChunkWriter chunkWriter(*context->getView(), inputNodeIDs, loopData->getRequestedTypes());
+    chunkWriter.setIndices(loopData->getIndices());
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setSrcIDs(loopData->getSources());
+
+    NLPendingEdgeHop pendingEdges(context, loopData, NLPendingEdgeHop::Direction::In, loopData->getSources());
+    pendingEdges.setEdgeTypes(loopData->getRequestedTypes());
+
+    runEdgeLoopSteps(context, loopData, &chunkWriter, &pendingEdges, loopData->getTargets());
+}
+
+void NLExecutor::runGetOutEdgesByLabelLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLEdgeByLabelLoopData* loopData = static_cast<NLEdgeByLabelLoopData*>(data);
+    const ColumnNodeIDs* inputNodeIDs = loopData->getInput();
+
+    // A requested label absent from the schema is carried by no node, and an empty input
+    // has no edges to walk: either way the loop body never runs.
+    if (!loopData->isMatchable() || inputNodeIDs->empty()) {
+        return;
+    }
+
+    // The LabelSetHandle borrows the loop data's owned LabelSet, which lives for the whole
+    // program, so the handle stays valid for every fill below.
+    const LabelSetHandle labelset(loopData->getLabelSet());
+
+    GetOutEdgesByLabelChunkWriter chunkWriter(*context->getView(), inputNodeIDs, labelset);
+    chunkWriter.setIndices(loopData->getIndices());
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setTgtIDs(loopData->getTargets());
+
+    NLPendingEdgeHop pendingEdges(context, loopData, NLPendingEdgeHop::Direction::Out, loopData->getTargets());
+    pendingEdges.setEndpointLabelSet(loopData->getLabelSet());
+
+    runEdgeLoopSteps(context, loopData, &chunkWriter, &pendingEdges, loopData->getSources());
+}
+
+void NLExecutor::runGetInEdgesByLabelLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLEdgeByLabelLoopData* loopData = static_cast<NLEdgeByLabelLoopData*>(data);
+    const ColumnNodeIDs* inputNodeIDs = loopData->getInput();
+
+    if (!loopData->isMatchable() || inputNodeIDs->empty()) {
+        return;
+    }
+
+    const LabelSetHandle labelset(loopData->getLabelSet());
+
+    GetInEdgesByLabelChunkWriter chunkWriter(*context->getView(), inputNodeIDs, labelset);
+    chunkWriter.setIndices(loopData->getIndices());
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setSrcIDs(loopData->getSources());
+
+    NLPendingEdgeHop pendingEdges(context, loopData, NLPendingEdgeHop::Direction::In, loopData->getSources());
+    pendingEdges.setEndpointLabelSet(loopData->getLabelSet());
+
+    runEdgeLoopSteps(context, loopData, &chunkWriter, &pendingEdges, loopData->getTargets());
+}
+
+void NLExecutor::runGetOutEdgesByTypeAndLabelLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLEdgeByTypeAndLabelLoopData* loopData = static_cast<NLEdgeByTypeAndLabelLoopData*>(data);
+    const ColumnNodeIDs* inputNodeIDs = loopData->getInput();
+
+    if (!loopData->isMatchable() || inputNodeIDs->empty()) {
+        return;
+    }
+
+    const std::span<const EdgeTypeID> requestedTypes = loopData->getRequestedTypes();
+    const LabelSetHandle labelset(loopData->getLabelSet());
+
+    GetOutEdgesByTypeAndLabelChunkWriter chunkWriter(*context->getView(), inputNodeIDs, requestedTypes, labelset);
+    chunkWriter.setIndices(loopData->getIndices());
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setTgtIDs(loopData->getTargets());
+
+    NLPendingEdgeHop pendingEdges(context, loopData, NLPendingEdgeHop::Direction::Out, loopData->getTargets());
+    pendingEdges.setEdgeTypes(requestedTypes);
+    pendingEdges.setEndpointLabelSet(loopData->getLabelSet());
+
+    runEdgeLoopSteps(context, loopData, &chunkWriter, &pendingEdges, loopData->getSources());
+}
+
+void NLExecutor::runGetInEdgesByTypeAndLabelLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLEdgeByTypeAndLabelLoopData* loopData = static_cast<NLEdgeByTypeAndLabelLoopData*>(data);
+    const ColumnNodeIDs* inputNodeIDs = loopData->getInput();
+
+    if (!loopData->isMatchable() || inputNodeIDs->empty()) {
+        return;
+    }
+
+    const std::span<const EdgeTypeID> requestedTypes = loopData->getRequestedTypes();
+    const LabelSetHandle labelset(loopData->getLabelSet());
+
+    GetInEdgesByTypeAndLabelChunkWriter chunkWriter(*context->getView(), inputNodeIDs, requestedTypes, labelset);
+    chunkWriter.setIndices(loopData->getIndices());
+    chunkWriter.setEdgeIDs(loopData->getEdgeIDs());
+    chunkWriter.setEdgeTypes(loopData->getEdgeTypes());
+    chunkWriter.setSrcIDs(loopData->getSources());
+
+    NLPendingEdgeHop pendingEdges(context, loopData, NLPendingEdgeHop::Direction::In, loopData->getSources());
+    pendingEdges.setEdgeTypes(requestedTypes);
+    pendingEdges.setEndpointLabelSet(loopData->getLabelSet());
+
+    runEdgeLoopSteps(context, loopData, &chunkWriter, &pendingEdges, loopData->getTargets());
+}
+
+void NLExecutor::runEachRowLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLEachRowLoopData* loopData = static_cast<NLEachRowLoopData*>(data);
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    const NLEachRowLoopData::Columns& columns = loopData->columns();
+    ColumnVector<size_t>* indices = loopData->getIndices();
+    std::vector<size_t>& indicesRaw = indices->getRaw();
+
+    // A null limit leaves the loop unbounded, exactly as in runUnwindConstLoop.
+    const NLLimitState* limit = loopData->getLimit();
+    const auto budgetLeft = [&]() { return !limit || limit->getRemaining() > 0; };
+
+    const size_t rowCount = columns.front().getInput()->size();
+    indicesRaw.resize(1);
+
+    for (size_t row = 0; row < rowCount && budgetLeft(); row++) {
+        indicesRaw[0] = row;
+
+        for (const NLCarriedColumn& column : columns) {
+            column.getGatherFunc()(column.getInput(), indices, column.getOutput());
+        }
+
+        runBody(context, loopBody);
+    }
+}
+
+namespace {
+
+// Runs the hop predicate of one step of an nl.explore_paths over a batch of frames: the
+// candidates and the frame's repetition so far are copied a chunk at a time into the columns
+// the hop statements read, and the survivors are compacted to the front of the batch. A chunk
+// may start and end mid-frame. The hop_labels filter, when there is one, cuts the batch first.
+class NLHopFilter : public PathHopFilter {
+public:
+    NLHopFilter(NLExecutionContext* context, const NLExploreStep* step, PathHopFilter* labelFilter)
+        : _context(context),
+        _step(step),
+        _labelFilter(labelFilter)
+    {
+        _indices.reserve(context->getChunkSize());
+    }
+
+    ~NLHopFilter() override {
+    }
+
+    size_t filter(std::span<PathHopFrame> frames, std::span<NodeID> candidateNodes, std::span<EdgeID> candidateEdges) override {
+        if (_labelFilter) {
+            const size_t labelled = _labelFilter->filter(frames, candidateNodes, candidateEdges);
+            candidateNodes = candidateNodes.first(labelled);
+            candidateEdges = candidateEdges.first(labelled);
+        }
+
+        const size_t chunkSize = _context->getChunkSize();
+        const std::span<ColumnNodeIDs* const> nodes = _step->getHopNodes();
+        const std::span<ColumnEdgeIDs* const> edges = _step->getHopEdges();
+        const size_t position = _step->getHopPosition();
+        ColumnNodeIDs* sources = nodes[position];
+        ColumnEdgeIDs* hopEdges = edges[position];
+        ColumnNodeIDs* ends = nodes[position + 1];
+        const Column* mask = _step->getHopMask();
+        const NLMaskSurvivorFunction survivors = _step->getHopSurvivors();
+        const NLStmtContainer* stmts = _step->getHopStmts();
+        const std::span<const NLHopImport> imports = _step->getHopImports();
+
+        _frameEnds.clear();
+        size_t frameEnd = 0;
+        for (PathHopFrame& frame : frames) {
+            frameEnd += frame._candidateCount;
+            _frameEnds.push_back(frameEnd);
+            frame._candidateCount = 0;
+        }
+
+        std::vector<size_t>& seedRows = _seedRows.getRaw();
+        size_t fillFrame = 0;
+        size_t survivorFrame = 0;
+        size_t kept = 0;
+        for (size_t begin = 0; begin < candidateNodes.size(); begin += chunkSize) {
+            const size_t count = std::min(chunkSize, candidateNodes.size() - begin);
+            const size_t end = begin + count;
+
+            sources->resize(count);
+            seedRows.resize(count);
+            for (size_t earlier = 0; earlier < position; earlier++) {
+                if (nodes[earlier]) {
+                    nodes[earlier]->resize(count);
+                }
+
+                if (edges[earlier]) {
+                    edges[earlier]->resize(count);
+                }
+            }
+
+            for (size_t segmentBegin = begin; segmentBegin < end;) {
+                const size_t segmentEnd = std::min(end, _frameEnds[fillFrame]);
+                const PathHopFrame& frame = frames[fillFrame];
+                const size_t segmentOffset = segmentBegin - begin;
+                const size_t segmentSize = segmentEnd - segmentBegin;
+                std::fill_n(sources->begin() + segmentOffset, segmentSize, frame._source);
+                std::fill_n(seedRows.begin() + segmentOffset, segmentSize, frame._seedRow);
+
+                for (size_t earlier = 0; earlier < position; earlier++) {
+                    if (nodes[earlier]) {
+                        std::fill_n(nodes[earlier]->begin() + segmentOffset, segmentSize, frame._repetitionNodes[earlier]);
+                    }
+
+                    if (edges[earlier]) {
+                        std::fill_n(edges[earlier]->begin() + segmentOffset, segmentSize, frame._repetitionEdges[earlier]);
+                    }
+                }
+
+                if (segmentEnd == _frameEnds[fillFrame]) {
+                    fillFrame++;
+                }
+                segmentBegin = segmentEnd;
+            }
+
+            hopEdges->resize(count);
+            std::copy_n(candidateEdges.begin() + begin, count, hopEdges->begin());
+
+            ends->resize(count);
+            std::copy_n(candidateNodes.begin() + begin, count, ends->begin());
+
+            for (const NLHopImport& import : imports) {
+                import._gather(import._source, &_seedRows, import._chunk);
+            }
+
+            runBody(_context, stmts);
+
+            _indices.getRaw().clear();
+            survivors(mask, &_indices);
+
+            for (const size_t survivor : _indices.getRaw()) {
+                const size_t candidatePosition = begin + survivor;
+                while (candidatePosition >= _frameEnds[survivorFrame]) {
+                    survivorFrame++;
+                }
+
+                frames[survivorFrame]._candidateCount++;
+                candidateNodes[kept] = candidateNodes[candidatePosition];
+                candidateEdges[kept] = candidateEdges[candidatePosition];
+                kept++;
+            }
+        }
+
+        return kept;
+    }
+
+    bool readsRepetition() const override {
+        const std::span<ColumnNodeIDs* const> nodes = _step->getHopNodes();
+        const std::span<ColumnEdgeIDs* const> edges = _step->getHopEdges();
+        const size_t position = _step->getHopPosition();
+
+        const auto isRead = [](const Column* column) { return column != nullptr; };
+
+        return std::any_of(nodes.begin(), nodes.begin() + position, isRead)
+            || std::any_of(edges.begin(), edges.begin() + position, isRead);
+    }
+
+private:
+    NLExecutionContext* _context {nullptr};
+    const NLExploreStep* _step {nullptr};
+    PathHopFilter* _labelFilter {nullptr};
+    ColumnVector<size_t> _indices;
+    ColumnVector<size_t> _seedRows;
+    std::vector<size_t> _frameEnds;
+};
+
+// The direction and edge types every step of the body follows together: what a walk can reach
+// over them bounds what the body reaches, so the pruning indexes are built over them
+PathExplorationDir combinedDirection(const NLExplorePathsLoopData* loopData) {
+    const NLExploreStep* firstStep = loopData->getStep(0);
+    const PathExplorationDir first = firstStep->getDirection();
+    const size_t stepCount = loopData->getStepCount();
+
+    for (size_t step = 1; step < stepCount; step++) {
+        const NLExploreStep* exploreStep = loopData->getStep(step);
+        if (exploreStep->getDirection() != first) {
+            return PathExplorationDir::BOTH;
+        }
+    }
+
+    return first;
+}
+
+// Empty when a step follows every type
+void combinedEdgeTypes(const NLExplorePathsLoopData* loopData, std::vector<EdgeTypeID>& edgeTypes) {
+    edgeTypes.clear();
+
+    const size_t stepCount = loopData->getStepCount();
+    for (size_t step = 0; step < stepCount; step++) {
+        const NLExploreStep* exploreStep = loopData->getStep(step);
+        if (!exploreStep->filtersByType()) {
+            edgeTypes.clear();
+            return;
+        }
+
+        const std::span<const EdgeTypeID> stepTypes = exploreStep->getEdgeTypes();
+        edgeTypes.insert(edgeTypes.end(), stepTypes.begin(), stepTypes.end());
+    }
+
+    std::sort(edgeTypes.begin(), edgeTypes.end());
+    edgeTypes.erase(std::unique(edgeTypes.begin(), edgeTypes.end()), edgeTypes.end());
+}
+
+// The hop bounds of the loop count repetitions of the body, the walk's count its edges
+uint64_t edgesOfRepetitions(uint64_t repetitions, size_t stepCount) {
+    return llvm::SaturatingMultiply<uint64_t>(repetitions, stepCount);
+}
+
+// The body the walk repeats, as a sample expands it. A filter reading the repetition sees
+// none in the sample, so its step is sampled unfiltered.
+void sampledBodyOf(std::span<const PathStep> walkedBody, std::vector<PathStep>& body) {
+    body.assign(walkedBody.begin(), walkedBody.end());
+    for (PathStep& bodyStep : body) {
+        const bool readsRepetition = bodyStep._hopFilter && bodyStep._hopFilter->readsRepetition();
+        if (readsRepetition) {
+            bodyStep._hopFilter = nullptr;
+        }
+    }
+}
+
+// The distance index of an end-constrained exploration is built at most once per loop, the
+// first time the seeds seen over all its chunks make the enumeration costlier than the
+// index; null until then
+const PathDistanceIndex* pruningIndexFor(const GraphView& view,
+                                         NLExplorePathsLoopData* loopData,
+                                         uint64_t maxHops,
+                                         const PathDistanceIndex::SeedExpansion& expansion) {
+    PathDistanceIndex* index = loopData->getDistanceIndex();
+    if (index->isBuilt()) {
+        return index;
+    }
+
+    std::vector<EdgeTypeID> edgeTypes;
+    combinedEdgeTypes(loopData, edgeTypes);
+
+    const PathExplorationDir direction = combinedDirection(loopData);
+    const PartDirectory parts(view);
+    const double walkChecks = PathDistanceIndex::estimatedEnumerationChecks(parts, expansion, loopData->getSeedsSeen(), maxHops);
+    const bool built = index->buildWithin(view, loopData->getEndLabels(), direction, edgeTypes, maxHops, walkChecks);
+
+    return built ? index : nullptr;
+}
+
+// The target index of an end set is the whole walk's: one search from every node of the set,
+// built once the seeds seen imply more enumeration than that search costs
+const PathTargetIndex* endSetTargetIndexFor(const GraphView& view,
+                                            NLExplorePathsLoopData* loopData,
+                                            std::span<const NodeID> endNodes,
+                                            uint64_t maxHops,
+                                            const PathDistanceIndex::SeedExpansion& expansion) {
+    PathTargetIndex* index = loopData->getTargetIndex();
+    if (index->isBuilt()) {
+        return index;
+    }
+
+    std::vector<EdgeTypeID> edgeTypes;
+    combinedEdgeTypes(loopData, edgeTypes);
+
+    const PathExplorationDir direction = combinedDirection(loopData);
+    const bool worthBuilding = PathTargetIndex::isWorthBuildingSet(view, direction, edgeTypes, expansion, loopData->getSeedsSeen(), endNodes.size(), maxHops);
+    if (!worthBuilding) {
+        return nullptr;
+    }
+
+    index->buildSet(view, endNodes, direction, edgeTypes, maxHops);
+
+    return index;
+}
+
+// The target index of a bound end is a chunk's own: its distinct targets, batched 64 per
+// word, when the enumeration they imply is costlier than the batches; null otherwise
+const PathTargetIndex* targetIndexFor(const GraphView& view,
+                                      NLExplorePathsLoopData* loopData,
+                                      uint64_t maxHops,
+                                      const PathDistanceIndex::SeedExpansion& expansion) {
+    const std::vector<NodeID>& endNodes = loopData->getEndNodes()->getRaw();
+
+    std::vector<NodeID> targets(endNodes.begin(), endNodes.end());
+    std::sort(targets.begin(), targets.end());
+    targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+
+    std::vector<EdgeTypeID> edgeTypes;
+    combinedEdgeTypes(loopData, edgeTypes);
+
+    const PathExplorationDir direction = combinedDirection(loopData);
+    const bool worthBuilding = PathTargetIndex::isWorthBuilding(view, direction, edgeTypes, expansion, endNodes.size(), targets.size(), maxHops);
+    if (!worthBuilding) {
+        return nullptr;
+    }
+
+    PathTargetIndex* index = loopData->getTargetIndex();
+    index->build(view, targets, direction, edgeTypes, maxHops);
+
+    return index;
+}
+
+// A walk to an end set emits the same rows from either end when no path is read and no hop
+// test sees which way the hop was taken
+bool emitsTheSameFromEitherEnd(const NLExplorePathsLoopData* loopData, std::span<const PathStep> walkedBody) {
+    const bool hasHopFilter = std::ranges::any_of(walkedBody, [](const PathStep& step) { return step._hopFilter != nullptr; });
+
+    return !loopData->getPaths() && !hasHopFilter;
+}
+
+void runFromTheEndSet(NLExecutionContext* context,
+                      NLExplorePathsLoopData* loopData,
+                      ReversedPathExplorator::Body body,
+                      std::span<const NodeID> endNodes,
+                      uint64_t minHops,
+                      uint64_t maxHops,
+                      bool walksPendingEdges,
+                      const PathDistanceIndex::SeedExpansion& fromEnds) {
+    const GraphView& view = *context->getView();
+    const LabelSet* endLabels = loopData->filtersByEndLabels() ? &loopData->getEndLabels() : nullptr;
+
+    ReversedPathExplorator explorator(view,
+                                      loopData->getInput(),
+                                      endNodes,
+                                      endLabels,
+                                      body,
+                                      minHops,
+                                      maxHops);
+    explorator.setIndices(loopData->getIndices());
+    explorator.setTargets(loopData->getTargets());
+    const bool distinctEnds = loopData->isDistinctEnds();
+    explorator.setDistinctEnds(distinctEnds);
+
+    if (context->getWriteBuffer()) {
+        const PendingAdjacency& pendingAdjacency = context->getPendingAdjacency();
+        explorator.setPendingAdjacency(&pendingAdjacency, pendingAdjacency.getEdgeIDBound());
+    }
+
+    std::vector<EdgeTypeID> edgeTypes;
+    combinedEdgeTypes(loopData, edgeTypes);
+
+    // The seeds are what this walk heads for, so they are the set its index is searched from
+    PathTargetIndex seedIndex;
+    const std::span<const NodeID> seedNodes = explorator.getSeedNodes();
+    const PathExplorationDir reversed = reverseOf(combinedDirection(loopData));
+    const bool indexesSeeds = !distinctEnds
+                           && !walksPendingEdges
+                           && PathTargetIndex::isWorthBuildingSet(view, reversed, edgeTypes, fromEnds, endNodes.size(), seedNodes.size(), maxHops);
+    if (indexesSeeds) {
+        seedIndex.buildSet(view, seedNodes, reversed, edgeTypes, maxHops);
+        explorator.setTargetIndex(&seedIndex);
+    }
+
+    runEdgeLoopSteps(context, loopData, &explorator, nullptr, loopData->getSources());
+}
+
+}
+
+void NLExecutor::runNodeSetReset(NLExecutionContext* context, NLFunctionData* data) {
+    const NLNodeSetResetData* reset = static_cast<NLNodeSetResetData*>(data);
+
+    reset->getState()->reset();
+}
+
+void NLExecutor::runNodeSetCollect(NLExecutionContext* context, NLFunctionData* data) {
+    const NLNodeSetCollectData* collect = static_cast<NLNodeSetCollectData*>(data);
+
+    collect->getState()->add(collect->getNodes()->getRaw());
+}
+
+void NLExecutor::runExplorePathsLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLExplorePathsLoopData* loopData = static_cast<NLExplorePathsLoopData*>(data);
+    const ColumnNodeIDs* inputNodeIDs = loopData->getInput();
+
+    if (inputNodeIDs->empty()) {
+        return;
+    }
+
+    // An end label absent from the schema is carried by no node, so no path can end
+    const bool filtersByEndLabels = loopData->filtersByEndLabels();
+    if (filtersByEndLabels && !loopData->isEndMatchable()) {
+        return;
+    }
+
+    // The ends a whole set binds, gathered by the loop that closed before this one opened.
+    // No node of the set is no node to end on, whatever the hop bounds say.
+    NLNodeSetState* const endNodeSet = loopData->getEndNodeSet();
+    std::span<const NodeID> endNodes;
+    if (endNodeSet) {
+        endNodes = endNodeSet->getNodes();
+        if (endNodes.empty()) {
+            return;
+        }
+    }
+
+    // An edge type absent from the schema matches no edge, so nothing is ever expanded;
+    // the zero-length rows of a min of zero still come out, so this is not an early return
+    const size_t stepCount = loopData->getStepCount();
+    const uint64_t minHops = edgesOfRepetitions(loopData->getMinHops(), stepCount);
+    const uint64_t maxHops = loopData->isMatchable() ? edgesOfRepetitions(loopData->getMaxHops(), stepCount) : 0;
+
+    const GraphView& view = *context->getView();
+    PathExplorator explorator(view, inputNodeIDs, minHops, maxHops);
+    explorator.setIndices(loopData->getIndices());
+    explorator.setTargets(loopData->getTargets());
+
+    if (loopData->getPaths()) {
+        explorator.setPaths(loopData->getPaths(), loopData->getTrie());
+    }
+
+    const bool distinctEnds = loopData->isDistinctEnds();
+    explorator.setDistinctEnds(distinctEnds);
+
+    const CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+    if (writeBuffer) {
+        PendingAdjacency& pendingAdjacency = context->getPendingAdjacency();
+        pendingAdjacency.index(*writeBuffer,
+                               context->getFirstQueryEdge(),
+                               committedNodeCount(&view),
+                               committedEdgeCount(&view));
+        explorator.setPendingAdjacency(&pendingAdjacency, pendingAdjacency.getEdgeIDBound());
+    }
+
+    // A change that wrote only nodes opens no path the committed graph does not already
+    // hold, so only a pending edge puts the two pruning indexes below out of date.
+    const bool walksPendingEdges = writeBuffer && writeBuffer->numPendingEdges() > context->getFirstQueryEdge();
+
+    std::vector<std::optional<NLHopFilter>> hopRegionFilters(stepCount);
+    std::vector<std::optional<PathLabelHopFilter>> hopLabelFilters(stepCount);
+    std::vector<PathStep> walkedBody(stepCount);
+    for (size_t step = 0; step < stepCount; step++) {
+        const NLExploreStep* exploreStep = loopData->getStep(step);
+        PathStep& bodyStep = walkedBody[step];
+        bodyStep._direction = exploreStep->getDirection();
+
+        if (exploreStep->filtersByType()) {
+            bodyStep._edgeTypes = exploreStep->getEdgeTypes();
+        }
+
+        PathHopFilter* hopFilter = nullptr;
+        if (exploreStep->filtersByHopLabels()) {
+            const PendingAdjacency* pendingAdjacency = writeBuffer ? &context->getPendingAdjacency() : nullptr;
+            hopFilter = &hopLabelFilters[step].emplace(view, exploreStep->getHopLabels(), exploreStep->areHopLabelsMatchable(), pendingAdjacency);
+        }
+
+        if (exploreStep->hasHopFilter()) {
+            hopFilter = &hopRegionFilters[step].emplace(context, exploreStep, hopFilter);
+        }
+
+        bodyStep._hopFilter = hopFilter;
+        explorator.addStep(bodyStep);
+    }
+
+    // The level search of the distinct mode prunes by no index
+    const bool prunes = !explorator.searchesLevels() && !walksPendingEdges && (filtersByEndLabels || loopData->getEndNodes() || endNodeSet);
+
+    const bool gatesDistanceIndex = filtersByEndLabels && !loopData->getDistanceIndex()->isBuilt();
+    const bool gatesEndSetIndex = endNodeSet && !loopData->getTargetIndex()->isBuilt();
+    const bool gatesBoundEndIndex = loopData->getEndNodes() != nullptr;
+    const bool readsSample = gatesDistanceIndex || gatesEndSetIndex || gatesBoundEndIndex;
+
+    // Once the walk from the seeds holds its index over the set, it walks only the prefixes
+    // that reach the set, as the walk from the set would toward the seeds
+    const bool weighsTheEndSet = gatesEndSetIndex && emitsTheSameFromEitherEnd(loopData, walkedBody);
+
+    // What this chunk's own seeds expand to: the gates price the walk by it, and it is what
+    // the walk does rather than what the average node carrying the type does
+    std::vector<PathStep> body;
+    PathDistanceIndex::SeedExpansion expansion;
+    const PartDirectory parts(view);
+    if (weighsTheEndSet || (prunes && readsSample)) {
+        sampledBodyOf(walkedBody, body);
+        PathDistanceIndex::sampleSeedExpansion(parts, body, inputNodeIDs->getRaw(), expansion);
+    }
+
+    if (weighsTheEndSet) {
+        PathDistanceIndex::SeedExpansion fromEnds;
+        if (ReversedPathExplorator::isCheaper(parts, body, expansion, inputNodeIDs->size(), endNodes, maxHops, fromEnds)) {
+            runFromTheEndSet(context, loopData, body, endNodes, minHops, maxHops, walksPendingEdges, fromEnds);
+            return;
+        }
+    }
+
+    if (prunes) {
+        loopData->addSeedsSeen(inputNodeIDs->size());
+    }
+
+    if (filtersByEndLabels) {
+        explorator.setEndLabels(&loopData->getEndLabels());
+        if (prunes) {
+            explorator.setDistanceIndex(pruningIndexFor(view, loopData, maxHops, expansion));
+        }
+    }
+
+    if (loopData->getEndNodes()) {
+        explorator.setEndNodes(loopData->getEndNodes());
+        if (prunes) {
+            explorator.setTargetIndex(targetIndexFor(view, loopData, maxHops, expansion));
+        }
+    }
+
+    if (endNodeSet) {
+        explorator.setEndNodeSet(endNodes);
+        if (prunes) {
+            explorator.setTargetIndex(endSetTargetIndexFor(view, loopData, endNodes, maxHops, expansion));
+        }
+    }
+
+    runEdgeLoopSteps(context, loopData, &explorator, nullptr, loopData->getSources());
+}
+
+void NLExecutor::runExpandPath(NLExecutionContext* context, NLFunctionData* data) {
+    const NLExpandPathData* expand = static_cast<NLExpandPathData*>(data);
+    const std::vector<PathRef>& paths = expand->getPaths()->getRaw();
+    std::vector<ListView>& lists = expand->getOutput()->getRaw();
+    const PathTrie& trie = *expand->getTrie();
+    QueryListBuffer& listBuffer = *expand->getListBuffer();
+    listBuffer.clear();
+
+    lists.resize(paths.size());
+
+    const bool reversed = expand->isReversed();
+    const PathHopStride hops = expand->getHops();
+
+    switch (expand->getKind()) {
+        case PathExpansionKind::Edges:
+            for (size_t row = 0; row < paths.size(); row++) {
+                lists[row] = trie.expandEdges(paths[row], listBuffer, reversed, hops);
+            }
+        break;
+
+        case PathExpansionKind::Sources: {
+            const ColumnNodeIDs* seeds = expand->getSeeds();
+            for (size_t row = 0; row < paths.size(); row++) {
+                const NodeID seed = seeds ? (*seeds)[row] : NodeID();
+                lists[row] = trie.expandSources(paths[row], seed, listBuffer, reversed, hops);
+            }
+        }
+        break;
+
+        case PathExpansionKind::Ends:
+            for (size_t row = 0; row < paths.size(); row++) {
+                lists[row] = trie.expandEnds(paths[row], listBuffer, reversed, hops);
+            }
+        break;
+
+        case PathExpansionKind::Nodes: {
+            const std::vector<NodeID>& seeds = expand->getSeeds()->getRaw();
+            for (size_t row = 0; row < paths.size(); row++) {
+                lists[row] = trie.expandNodes(paths[row], seeds[row], listBuffer, reversed);
+            }
+        }
+        break;
+    }
+}
+
+void NLExecutor::runPathLength(NLExecutionContext* context, NLFunctionData* data) {
+    const NLPathLengthData* length = static_cast<NLPathLengthData*>(data);
+    const std::vector<PathRef>& paths = length->getPaths()->getRaw();
+    std::vector<uint64_t>& lengths = length->getOutput()->getRaw();
+    const PathTrie& trie = *length->getTrie();
+
+    lengths.resize(paths.size());
+    for (size_t row = 0; row < paths.size(); row++) {
+        lengths[row] = trie.getDepth(paths[row]);
+    }
+}
+
+void NLExecutor::runPathElements(NLExecutionContext* context, NLFunctionData* data) {
+    const NLPathElementsData* elements = static_cast<NLPathElementsData*>(data);
+    const Column* paths = elements->getPaths();
+    const PathElementsKind kind = elements->getKind();
+    Column* output = elements->getOutput();
+    QueryListBuffer& listBuffer = *elements->getListBuffer();
+    listBuffer.clear();
+
+    if (paths->getKind() == ColumnVector<Path>::staticKind()) {
+        readPathElements(static_cast<const ColumnVector<Path>*>(paths)->getRaw(), kind, output, listBuffer);
+    } else {
+        readPathElements(static_cast<const ColumnVector<EntityList>*>(paths)->getRaw(), kind, output, listBuffer);
+    }
+}
+
+void NLExecutor::runMakePath(NLExecutionContext* context, NLFunctionData* data) {
+    const NLMakePathData* make = static_cast<NLMakePathData*>(data);
+    const NLMakePathData::PathEntities& entities = make->entities();
+    std::vector<EntityList>& paths = make->getOutput()->getRaw();
+    const PathTrie& trie = *make->getTrie();
+
+    bioassert(!entities.empty(), "nl.make_path builds a path out of at least one node");
+
+    // Every entity column is row-aligned with the others, so the first gives the rows
+    const size_t rowCount = entities.front()._column->size();
+
+    const auto isRowAligned = [rowCount](const NLPathEntity& entity) {
+        return entity._column->size() == rowCount;
+    };
+    bioassert(std::ranges::all_of(entities, isRowAligned),
+              "Entity columns of a path build are not row-aligned.");
+
+    paths.resize(rowCount);
+    for (EntityList& path : paths) {
+        path.clear();
+    }
+
+    for (const NLPathEntity& entity : entities) {
+        switch (entity._kind) {
+            case NLPathEntity::Kind::Node: {
+                const std::vector<NodeID>& nodes = static_cast<const ColumnNodeIDs*>(entity._column)->getRaw();
+                for (size_t row = 0; row < rowCount; row++) {
+                    paths[row].add(EntityType::Node, EntityID(nodes[row].getValue()));
+                }
+            }
+            break;
+
+            case NLPathEntity::Kind::Edge: {
+                const std::vector<EdgeID>& edges = static_cast<const ColumnEdgeIDs*>(entity._column)->getRaw();
+                for (size_t row = 0; row < rowCount; row++) {
+                    paths[row].add(EntityType::Edge, EntityID(edges[row].getValue()));
+                }
+            }
+            break;
+
+            case NLPathEntity::Kind::Path: {
+                const std::vector<PathRef>& handles = static_cast<const ColumnVector<PathRef>*>(entity._column)->getRaw();
+                for (size_t row = 0; row < rowCount; row++) {
+                    trie.appendHops(handles[row], paths[row], entity._reversed);
+                }
+            }
+            break;
+        }
+    }
+}
+
+void NLExecutor::runCrossProductLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLCrossProductLoopData* loopData = static_cast<NLCrossProductLoopData*>(data);
+
+    const NLCrossProductLoopData::Columns& outerColumns = loopData->outerColumns();
+    const NLCrossProductLoopData::Columns& innerColumns = loopData->innerColumns();
+    bioassert(!outerColumns.empty() && !innerColumns.empty(),
+              "nl.cross_product needs a column on each side to size the product");
+
+    // N outer rows crossed with M inner rows make N*M pairs. The counts come from
+    // the first column of each side; every column of a side is row-aligned with
+    // that first one, which is what lets one position slice them all.
+    const size_t outerRowCount = outerColumns.front().getInput()->size();
+    const size_t innerRowCount = innerColumns.front().getInput()->size();
+
+    const size_t productRowCount = outerRowCount * innerRowCount;
+    const size_t chunkSize = context->getChunkSize();
+    const NLLimitState* limit = loopData->getLimit();
+    const NLStmtContainer* loopBody = loopData->getStmts();
+
+    // Walk the pairs a chunk at a time. Under a limit the step is cut to what the
+    // budget can still emit - the pairs come out in (outer, inner) order, so the
+    // step's prefix is exactly what the nl.limit_update/nl.output below can take,
+    // and the loop stops once the budget is spent, as a scan's loop does.
+    size_t position = 0;
+    while (position < productRowCount) {
+        const size_t remaining = limit ? limit->getRemaining() : productRowCount;
+        if (remaining == 0) {
+            return;
+        }
+
+        const size_t chunkRowCount = std::min(chunkSize, productRowCount - position);
+        const size_t rowCount = std::min(chunkRowCount, remaining);
+
+        for (const NLCrossColumn& column : outerColumns) {
+            const NLBroadcastFunction broadcast = column.getBroadcast();
+            broadcast(column.getInput(), innerRowCount, position, rowCount, column.getOutput());
+        }
+
+        for (const NLCrossColumn& column : innerColumns) {
+            const NLBroadcastFunction broadcast = column.getBroadcast();
+            broadcast(column.getInput(), innerRowCount, position, rowCount, column.getOutput());
+        }
+
+        runBody(context, loopBody);
+
+        position += rowCount;
+    }
+}
+
+void NLExecutor::runLimitInit(NLExecutionContext* context, NLFunctionData* data) {
+    const NLLimitInitData* init = static_cast<NLLimitInitData*>(data);
+    init->getState()->reset(init->getCount());
+}
+
+void NLExecutor::runLimitRemaining(NLExecutionContext* context, NLFunctionData* data) {
+    const NLLimitRemainingData* remaining = static_cast<NLLimitRemainingData*>(data);
+    remaining->getState()->reset(remaining->getSource()->getRemaining());
+}
+
+void NLExecutor::runLimitUpdate(NLExecutionContext* context, NLFunctionData* data) {
+    const NLLimitUpdateData* update = static_cast<NLLimitUpdateData*>(data);
+    update->getState()->update(update->getRows()->size());
+}
+
+void NLExecutor::runLimitTruncate(NLExecutionContext* context, NLFunctionData* data) {
+    const NLLimitTruncateData* truncate = static_cast<NLLimitTruncateData*>(data);
+    const size_t emitThisStep = truncate->getState()->getEmitThisStep();
+
+    // Block-repeat with factor 1 emits each input row once and stops at
+    // emitThisStep, so it copies exactly the prefix [0, emitThisStep) into the
+    // fresh output chunk. Reads emitThisStep (set by the preceding
+    // nl.limit_update); never mutates the counter.
+    for (const NLCrossColumn& column : truncate->columns()) {
+        const NLBroadcastFunction copyPrefix = column.getBroadcast();
+        copyPrefix(column.getInput(), 1, 0, emitThisStep, column.getOutput());
+    }
+}
+
+void NLExecutor::runSkipInit(NLExecutionContext* context, NLFunctionData* data) {
+    const NLSkipInitData* init = static_cast<NLSkipInitData*>(data);
+    init->getState()->reset(init->getCount());
+}
+
+void NLExecutor::runSkipUpdate(NLExecutionContext* context, NLFunctionData* data) {
+    const NLSkipUpdateData* update = static_cast<NLSkipUpdateData*>(data);
+    update->getState()->update(update->getRows()->size());
+}
+
+void NLExecutor::runSkipTruncate(NLExecutionContext* context, NLFunctionData* data) {
+    const NLSkipTruncateData* truncate = static_cast<NLSkipTruncateData*>(data);
+    const NLSkipState* state = truncate->getState();
+
+    // Copy the surviving suffix [skipThisStep, skipThisStep + emitThisStep) of each
+    // column into the fresh front-aligned output chunk. Reads the offset and count
+    // (set by the preceding nl.skip_update); never mutates the counter.
+    const size_t offset = state->getSkipThisStep();
+    const size_t rowCount = state->getEmitThisStep();
+    for (const NLSkipColumn& column : truncate->columns()) {
+        const NLCopyFunction copySuffix = column.getCopy();
+        copySuffix(column.getInput(), offset, rowCount, column.getOutput());
+    }
+}
+
+void NLExecutor::runOutput(NLExecutionContext* context, NLFunctionData* data) {
+    NLOutputData* output = static_cast<NLOutputData*>(data);
+    const auto& cols = output->outputs();
+    bioassert(!cols.empty(), "nl.output requires at least one column");
+
+    // A path chunk reaches the sink as the lists its handles stand for, expanded into a
+    // buffer of this emission alone: the sink reads them during the call and never again
+    const std::vector<NLOutputData::PathExpansion>& expansions = output->pathExpansions();
+    if (!expansions.empty()) {
+        QueryListBuffer& listBuffer = output->pathListBuffer();
+        listBuffer.clear();
+
+        const PathTrie& trie = *output->getTrie();
+        for (const NLOutputData::PathExpansion& expansion : expansions) {
+            const std::vector<PathRef>& paths = expansion._paths->getRaw();
+            std::vector<ListView>& lists = expansion._lists->getRaw();
+
+            lists.resize(paths.size());
+            for (size_t row = 0; row < paths.size(); row++) {
+                lists[row] = trie.expandEdges(paths[row], listBuffer, false);
+            }
+        }
+    }
+
+    // Compute the [offset, offset + rowCount) window to emit, copy-free:
+    //  - skip (the folded terminal-SKIP form): emit the surviving suffix at offset
+    //    getSkipThisStep() for getEmitThisStep() rows, both sized by the preceding
+    //    nl.skip_update. Reading them, not remaining, so the decrement already done
+    //    does not affect the window.
+    //  - limit (the folded terminal-LIMIT form): emit the getEmitThisStep() prefix
+    //    nl.limit_update sized this step, from offset zero.
+    //  - neither: emit the whole chunk (already cut by a truncate when one governs
+    //    it).
+    // A folded output carries at most one of limit/skip, so the two never combine.
+    const NLLimitState* limit = output->getLimit();
+    const NLSkipState* skip = output->getSkip();
+    // Column that defines the cardinality of the result
+    const Column* cardinality = output->getCardinality();
+
+    size_t offset = 0;
+    size_t rowCount = 0;
+    if (skip) {
+        offset = skip->getSkipThisStep();
+        rowCount = skip->getEmitThisStep();
+    } else if (limit) {
+        rowCount = limit->getEmitThisStep();
+    } else if (cardinality) {
+        rowCount = cardinality->size();
+    } else {
+        // Logical row count, assumes the columns that carry rows share a dimension. A
+        // constant is not one of them: it holds a single value standing for every row of
+        // the step, so a step that kept no row would emit it as a row of its own
+        for (const Column* column : output->rowCountColumns()) {
+            rowCount = std::max(rowCount, column->size());
+        }
+    }
+
+    context->getSink()->appendChunks(cols, offset, rowCount);
+}
+
+void NLExecutor::runBroadcastConstant(NLExecutionContext*, NLFunctionData* data) {
+    const NLBroadcastConstantData* broadcast = static_cast<NLBroadcastConstantData*>(data);
+    const Column* cardinality = broadcast->getCardinality();
+
+    // The driving relation's chunk sizes this step, exactly as it sizes an output of
+    // constants alone; a projection no relation drives is the single row the constant
+    // is. The fill writes that many rows of the constant's value.
+    const size_t rowCount = cardinality ? cardinality->size() : 1;
+
+    broadcast->getFill()(broadcast->getValue(), rowCount, broadcast->getOutput());
+}
+
+void NLExecutor::runBinary(NLExecutionContext*, NLFunctionData* data) {
+    const NLBinaryData* binary = static_cast<NLBinaryData*>(data);
+    NLStepBuffers* const stepBuffers = binary->getStepBuffers();
+    stepBuffers->clear();
+
+    binary->getFn()(binary->getResult(), binary->getLhs(), binary->getRhs(), stepBuffers);
+}
+
+void NLExecutor::runUnary(NLExecutionContext*, NLFunctionData* data) {
+    const NLUnaryData* unary = static_cast<NLUnaryData*>(data);
+    unary->getFn()(unary->getResult(), unary->getOperand());
+}
+
+void NLExecutor::runFillNull(NLExecutionContext*, NLFunctionData* data) {
+    const NLFillNullData* fillNull = static_cast<NLFillNullData*>(data);
+
+    fillNull->getFill()(fillNull->getOutput(), fillNull->getRows()->size());
+}
+
+void NLExecutor::runCase(NLExecutionContext*, NLFunctionData* data) {
+    const NLCaseData* caseData = static_cast<NLCaseData*>(data);
+
+    Column* const result = caseData->getResult();
+    const size_t rowCount = caseData->getCardinality()->size();
+
+    NLStepBuffers* const stepBuffers = caseData->getStepBuffers();
+    stepBuffers->clear();
+    NLValueStore& values = stepBuffers->valueStore();
+
+    caseData->getReset()(result, rowCount);
+
+    const std::vector<NLCaseData::Branch>& branches = caseData->branches();
+    const Column* const defaultValue = caseData->getDefaultValue();
+    const NLCellWrite& writeDefault = caseData->getWriteDefault();
+
+    // A row takes the first branch whose condition holds, so the branches are walked per
+    // row rather than the rows per branch: the first match ends the row
+    for (size_t row = 0; row < rowCount; row++) {
+        bool matched = false;
+
+        for (const NLCaseData::Branch& branch : branches) {
+            if (!branch._test(branch._condition, row)) {
+                continue;
+            }
+
+            writeCell(result, row, branch._write, branch._value, row, stepBuffers, values);
+            matched = true;
+            break;
+        }
+
+        if (!matched && defaultValue) {
+            writeCell(result, row, writeDefault, defaultValue, row, stepBuffers, values);
+        }
+    }
+}
+
+void NLExecutor::runCaseMerge(NLExecutionContext*, NLFunctionData* data) {
+    NLCaseData* caseData = static_cast<NLCaseData*>(data);
+
+    Column* const result = caseData->getResult();
+    const size_t rowCount = caseData->getCardinality()->size();
+
+    NLStepBuffers* const stepBuffers = caseData->getStepBuffers();
+    stepBuffers->clear();
+    NLValueStore& values = stepBuffers->valueStore();
+
+    caseData->getReset()(result, rowCount);
+
+    const std::vector<NLCaseData::Branch>& branches = caseData->branches();
+    const Column* const defaultValue = caseData->getDefaultValue();
+    const NLCellWrite& writeDefault = caseData->getWriteDefault();
+
+    std::vector<NLCaseData::BranchCursor>& cursors = caseData->cursors();
+    std::fill(cursors.begin(), cursors.end(), NLCaseData::BranchCursor {});
+
+    size_t defaultRow = 0;
+
+    for (size_t row = 0; row < rowCount; row++) {
+        bool matched = false;
+
+        for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
+            const NLCaseData::Branch& branch = branches[branchIndex];
+            NLCaseData::BranchCursor& cursor = cursors[branchIndex];
+
+            const bool holds = branch._test(branch._condition, cursor._conditionRow);
+            cursor._conditionRow++;
+
+            if (!holds) {
+                continue;
+            }
+
+            writeCell(result, row, branch._write, branch._value, cursor._valueRow, stepBuffers, values);
+            cursor._valueRow++;
+            matched = true;
+            break;
+        }
+
+        if (!matched && defaultValue) {
+            writeCell(result, row, writeDefault, defaultValue, defaultRow, stepBuffers, values);
+            defaultRow++;
+        }
+    }
+}
+
+void NLExecutor::runMakeList(NLExecutionContext*, NLFunctionData* data) {
+    const NLMakeListData* makeList = static_cast<NLMakeListData*>(data);
+
+    const std::vector<NLMakeListData::Element>& elements = makeList->elements();
+    NLStepBuffers* const stepBuffers = makeList->getStepBuffers();
+    stepBuffers->clear();
+
+    ListBuffer<>& listBuffer = stepBuffers->listBuffer();
+
+    // Every element column is row-aligned with the others, so the first gives the rows
+    const size_t rowCount = elements.front()._column->size();
+
+    const auto isRowAligned = [rowCount](const NLMakeListData::Element& element) {
+        return element._column->size() == rowCount;
+    };
+    bioassert(std::ranges::all_of(elements, isRowAligned),
+              "Element columns of a list build are not row-aligned.");
+
+    std::vector<ListView>& outputRaw = static_cast<ColumnVector<ListView>*>(makeList->getResult())->getRaw();
+    outputRaw.resize(rowCount);
+
+    std::vector<ListBuffer<>::ListItemVariant> row;
+    row.reserve(elements.size());
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        row.clear();
+        for (const NLMakeListData::Element& element : elements) {
+            row.push_back(element._read(element._column, rowIndex, stepBuffers));
+        }
+
+        outputRaw[rowIndex] = listBuffer.insert(row);
+    }
+}
+
+void NLExecutor::runListSlice(NLExecutionContext*, NLFunctionData* data) {
+    const NLListSliceData* slice = static_cast<NLListSliceData*>(data);
+
+    const Column* const list = slice->getList();
+    const NLListReadFunction listRead = slice->getListRead();
+    const NLListSliceData::Bound& from = slice->getFrom();
+    const NLListSliceData::Bound& to = slice->getTo();
+
+    const size_t rowCount = list->size();
+
+    std::vector<std::optional<ListView>>& outputRaw =
+        static_cast<ColumnOptVector<ListView>*>(slice->getResult())->getRaw();
+    outputRaw.clear();
+    outputRaw.reserve(rowCount);
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        const std::optional<ListView> elements = listRead(list, rowIndex);
+
+        const std::optional<types::Int64::Primitive> lower =
+            from._column ? from._read(from._column, rowIndex) : std::optional<types::Int64::Primitive> {0};
+
+        const std::optional<types::Int64::Primitive> upper =
+            to._column ? to._read(to._column, rowIndex) : std::optional<types::Int64::Primitive> {};
+
+        const bool boundsPresent = lower.has_value() && (!to._column || upper.has_value());
+        if (!elements || !boundsPresent) {
+            outputRaw.push_back(std::nullopt);
+            continue;
+        }
+
+        const int64_t size = static_cast<int64_t>(elements->size());
+        const int64_t last = to._column ? *upper : size;
+
+        // A bound counts from the end where it is negative, and is clamped to the list
+        // where it runs past either end, so no row errors on a bound of its own
+        const int64_t first = std::clamp(*lower < 0 ? size + *lower : *lower, int64_t {0}, size);
+        const int64_t end = std::clamp(last < 0 ? size + last : last, int64_t {0}, size);
+
+        const size_t count = end > first ? static_cast<size_t>(end - first) : 0;
+
+        outputRaw.push_back(elements->slice(static_cast<size_t>(first), count));
+    }
+}
+
+void NLExecutor::runPercentileCont(NLExecutionContext*, NLFunctionData* data) {
+    const auto interpolate = [](const std::vector<ListElementView>& sorted, double percentile) {
+        return std::optional<double>(continuousPercentile(sorted, percentile));
+    };
+
+    runPercentileRows<std::optional<double>>(static_cast<NLPercentileData*>(data), "percentileCont", interpolate);
+}
+
+template <typename Result>
+void NLExecutor::runPercentileDisc(NLExecutionContext*, NLFunctionData* data) {
+    const auto pick = [](const std::vector<ListElementView>& sorted, double percentile) {
+        return percentileElement<Result>(sorted[discretePercentilePosition(sorted.size(), percentile)]);
+    };
+
+    runPercentileRows<Result>(static_cast<NLPercentileData*>(data), "percentileDisc", pick);
+}
+
+template void NLExecutor::runPercentileDisc<std::optional<types::Int64::Primitive>>(NLExecutionContext* context, NLFunctionData* data);
+template void NLExecutor::runPercentileDisc<std::optional<types::UInt64::Primitive>>(NLExecutionContext* context, NLFunctionData* data);
+template void NLExecutor::runPercentileDisc<std::optional<types::Double::Primitive>>(NLExecutionContext* context, NLFunctionData* data);
+template void NLExecutor::runPercentileDisc<ListElementView>(NLExecutionContext* context, NLFunctionData* data);
+
+void NLExecutor::runMakeMap(NLExecutionContext*, NLFunctionData* data) {
+    const NLMakeMapData* makeMap = static_cast<NLMakeMapData*>(data);
+
+    const std::vector<NLMakeMapData::Entry>& entries = makeMap->entries();
+    NLStepBuffers* memory = makeMap->getStepBuffers();
+    memory->clear();
+    MapBuffer<>& mapBuffer = memory->mapBuffer();
+
+    const size_t rowCount = entries.front()._column->size();
+
+    const auto isRowAligned = [rowCount](const NLMakeMapData::Entry& entry) {
+        return entry._column->size() == rowCount;
+    };
+    bioassert(std::ranges::all_of(entries, isRowAligned),
+              "Value columns of a map build are not row-aligned.");
+
+    std::vector<MapView>& outputRaw = static_cast<ColumnVector<MapView>*>(makeMap->getResult())->getRaw();
+    outputRaw.resize(rowCount);
+
+    std::vector<MapBuffer<>::MapKeyValuePair> row;
+    row.reserve(entries.size());
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        row.clear();
+        for (const NLMakeMapData::Entry& entry : entries) {
+            row.push_back(MapBuffer<>::MapKeyValuePair {
+                .key = entry._key,
+                .value = entry._read(entry._column, rowIndex, memory),
+            });
+        }
+
+        outputRaw[rowIndex] = mapBuffer.insert(row);
+    }
+}
+
+template <typename Result>
+void NLExecutor::runSubstring(NLExecutionContext*, NLFunctionData* data) {
+    const NLSubstringData* substring = static_cast<NLSubstringData*>(data);
+
+    const NLSubstringData::StringArgument& string = substring->getString();
+    const NLSubstringData::IntegerArgument& start = substring->getStart();
+    const NLSubstringData::IntegerArgument& length = substring->getLength();
+
+    const size_t rowCount = string._column->size();
+    bioassert(start._column->size() == rowCount, "Start column of a substring is not row-aligned with its string.");
+    bioassert(!length._column || length._column->size() == rowCount,
+              "Length column of a substring is not row-aligned with its string.");
+
+    std::vector<Result>& outputRaw = static_cast<ColumnVector<Result>*>(substring->getResult())->getRaw();
+    outputRaw.resize(rowCount);
+
+    const SubstringFunction function {};
+    constexpr std::string_view name = SubstringFunction::NAME;
+
+    constexpr std::optional<types::Int64::Primitive> toTheEnd = MAX_CHARACTER_ARGUMENT;
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        const std::optional<types::String::Primitive> text = string._read(string._column, rowIndex, name);
+        const std::optional<types::Int64::Primitive> from = start._read(start._column, rowIndex, name);
+        const std::optional<types::Int64::Primitive> count = length._column ? length._read(length._column, rowIndex, name) : toTheEnd;
+
+        const bool boundIsNull = !from.has_value() || !count.has_value();
+        if (!text.has_value()) {
+            if constexpr (TypeUtils::is_optional_v<Result>) {
+                outputRaw[rowIndex] = std::nullopt;
+            } else {
+                throw IRException("substring() typed as never null read a null string");
+            }
+        } else if (boundIsNull) {
+            throw IRException("substring() does not take a null start or length");
+        } else {
+            outputRaw[rowIndex] = function(*text, *from, *count);
+        }
+    }
+}
+
+template void NLExecutor::runSubstring<types::String::Primitive>(NLExecutionContext* context, NLFunctionData* data);
+template void NLExecutor::runSubstring<std::optional<types::String::Primitive>>(NLExecutionContext* context, NLFunctionData* data);
+
+template <typename Result>
+void NLExecutor::runSplit(NLExecutionContext*, NLFunctionData* data) {
+    const NLSplitData* split = static_cast<NLSplitData*>(data);
+
+    const NLSplitData::StringArgument& string = split->getString();
+    const NLSplitData::StringArgument& delimiter = split->getDelimiter();
+
+    const size_t rowCount = string._column->size();
+    bioassert(delimiter._column->size() == rowCount, "Delimiter column of a split is not row-aligned with its string.");
+
+    std::vector<Result>& outputRaw = static_cast<ColumnVector<Result>*>(split->getResult())->getRaw();
+    outputRaw.resize(rowCount);
+
+    NLStepBuffers* const stepBuffers = split->getStepBuffers();
+    stepBuffers->clear();
+
+    SplitFunction function(&stepBuffers->listBuffer());
+    constexpr std::string_view name = SplitFunction::NAME;
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        const std::optional<types::String::Primitive> text = string._read(string._column, rowIndex, name);
+        const std::optional<types::String::Primitive> separator = delimiter._read(delimiter._column, rowIndex, name);
+
+        const bool readsANull = !text.has_value() || !separator.has_value();
+        if (!readsANull) {
+            outputRaw[rowIndex] = function(*text, *separator);
+        } else if constexpr (TypeUtils::is_optional_v<Result>) {
+            outputRaw[rowIndex] = std::nullopt;
+        } else {
+            throw IRException("split() typed as never null read a null argument");
+        }
+    }
+}
+
+template void NLExecutor::runSplit<ListView>(NLExecutionContext* context, NLFunctionData* data);
+template void NLExecutor::runSplit<std::optional<ListView>>(NLExecutionContext* context, NLFunctionData* data);
+
+template <typename Function, typename Result>
+void NLExecutor::runStringEnd(NLExecutionContext*, NLFunctionData* data) {
+    const NLStringEndData* stringEnd = static_cast<NLStringEndData*>(data);
+
+    const NLStringEndData::StringArgument& string = stringEnd->getString();
+    const NLStringEndData::IntegerArgument& length = stringEnd->getLength();
+
+    const size_t rowCount = string._column->size();
+    bioassert(length._column->size() == rowCount, "Length column of a string end is not row-aligned with its string.");
+
+    std::vector<Result>& outputRaw = static_cast<ColumnVector<Result>*>(stringEnd->getResult())->getRaw();
+    outputRaw.resize(rowCount);
+
+    const Function function {};
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        const std::optional<types::String::Primitive> text = string._read(string._column, rowIndex, Function::NAME);
+        const std::optional<types::Int64::Primitive> count = length._read(length._column, rowIndex, Function::NAME);
+
+        if (!text.has_value()) {
+            if constexpr (TypeUtils::is_optional_v<Result>) {
+                outputRaw[rowIndex] = std::nullopt;
+            } else {
+                throw IRException(fmt::format("{}() typed as never null read a null string", Function::NAME));
+            }
+        } else if (!count.has_value()) {
+            throw IRException(fmt::format("{}() does not take a null length", Function::NAME));
+        } else {
+            outputRaw[rowIndex] = function(*text, *count);
+        }
+    }
+}
+
+template void NLExecutor::runStringEnd<LeftFunction, types::String::Primitive>(NLExecutionContext* context, NLFunctionData* data);
+template void NLExecutor::runStringEnd<LeftFunction, std::optional<types::String::Primitive>>(NLExecutionContext* context, NLFunctionData* data);
+template void NLExecutor::runStringEnd<RightFunction, types::String::Primitive>(NLExecutionContext* context, NLFunctionData* data);
+template void NLExecutor::runStringEnd<RightFunction, std::optional<types::String::Primitive>>(NLExecutionContext* context, NLFunctionData* data);
+
+template <typename Result>
+void NLExecutor::runReplace(NLExecutionContext*, NLFunctionData* data) {
+    const NLReplaceData* replace = static_cast<NLReplaceData*>(data);
+
+    const NLReplaceData::StringArgument& string = replace->getString();
+    const NLReplaceData::StringArgument& search = replace->getSearch();
+    const NLReplaceData::StringArgument& replacement = replace->getReplacement();
+
+    const size_t rowCount = string._column->size();
+    bioassert(search._column->size() == rowCount, "Search column of a replace is not row-aligned with its string.");
+    bioassert(replacement._column->size() == rowCount, "Replacement column of a replace is not row-aligned with its string.");
+
+    std::vector<Result>& outputRaw = static_cast<ColumnVector<Result>*>(replace->getResult())->getRaw();
+    outputRaw.resize(rowCount);
+
+    NLStepBuffers* const stepBuffers = replace->getStepBuffers();
+    stepBuffers->clear();
+
+    ReplaceFunction function(&stepBuffers->stringBuffer());
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        const std::optional<types::String::Primitive> text = string._read(string._column, rowIndex, ReplaceFunction::NAME);
+        const std::optional<types::String::Primitive> searched = search._read(search._column, rowIndex, ReplaceFunction::NAME);
+        const std::optional<types::String::Primitive> replacing = replacement._read(replacement._column, rowIndex, ReplaceFunction::NAME);
+
+        const bool readsANull = !text.has_value() || !searched.has_value() || !replacing.has_value();
+        if (!readsANull) {
+            outputRaw[rowIndex] = function(*text, *searched, *replacing);
+        } else if constexpr (TypeUtils::is_optional_v<Result>) {
+            outputRaw[rowIndex] = std::nullopt;
+        } else {
+            throw IRException("replace() typed as never null read a null argument");
+        }
+    }
+}
+
+template void NLExecutor::runReplace<types::String::Primitive>(NLExecutionContext* context, NLFunctionData* data);
+template void NLExecutor::runReplace<std::optional<types::String::Primitive>>(NLExecutionContext* context, NLFunctionData* data);
+
+void NLExecutor::runRange(NLExecutionContext*, NLFunctionData* data) {
+    const NLRangeData* range = static_cast<NLRangeData*>(data);
+
+    const NLRangeData::Bound& start = range->getStart();
+    const NLRangeData::Bound& end = range->getEnd();
+    const NLRangeData::Bound& step = range->getStep();
+
+    NLStepBuffers* const stepBuffers = range->getStepBuffers();
+    stepBuffers->clear();
+
+    ListBuffer<>& listBuffer = stepBuffers->listBuffer();
+
+    const size_t rowCount = start._column->size();
+    bioassert(end._column->size() == rowCount, "Bound columns of a range are not row-aligned.");
+    bioassert(!step._column || step._column->size() == rowCount,
+              "Step column of a range is not row-aligned with its bounds.");
+
+    std::vector<std::optional<ListView>>& outputRaw =
+        static_cast<ColumnOptVector<ListView>*>(range->getResult())->getRaw();
+    outputRaw.clear();
+    outputRaw.reserve(rowCount);
+
+    std::vector<ListBuffer<>::ListItemVariant> elements;
+    NLRangeSpan span;
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        if (!span.read(start, end, step, rowIndex)) {
+            outputRaw.push_back(std::nullopt);
+            continue;
+        }
+
+        elements.clear();
+
+        if (!span.isEmpty()) {
+            const uint64_t steps = span.getSteps();
+
+            if (steps >= RANGE_LENGTH_LIMIT) {
+                throw IRException(fmt::format("range() size exceeds {} integers", RANGE_LENGTH_LIMIT));
+            }
+
+            const uint64_t length = steps + 1;
+
+            elements.reserve(length);
+
+            for (uint64_t position = 0; position < length; position++) {
+                elements.push_back(ListBuffer<>::ListItemVariant {span.at(position)});
+            }
+        }
+
+        outputRaw.push_back(listBuffer.insert(elements));
+    }
+}
+
+void NLExecutor::runRowListsReset(NLExecutionContext* context, NLFunctionData* data) {
+    NLRowListsResetData* reset = static_cast<NLRowListsResetData*>(data);
+
+    // No cardinality chunk: nothing was in flight where the lists are read, which is the
+    // single empty row Cypher starts from
+    const Column* const cardinality = reset->getCardinality();
+    const size_t rowCount = cardinality ? cardinality->size() : 1;
+
+    reset->getState()->reset(rowCount);
+
+    // The tag holds each row's position, so the body carries it the way it carries any
+    // other column and the collect reads the row each value belongs to off it.
+    std::vector<uint64_t>& tagRaw = reset->getTag()->getRaw();
+    tagRaw.resize(rowCount);
+    std::iota(tagRaw.begin(), tagRaw.end(), uint64_t {0});
+}
+
+void NLExecutor::runRowListsCollect(NLExecutionContext* context, NLFunctionData* data) {
+    NLRowListsCollectData* collect = static_cast<NLRowListsCollectData*>(data);
+
+    NLRowListsState* state = collect->getState();
+    const Column* const value = collect->getValue();
+    const NLListItemReadFunction valueRead = collect->getValueRead();
+    NLStepBuffers* const memory = collect->getStepBuffers();
+    memory->clear();
+
+    const ColumnVector<uint64_t>* const tag = collect->getTag();
+
+    if (!tag) {
+        // No input row to tag: every value belongs to the single row the step is
+        for (size_t match = 0; match < value->size(); match++) {
+            state->stage(0, valueRead(value, match, memory));
+        }
+
+        return;
+    }
+
+    const std::vector<uint64_t>& tagRaw = tag->getRaw();
+
+    bioassert(value->size() == tagRaw.size(),
+              "Yielded value of a row lists body is not row-aligned with its row tags.");
+
+    for (size_t match = 0; match < tagRaw.size(); match++) {
+        state->stage(tagRaw[match], valueRead(value, match, memory));
+    }
+}
+
+void NLExecutor::runRowListsResult(NLExecutionContext* context, NLFunctionData* data) {
+    NLRowListsResultData* result = static_cast<NLRowListsResultData*>(data);
+
+    NLStepBuffers* const memory = result->getStepBuffers();
+    memory->clear();
+
+    result->getState()->buildLists(memory->listBuffer(), result->getResult()->getRaw());
+}
+
+void NLExecutor::runListPredicate(NLExecutionContext* context, NLFunctionData* data) {
+    NLListPredicateData* predicate = static_cast<NLListPredicateData*>(data);
+
+    const Column* source = predicate->getSource();
+
+    const NLCellAbsentFunction cellAbsent = predicate->getCellAbsentFunc();
+    const NLTruthReadFunction truthRead = predicate->getTruthRead();
+    const Column* value = predicate->getValue();
+
+    NLElementCursor cursor(source, predicate->getElementCountFunc());
+    const size_t sourceRows = cursor.getSourceRows();
+
+    std::vector<size_t>& trueCounts = predicate->trueCounts();
+    std::vector<size_t>& falseCounts = predicate->falseCounts();
+    std::vector<size_t>& nullCounts = predicate->nullCounts();
+    trueCounts.assign(sourceRows, 0);
+    falseCounts.assign(sourceRows, 0);
+    nullCounts.assign(sourceRows, 0);
+
+    const ListPredicateKind kind = predicate->getKind();
+
+    runElementBody(context, predicate, cursor, [&](const std::vector<uint64_t>& taggedRaw) {
+        for (size_t element = 0; element < taggedRaw.size(); element++) {
+            const std::optional<bool> truth = truthRead(value, element);
+            const size_t row = taggedRaw[element];
+
+            if (!truth.has_value()) {
+                nullCounts[row]++;
+            } else if (*truth) {
+                trueCounts[row]++;
+            } else {
+                falseCounts[row]++;
+            }
+        }
+
+        if (!cursor.exhausted()) {
+            const size_t openRow = cursor.getRow();
+            if (isListPredicateDecided(kind, trueCounts[openRow], falseCounts[openRow])) {
+                cursor.skipRow();
+            }
+        }
+    });
+
+    std::vector<std::optional<CustomBool>>& resultRaw =
+        static_cast<ColumnOptMask*>(predicate->getResult())->getRaw();
+    resultRaw.resize(sourceRows);
+
+    for (size_t row = 0; row < sourceRows; row++) {
+        if (cellAbsent(source, row)) {
+            resultRaw[row] = std::nullopt;
+            continue;
+        }
+
+        const std::optional<bool> decided = decideListPredicate(kind, trueCounts[row], falseCounts[row], nullCounts[row]);
+        if (decided.has_value()) {
+            resultRaw[row] = CustomBool(*decided);
+        } else {
+            resultRaw[row] = std::nullopt;
+        }
+    }
+}
+
+void NLExecutor::runListComprehension(NLExecutionContext* context, NLFunctionData* data) {
+    NLListComprehensionData* comprehension = static_cast<NLListComprehensionData*>(data);
+
+    const Column* source = comprehension->getSource();
+
+    const NLCellAbsentFunction cellAbsent = comprehension->getCellAbsentFunc();
+    const NLListItemReadFunction valueRead = comprehension->getValueRead();
+    const Column* value = comprehension->getValue();
+    NLStepBuffers* const memory = comprehension->getStepBuffers();
+    memory->clear();
+    ListBuffer<>& listBuffer = memory->listBuffer();
+
+    NLElementCursor cursor(source, comprehension->getElementCountFunc());
+    const size_t sourceRows = cursor.getSourceRows();
+
+    // What the rows the cursor still has open gathered: the elements arrive in row order,
+    // so a row's elements are one contiguous run of this buffer and the counts locate it
+    std::vector<ListBuffer<>::ListItemVariant>& staged = comprehension->stagedElements();
+    std::vector<size_t>& stagedCounts = comprehension->stagedCounts();
+    NLValueStore& stagedValues = comprehension->stagedValues();
+    staged.clear();
+    stagedValues.clear();
+    stagedCounts.assign(sourceRows, 0);
+
+    std::vector<std::optional<ListView>>& resultRaw =
+        static_cast<ColumnOptVector<ListView>*>(comprehension->getResult())->getRaw();
+    resultRaw.clear();
+    resultRaw.reserve(sourceRows);
+
+    // A row's list is complete as soon as the run past it starts, so the rows behind the
+    // cursor are built and dropped at every step rather than the whole source being held
+    const auto buildRowsBefore = [&](size_t end) {
+        size_t builtElements = 0;
+
+        while (resultRaw.size() < end) {
+            const size_t row = resultRaw.size();
+            const size_t rowElements = stagedCounts[row];
+            const std::span<const ListBuffer<>::ListItemVariant> elements {staged.data() + builtElements,
+                                                                          rowElements};
+
+            // A cell holding no list gives its row no list either, which is what Cypher
+            // reads `[x IN null | x]` as - as opposed to the empty list a cell whose
+            // elements the predicate all dropped gives
+            if (cellAbsent(source, row)) {
+                resultRaw.push_back(std::nullopt);
+            } else {
+                resultRaw.push_back(listBuffer.insert(elements));
+            }
+
+            builtElements += rowElements;
+        }
+
+        staged.erase(staged.begin(), staged.begin() + builtElements);
+    };
+
+    runElementBody(context, comprehension, cursor, [&](const std::vector<uint64_t>& keptRaw) {
+        for (size_t element = 0; element < keptRaw.size(); element++) {
+            staged.push_back(stagedValues.ownItem(valueRead(value, element, memory)));
+            stagedCounts[keptRaw[element]]++;
+        }
+
+        buildRowsBefore(cursor.getRow());
+    });
+
+    buildRowsBefore(sourceRows);
+}
+
+void NLExecutor::runReduce(NLExecutionContext* context, NLFunctionData* data) {
+    NLReduceData* reduce = static_cast<NLReduceData*>(data);
+
+    const Column* source = reduce->getSource();
+    const NLUnwindElementCountFunction elementCount = reduce->getElementCountFunc();
+    const NLUnwindElementEmitFunction elementEmit = reduce->getElementEmitFunc();
+    const NLCellAbsentFunction cellAbsent = reduce->getCellAbsentFunc();
+    const Column* initialValue = reduce->getInitialValue();
+    const Column* value = reduce->getValue();
+    const NLStmtContainer* body = reduce->getStmts();
+    Column* accumulator = reduce->getResult();
+    NLStepBuffers* const memory = reduce->getStepBuffers();
+    memory->clear();
+    NLCompactingValueStore& accumulatorValues = reduce->accumulatorValues();
+    const NLReownFunction reown = reduce->getReown();
+    const NLReownRowsFunction reownRows = reduce->getReownRows();
+
+    const size_t sourceRows = source->size();
+    const size_t chunkSize = context->getChunkSize();
+
+    const auto write = [&](const NLCellWrite& rowWrite, size_t row, const Column* written, size_t writtenRow) {
+        writeCell(accumulator, row, rowWrite, written, writtenRow, memory, accumulatorValues.getActive());
+    };
+
+    accumulatorValues.clear();
+    reduce->getReset()(accumulator, sourceRows);
+
+    std::vector<size_t>& elementCounts = reduce->elementCounts();
+    std::vector<size_t>& reachingRows = reduce->reachingRows();
+    elementCounts.assign(sourceRows, 0);
+    reachingRows.clear();
+
+    // A row whose cell holds no list keeps the null the reset left it, as Cypher reads
+    // `reduce(s = 0, x IN null | s + x)`
+    for (size_t row = 0; row < sourceRows; row++) {
+        if (cellAbsent(source, row)) {
+            continue;
+        }
+
+        write(reduce->getInitialWrite(), row, initialValue, row);
+
+        elementCounts[row] = elementCount(source, row);
+        if (elementCounts[row] > 0) {
+            reachingRows.push_back(row);
+        }
+    }
+
+    std::vector<size_t>& rowsRaw = reduce->getRows()->getRaw();
+    std::vector<size_t>& positionsRaw = reduce->getPositions()->getRaw();
+
+    for (size_t position = 0; !reachingRows.empty(); position++) {
+        for (size_t first = 0; first < reachingRows.size(); first += chunkSize) {
+            const size_t last = std::min(first + chunkSize, reachingRows.size());
+            rowsRaw.assign(reachingRows.begin() + first, reachingRows.begin() + last);
+
+            if (elementEmit) {
+                positionsRaw.assign(rowsRaw.size(), position);
+                elementEmit(source, reduce->getRows(), reduce->getPositions(), reduce->getElementOutput());
+            }
+
+            for (const NLCarriedColumn& carriedColumn : reduce->carriedColumns()) {
+                const auto gatherFunc = carriedColumn.getGatherFunc();
+                gatherFunc(carriedColumn.getInput(), reduce->getRows(), carriedColumn.getOutput());
+            }
+
+            runBody(context, body);
+
+            bioassert(value->size() == rowsRaw.size(),
+                      "Yielded accumulator of an nl.reduce is not row-aligned with its elements.");
+
+            for (size_t index = 0; index < rowsRaw.size(); index++) {
+                write(reduce->getValueWrite(), rowsRaw[index], value, index);
+            }
+
+            if (reownRows) {
+                reownRows(accumulator, rowsRaw, accumulatorValues.getActive());
+            }
+        }
+
+        std::erase_if(reachingRows, [&](size_t row) { return elementCounts[row] == position + 1; });
+
+        if (reown && !reachingRows.empty() && accumulatorValues.needsCompaction(sourceRows)) {
+            reown(accumulator, accumulatorValues.getSpare());
+            accumulatorValues.flip();
+        }
+    }
+}
+
+NLCaseResetFn NLExecutor::selectTaggedCellReset() {
+    return &resetTaggedCells;
+}
+
+NLCaseWriteFn NLExecutor::selectNullCellWrite() {
+    return &caseWriteNullTaggedCell;
+}
+
+NLListItemReadFunction NLExecutor::selectValueListItemRead(ValueType valueType) {
+    NLListItemReadFunction selected = nullptr;
+
+    const auto select = [&]<SupportedType T>() {
+        selected = &valueItem<ListBuffer<>::ListItemVariant, typename T::Primitive>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return selected;
+}
+
+NLKeyedReadFunction NLExecutor::selectKeyedRead(const Column* input) {
+    const ColumnKind::Code kind = input->getKind();
+
+    if (kind == ColumnVector<MapView>::staticKind()) {
+        return &mapRead<ColumnVector<MapView>>;
+    } else if (kind == ColumnOptVector<MapView>::staticKind()) {
+        return &mapRead<ColumnOptVector<MapView>>;
+    } else if (kind == ColumnConst<MapView>::staticKind()) {
+        return &mapRead<ColumnConst<MapView>>;
+    } else if (kind == ColumnConst<std::optional<MapView>>::staticKind()) {
+        return &mapRead<ColumnConst<std::optional<MapView>>>;
+    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+        return &readTaggedKeyed<ColumnVector<ListElementView>>;
+    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+        return &readTaggedKeyed<ColumnOptVector<ListElementView>>;
+    } else if (kind == ColumnConst<ListElementView>::staticKind()) {
+        return &readTaggedKeyed<ColumnConst<ListElementView>>;
+    } else if (kind == ColumnConst<std::optional<ListElementView>>::staticKind()) {
+        return &readTaggedKeyed<ColumnConst<std::optional<ListElementView>>>;
+    } else if (kind == ColumnVector<MapEntryView>::staticKind()) {
+        return &readTaggedKeyed<ColumnVector<MapEntryView>>;
+    } else if (kind == ColumnConst<MapEntryView>::staticKind()) {
+        return &readTaggedKeyed<ColumnConst<MapEntryView>>;
+    }
+
+    throw IRException("a map key read reads a map column, or a column of tagged cells");
+}
+
+NLStringReadFunction NLExecutor::selectStringRead(const Column* input) {
+    using String = types::String::Primitive;
+
+    const ColumnKind::Code kind = input->getKind();
+
+    if (kind == ColumnVector<String>::staticKind()) {
+        return &stringRead<ColumnVector<String>>;
+    } else if (kind == ColumnOptVector<String>::staticKind()) {
+        return &stringRead<ColumnOptVector<String>>;
+    } else if (kind == ColumnConst<String>::staticKind()) {
+        return &stringRead<ColumnConst<String>>;
+    } else if (kind == ColumnConst<std::optional<String>>::staticKind()) {
+        return &stringRead<ColumnConst<std::optional<String>>>;
+    } else if (kind == ColumnConst<PropertyNull>::staticKind()) {
+        return &nullStringRead;
+    }
+
+    throw IRException("a dynamic map key read reads its key out of a string column");
+}
+
+NLStringArgumentRead NLExecutor::selectStringArgumentRead(const Column* input) {
+    const ColumnKind::Code kind = input->getKind();
+
+    if (kind == ColumnOptVector<types::String::Primitive>::staticKind()) {
+        return &stringValueArgument<ColumnOptVector<types::String::Primitive>>;
+    } else if (kind == ColumnConst<types::String::Primitive>::staticKind()) {
+        return &stringValueArgument<ColumnConst<types::String::Primitive>>;
+    } else if (kind == ColumnConst<std::optional<types::String::Primitive>>::staticKind()) {
+        return &stringValueArgument<ColumnConst<std::optional<types::String::Primitive>>>;
+    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+        return &cellStringArgument<ColumnVector<ListElementView>>;
+    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+        return &cellStringArgument<ColumnOptVector<ListElementView>>;
+    } else if (kind == ColumnConst<ListElementView>::staticKind()) {
+        return &cellStringArgument<ColumnConst<ListElementView>>;
+    } else if (kind == ColumnConst<std::optional<ListElementView>>::staticKind()) {
+        return &cellStringArgument<ColumnConst<std::optional<ListElementView>>>;
+    }
+
+    throw IRException("a string function reads a string argument out of a nullable string column, or a column of tagged cells");
+}
+
+NLIntegerArgumentRead NLExecutor::selectIntegerArgumentRead(const Column* input) {
+    const ColumnKind::Code kind = input->getKind();
+
+    if (kind == ColumnOptVector<types::Int64::Primitive>::staticKind()) {
+        return &integerValueArgument;
+    } else if (kind == ColumnOptVector<types::UInt64::Primitive>::staticKind()) {
+        return &unsignedValueArgument;
+    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+        return &cellIntegerArgument<ColumnVector<ListElementView>>;
+    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+        return &cellIntegerArgument<ColumnOptVector<ListElementView>>;
+    }
+
+    throw IRException("a string function reads an integer argument out of a nullable integer column, or a column of tagged cells");
+}
+
+// Row r of the result views the entry row r's map already holds under the key, so the
+// read copies nothing. A row holding no map, and a map holding no such key, read back as
+// an entry under the same key whose tag is null: every row of the column names the key
+// the query read it under, so one entry per chunk serves all of them.
+void NLExecutor::runStaticMapKey(NLExecutionContext* context, NLFunctionData* data) {
+    const NLStaticMapKeyData* mapKey = static_cast<NLStaticMapKeyData*>(data);
+
+    const Column* input = mapKey->getInput();
+    const NLKeyedReadFunction read = mapKey->getKeyedRead();
+    const std::string_view key = mapKey->getKey();
+
+    const MapEntryView absent = mapKey->getAbsentEntry();
+
+    NLStepBuffers* const stepBuffers = mapKey->getStepBuffers();
+    stepBuffers->clear();
+
+    MapBuffer<>& mapBuffer = stepBuffers->mapBuffer();
+    NLEntityProperties properties(context, &stepBuffers->valueStore());
+
+    const auto entryAt = [input, read, key, absent, &properties, &mapBuffer](size_t row) {
+        MapEntryView entry;
+        if (!findKeyedEntry(read(input, row), key, properties, mapBuffer, entry)) {
+            return absent;
+        }
+
+        return entry;
+    };
+
+    Column* result = mapKey->getResult();
+
+    if (result->getKind() == ColumnConst<MapEntryView>::staticKind()) {
+        *static_cast<ColumnConst<MapEntryView>*>(result) = entryAt(0);
+        return;
+    }
+
+    std::vector<MapEntryView>& outputRaw = static_cast<ColumnVector<MapEntryView>*>(result)->getRaw();
+    const size_t rowCount = input->size();
+
+    outputRaw.resize(rowCount);
+
+    for (size_t row = 0; row < rowCount; row++) {
+        outputRaw[row] = entryAt(row);
+    }
+}
+
+// The values are copied into the step's list buffer as one list, whose elements are the cells
+void NLExecutor::runMapEntryValue(NLExecutionContext*, NLFunctionData* data) {
+    NLMapEntryValueData* entryValue = static_cast<NLMapEntryValueData*>(data);
+
+    const Column* input = entryValue->getInput();
+    Column* result = entryValue->getResult();
+
+    NLStepBuffers* const stepBuffers = entryValue->getStepBuffers();
+    stepBuffers->clear();
+
+    std::vector<QueryListBuffer::ListItemVariant>& items = entryValue->getItems();
+    items.clear();
+
+    if (result->getKind() == ColumnConst<ListElementView>::staticKind()) {
+        const ColumnConst<MapEntryView>* constant = static_cast<const ColumnConst<MapEntryView>*>(input);
+        items.push_back(entryItem(constant->getRaw()));
+
+        const ListView cells = stepBuffers->listBuffer().insert(items);
+        static_cast<ColumnConst<ListElementView>*>(result)->set(cells.front());
+        return;
+    }
+
+    const std::vector<MapEntryView>& entries = static_cast<const ColumnVector<MapEntryView>*>(input)->getRaw();
+
+    items.resize(entries.size());
+    std::ranges::transform(entries, items.begin(), entryItem);
+
+    const ListView cells = stepBuffers->listBuffer().insert(items);
+    std::vector<ListElementView>& resultRaw = static_cast<ColumnVector<ListElementView>*>(result)->getRaw();
+
+    resultRaw.resize(entries.size());
+    std::ranges::copy(cells.elements(), resultRaw.begin());
+}
+
+// Row r of the result views the entry row r's map already holds under row r's key, so the
+// read copies nothing. A map holding no such key is answered by an entry written under that
+// row's key and tagged null, so the reader sees the key it asked for; a row holding no key
+// at all has none to name, and reads the one keyless entry translation wrote.
+void NLExecutor::runDynamicMapKey(NLExecutionContext* context, NLFunctionData* data) {
+    const NLDynamicMapKeyData* dynamicMapKey = static_cast<NLDynamicMapKeyData*>(data);
+
+    const Column* input = dynamicMapKey->getInput();
+    const Column* keyColumn = dynamicMapKey->getKey();
+
+    const NLKeyedReadFunction readKeyed = dynamicMapKey->getKeyedRead();
+    const NLStringReadFunction readKey = dynamicMapKey->getKeyRead();
+
+    const MapEntryView keyless = dynamicMapKey->getAbsentEntry();
+    NLStepBuffers* const stepBuffers = dynamicMapKey->getStepBuffers();
+    stepBuffers->clear();
+
+    MapBuffer<>& mapBuffer = stepBuffers->mapBuffer();
+    NLEntityProperties properties(context, &stepBuffers->valueStore());
+
+    const auto entryAt = [input, keyColumn, readKeyed, readKey, keyless, &properties, &mapBuffer](size_t row) {
+        const std::optional<types::String::Primitive> key = readKey(keyColumn, row);
+        if (!key) {
+            return keyless;
+        }
+
+        MapEntryView entry;
+        if (findKeyedEntry(readKeyed(input, row), *key, properties, mapBuffer, entry)) {
+            return entry;
+        }
+
+        MapWriteCursor absentCursor = mapBuffer.reserveMap(1, sizeof(PropertyNull));
+        absentCursor.writeKey(*key);
+
+        return absentCursor.writeValue(MapBufferTypeTag::Null, PropertyNull {});
+    };
+
+    Column* result = dynamicMapKey->getResult();
+
+    if (result->getKind() == ColumnConst<MapEntryView>::staticKind()) {
+        *static_cast<ColumnConst<MapEntryView>*>(result) = entryAt(0);
+        return;
+    }
+
+    const size_t mapRows = input->size();
+    const size_t keyRows = keyColumn->size();
+    const size_t rowCount = std::max(mapRows, keyRows);
+
+    bioassert(mapRows == rowCount || mapRows == 1,
+              "Map column of a dynamic map key is not row-aligned with its key column.");
+    bioassert(keyRows == rowCount || keyRows == 1,
+              "Key column of a dynamic map key is not row-aligned with its map column.");
+
+    std::vector<MapEntryView>& outputRaw = static_cast<ColumnVector<MapEntryView>*>(result)->getRaw();
+
+    outputRaw.resize(rowCount);
+
+    for (size_t row = 0; row < rowCount; row++) {
+        outputRaw[row] = entryAt(row);
+    }
+}
+
+NLListReadFunction NLExecutor::selectListRead(const Column* input) {
+    const ColumnKind::Code kind = input->getKind();
+
+    if (kind == ColumnVector<ListView>::staticKind()) {
+        return &plainListRead;
+    } else if (kind == ColumnOptVector<ListView>::staticKind()) {
+        return &optListRead;
+    } else if (kind == ColumnConst<ListView>::staticKind()) {
+        return &constListRead;
+    } else if (kind == ColumnConst<std::optional<ListView>>::staticKind()) {
+        return &optConstListRead;
+    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+        return &taggedListRead;
+    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+        return &optTaggedListRead;
+    } else if (kind == ColumnConst<ListElementView>::staticKind()) {
+        return &constTaggedListRead;
+    } else if (kind == ColumnConst<std::optional<ListElementView>>::staticKind()) {
+        return &optConstTaggedListRead;
+    }
+
+    throw IRException("a list slice reads a list column");
+}
+
+NLRangeBoundReadFunction NLExecutor::selectRangeBoundRead(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &rangeBound<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &rangeBound<types::UInt64::Primitive>;
+        break;
+
+        default:
+            throw IRException("nl.range reads its bounds out of integer columns");
+        break;
+    }
+}
+
+NLPercentileReadFunction NLExecutor::selectPercentileRead(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &percentileArgument<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &percentileArgument<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &percentileArgument<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("a percentile is read out of a number column");
+        break;
+    }
+}
+
+NLListItemReadFunction NLExecutor::selectNodeListItemRead() {
+    return &validIDItem<ListBuffer<>::ListItemVariant, NodeID>;
+}
+
+NLListItemReadFunction NLExecutor::selectEdgeListItemRead() {
+    return &validIDItem<ListBuffer<>::ListItemVariant, EdgeID>;
+}
+
+NLListItemReadFunction NLExecutor::selectNestedListItemRead() {
+    return &plainItem<ListBuffer<>::ListItemVariant, ListView>;
+}
+
+NLListItemReadFunction NLExecutor::selectNestedMapListItemRead() {
+    return &plainItem<ListBuffer<>::ListItemVariant, MapView>;
+}
+
+NLListItemReadFunction NLExecutor::selectTaggedListItemRead(bool nullable) {
+    return nullable ? &optTaggedColumnItem<ListBuffer<>::ListItemVariant> : &taggedColumnItem<ListBuffer<>::ListItemVariant>;
+}
+
+NLMapValueReadFunction NLExecutor::selectValueMapValueRead(ValueType valueType) {
+    NLMapValueReadFunction selected = nullptr;
+
+    const auto select = [&]<SupportedType T>() {
+        selected = &valueItem<MapBuffer<>::MapItemVariant, typename T::Primitive>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return selected;
+}
+
+NLMapValueReadFunction NLExecutor::selectNodeMapValueRead() {
+    return &validIDItem<MapBuffer<>::MapItemVariant, NodeID>;
+}
+
+NLMapValueReadFunction NLExecutor::selectEdgeMapValueRead() {
+    return &validIDItem<MapBuffer<>::MapItemVariant, EdgeID>;
+}
+
+NLMapValueReadFunction NLExecutor::selectNestedListMapValueRead() {
+    return &plainItem<MapBuffer<>::MapItemVariant, ListView>;
+}
+
+NLMapValueReadFunction NLExecutor::selectOptNestedListMapValueRead() {
+    return &optItem<MapBuffer<>::MapItemVariant, ListView>;
+}
+
+NLMapValueReadFunction NLExecutor::selectNestedMapValueRead() {
+    return &plainItem<MapBuffer<>::MapItemVariant, MapView>;
+}
+
+NLMapValueReadFunction NLExecutor::selectTaggedMapValueRead(bool nullable) {
+    return nullable ? &optTaggedColumnItem<MapBuffer<>::MapItemVariant> : &taggedColumnItem<MapBuffer<>::MapItemVariant>;
+}
+
+NLCellAbsentFunction NLExecutor::selectPresentCell() {
+    return &presentCell;
+}
+
+NLCellAbsentFunction NLExecutor::selectListCellAbsent() {
+    return &absentListCell;
+}
+
+NLCellAbsentFunction NLExecutor::selectTaggedCellAbsent(bool nullable) {
+    return nullable ? &absentOptTaggedCell : &absentTaggedCell;
+}
+
+NLCellAbsentFunction NLExecutor::selectValueCellAbsent(ValueType valueType) {
+    NLCellAbsentFunction selected = nullptr;
+
+    const auto select = [&]<SupportedType T>() {
+        selected = &absentValueCell<typename T::Primitive>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return selected;
+}
+
+NLCaseResetFn NLExecutor::selectCaseReset(ValueType valueType) {
+    NLCaseResetFn reset = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        reset = &caseResetColumn<typename T::Primitive>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return reset;
+}
+
+NLTruthReadFunction NLExecutor::selectTruthRead(bool nullable, bool untypedNull, bool taggedCells) {
+    if (untypedNull) {
+        return &readNullTruth;
+    } else if (taggedCells) {
+        return nullable ? &readOptTaggedCellTruth : &readTaggedCellTruth;
+    } else if (nullable) {
+        return &readOptMaskTruth;
+    }
+
+    return &readMaskTruth;
+}
+
+NLCaseTestFn NLExecutor::selectCaseTest(const Column* condition, bool nullable, bool untypedNull) {
+    const ColumnKind::Code kind = condition->getKind();
+
+    if (untypedNull) {
+        return &caseTestNever;
+    } else if (condition->getContainerKind() == ContainerKind::code<ColumnMask>()) {
+        return &caseTestMask;
+    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+        return &caseTestTaggedCell;
+    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+        return &caseTestOptTaggedCell;
+    }
+
+    return nullable ? &caseTestOptMask : &caseTestBoolColumn;
+}
+
+NLUnaryFn NLExecutor::selectIsNotTrue(const Column* operand, bool untypedNull, LocalMemory* memory, Column*& result) {
+    result = memory->alloc<ColumnMask>();
+
+    const ColumnKind::Code kind = operand->getKind();
+
+    if (untypedNull) {
+        return &applyIsNotTrueOnNull;
+    } else if (kind == ColumnMask::staticKind()) {
+        return &applyIsNotTrueOnMask;
+    } else if (kind == ColumnOptMask::staticKind()) {
+        return &applyIsNotTrueOnOptMask;
+    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+        return &applyIsNotTrueOnTaggedCells;
+    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+        return &applyIsNotTrueOnOptTaggedCells;
+    }
+
+    return &applyIsNotTrueOnBoolColumn;
+}
+
+NLCaseResetFn NLExecutor::selectEntityCaseReset(NLChunkKind kind) {
+    if (kind == NLChunkKind::NodeID) {
+        return &caseResetEntityColumn<NodeID>;
+    } else if (kind == NLChunkKind::EdgeID) {
+        return &caseResetEntityColumn<EdgeID>;
+    }
+
+    throw IRException("Only a node or an edge column can hold a selection over entities");
+}
+
+NLCaseWriteFn NLExecutor::selectEntityCaseWrite(NLChunkKind kind, bool untypedNull) {
+    if (kind == NLChunkKind::NodeID) {
+        return untypedNull ? &caseWriteNullEntity<NodeID> : &caseWriteEntityCell<NodeID>;
+    } else if (kind == NLChunkKind::EdgeID) {
+        return untypedNull ? &caseWriteNullEntity<EdgeID> : &caseWriteEntityCell<EdgeID>;
+    }
+
+    throw IRException("Only a node or an edge column can hold a selection over entities");
+}
+
+NLCaseWriteFn NLExecutor::selectCaseWrite(ValueType valueType,
+                                          const Column* value,
+                                          bool nullable,
+                                          bool untypedNull) {
+    if (value->getContainerKind() == ContainerKind::code<ColumnMask>()) {
+        return &caseWriteMaskCell;
+    }
+
+    NLCaseWriteFn write = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        if (untypedNull) {
+            write = &caseWriteNull<typename T::Primitive>;
+        } else if (nullable) {
+            write = &caseWriteOptCell<typename T::Primitive>;
+        } else {
+            write = &caseWritePlainCell<typename T::Primitive>;
+        }
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return write;
+}
+
+NLUnaryFn NLExecutor::selectNot(const Column* operand, LocalMemory* memory, Column*& result) {
+    const ColumnKind::Code kind = operand->getKind();
+
+    if (kind == ColumnConst<PropertyNull>::staticKind()) {
+        result = memory->alloc<ColumnConst<PropertyNull>>();
+        return &applyNotOnNullConst;
+    } else if (kind == ColumnConst<CustomBool>::staticKind()) {
+        result = memory->alloc<ColumnConst<CustomBool>>();
+        return &applyNotOnConst;
+    } else if (kind == ColumnConst<std::optional<CustomBool>>::staticKind()) {
+        result = memory->alloc<ColumnConst<std::optional<CustomBool>>>();
+        return &applyNotOnOptConst;
+    } else if (kind == ColumnOptMask::staticKind()) {
+        result = memory->alloc<ColumnOptMask>();
+        return &applyNotOnOptMask;
+    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+        result = memory->alloc<ColumnOptMask>();
+        return &applyNotOnTaggedCells;
+    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+        result = memory->alloc<ColumnOptMask>();
+        return &applyNotOnOptTaggedCells;
+    } else if (kind == ColumnConst<ListElementView>::staticKind()) {
+        result = memory->alloc<ColumnConst<std::optional<CustomBool>>>();
+        return &applyNotOnConstTaggedCell;
+    } else if (kind == ColumnConst<std::optional<ListElementView>>::staticKind()) {
+        result = memory->alloc<ColumnConst<std::optional<CustomBool>>>();
+        return &applyNotOnOptConstTaggedCell;
+    }
+
+    result = memory->alloc<ColumnMask>();
+    return &applyNotOnMask;
+}
+
+NLUnaryFn NLExecutor::selectEntityToNullable(NLChunkKind kind, LocalMemory* memory, Column*& result) {
+    const bool readsIDs = kind == NLChunkKind::NodeID || kind == NLChunkKind::EdgeID || kind == NLChunkKind::PathRef;
+    if (!readsIDs) {
+        throw IRException("Only a node, an edge or a walk column can be read as a nullable ID column");
+    }
+
+    result = memory->alloc<ColumnOptVector<types::UInt64::Primitive>>();
+
+    if (kind == NLChunkKind::NodeID) {
+        return &entityToNullableColumn<NodeID>;
+    } else if (kind == NLChunkKind::PathRef) {
+        return &entityToNullableColumn<PathRef>;
+    }
+
+    return &entityToNullableColumn<EdgeID>;
+}
+
+NLUnaryFn NLExecutor::selectPathToNullable(LocalMemory* memory, Column*& result) {
+    result = memory->alloc<ColumnOptVector<types::UInt64::Primitive>>();
+
+    return &pathToNullableColumn;
+}
+
+NLUnaryFn NLExecutor::selectToNullable(ValueType valueType, const Column* operand, LocalMemory* memory, Column*& result) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return selectToNullableOf<types::Int64::Primitive>(operand, memory, result);
+        break;
+
+        case ValueType::UInt64:
+            return selectToNullableOf<types::UInt64::Primitive>(operand, memory, result);
+        break;
+
+        case ValueType::Double:
+            return selectToNullableOf<types::Double::Primitive>(operand, memory, result);
+        break;
+
+        case ValueType::Bool:
+            return selectToNullableOf<types::Bool::Primitive>(operand, memory, result);
+        break;
+
+        case ValueType::String:
+            return selectToNullableOf<types::String::Primitive>(operand, memory, result);
+        break;
+
+        case ValueType::Embedding:
+            return selectToNullableOf<types::Embedding::Primitive>(operand, memory, result);
+        break;
+
+        case ValueType::DateTime:
+            return selectToNullableOf<types::DateTime::Primitive>(operand, memory, result);
+        break;
+
+        case ValueType::Duration:
+            return selectToNullableOf<types::Duration::Primitive>(operand, memory, result);
+        break;
+
+        // A cell is a view into the query's list buffer, so the nullable column holds the
+        // views the plain one held and an empty optional where a row has no list at all
+        case ValueType::List:
+            return selectToNullableOf<types::List::Primitive>(operand, memory, result);
+        break;
+
+        case ValueType::Map:
+            return selectToNullableOf<types::Map::Primitive>(operand, memory, result);
+        break;
+
+        default:
+            throw IRException("Only a scalar, a list or a map column can be read as a nullable value column");
+        break;
+    }
+
+    return nullptr;
+}
+
+template <ColumnOperator Op>
+NLBinaryFn NLExecutor::selectBinary(const Column* lhs,
+                                    const Column* rhs,
+                                    LocalMemory* memory,
+                                    Column*& result) {
+    using Pairs = PairRestrictions<Op>;
+
+    BinaryOpSelector<Op> selector {._memory = memory};
+    ColumnDoubleDispatcher<typename Pairs::Allowed,
+                           typename Pairs::AllowedMixed,
+                           BinaryOpSelector<Op>,
+                           typename Pairs::Excluded>::dispatch(lhs, rhs, selector);
+
+    result = selector._result;
+    return selector._fn;
+}
+
+NLBinaryFn NLExecutor::selectEntityListIndex(NLChunkKind kind,
+                                             const Column* lhs,
+                                             const Column* rhs,
+                                             LocalMemory* memory,
+                                             Column*& result) {
+    NLBinaryFn selected = nullptr;
+
+    if (kind == NLChunkKind::NodeID) {
+        selected = selectEntityListIndexOf<NodeID>(lhs, rhs, memory, result);
+    } else if (kind == NLChunkKind::EdgeID) {
+        selected = selectEntityListIndexOf<EdgeID>(lhs, rhs, memory, result);
+    } else {
+        throw IRException("Only a node or an edge column can hold an entity read out of a list");
+    }
+
+    if (!selected) {
+        throw IRException("An entity is read out of a plain list column, not out of a constant or a type-erased one");
+    }
+
+    return selected;
+}
+
+NLBinaryFn NLExecutor::selectValueListIndex(ValueType valueType,
+                                            const Column* lhs,
+                                            const Column* rhs,
+                                            LocalMemory* memory,
+                                            Column*& result) {
+    using Pairs = PairRestrictions<OP_INDEX>;
+
+    NLBinaryFn selected = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        using Selector = ValueListIndexSelector<typename T::Primitive>;
+
+        Selector selector {._memory = memory};
+        ColumnDoubleDispatcher<typename Pairs::Allowed,
+                               typename Pairs::AllowedMixed,
+                               Selector,
+                               typename Pairs::Excluded>::dispatch(lhs, rhs, selector);
+
+        result = selector._result;
+        selected = selector._fn;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return selected;
+}
+
+void NLExecutor::runUnaryFunction(NLExecutionContext* context, NLFunctionData* data) {
+    const NLUnaryFunctionData* funcData = static_cast<NLUnaryFunctionData*>(data);
+    NLStepBuffers* const stepBuffers = funcData->getStepBuffers();
+    stepBuffers->clear();
+
+    funcData->getKernel()(context, funcData->getResult(), funcData->getInput(), stepBuffers);
+}
+
+template <typename Functor>
+NLUnaryFunctionKernel NLExecutor::selectFunction(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    using Arg = typename Functor::ArgType;
+    using Res = typename Functor::ResultType;
+    using JustRes = TypeUtils::unwrap_optional_t<Res>;
+
+    // Early exit noop for NULL literals
+    if (dynamic_cast<const ColumnConst<PropertyNull>*>(input)) {
+        result = memory->alloc<ColumnConst<PropertyNull>>();
+        return &functionNullKernel;
+    }
+
+    // A column of type-erased cells is served by the counterpart reading one, which
+    // answers over the same rows but reads its argument - and its nulls - out of the tag
+    if constexpr (HasTaggedCounterpart<Functor>) {
+        if (readsTaggedCells(input)) {
+            return selectTaggedCellFunction<typename Functor::TaggedCounterpart>(input, inputNullable, memory, result);
+        }
+    }
+
+    // A constant that can be null - what a conversion of a constant answers - is the one-row
+    // form of a nullable column, and is read the way functionOptKernel reads one
+    constexpr bool hasNullableConstant = InternalKind::Types::contains<std::optional<Arg>>()
+                                         && InternalKind::Types::contains<std::optional<JustRes>>()
+                                         && !TypedInternalID<Res>;
+
+    if constexpr (hasNullableConstant) {
+        if (isNullableConstantOf<Arg>(input)) {
+            if constexpr (ReadsItsNulls<Functor>) {
+                result = memory->alloc<ColumnConst<Res>>();
+                return &functionOptConstKernel<Functor>;
+            } else {
+                result = memory->alloc<ColumnConst<std::optional<JustRes>>>();
+                return &functionNullableConstKernel<Functor>;
+            }
+        }
+    }
+
+    if constexpr (std::is_same_v<Arg, types::Bool::Primitive>) {
+        if (input->getContainerKind() == ContainerKind::code<ColumnMask>()) {
+            result = memory->alloc<ColumnVector<Res>>();
+            return &functionMaskKernel<Functor>;
+        }
+    }
+
+    if (input->getContainerKind() == ContainerKind::code<ColumnConst>()) {
+        result = memory->alloc<ColumnConst<Res>>();
+        return &functionConstKernel<Functor>;
+    }
+
+    // An entity answers with the invalid ID where it is absent, so a function answering one
+    // needs no nullable column to carry that: it fills the plain ID column every other
+    // entity column in the engine is, and its rows say for themselves which matched nothing
+    if constexpr (TypedInternalID<Res>) {
+        result = memory->alloc<ColumnVector<Res>>();
+        return &functionEntityToEntityKernel<Functor>;
+    } else {
+        if (inputNullable) {
+            if constexpr (ReadsItsNulls<Functor>) {
+                result = memory->alloc<ColumnVector<Res>>();
+                return &functionNullReadingKernel<Functor>;
+            } else {
+                result = memory->alloc<ColumnOptVector<JustRes>>();
+                return &functionOptKernel<Functor>;
+            }
+        }
+
+        // An entity column carries its null in the ID rather than in an optional, so it is
+        // read row by row for validity and its result is nullable all the same
+        if constexpr (TypedInternalID<typename Functor::ArgType>) {
+            result = memory->alloc<ColumnOptVector<JustRes>>();
+            return &functionEntityKernel<Functor>;
+        }
+
+        result = memory->alloc<ColumnVector<Res>>();
+        return &functionVectorKernel<Functor>;
+    }
+}
+
+template <typename StringFunctor>
+NLUnaryFunctionKernel NLExecutor::selectConversion(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    NLUnaryFunctionKernel kernel = nullptr;
+
+    const auto selectForElement = [&]<typename Element>() {
+        using Functor = ConversionFunctorFor<StringFunctor, Element>::Type;
+
+        if constexpr (!std::is_same_v<Functor, StringFunctor>) {
+            if (!kernel && columnHoldsConvertible<Element>(input)) {
+                kernel = selectFunction<Functor>(input, inputNullable, memory, result);
+            }
+        }
+    };
+
+    selectForElement.template operator()<types::Int64::Primitive>();
+    selectForElement.template operator()<types::UInt64::Primitive>();
+    selectForElement.template operator()<types::Double::Primitive>();
+    selectForElement.template operator()<types::Bool::Primitive>();
+    selectForElement.template operator()<types::DateTime::Primitive>();
+    selectForElement.template operator()<types::Duration::Primitive>();
+
+    if (kernel) {
+        return kernel;
+    }
+
+    return selectFunction<StringFunctor>(input, inputNullable, memory, result);
+}
+
+NLUnaryFunctionKernel NLExecutor::selectDateTimeConversion(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<types::Int64::Primitive>(input)) {
+        return selectFunction<EpochSecondsToDateTimeFunction<types::Int64::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::UInt64::Primitive>(input)) {
+        return selectFunction<EpochSecondsToDateTimeFunction<types::UInt64::Primitive>>(input, inputNullable, memory, result);
+    }
+
+    return selectFunction<ToDateTimeFunction>(input, inputNullable, memory, result);
+}
+
+NLUnaryFunctionKernel NLExecutor::selectDurationConversion(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<types::Int64::Primitive>(input)) {
+        return selectFunction<MicrosecondsToDurationFunction<types::Int64::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::UInt64::Primitive>(input)) {
+        return selectFunction<MicrosecondsToDurationFunction<types::UInt64::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<MapView>(input)) {
+        return selectFunction<MapToDurationFunction>(input, inputNullable, memory, result);
+    } else if (readsTaggedCells(input)) {
+        return selectTaggedCellFunction<TaggedDurationFunction>(input, inputNullable, memory, result);
+    }
+
+    throw IRException("duration() requires an integer count of microseconds or a map of unit counts");
+}
+
+NLUnaryFunctionKernel NLExecutor::selectSize(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<types::String::Primitive>(input)) {
+        return selectFunction<StringSizeFunction>(input, inputNullable, memory, result);
+    }
+
+    return selectFunction<ListSizeFunction>(input, inputNullable, memory, result);
+}
+
+NLUnaryFunctionKernel NLExecutor::selectId(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<NodeID>(input)) {
+        return selectFunction<IdFunction<NodeID>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<EdgeID>(input)) {
+        return selectFunction<IdFunction<EdgeID>>(input, inputNullable, memory, result);
+    }
+
+    return selectFunction<TaggedIdFunction>(input, inputNullable, memory, result);
+}
+
+NLUnaryFunctionKernel NLExecutor::selectReverse(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<types::String::Primitive>(input)) {
+        return selectFunction<ReverseFunction>(input, inputNullable, memory, result);
+    } else if (readsTaggedCells(input)) {
+        return selectTaggedCellFunction<TaggedReverseFunction>(input, inputNullable, memory, result);
+    }
+
+    return selectFunction<ListReverseFunction>(input, inputNullable, memory, result);
+}
+
+NLUnaryFunctionKernel NLExecutor::selectKeys(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<NodeID>(input)) {
+        return selectFunction<NLKeysFunction<NodeID>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<EdgeID>(input)) {
+        return selectFunction<NLKeysFunction<EdgeID>>(input, inputNullable, memory, result);
+    } else if (readsTaggedCells(input)) {
+        return selectTaggedCellFunction<NLTaggedKeysFunction<ListElementView>>(input, inputNullable, memory, result);
+    } else if (readsMapValues(input)) {
+        return selectMapValueFunction<NLTaggedKeysFunction<MapEntryView>>(input, memory, result);
+    } else if (columnHoldsElement<MapView>(input)) {
+        return selectFunction<MapKeysFunction>(input, inputNullable, memory, result);
+    }
+
+    throw IRException("keys() reads a node, a relationship or a map column");
+}
+
+NLUnaryFunctionKernel NLExecutor::selectLabels(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<NodeID>(input)) {
+        return selectFunction<LabelsFunction>(input, inputNullable, memory, result);
+    } else if (readsTaggedCells(input)) {
+        return selectTaggedCellFunction<NLTaggedLabelsFunction<ListElementView>>(input, inputNullable, memory, result);
+    } else if (readsMapValues(input)) {
+        return selectMapValueFunction<NLTaggedLabelsFunction<MapEntryView>>(input, memory, result);
+    }
+
+    throw IRException("labels() reads a node column");
+}
+
+NLUnaryFunctionKernel NLExecutor::selectEdgeType(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<EdgeID>(input)) {
+        return selectFunction<EdgeTypesFunction>(input, inputNullable, memory, result);
+    } else if (readsTaggedCells(input)) {
+        return selectTaggedCellFunction<NLTaggedEdgeTypeFunction<ListElementView>>(input, inputNullable, memory, result);
+    } else if (readsMapValues(input)) {
+        return selectMapValueFunction<NLTaggedEdgeTypeFunction<MapEntryView>>(input, memory, result);
+    }
+
+    throw IRException("type() reads a relationship column");
+}
+
+NLUnaryFunctionKernel NLExecutor::selectProperties(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<NodeID>(input)) {
+        return selectFunction<NLPropertiesFunction<NodeID>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<EdgeID>(input)) {
+        return selectFunction<NLPropertiesFunction<EdgeID>>(input, inputNullable, memory, result);
+    } else if (readsTaggedCells(input)) {
+        return selectTaggedCellFunction<NLTaggedPropertiesFunction<ListElementView>>(input, inputNullable, memory, result);
+    } else if (readsMapValues(input)) {
+        return selectMapValueFunction<NLTaggedPropertiesFunction<MapEntryView>>(input, memory, result);
+    }
+
+    throw IRException("properties() reads a node, a relationship or a map column");
+}
+
+template <template <typename> typename NumberFunctor>
+NLUnaryFunctionKernel NLExecutor::selectNumberFunction(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<types::Int64::Primitive>(input)) {
+        return selectFunction<NumberFunctor<types::Int64::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::UInt64::Primitive>(input)) {
+        return selectFunction<NumberFunctor<types::UInt64::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::Double::Primitive>(input)) {
+        return selectFunction<NumberFunctor<types::Double::Primitive>>(input, inputNullable, memory, result);
+    } else if (readsTaggedCells(input)) {
+        return selectTaggedCellFunction<typename NumberFunctor<types::Int64::Primitive>::TaggedCounterpart>(input, inputNullable, memory, result);
+    }
+
+    throw IRException("A numeric function reads an integer or a double column");
+}
+
+NLUnaryFunctionKernel NLExecutor::selectNegateFunction(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<types::Int64::Primitive>(input)) {
+        return selectFunction<NegateFunction<types::Int64::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::UInt64::Primitive>(input)) {
+        return selectFunction<NegateFunction<types::UInt64::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::Double::Primitive>(input)) {
+        return selectFunction<NegateFunction<types::Double::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::Duration::Primitive>(input)) {
+        return selectFunction<NegateFunction<types::Duration::Primitive>>(input, inputNullable, memory, result);
+    } else if (readsTaggedCells(input)) {
+        return selectTaggedCellFunction<TaggedNegateFunction>(input, inputNullable, memory, result);
+    }
+
+    throw IRException("A unary minus reads an integer, a double or a duration column");
+}
+
+NLUnaryFunctionKernel NLExecutor::selectUnaryPlusFunction(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<types::Int64::Primitive>(input)) {
+        return selectFunction<UnaryPlusFunction<types::Int64::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::UInt64::Primitive>(input)) {
+        return selectFunction<UnaryPlusFunction<types::UInt64::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::Double::Primitive>(input)) {
+        return selectFunction<UnaryPlusFunction<types::Double::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::Duration::Primitive>(input)) {
+        return selectFunction<UnaryPlusFunction<types::Duration::Primitive>>(input, inputNullable, memory, result);
+    } else if (readsTaggedCells(input)) {
+        return selectTaggedCellFunction<TaggedUnaryPlusFunction>(input, inputNullable, memory, result);
+    }
+
+    throw IRException("A unary plus reads an integer, a double or a duration column");
+}
+
+template <FloatFunctionKind Kind>
+NLUnaryFunctionKernel NLExecutor::selectFloatFunction(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<types::Int64::Primitive>(input)) {
+        return selectFunction<FloatFunction<Kind, types::Int64::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::UInt64::Primitive>(input)) {
+        return selectFunction<FloatFunction<Kind, types::UInt64::Primitive>>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<types::Double::Primitive>(input)) {
+        return selectFunction<FloatFunction<Kind, types::Double::Primitive>>(input, inputNullable, memory, result);
+    } else if (readsTaggedCells(input)) {
+        return selectTaggedCellFunction<TaggedFloatFunction<Kind>>(input, inputNullable, memory, result);
+    }
+
+    throw IRException("A numeric function reads an integer or a double column");
+}
+
+template NLUnaryFunctionKernel NLExecutor::selectNumberFunction<AbsFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectNumberFunction<SignFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Ceil>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Floor>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Round>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Sqrt>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Exp>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Log>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Log10>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Sin>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Cos>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Tan>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Cot>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Asin>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Acos>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Atan>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Degrees>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Radians>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFloatFunction<FloatFunctionKind::Haversin>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+
+template NLUnaryFunctionKernel NLExecutor::selectFunction<LabelsFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<EdgeTypesFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<StartNodeFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<EndNodeFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<ToDateTimeFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<EpochSecondsToDateTimeFunction<types::Int64::Primitive>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<EpochSecondsToDateTimeFunction<types::UInt64::Primitive>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<MicrosecondsToDurationFunction<types::Int64::Primitive>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<MicrosecondsToDurationFunction<types::UInt64::Primitive>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<MapToDurationFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Year>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Month>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Day>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Hour>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Minute>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Second>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Millisecond>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Microsecond>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Years>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Quarters>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Months>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Weeks>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Days>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Hours>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Minutes>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Seconds>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Milliseconds>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Microseconds>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::QuartersOfYear>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MonthsOfYear>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MonthsOfQuarter>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::DaysOfWeek>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MinutesOfHour>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::SecondsOfMinute>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MillisecondsOfSecond>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MicrosecondsOfSecond>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<ListHeadFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<ListLastFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<ListTailFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<CharLengthFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<ToUpperFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<ToLowerFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<TrimFunction<TrimSide::Start>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<TrimFunction<TrimSide::End>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<TrimFunction<TrimSide::Both>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFC>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFD>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFKC>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<NormalizeFunction<UnicodeNormalForm::NFKD>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<IsNormalizedFunction<UnicodeNormalForm::NFC>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<IsNormalizedFunction<UnicodeNormalForm::NFD>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<IsNormalizedFunction<UnicodeNormalForm::NFKC>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<IsNormalizedFunction<UnicodeNormalForm::NFKD>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+
+template NLUnaryFunctionKernel NLExecutor::selectConversion<ToIntegerFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectConversion<ToFloatFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectConversion<ToStringFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectConversion<ToBoolFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+
+template <auto StrictSelector, typename TaggedFunctor>
+NLUnaryFunctionKernel NLExecutor::selectOrNull(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (readsTaggedCells(input)) {
+        return selectTaggedCellFunction<TaggedFunctor>(input, inputNullable, memory, result);
+    }
+
+    return StrictSelector(input, inputNullable, memory, result);
+}
+
+template NLUnaryFunctionKernel NLExecutor::selectOrNull<&NLExecutor::selectConversion<ToIntegerFunction>, TaggedToIntegerOrNullFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectOrNull<&NLExecutor::selectConversion<ToFloatFunction>, TaggedToFloatOrNullFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectOrNull<&NLExecutor::selectConversion<ToBoolFunction>, TaggedToBooleanOrNullFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectOrNull<&NLExecutor::selectConversion<ToStringFunction>, TaggedToStringOrNullFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+
+void NLExecutor::runSortReset(NLExecutionContext* context, NLFunctionData* data) {
+    const NLSortResetData* reset = static_cast<NLSortResetData*>(data);
+    reset->getState()->reset();
+}
+
+void NLExecutor::runSortCollect(NLExecutionContext* context, NLFunctionData* data) {
+    const NLSortCollectData* collect = static_cast<NLSortCollectData*>(data);
+
+    // Append this step's chunk of every column onto its buffer's tail; the
+    // columns are taken together so the buffers stay row-aligned.
+    for (const NLSortCollectData::Append& append : collect->appends()) {
+        appendCollectedChunk(append, collect->getState()->values());
+    }
+
+    // For a bounded (top-K) accumulator, drop all but the best k once the buffers
+    // have grown past the bound, so memory stays O(k) rather than O(rows). A
+    // no-op for an unbounded sort.
+    collect->getState()->trimIfNeeded();
+}
+
+void NLExecutor::runSortLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLSortLoopData* loopData = static_cast<NLSortLoopData*>(data);
+    NLSortState* state = loopData->getState();
+
+    // Sort the accumulated rows once: the permutation is the global row order the
+    // emit chunks read in.
+    state->sort();
+    const std::vector<size_t>& permutation = state->permutation().getRaw();
+    const size_t totalRows = permutation.size();
+
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    const size_t chunkSize = context->getChunkSize();
+    ColumnVector<size_t>* indices = loopData->getIndices();
+
+    const NLLimitState* limit = loopData->getLimit();
+
+    // Re-chunk the sorted rows: each step gathers the next chunkSize rows, in
+    // permutation order, into the loop variables, then runs the body (nl.output).
+    // The last chunk may be partial; an empty result runs the body zero times.
+    const auto runIteration = [&](size_t offset) {
+        const size_t stepRows = std::min(chunkSize, totalRows - offset);
+
+        std::vector<size_t>& indicesRaw = indices->getRaw();
+        indicesRaw.assign(permutation.begin() + offset, permutation.begin() + offset + stepRows);
+
+        for (const NLCarriedColumn& column : loopData->columns()) {
+            const NLGatherFunction gather = column.getGatherFunc();
+            gather(column.getInput(), indices, column.getOutput());
+        }
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        for (size_t offset = 0; offset < totalRows && limit->getRemaining() > 0; offset += chunkSize) {
+            runIteration(offset);
+        }
+    } else {
+        for (size_t offset = 0; offset < totalRows; offset += chunkSize) {
+            runIteration(offset);
+        }
+    }
+}
+
+void NLExecutor::runRowReset(NLExecutionContext* context, NLFunctionData* data) {
+    const NLRowResetData* reset = static_cast<NLRowResetData*>(data);
+    reset->getState()->reset();
+}
+
+void NLExecutor::runRowCollect(NLExecutionContext* context, NLFunctionData* data) {
+    const NLRowCollectData* collect = static_cast<NLRowCollectData*>(data);
+
+    for (const NLSortCollectData::Append& append : collect->appends()) {
+        appendCollectedChunk(append, collect->getState()->values());
+    }
+}
+
+void NLExecutor::runRowLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLRowLoopData* loopData = static_cast<NLRowLoopData*>(data);
+    const size_t totalRows = loopData->getState()->getRowCount();
+
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    const size_t chunkSize = context->getChunkSize();
+    ColumnVector<size_t>* indices = loopData->getIndices();
+
+    const NLLimitState* limit = loopData->getLimit();
+
+    const auto runIteration = [&](size_t offset) {
+        const size_t stepRows = std::min(chunkSize, totalRows - offset);
+
+        std::vector<size_t>& indicesRaw = indices->getRaw();
+        indicesRaw.resize(stepRows);
+        std::iota(indicesRaw.begin(), indicesRaw.end(), offset);
+
+        for (const NLCarriedColumn& column : loopData->columns()) {
+            const NLGatherFunction gather = column.getGatherFunc();
+            gather(column.getInput(), indices, column.getOutput());
+        }
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        for (size_t offset = 0; offset < totalRows && limit->getRemaining() > 0; offset += chunkSize) {
+            runIteration(offset);
+        }
+    } else {
+        for (size_t offset = 0; offset < totalRows; offset += chunkSize) {
+            runIteration(offset);
+        }
+    }
+}
+
+void NLExecutor::runOptionalReset(NLExecutionContext* context, NLFunctionData* data) {
+    NLOptionalResetData* reset = static_cast<NLOptionalResetData*>(data);
+    NLOptionalState* state = reset->getState();
+
+    state->reset();
+
+    // The tag holds each input row's position, so the pattern carries it the way it
+    // carries any other column and the collect reads the rows it matched off it.
+    std::vector<uint64_t>& tagRaw = reset->getTag()->getRaw();
+    tagRaw.resize(state->getRowCount());
+    std::iota(tagRaw.begin(), tagRaw.end(), uint64_t {0});
+}
+
+void NLExecutor::runOptionalCollect(NLExecutionContext* context, NLFunctionData* data) {
+    NLOptionalCollectData* collect = static_cast<NLOptionalCollectData*>(data);
+    NLOptionalState* state = collect->getState();
+
+    for (const NLSortCollectData::Append& append : collect->appends()) {
+        appendCollectedChunk(append, collect->getState()->values());
+    }
+
+    const ColumnVector<uint64_t>* tag = collect->getTag();
+    if (!tag) {
+        // No input row to tag: the step is the single empty row, which this step's rows
+        // match - and a predicate that cut them all leaves nothing to match it.
+        const std::vector<NLSortCollectData::Append>& appends = collect->appends();
+        bioassert(!appends.empty(), "nl.optional_collect needs at least one column");
+
+        if (appends.front()._input->size() > 0) {
+            state->markMatched(0);
+        }
+
+        return;
+    }
+
+    for (const uint64_t row : tag->getRaw()) {
+        state->markMatched(row);
+    }
+}
+
+void NLExecutor::runOptionalDrainLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLOptionalDrainLoopData* loopData = static_cast<NLOptionalDrainLoopData*>(data);
+    NLOptionalState* state = loopData->getState();
+
+    const NLStmtContainer* loopBody = loopData->getStmts();
+    const size_t chunkSize = context->getChunkSize();
+    ColumnVector<size_t>* indices = loopData->getIndices();
+    std::vector<size_t>& indicesRaw = indices->getRaw();
+
+    const NLLimitState* limit = loopData->getLimit();
+    const auto budgetLeft = [&]() { return !limit || limit->getRemaining() > 0; };
+
+    // The rows the pattern matched, re-chunked out of the buffers the collect grew. A
+    // chunk never mixes them with the padded ones: the two are gathered from different
+    // columns, so each step reads one or the other.
+    const size_t matchedRows = state->getMatchedRowCount();
+    for (size_t offset = 0; offset < matchedRows && budgetLeft(); offset += chunkSize) {
+        const size_t stepRows = std::min(chunkSize, matchedRows - offset);
+
+        indicesRaw.resize(stepRows);
+        std::iota(indicesRaw.begin(), indicesRaw.end(), offset);
+
+        for (const NLOptionalDrainLoopData::DrainColumn& column : loopData->columns()) {
+            column._gather(column._buffer, indices, column._output);
+        }
+
+        runBody(context, loopBody);
+    }
+
+    // Then one row per input row nothing matched: its own values in the columns the
+    // pattern joined onto, and null in the ones the pattern binds.
+    const std::vector<size_t>& missedRaw = state->missedRows().getRaw();
+    const size_t missedRows = missedRaw.size();
+    for (size_t offset = 0; offset < missedRows && budgetLeft(); offset += chunkSize) {
+        const size_t stepRows = std::min(chunkSize, missedRows - offset);
+
+        indicesRaw.assign(missedRaw.begin() + offset, missedRaw.begin() + offset + stepRows);
+
+        for (const NLOptionalDrainLoopData::DrainColumn& column : loopData->columns()) {
+            if (column._input) {
+                column._gather(column._input, indices, column._output);
+            } else {
+                column._fillNull(column._output, stepRows);
+            }
+        }
+
+        runBody(context, loopBody);
+    }
+}
+
+void NLExecutor::runSubqueryExpressionReset(NLExecutionContext* context, NLFunctionData* data) {
+    NLSubqueryExpressionResetData* reset = static_cast<NLSubqueryExpressionResetData*>(data);
+    NLSubqueryExpressionState* state = reset->getState();
+
+    state->reset();
+
+    // The tag holds each input row's position, so the body carries it the way it carries
+    // any other column and the mark reads the rows it reached off it.
+    std::vector<uint64_t>& tagRaw = reset->getTag()->getRaw();
+    tagRaw.resize(state->getRowCount());
+    std::iota(tagRaw.begin(), tagRaw.end(), uint64_t {0});
+}
+
+void NLExecutor::runExistsMark(NLExecutionContext* context, NLFunctionData* data) {
+    NLExistsMarkData* mark = static_cast<NLExistsMarkData*>(data);
+    NLExistsState* state = mark->getState();
+
+    const ColumnVector<uint64_t>* tag = mark->getTag();
+    if (!tag) {
+        // No input row to tag: the step is the single empty row, which this step's rows
+        // mark - and a predicate that cut them all leaves nothing to mark it.
+        const std::vector<const Column*>& columns = mark->columns();
+        bioassert(!columns.empty(), "nl.exists_mark needs at least one column when it has no tag");
+
+        if (columns.front()->size() > 0) {
+            state->markMatched(0);
+        }
+
+        return;
+    }
+
+    for (const uint64_t row : tag->getRaw()) {
+        state->markMatched(row);
+    }
+}
+
+void NLExecutor::runExistsResult(NLExecutionContext* context, NLFunctionData* data) {
+    NLExistsResultData* result = static_cast<NLExistsResultData*>(data);
+    const NLExistsState* state = result->getState();
+
+    const std::vector<bool>& matched = state->matched();
+
+    std::vector<ColumnMask::Bool_t>& answer = result->getResult()->getRaw();
+    answer.resize(matched.size());
+
+    std::copy(matched.begin(), matched.end(), answer.begin());
+}
+
+void NLExecutor::runCountSubqueryTally(NLExecutionContext* context, NLFunctionData* data) {
+    NLCountSubqueryTallyData* tally = static_cast<NLCountSubqueryTallyData*>(data);
+    NLCountSubqueryState* state = tally->getState();
+
+    const ColumnVector<uint64_t>* tag = tally->getTag();
+    if (!tag) {
+        const Column* rows = tally->getRows();
+        state->addRows(rows->size());
+
+        return;
+    }
+
+    state->addTaggedRows(tag->getRaw());
+}
+
+void NLExecutor::runCountSubqueryResult(NLExecutionContext* context, NLFunctionData* data) {
+    NLCountSubqueryResultData* result = static_cast<NLCountSubqueryResultData*>(data);
+    const NLCountSubqueryState* state = result->getState();
+
+    const std::vector<uint64_t>& counts = state->getCounts();
+
+    std::vector<uint64_t>& answer = result->getResult()->getRaw();
+    answer.resize(counts.size());
+
+    std::copy(counts.begin(), counts.end(), answer.begin());
+}
+
+void NLExecutor::runDistinctReset(NLExecutionContext* context, NLFunctionData* data) {
+    const NLDistinctResetData* reset = static_cast<NLDistinctResetData*>(data);
+    reset->getState()->reset();
+}
+
+void NLExecutor::runDistinctFilter(NLExecutionContext* context, NLFunctionData* data) {
+    NLDistinctFilterData* filter = static_cast<NLDistinctFilterData*>(data);
+    NLDistinctState* state = filter->getState();
+
+    const std::vector<NLDistinctFilterData::FilterColumn>& columns = filter->columns();
+    bioassert(!columns.empty(), "nl.distinct_filter needs at least one column");
+
+    // Every column is row-aligned, so the first sizes this step's row set.
+    const size_t rowCount = columns.front()._input->size();
+
+    // Collect this step's surviving row indices: a row survives iff its key - the
+    // concatenation of every column's serialized value at that row - is new to the
+    // seen-set. insertIfNew both tests membership and records the new key, so a
+    // duplicate later in the same chunk is caught by an earlier row of it too.
+    ColumnVector<size_t>* indices = filter->getIndices();
+    std::vector<size_t>& survivingRaw = indices->getRaw();
+    survivingRaw.clear();
+
+    std::string* key = filter->getKeyScratch();
+    for (size_t row = 0; row < rowCount; row++) {
+        key->clear();
+        for (const NLDistinctFilterData::FilterColumn& column : columns) {
+            column._keyAppend(column._input, row, *key);
+        }
+
+        if (state->insertIfNew(*key)) {
+            survivingRaw.push_back(row);
+        }
+    }
+
+    // Gather the survivors into the fresh output chunks, in first-seen order, so a
+    // downstream consumer reads a genuinely deduped chunk.
+    for (const NLDistinctFilterData::FilterColumn& column : columns) {
+        column._gather(column._input, indices, column._output);
+    }
+}
+
+void NLExecutor::runHashJoinReset(NLExecutionContext* context, NLFunctionData* data) {
+    const NLHashJoinResetData* reset = static_cast<NLHashJoinResetData*>(data);
+    reset->getState()->reset();
+}
+
+void NLExecutor::runHashJoinCollect(NLExecutionContext* context, NLFunctionData* data) {
+    NLHashJoinCollectData* collect = static_cast<NLHashJoinCollectData*>(data);
+    NLHashJoinState* state = collect->getState();
+    NLHashJoinIndex& index = state->getIndex();
+
+    const Column* key = collect->getKeyColumn();
+    const size_t rowCount = key->size();
+    const size_t firstRow = index.getRowCount();
+
+    const NLKeyHashFunction hashKeys = collect->getKeyHash();
+    std::vector<uint64_t>& hashes = *collect->getHashScratch();
+    hashKeys(key, hashes);
+
+    // Appending before indexing puts every row a key could join with in the buffer, so a
+    // new row's key is compared against one already indexed through that buffer alone.
+    for (const NLSortCollectData::Append& append : collect->appends()) {
+        appendCollectedChunk(append, state->values());
+    }
+
+    index.addRows(rowCount);
+
+    const Column* buildKey = collect->getBuildKeyColumn();
+    const NLKeyEqualFunction keyEqual = collect->getKeyEqual();
+    const NLKeyIsMatchableFunction keyIsMatchable = collect->getKeyIsMatchable();
+
+    // A key no probe key can match - a null, a NaN - is indexed under nothing, so no probe
+    // row reaches it.
+    for (size_t row = 0; row < rowCount; row++) {
+        if (!keyIsMatchable(key, row)) {
+            continue;
+        }
+
+        const uint64_t hash = hashes[row];
+        const size_t bufferRow = firstRow + row;
+        const size_t group = findKeyGroup(index, hash, buildKey, bufferRow, buildKey, keyEqual);
+
+        if (group == NLHashJoinIndex::noRow) {
+            index.openGroup(bufferRow, hash);
+        } else {
+            index.addToGroup(group, bufferRow);
+        }
+    }
+}
+
+void NLExecutor::runHashJoinProbeLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLHashJoinProbeLoopData* probe = static_cast<NLHashJoinProbeLoopData*>(data);
+    const NLHashJoinState* state = probe->getState();
+    const NLHashJoinIndex& index = state->getIndex();
+
+    const Column* key = probe->getKeyColumn();
+    const Column* buildKey = probe->getBuildKeyColumn();
+    const size_t rowCount = key->size();
+
+    const NLKeyHashFunction hashKeys = probe->getKeyHash();
+    const NLKeyEqualFunction keyEqual = probe->getKeyEqual();
+    const NLKeyIsMatchableFunction keyIsMatchable = probe->getKeyIsMatchable();
+
+    std::vector<uint64_t>& hashes = *probe->getHashScratch();
+    hashKeys(key, hashes);
+
+    ColumnVector<size_t>* probeIndices = probe->getProbeIndices();
+    ColumnVector<size_t>* buildIndices = probe->getBuildIndices();
+    std::vector<size_t>& probeRaw = probeIndices->getRaw();
+    std::vector<size_t>& buildRaw = buildIndices->getRaw();
+
+    const size_t chunkSize = context->getChunkSize();
+    const NLLimitState* limit = probe->getLimit();
+    const NLStmtContainer* loopBody = probe->getStmts();
+
+    // Walk the pairs a chunk at a time, holding the probe row reached and the next row of
+    // its group to pair, so a step can start and end partway through one row's matches.
+    // noRow with nothing left to pair is what advances the probe row.
+    size_t probeRow = 0;
+    size_t match = NLHashJoinIndex::noRow;
+    bool inGroup = false;
+
+    while (probeRow < rowCount) {
+        const size_t remaining = limit ? limit->getRemaining() : chunkSize;
+        if (remaining == 0) {
+            return;
+        }
+
+        const size_t stepBudget = std::min(chunkSize, remaining);
+
+        probeRaw.clear();
+        buildRaw.clear();
+
+        while (probeRow < rowCount && probeRaw.size() < stepBudget) {
+            if (!inGroup) {
+                if (!keyIsMatchable(key, probeRow)) {
+                    probeRow++;
+                    continue;
+                }
+
+                match = findKeyGroup(index, hashes[probeRow], key, probeRow, buildKey, keyEqual);
+                inGroup = true;
+            }
+
+            // Every row of the group carries the key this probe row matched, so the group
+            // is walked without comparing again.
+            while (match != NLHashJoinIndex::noRow && probeRaw.size() < stepBudget) {
+                probeRaw.push_back(probeRow);
+                buildRaw.push_back(match);
+
+                match = index.getNextInGroup(match);
+            }
+
+            if (match == NLHashJoinIndex::noRow) {
+                probeRow++;
+                inGroup = false;
+            }
+        }
+
+        if (probeRaw.empty()) {
+            return;
+        }
+
+        for (const NLCarriedColumn& column : probe->probeColumns()) {
+            const NLGatherFunction gather = column.getGatherFunc();
+            gather(column.getInput(), probeIndices, column.getOutput());
+        }
+
+        for (const NLCarriedColumn& column : probe->buildColumns()) {
+            const NLGatherFunction gather = column.getGatherFunc();
+            gather(column.getInput(), buildIndices, column.getOutput());
+        }
+
+        runBody(context, loopBody);
+    }
+}
+
+void NLExecutor::runFilter(NLExecutionContext* context, NLFunctionData* data) {
+    NLFilterData* filter = static_cast<NLFilterData*>(data);
+
+    const std::vector<NLFilterData::FilterColumn>& columns = filter->columns();
+    bioassert(!columns.empty(), "nl.filter needs at least one column");
+
+    const Column* mask = filter->getMask();
+
+    // Special case for a ColumnConst<Bool> mask where all rows are either kept or
+    // filtered
+    if (isMaskConstant(mask)) {
+        const auto* constMask = static_cast<const ColumnConst<CustomBool>*>(mask);
+        const bool passes = !constMask->empty() && constMask->getRaw()._boolean;
+
+        for (const NLFilterData::FilterColumn& column : columns) {
+            if (passes) {
+                column._output->assign(column._input);
+            } else {
+                column._output->clear();
+            }
+        }
+        return;
+    }
+
+    // General case: Otherwise apply the mask to each column
+    ColumnVector<size_t>* indices = filter->getIndices();
+    indices->getRaw().clear();
+    filter->getSurvivors()(mask, indices);
+
+    for (const NLFilterData::FilterColumn& column : columns) {
+        column._gather(column._input, indices, column._output);
+    }
+}
+
+void NLExecutor::runFetchNodes(NLExecutionContext* context, NLFunctionData* data) {
+    NLFetchNodesData* fetch = static_cast<NLFetchNodesData*>(data);
+
+    ColumnVector<size_t>* indices = fetch->getIndices();
+    ColumnNodeIDs* nodes = fetch->getNodes();
+
+    indices->getRaw().clear();
+    nodes->getRaw().clear();
+
+    fetch->getFetch()(fetch->getIDs(), context, indices, nodes);
+
+    for (const NLFilterData::FilterColumn& column : fetch->getColumns()) {
+        column._gather(column._input, indices, column._output);
+    }
+}
+
+void NLExecutor::runCountReset(NLExecutionContext* context, NLFunctionData* data) {
+    const NLCountResetData* reset = static_cast<NLCountResetData*>(data);
+    reset->getState()->reset();
+}
+
+void NLExecutor::runCountUpdate(NLExecutionContext* context, NLFunctionData* data) {
+    const NLCountUpdateData* update = static_cast<NLCountUpdateData*>(data);
+
+    // Charge this step's non-null rows: the handle returns all rows for an ID
+    // chunk, the present values for a nullable value chunk.
+    const NLCountFunction count = update->getCount();
+    update->getState()->add(count(update->getRows()));
+}
+
+void NLExecutor::runCountResult(NLExecutionContext* context, NLFunctionData* data) {
+    const NLCountResultData* result = static_cast<NLCountResultData*>(data);
+
+    // The aggregate collapses every counted row to a single result row: write the
+    // final tally into the output chunk as one unsigned i64 (the !nl.chunk<ui64>
+    // count column). Runs after the producing loop, so the counter holds the whole
+    // dataflow's count; nl.output emits this chunk at function scope.
+    const size_t count = result->getState()->getCount();
+    ColumnVector<uint64_t>* output = static_cast<ColumnVector<uint64_t>*>(result->getOutput());
+    std::vector<uint64_t>& raw = output->getRaw();
+    raw.assign(1, static_cast<uint64_t>(count));
+}
+
+void NLExecutor::runCountScanRows(NLExecutionContext* context, NLFunctionData* data) {
+    const NLCountScanRowsData* scanRows = static_cast<NLCountScanRowsData*>(data);
+
+    ColumnVector<uint64_t>* output = static_cast<ColumnVector<uint64_t>*>(scanRows->getOutput());
+    std::vector<uint64_t>& raw = output->getRaw();
+
+    // A conjunction naming a label, or a property, the schema never had matches no node, so
+    // the scan it stands for contributes no row and the product is empty.
+    if (!scanRows->isMatchable()) {
+        raw.assign(1, 0);
+        return;
+    }
+
+    // Each scan contributes the nodes carrying its labels, and crossed together they make
+    // the product of those counts. An empty conjunction filters nothing, so its scan is
+    // every node of the graph; a named property narrows the one scan it is read from to the
+    // nodes that hold it, which is what count(b.name) tallies over a product.
+    const GraphReader reader(*context->getView());
+    const std::span<const LabelSet> labelSets = scanRows->getLabelSets();
+    const PropertyTypeID propertyTypeID = scanRows->getPropertyTypeID();
+    const size_t propertyScan = scanRows->getPropertyScan();
+
+    size_t rows = 1;
+    for (size_t scanIndex = 0; scanIndex < labelSets.size(); scanIndex++) {
+        const LabelSet& labelset = labelSets[scanIndex];
+        const LabelSetHandle labelsetHandle {labelset};
+
+        if (propertyTypeID.isValid() && scanIndex == propertyScan) {
+            rows *= reader.getNodeCountWithProperty(labelsetHandle, propertyTypeID);
+        } else if (labelset.empty()) {
+            rows *= reader.getNodeCount();
+        } else {
+            rows *= reader.getNodeCountMatchingLabelset(labelsetHandle);
+        }
+    }
+
+    raw.assign(1, static_cast<uint64_t>(rows));
+}
+
+void NLExecutor::runAggregateReset(NLExecutionContext* context, NLFunctionData* data) {
+    const NLAggregateResetData* reset = static_cast<NLAggregateResetData*>(data);
+    reset->getReset()(reset->getState());
+}
+
+void NLExecutor::runAggregateUpdate(NLExecutionContext* context, NLFunctionData* data) {
+    const NLAggregateUpdateData* update = static_cast<NLAggregateUpdateData*>(data);
+
+    // Fold this step's non-null values into the accumulator the way its kind and
+    // value type demand (add for sum/avg, keep the extreme for min/max).
+    update->getUpdate()(update->getState(), update->getInput());
+}
+
+void NLExecutor::runAggregateResult(NLExecutionContext* context, NLFunctionData* data) {
+    const NLAggregateResultData* result = static_cast<NLAggregateResultData*>(data);
+
+    // The aggregate collapses every folded row to a single result row: write the
+    // reduced value into the output chunk's one nullable row. Runs after the
+    // producing loop, so the accumulator holds the whole dataflow's reduction;
+    // nl.output emits this chunk at function scope.
+    result->getResult()(result->getState(), result->getOutput());
+}
+
+void NLExecutor::runGroupAggregateReset(NLExecutionContext* context, NLFunctionData* data) {
+    const NLGroupAggregateResetData* reset = static_cast<NLGroupAggregateResetData*>(data);
+    reset->getState()->reset();
+}
+
+void NLExecutor::runGroupAggregateUpdate(NLExecutionContext* context, NLFunctionData* data) {
+    NLGroupAggregateUpdateData* update = static_cast<NLGroupAggregateUpdateData*>(data);
+    NLGroupAggregateState* state = update->getState();
+
+    std::vector<NLGroupAggregateState::KeyColumn>& keyColumns = state->keyColumns();
+    std::vector<NLGroupAggregateState::Aggregate>& aggregates = state->aggregates();
+    bioassert(!keyColumns.empty(), "nl.group_aggregate_update needs at least one grouping key");
+
+    // Every column is row-aligned, so the first grouping key sizes this step's rows.
+    const size_t rowCount = keyColumns.front()._input->size();
+
+    // That alignment is this step's precondition, not a property of the op's types:
+    // the group assignment is computed once per key row, then indexed by each fold as
+    // it walks its own input, so a column of another length folds rows into the wrong
+    // group - or, when it is the longer one, reads past the assignments entirely.
+    // Generated IR places the update where every column is bound together, so a
+    // mismatch here means malformed IR.
+    for (const NLGroupAggregateState::KeyColumn& keyColumn : keyColumns) {
+        bioassert(keyColumn._input->size() == rowCount,
+                  "nl.group_aggregate_update grouping keys must be row-aligned");
+    }
+
+    for (const NLGroupAggregateState::Aggregate& aggregate : aggregates) {
+        bioassert(aggregate._input->size() == rowCount,
+                  "nl.group_aggregate_update aggregate inputs must be row-aligned with the grouping keys");
+    }
+
+    if (rowCount == 0) {
+        return;
+    }
+
+    // Assign each row to its group: serialize the grouping-key tuple, look it up,
+    // and on first sight create a new group (its index is the next group count) and
+    // record the row that created it, so the key buffers can take that row's values.
+    NLGroupTable& groupTable = state->groupTable();
+    std::vector<size_t>& groupIndices = state->groupIndicesScratch();
+    std::vector<size_t>& newGroupRows = state->newGroupRowsScratch();
+    std::string& key = state->keyScratch();
+
+    groupIndices.resize(rowCount);
+    newGroupRows.clear();
+
+    for (size_t row = 0; row < rowCount; row++) {
+        key.clear();
+        for (const NLGroupAggregateState::KeyColumn& keyColumn : keyColumns) {
+            keyColumn._keyAppend(keyColumn._input, row, key);
+        }
+
+        const NLGroupTable::Assignment assignment = groupTable.assign(key);
+        if (assignment._created) {
+            newGroupRows.push_back(row);
+        }
+
+        groupIndices[row] = assignment._index;
+    }
+
+    const size_t groupCount = groupTable.getGroupCount();
+
+    // Grow the key buffers with the new groups' key values, then grow every
+    // accumulator to the new group count - initializing the new groups to their
+    // reduction's identity - before folding this step's rows into their groups.
+    for (NLGroupAggregateState::KeyColumn& keyColumn : keyColumns) {
+        keyColumn._gatherAppend(keyColumn._input, newGroupRows, keyColumn._buffer, state->keyValues());
+    }
+
+    for (NLGroupAggregateState::Aggregate& aggregate : aggregates) {
+        aggregate._grow(aggregate._accumulator, aggregate._counts, groupCount);
+    }
+
+    NLValueStore& extremeValues = state->extremeValues();
+
+    for (NLGroupAggregateState::Aggregate& aggregate : aggregates) {
+        aggregate._fold(aggregate._accumulator,
+                        aggregate._counts,
+                        aggregate._input,
+                        groupIndices,
+                        aggregate._distinct,
+                        extremeValues);
+    }
+
+    state->compactExtremeValues();
+}
+
+void NLExecutor::runGroupAggregateLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLGroupAggregateLoopData* loopData = static_cast<NLGroupAggregateLoopData*>(data);
+    NLGroupAggregateState* state = loopData->getState();
+
+    const size_t totalGroups = state->groupTable().getGroupCount();
+    const size_t chunkSize = context->getChunkSize();
+    const NLStmtContainer* loopBody = loopData->getStmts();
+
+    std::vector<NLGroupAggregateState::KeyColumn>& keyColumns = state->keyColumns();
+    std::vector<NLGroupAggregateState::Aggregate>& aggregates = state->aggregates();
+
+    const NLLimitState* limit = loopData->getLimit();
+
+    // Re-chunk the accumulated groups: each step materializes the next chunk of
+    // group rows - the key values sliced from the buffers and each aggregate
+    // finalized from the per-group state - into the loop variables, then runs the
+    // body (the nl.output) per chunk. An empty result (no group) runs the body zero
+    // times, so a grouped aggregate over no row emits nothing.
+    const auto runIteration = [&](size_t offset) {
+        const size_t stepGroups = std::min(chunkSize, totalGroups - offset);
+
+        for (const NLGroupAggregateState::KeyColumn& keyColumn : keyColumns) {
+            keyColumn._emitCopy(keyColumn._buffer, offset, stepGroups, keyColumn._output);
+        }
+
+        for (const NLGroupAggregateState::Aggregate& aggregate : aggregates) {
+            aggregate._emit(aggregate._accumulator, aggregate._counts, offset, stepGroups, aggregate._output);
+        }
+
+        runBody(context, loopBody);
+    };
+
+    if (limit) {
+        for (size_t offset = 0; offset < totalGroups && limit->getRemaining() > 0; offset += chunkSize) {
+            runIteration(offset);
+        }
+    } else {
+        for (size_t offset = 0; offset < totalGroups; offset += chunkSize) {
+            runIteration(offset);
+        }
+    }
+}
+
+void NLExecutor::runCollectReset(NLExecutionContext* context, NLFunctionData* data) {
+    const NLCollectResetData* reset = static_cast<NLCollectResetData*>(data);
+    reset->getState()->reset();
+}
+
+void NLExecutor::runCollectUpdate(NLExecutionContext* context, NLFunctionData* data) {
+    NLCollectUpdateData* update = static_cast<NLCollectUpdateData*>(data);
+    NLCollectState* state = update->getState();
+
+    std::vector<NLCollectState::KeyColumn>& keyColumns = state->keyColumns();
+    std::vector<NLCollectState::ValueColumn>& valueColumns = state->valueColumns();
+
+    // Every column is row-aligned. With grouping keys the first key sizes this step's
+    // rows; ungrouped (no key), the first collected value column sizes it.
+    const size_t rowCount = keyColumns.empty() ? valueColumns.front()._input->size()
+                                               : keyColumns.front()._input->size();
+
+    // That alignment is this step's precondition, not a property of the op's types:
+    // the group assignment is computed once per key row, then indexed by the fold as it
+    // walks the value column, so a column of another length appends values to the wrong
+    // group - or, when the value column is the longer one, reads past the assignments
+    // entirely. Generated IR places the update where every column is bound together, so
+    // a mismatch here means malformed IR.
+    for (const NLCollectState::KeyColumn& keyColumn : keyColumns) {
+        bioassert(keyColumn._input->size() == rowCount,
+                  "nl.collect_update grouping keys must be row-aligned");
+    }
+
+    for (const NLCollectState::ValueColumn& valueColumn : valueColumns) {
+        bioassert(valueColumn._input->size() == rowCount,
+                  "nl.collect_update value columns must be row-aligned with the grouping keys");
+    }
+
+    std::vector<NLGroupAggregateState::Aggregate>& aggregates = state->aggregates();
+    for (const NLGroupAggregateState::Aggregate& aggregate : aggregates) {
+        bioassert(aggregate._input->size() == rowCount,
+                  "nl.collect_update aggregate inputs must be row-aligned with the grouping keys");
+    }
+
+    if (rowCount == 0) {
+        return;
+    }
+
+    // Assign each row to its group: serialize the grouping-key tuple, look it up, and
+    // on first sight create a new group (its index is the next group count) and record
+    // the row that created it, so the key buffers can take that row's values. With no
+    // grouping key the tuple is empty, so every row falls into the single group 0.
+    NLGroupTable& groupTable = state->groupTable();
+    std::vector<size_t>& groupIndices = state->groupIndicesScratch();
+    std::vector<size_t>& newGroupRows = state->newGroupRowsScratch();
+    std::string& key = state->keyScratch();
+
+    groupIndices.resize(rowCount);
+    newGroupRows.clear();
+
+    for (size_t row = 0; row < rowCount; row++) {
+        key.clear();
+        for (const NLCollectState::KeyColumn& keyColumn : keyColumns) {
+            keyColumn._keyAppend(keyColumn._input, row, key);
+        }
+
+        const NLGroupTable::Assignment assignment = groupTable.assign(key);
+        if (assignment._created) {
+            newGroupRows.push_back(row);
+        }
+
+        groupIndices[row] = assignment._index;
+    }
+
+    const size_t groupCount = groupTable.getGroupCount();
+
+    // Grow the key buffers with the new groups' key values, and the per-group position
+    // lists to the new group count, then append this step's present values to their
+    // groups' lists.
+    for (NLCollectState::KeyColumn& keyColumn : keyColumns) {
+        keyColumn._gatherAppend(keyColumn._input, newGroupRows, keyColumn._buffer, state->keyValues());
+    }
+
+    for (NLCollectState::ValueColumn& valueColumn : valueColumns) {
+        valueColumn._groupPositions.resize(groupCount);
+
+        valueColumn._fold(valueColumn._buffer,
+                          valueColumn._input,
+                          groupIndices,
+                          valueColumn._groupPositions,
+                          valueColumn._distinct,
+                          state->collectedValues());
+    }
+
+    // The reductions taken over the same groups fold beside the list, off the group
+    // assignment computed once above, exactly as nl.group_aggregate_update folds them.
+    for (NLGroupAggregateState::Aggregate& aggregate : aggregates) {
+        aggregate._grow(aggregate._accumulator, aggregate._counts, groupCount);
+    }
+
+    NLValueStore& extremeValues = state->extremeValues();
+
+    for (NLGroupAggregateState::Aggregate& aggregate : aggregates) {
+        aggregate._fold(aggregate._accumulator,
+                        aggregate._counts,
+                        aggregate._input,
+                        groupIndices,
+                        aggregate._distinct,
+                        extremeValues);
+    }
+
+    state->compactExtremeValues();
+}
+
+// Only the scalar value types are collectable for now; an embedding column (a span of
+// floats per row) has no owned primitive to buffer, so it is rejected here rather than
+// silently mishandled.
+NLCollectFoldFunction NLExecutor::selectCollectFold(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &collectFold<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &collectFold<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &collectFold<types::Double::Primitive>;
+        break;
+
+        case ValueType::Bool:
+            return &collectFold<types::Bool::Primitive>;
+        break;
+
+        case ValueType::String:
+            return &collectFold<types::String::Primitive>;
+        break;
+
+        case ValueType::List:
+            return &collectFold<ListView>;
+        break;
+
+        case ValueType::DateTime:
+            return &collectFold<types::DateTime::Primitive>;
+        break;
+
+        case ValueType::Duration:
+            return &collectFold<types::Duration::Primitive>;
+        break;
+
+        default:
+            throw IRException("collect does not support this value type");
+        break;
+    }
+
+    return nullptr;
+}
+
+// The collect(DISTINCT x) fold for a column of this value type: collect's own domain,
+// with each of a group's values buffered once. An embedding has no bytes to key on, and
+// no primitive to buffer either, so it is rejected for both reasons.
+NLCollectFoldFunction NLExecutor::selectCollectDistinctFold(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &collectFoldDistinct<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &collectFoldDistinct<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &collectFoldDistinct<types::Double::Primitive>;
+        break;
+
+        case ValueType::Bool:
+            return &collectFoldDistinct<types::Bool::Primitive>;
+        break;
+
+        case ValueType::String:
+            return &collectFoldDistinct<types::String::Primitive>;
+        break;
+
+        case ValueType::List:
+            return &collectFoldDistinct<ListView>;
+        break;
+
+        case ValueType::DateTime:
+            return &collectFoldDistinct<types::DateTime::Primitive>;
+        break;
+
+        case ValueType::Duration:
+            return &collectFoldDistinct<types::Duration::Primitive>;
+        break;
+
+        default:
+            throw IRException("collect does not support this value type");
+        break;
+    }
+
+    return nullptr;
+}
+
+NLUnwindElementCountFunction NLExecutor::selectListUnwindElementCount(bool sourceIsNullable) {
+    return sourceIsNullable ? &unwindOptListElementCount : &unwindListElementCount;
+}
+
+NLUnwindElementCountFunction NLExecutor::selectOptUnwindElementCount(ValueType valueType) {
+    NLUnwindElementCountFunction selected = nullptr;
+
+    const auto select = [&]<SupportedType T>() {
+        selected = &unwindOptElementCount<typename T::Primitive>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return selected;
+}
+
+NLUnwindElementCountFunction NLExecutor::selectValueUnwindElementCount() {
+    return &unwindValueElementCount;
+}
+
+NLUnwindElementEmitFunction NLExecutor::selectListUnwindElementEmit(bool sourceIsNullable) {
+    return sourceIsNullable ? &unwindListElementEmit<ColumnOptVector<ListView>>
+                            : &unwindListElementEmit<ColumnVector<ListView>>;
+}
+
+NLUnwindElementEmitFunction NLExecutor::selectListUnwindValueEmit(bool sourceIsNullable, ValueType valueType) {
+    NLUnwindElementEmitFunction selected = nullptr;
+
+    const auto select = [&]<SupportedType T>() {
+        selected = sourceIsNullable
+                       ? &unwindListValueEmit<ColumnOptVector<ListView>, typename T::Primitive>
+                       : &unwindListValueEmit<ColumnVector<ListView>, typename T::Primitive>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return selected;
+}
+
+NLUnwindElementEmitFunction NLExecutor::selectListUnwindNodeEmit(bool sourceIsNullable) {
+    return sourceIsNullable ? &unwindListValidIDEmit<ColumnOptVector<ListView>, NodeID>
+                            : &unwindListValidIDEmit<ColumnVector<ListView>, NodeID>;
+}
+
+NLUnwindElementEmitFunction NLExecutor::selectListUnwindEdgeEmit(bool sourceIsNullable) {
+    return sourceIsNullable ? &unwindListValidIDEmit<ColumnOptVector<ListView>, EdgeID>
+                            : &unwindListValidIDEmit<ColumnVector<ListView>, EdgeID>;
+}
+
+NLUnwindElementCountFunction NLExecutor::selectTaggedUnwindElementCount() {
+    return &unwindTaggedElementCount;
+}
+
+NLUnwindElementEmitFunction NLExecutor::selectTaggedUnwindElementEmit() {
+    return &unwindTaggedElementEmit;
+}
+
+NLUnwindElementCountFunction NLExecutor::selectOptTaggedUnwindElementCount() {
+    return &unwindOptTaggedElementCount;
+}
+
+NLUnwindElementEmitFunction NLExecutor::selectOptTaggedUnwindElementEmit() {
+    return &unwindOptTaggedElementEmit;
+}
+
+NLUnwindCollectValueEmitFunction NLExecutor::selectUnwindCollectValueEmit(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &unwindCollectValueEmit<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &unwindCollectValueEmit<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &unwindCollectValueEmit<types::Double::Primitive>;
+        break;
+
+        case ValueType::Bool:
+            return &unwindCollectValueEmit<types::Bool::Primitive>;
+        break;
+
+        case ValueType::String:
+            return &unwindCollectValueEmit<types::String::Primitive>;
+        break;
+
+        case ValueType::List:
+            return &unwindCollectValueEmit<ListView>;
+        break;
+
+        case ValueType::DateTime:
+            return &unwindCollectValueEmit<types::DateTime::Primitive>;
+        break;
+
+        case ValueType::Duration:
+            return &unwindCollectValueEmit<types::Duration::Primitive>;
+        break;
+
+        default:
+            throw IRException("unwind does not support this value type");
+        break;
+    }
+
+    return nullptr;
+}
+
+NLCollectListEmitFunction NLExecutor::selectCollectListEmit(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &collectListEmit<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &collectListEmit<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &collectListEmit<types::Double::Primitive>;
+        break;
+
+        case ValueType::Bool:
+            return &collectListEmit<types::Bool::Primitive>;
+        break;
+
+        case ValueType::String:
+            return &collectListEmit<types::String::Primitive>;
+        break;
+
+        case ValueType::List:
+            return &collectListEmit<ListView>;
+        break;
+
+        case ValueType::DateTime:
+            return &collectListEmit<types::DateTime::Primitive>;
+        break;
+
+        case ValueType::Duration:
+            return &collectListEmit<types::Duration::Primitive>;
+        break;
+
+        default:
+            throw IRException("collect does not support this value type");
+        break;
+    }
+
+    return nullptr;
+}
+
+void NLExecutor::selectCollectEntityHandlers(NLChunkKind kind,
+                                             bool distinctValues,
+                                             NLCollectFoldFunction& fold,
+                                             NLCollectListEmitFunction& listEmit) {
+    switch (kind) {
+        case NLChunkKind::NodeID:
+            return selectCollectIDHandlers<NodeID>(distinctValues, fold, listEmit);
+        break;
+
+        case NLChunkKind::EdgeID:
+            return selectCollectIDHandlers<EdgeID>(distinctValues, fold, listEmit);
+        break;
+
+        default:
+            throw IRException("collect does not support this chunk kind");
+        break;
+    }
+}
+
+void NLExecutor::selectCollectOptEntityHandlers(NLChunkKind kind,
+                                                bool distinctValues,
+                                                NLCollectFoldFunction& fold,
+                                                NLCollectListEmitFunction& listEmit) {
+    switch (kind) {
+        case NLChunkKind::NodeID:
+            return selectCollectOptIDHandlers<NodeID>(distinctValues, fold, listEmit);
+        break;
+
+        case NLChunkKind::EdgeID:
+            return selectCollectOptIDHandlers<EdgeID>(distinctValues, fold, listEmit);
+        break;
+
+        default:
+            throw IRException("collect does not support this chunk kind");
+        break;
+    }
+}
+
+// A list cell is present in every row, so it folds with no null to drop; only the dedup
+// differs, keying on the elements rather than on the cell.
+void NLExecutor::selectCollectListHandlers(bool distinctValues,
+                                           NLCollectFoldFunction& fold,
+                                           NLCollectListEmitFunction& listEmit) {
+    fold = distinctValues ? &collectListFoldDistinct : &collectCellFold<ListView>;
+    listEmit = &collectListEmit<ListView>;
+}
+
+void NLExecutor::selectCollectOptListHandlers(bool distinctValues,
+                                             NLCollectFoldFunction& fold,
+                                             NLCollectListEmitFunction& listEmit) {
+    fold = distinctValues ? &collectOptListFoldDistinct : &collectOptListFold;
+    listEmit = &collectListEmit<ListView>;
+}
+
+// A type-erased cell carries its own type, so the fold drops the ones tagged null and the
+// emit writes each survivor back under the type its tag names.
+void NLExecutor::selectCollectTaggedHandlers(bool distinctValues,
+                                             NLCollectFoldFunction& fold,
+                                             NLCollectListEmitFunction& listEmit) {
+    fold = distinctValues ? &collectTaggedFoldDistinct<ListElementView>
+                          : &collectTaggedFold<ListElementView>;
+    listEmit = &collectTaggedListEmit;
+}
+
+void NLExecutor::selectCollectOptTaggedHandlers(bool distinctValues,
+                                                NLCollectFoldFunction& fold,
+                                                NLCollectListEmitFunction& listEmit) {
+    fold = distinctValues ? &collectTaggedFoldDistinct<std::optional<ListElementView>>
+                          : &collectTaggedFold<std::optional<ListElementView>>;
+    listEmit = &collectTaggedListEmit;
+}
+
+void NLExecutor::runUnwindCollectLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLUnwindCollectLoopData* loopData = static_cast<NLUnwindCollectLoopData*>(data);
+    NLCollectState* state = loopData->getState();
+
+    const size_t chunkSize = context->getChunkSize();
+    const NLStmtContainer* loopBody = loopData->getStmts();
+
+    std::vector<NLCollectState::KeyColumn>& keyColumns = state->keyColumns();
+    NLCollectState::ValueColumn& unwound = state->unwoundColumn();
+    const std::vector<std::vector<size_t>>& groupPositions = unwound._groupPositions;
+    const size_t totalGroups = groupPositions.size();
+
+    ColumnVector<size_t>* groupIndices = loopData->getGroupIndices();
+    ColumnVector<size_t>* positions = loopData->getPositions();
+
+    // Walk every (group, element) pair in group order. currentGroup / indexInGroup is
+    // the cursor into that flattened sequence; empty groups (all values null) are
+    // skipped, so they contribute no row - matching UNWIND of an empty list.
+    size_t currentGroup = 0;
+    size_t indexInGroup = 0;
+    while (currentGroup < totalGroups && groupPositions[currentGroup].empty()) {
+        currentGroup++;
+    }
+
+    while (currentGroup < totalGroups) {
+        std::vector<size_t>& groupIndicesRaw = groupIndices->getRaw();
+        std::vector<size_t>& positionsRaw = positions->getRaw();
+        groupIndicesRaw.clear();
+        positionsRaw.clear();
+
+        // Fill up to chunkSize rows, each the next (group, element) pair.
+        while (groupIndicesRaw.size() < chunkSize && currentGroup < totalGroups) {
+            const std::vector<size_t>& groupPos = groupPositions[currentGroup];
+
+            groupIndicesRaw.push_back(currentGroup);
+            positionsRaw.push_back(groupPos[indexInGroup]);
+            indexInGroup++;
+
+            if (indexInGroup == groupPos.size()) {
+                indexInGroup = 0;
+                currentGroup++;
+                while (currentGroup < totalGroups && groupPositions[currentGroup].empty()) {
+                    currentGroup++;
+                }
+            }
+        }
+
+        // The key values repeat once per element (gather by the per-row group index);
+        // the element values come from the flat buffer at this chunk's positions.
+        for (const NLCollectState::KeyColumn& keyColumn : keyColumns) {
+            keyColumn._gather(keyColumn._buffer, groupIndices, keyColumn._output);
+        }
+
+        unwound._unwindCollectEmit(unwound._buffer, positions, unwound._output);
+
+        runBody(context, loopBody);
+    }
+}
+
+void NLExecutor::runCollectLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLCollectLoopData* loopData = static_cast<NLCollectLoopData*>(data);
+    NLCollectState* state = loopData->getState();
+
+    const size_t totalGroups = state->groupTable().getGroupCount();
+    const size_t chunkSize = context->getChunkSize();
+    const NLStmtContainer* loopBody = loopData->getStmts();
+
+    std::vector<NLCollectState::KeyColumn>& keyColumns = state->keyColumns();
+
+    // Re-chunk the groups: each step slices the next chunk of key values from the key
+    // buffers and materializes one list cell per group (a ListView over that group's
+    // run in the list buffer), then runs the body. A grouped collect over no row has no
+    // group, so the body runs zero times and it emits nothing; an ungrouped collect
+    // always carries the single group the reset created, so it emits exactly one row -
+    // holding the empty list when no value was folded.
+    for (size_t offset = 0; offset < totalGroups; offset += chunkSize) {
+        const size_t stepGroups = std::min(chunkSize, totalGroups - offset);
+
+        for (const NLCollectState::KeyColumn& keyColumn : keyColumns) {
+            keyColumn._emitCopy(keyColumn._buffer, offset, stepGroups, keyColumn._output);
+        }
+
+        for (NLCollectState::ValueColumn& valueColumn : state->valueColumns()) {
+            valueColumn._listEmit(valueColumn._buffer,
+                                  valueColumn._groupPositions,
+                                  offset,
+                                  stepGroups,
+                                  state->listBuffer(),
+                                  valueColumn._output);
+        }
+
+        for (const NLGroupAggregateState::Aggregate& aggregate : state->aggregates()) {
+            aggregate._emit(aggregate._accumulator, aggregate._counts, offset, stepGroups, aggregate._output);
+        }
+
+        runBody(context, loopBody);
+    }
+}
+
+void NLExecutor::runShortestPathReset(NLExecutionContext* context, NLFunctionData* data) {
+    const NLShortestPathResetData* reset = static_cast<NLShortestPathResetData*>(data);
+    reset->getState()->reset();
+}
+
+void NLExecutor::runShortestPathUpdate(NLExecutionContext* context, NLFunctionData* data) {
+    NLShortestPathUpdateData* update = static_cast<NLShortestPathUpdateData*>(data);
+    NLShortestPathState* state = update->getState();
+
+    const std::vector<NodeID>& nodes = update->getNodes()->getRaw();
+
+    // A target only needs to be a member; a source seeds the frontier at distance zero, so it
+    // goes through the typed accumulator.
+    if (update->isTarget()) {
+        state->targets().insert(nodes.begin(), nodes.end());
+    } else {
+        state->addSources(nodes);
+    }
+}
+
+void NLExecutor::runShortestPathLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLShortestPathLoopData* loopData = static_cast<NLShortestPathLoopData*>(data);
+
+    switch (loopData->getState()->getValueType()) {
+        case ValueType::Double:
+            return shortestPathSearch<types::Double>(context, loopData);
+        break;
+
+        case ValueType::Int64:
+            return shortestPathSearch<types::Int64>(context, loopData);
+        break;
+
+        case ValueType::UInt64:
+            return shortestPathSearch<types::UInt64>(context, loopData);
+        break;
+
+        default:
+            throw IRException("SHORTESTPATH weight must be an Int64, UInt64 or Double property");
+        break;
+    }
+}
+
+void NLExecutor::runProcedureInitLoop(NLExecutionContext* context, NLFunctionData* data) {
+    NLProcedureLoopData* loopData = static_cast<NLProcedureLoopData*>(data);
+    NLProcedureState* state = loopData->getState();
+
+    // This loop drives the procedure over one chunk of its arguments and is re-entered
+    // for the next chunk, so rewind it here: a procedure that finished the previous
+    // chunk starts afresh on this one, and its own per-drive state goes with it.
+    state->prepareOrResetForNewDrive();
+
+    runProcedureDrive(context, loopData, [state]() { state->execute(); });
+}
+
+NLFillNullFunction NLExecutor::selectFillNullFunction(NLChunkKind kind) {
+    NLFillNullFunction selected = nullptr;
+    dispatchChunkKind(kind, [&]<typename ElementType>() { selected = &fillNullColumn<ElementType>; });
+
+    return selected;
+}
+
+NLFillNullFunction NLExecutor::selectOptFillNullFunction(ValueType valueType) {
+    NLFillNullFunction fill = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        fill = &fillNullColumn<std::optional<typename T::Primitive>>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return fill;
+}
+
+NLFillNullFunction NLExecutor::selectOptFillNullFunction(NLChunkKind kind) {
+    NLFillNullFunction fill = nullptr;
+    dispatchIDChunkKind(kind, [&]<typename ID>() { fill = &fillNullColumn<std::optional<ID>>; });
+
+    return fill;
+}
+
+NLFillNullFunction NLExecutor::selectPlainFillNullFunction(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &fillNullColumn<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &fillNullColumn<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &fillNullColumn<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("a plain value column must be numeric");
+        break;
+    }
+}
+
+NLFillNullFunction NLExecutor::selectMaskFillNull() {
+    return &fillNullColumn<ColumnMask::Bool_t, ColumnMask>;
+}
+
+NLFillNullFunction NLExecutor::selectOptListFillNull() {
+    return &fillNullColumn<std::optional<ListView>>;
+}
+
+NLFillNullFunction NLExecutor::selectOptListElementFillNull() {
+    return &fillNullColumn<std::optional<ListElementView>>;
+}
+
+NLFillNullFunction NLExecutor::selectListElementFillNull() {
+    return &fillNullColumn<ListElementView>;
+}
+
+NLGatherFunction NLExecutor::selectGatherFunction(NLChunkKind kind) {
+    NLGatherFunction selected = nullptr;
+    dispatchChunkKind(kind, [&]<typename ElementType>() { selected = &gatherColumn<ElementType>; });
+
+    return selected;
+}
+
+NLGatherFunction NLExecutor::selectCountGatherFunction() {
+    return &gatherColumn<uint64_t>;
+}
+
+NLMaskSurvivorFunction NLExecutor::selectMaskSurvivorFunction(bool nullable, bool untypedNull, bool taggedCells) {
+    if (untypedNull) {
+        return &collectNoSurvivors;
+    } else if (taggedCells) {
+        return nullable ? &collectOptTaggedCellSurvivors : &collectTaggedCellSurvivors;
+    } else if (nullable) {
+        return &collectOptMaskSurvivors;
+    }
+
+    return &collectMaskSurvivors;
+}
+
+NLFetchNodesFunction NLExecutor::selectNodeFetchFunction(bool nullable) {
+    return nullable ? &fetchNamedNodes<std::optional<NodeID>> : &fetchNamedNodes<NodeID>;
+}
+
+NLFetchNodesFunction NLExecutor::selectIntegerFetchFunction(ValueType valueType, bool nullable) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return nullable ? &fetchNamedNodes<std::optional<types::Int64::Primitive>> : &fetchNamedNodes<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return nullable ? &fetchNamedNodes<std::optional<types::UInt64::Primitive>> : &fetchNamedNodes<types::UInt64::Primitive>;
+        break;
+
+        default:
+            throw IRException("nl.fetch_nodes reads node IDs out of nodes, integers or tagged cells");
+        break;
+    }
+}
+
+NLFetchNodesFunction NLExecutor::selectTaggedFetchFunction(bool nullable) {
+    return nullable ? &fetchNamedNodes<std::optional<ListElementView>> : &fetchNamedNodes<ListElementView>;
+}
+
+NLBroadcastFunction NLExecutor::selectBlockRepeatFunction(NLChunkKind kind) {
+    NLBroadcastFunction selected = nullptr;
+    dispatchChunkKind(kind, [&]<typename ElementType>() { selected = &blockRepeatColumn<ElementType>; });
+
+    return selected;
+}
+
+NLBroadcastFunction NLExecutor::selectCountBlockRepeatFunction() {
+    return &blockRepeatColumn<uint64_t>;
+}
+
+NLBroadcastFunction NLExecutor::selectConstBlockRepeatFunction() {
+    return &blockRepeatConstColumn;
+}
+
+NLBroadcastFunction NLExecutor::selectTileFunction(NLChunkKind kind) {
+    NLBroadcastFunction selected = nullptr;
+    dispatchChunkKind(kind, [&]<typename ElementType>() { selected = &tileColumn<ElementType>; });
+
+    return selected;
+}
+
+// A nullable value chunk is a ColumnOptVector<Primitive> - that is,
+// ColumnVector<std::optional<Primitive>> - so the same broadcast templates,
+// instantiated on std::optional<Primitive>, carry value and null together.
+NLBroadcastFunction NLExecutor::selectOptBlockRepeatFunction(ValueType valueType) {
+    NLBroadcastFunction broadcast = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        broadcast = &blockRepeatColumn<std::optional<typename T::Primitive>>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return broadcast;
+}
+
+NLBroadcastFunction NLExecutor::selectOptTileFunction(ValueType valueType) {
+    NLBroadcastFunction broadcast = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        broadcast = &tileColumn<std::optional<typename T::Primitive>>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return broadcast;
+}
+
+NLBroadcastConstantFunction NLExecutor::selectNullConstantBroadcast() {
+    return &broadcastNullColumn;
+}
+
+NLBroadcastConstantFunction NLExecutor::selectConstantListBroadcast() {
+    return &broadcastConstantViewColumn<ListView>;
+}
+
+NLBroadcastConstantFunction NLExecutor::selectConstantMapBroadcast() {
+    return &broadcastConstantViewColumn<MapView>;
+}
+
+NLBroadcastConstantFunction NLExecutor::selectConstantMapEntryBroadcast() {
+    return &broadcastConstantViewColumn<MapEntryView>;
+}
+
+NLBroadcastConstantFunction NLExecutor::selectOptListElementBroadcast(const Column* value) {
+    const bool isConst = value->getContainerKind() == ContainerKind::code<ColumnConst>();
+    const bool holdsOptional = value->getInternalKind() == InternalKind::code<std::optional<ListElementView>>();
+
+    // A tagged cell carries its own null, so head() and last() answer with a plain cell rather
+    // than an optional even where the chunk it is laid out over is a nullable one.
+    if (!isConst) {
+        return &broadcastSingleRowColumn<ListElementView>;
+    } else if (holdsOptional) {
+        return &broadcastNullableConstantColumn<ListElementView>;
+    }
+
+    return &broadcastConstantColumn<ListElementView>;
+}
+
+NLBroadcastConstantFunction NLExecutor::selectConstantBroadcast(ValueType valueType, const Column* value) {
+    const bool isConst = value->getContainerKind() == ContainerKind::code<ColumnConst>();
+
+    NLBroadcastConstantFunction fill = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        using Primitive = typename T::Primitive;
+
+        if (!isConst) {
+            fill = &broadcastSingleRowColumn<Primitive>;
+        } else if (value->getInternalKind() == InternalKind::code<std::optional<Primitive>>()) {
+            fill = &broadcastNullableConstantColumn<Primitive>;
+        } else {
+            fill = &broadcastConstantColumn<Primitive>;
+        }
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return fill;
+}
+
+NLUnaryFn NLExecutor::selectRowConstant(const Column* row, LocalMemory* memory, Column*& result) {
+    NLUnaryFn read = nullptr;
+
+    const auto selectForElement = [&]<typename Element>() {
+        if (!read && row->getKind() == ColumnVector<Element>::staticKind()) {
+            result = memory->alloc<ColumnConst<Element>>();
+            read = &readSingleRowAsConstant<Element>;
+        }
+    };
+
+    selectForElement.template operator()<types::Int64::Primitive>();
+    selectForElement.template operator()<types::UInt64::Primitive>();
+    selectForElement.template operator()<types::Double::Primitive>();
+    selectForElement.template operator()<types::String::Primitive>();
+    selectForElement.template operator()<types::Bool::Primitive>();
+    selectForElement.template operator()<types::Embedding::Primitive>();
+    selectForElement.template operator()<types::DateTime::Primitive>();
+    selectForElement.template operator()<types::Duration::Primitive>();
+    selectForElement.template operator()<std::optional<types::Int64::Primitive>>();
+    selectForElement.template operator()<std::optional<types::UInt64::Primitive>>();
+    selectForElement.template operator()<std::optional<types::Double::Primitive>>();
+    selectForElement.template operator()<std::optional<types::String::Primitive>>();
+    selectForElement.template operator()<std::optional<types::Bool::Primitive>>();
+    selectForElement.template operator()<std::optional<types::Embedding::Primitive>>();
+    selectForElement.template operator()<std::optional<types::DateTime::Primitive>>();
+    selectForElement.template operator()<std::optional<types::Duration::Primitive>>();
+    selectForElement.template operator()<NodeID>();
+    selectForElement.template operator()<EdgeID>();
+    selectForElement.template operator()<ListView>();
+    selectForElement.template operator()<std::optional<ListView>>();
+    selectForElement.template operator()<ListElementView>();
+    selectForElement.template operator()<std::optional<ListElementView>>();
+    selectForElement.template operator()<MapView>();
+    selectForElement.template operator()<std::optional<MapView>>();
+    selectForElement.template operator()<MapEntryView>();
+
+    if (!read) {
+        throw IRException(fmt::format("nl.row_constant can not read a {} as a constant", row->getTypeName()));
+    }
+
+    return read;
+}
+
+// A !storage.any chunk is a ColumnVector<ListElementView> of fixed-width tagged
+// scalars, so the same broadcast templates carry the tag along with the value.
+NLBroadcastFunction NLExecutor::selectListElementBlockRepeatFunction() {
+    return &blockRepeatColumn<ListElementView>;
+}
+
+NLBroadcastFunction NLExecutor::selectListElementTileFunction() {
+    return &tileColumn<ListElementView>;
+}
+
+NLAppendFunction NLExecutor::selectListElementAppendFunction() {
+    return &appendColumn<ListElementView>;
+}
+
+NLGatherFunction NLExecutor::selectListElementGatherFunction() {
+    return &gatherColumn<ListElementView>;
+}
+
+NLAppendFunction NLExecutor::selectOptListElementAppendFunction() {
+    return &appendColumn<std::optional<ListElementView>>;
+}
+
+NLGatherFunction NLExecutor::selectOptListElementGatherFunction() {
+    return &gatherColumn<std::optional<ListElementView>>;
+}
+
+NLCompareFunction NLExecutor::selectListElementCompareFunction() {
+    return &compareListElementColumn;
+}
+
+NLKeyAppendFunction NLExecutor::selectListElementKeyAppendFunction() {
+    return &distinctKeyAppendListElementColumn;
+}
+
+NLCountFunction NLExecutor::selectListElementCountFunction() {
+    return &countNonNullElementsColumn;
+}
+
+NLGroupKeyGatherFunction NLExecutor::selectListElementGroupKeyGatherFunction() {
+    return &groupGatherAppendColumn<ListElementView>;
+}
+
+NLCopyFunction NLExecutor::selectListElementCopyFunction() {
+    return &copyRangeColumn<ListElementView>;
+}
+
+// A map_element chunk is a ColumnVector<MapEntryView> of fixed-width entries, so the
+// same templates carry each entry's key and tag along with its value. Only the passing
+// -through families are selected here: ordering, keying and joining a map value are not
+// supported, and their selectors reject it rather than silently misreading the entry.
+NLBroadcastFunction NLExecutor::selectMapEntryBlockRepeatFunction() {
+    return &blockRepeatColumn<MapEntryView>;
+}
+
+NLBroadcastFunction NLExecutor::selectMapEntryTileFunction() {
+    return &tileColumn<MapEntryView>;
+}
+
+NLAppendFunction NLExecutor::selectMapEntryAppendFunction() {
+    return &appendColumn<MapEntryView>;
+}
+
+NLGatherFunction NLExecutor::selectMapEntryGatherFunction() {
+    return &gatherColumn<MapEntryView>;
+}
+
+NLCopyFunction NLExecutor::selectMapEntryCopyFunction() {
+    return &copyRangeColumn<MapEntryView>;
+}
+
+NLBroadcastFunction NLExecutor::selectOptListElementBlockRepeatFunction() {
+    return &blockRepeatColumn<std::optional<ListElementView>>;
+}
+
+NLBroadcastFunction NLExecutor::selectOptListElementTileFunction() {
+    return &tileColumn<std::optional<ListElementView>>;
+}
+
+NLCompareFunction NLExecutor::selectOptListElementCompareFunction() {
+    return &compareOptListElementColumn;
+}
+
+NLKeyAppendFunction NLExecutor::selectOptListElementKeyAppendFunction() {
+    return &distinctKeyAppendOptListElementColumn;
+}
+
+NLCountFunction NLExecutor::selectOptListElementCountFunction() {
+    return &countPresentElementsColumn;
+}
+
+NLGroupKeyGatherFunction NLExecutor::selectOptListElementGroupKeyGatherFunction() {
+    return &groupGatherAppendColumn<std::optional<ListElementView>>;
+}
+
+NLCopyFunction NLExecutor::selectOptListElementCopyFunction() {
+    return &copyRangeColumn<std::optional<ListElementView>>;
+}
+
+NLCompareFunction NLExecutor::selectListCompareFunction() {
+    return &compareContainerColumn<ListView>;
+}
+
+// The nullable list family, which labels() produces: a node an OPTIONAL MATCH did not
+// match holds no list, where a collected list column holds one in every row.
+NLBroadcastFunction NLExecutor::selectOptListBlockRepeatFunction() {
+    return &blockRepeatColumn<std::optional<ListView>>;
+}
+
+NLBroadcastFunction NLExecutor::selectOptListTileFunction() {
+    return &tileColumn<std::optional<ListView>>;
+}
+
+NLAppendFunction NLExecutor::selectOptListAppendFunction() {
+    return &appendColumn<std::optional<ListView>>;
+}
+
+NLOwnedAppendFunction NLExecutor::selectOwnedAppendFunction(const Column* buffer) {
+    NLOwnedAppendFunction append = nullptr;
+    dispatchViewColumn(buffer, [&]<typename ElementType>(const ColumnVector<ElementType>* column) {
+        append = &appendOwnedColumn<ElementType>;
+    });
+
+    return append;
+}
+
+NLReownFunction NLExecutor::selectReownFunction(const Column* column) {
+    NLReownFunction reown = nullptr;
+    dispatchViewColumn(column, [&]<typename ElementType>(const ColumnVector<ElementType>* viewColumn) {
+        reown = &reownColumn<ElementType>;
+    });
+
+    return reown;
+}
+
+NLReownRowsFunction NLExecutor::selectReownRowsFunction(const Column* column) {
+    NLReownRowsFunction reown = nullptr;
+    dispatchViewColumn(column, [&]<typename ElementType>(const ColumnVector<ElementType>* viewColumn) {
+        reown = &reownColumnRows<ElementType>;
+    });
+
+    return reown;
+}
+
+NLGatherFunction NLExecutor::selectOptListGatherFunction() {
+    return &gatherColumn<std::optional<ListView>>;
+}
+
+NLCompareFunction NLExecutor::selectOptListCompareFunction() {
+    return &compareOptContainerColumn<ListView>;
+}
+
+NLKeyAppendFunction NLExecutor::selectOptListKeyAppendFunction() {
+    return &distinctKeyAppendOptListColumn;
+}
+
+NLCountFunction NLExecutor::selectOptListCountFunction() {
+    return &countPresentListsColumn;
+}
+
+NLGroupKeyGatherFunction NLExecutor::selectOptListGroupKeyGatherFunction() {
+    return &groupGatherAppendColumn<std::optional<ListView>>;
+}
+
+NLCopyFunction NLExecutor::selectOptListCopyFunction() {
+    return &copyRangeColumn<std::optional<ListView>>;
+}
+
+NLListItemReadFunction NLExecutor::selectOptNestedListItemRead() {
+    return &optItem<ListBuffer<>::ListItemVariant, ListView>;
+}
+
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountOptListFold() {
+    return &groupFoldCountPresent<ListView>;
+}
+
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctOptListFold() {
+    return &groupFoldCountDistinctPresentList;
+}
+
+NLCopyFunction NLExecutor::selectCopyFunction(NLChunkKind kind) {
+    NLCopyFunction selected = nullptr;
+    dispatchChunkKind(kind, [&]<typename ElementType>() { selected = &copyRangeColumn<ElementType>; });
+
+    return selected;
+}
+
+NLCopyFunction NLExecutor::selectCountCopyFunction() {
+    return &copyRangeColumn<uint64_t>;
+}
+
+NLCopyFunction NLExecutor::selectConstCopyFunction() {
+    return &copyRangeConstColumn;
+}
+
+NLGatherFunction NLExecutor::selectConstGatherFunction() {
+    return &gatherConstColumn;
+}
+
+// A nullable value chunk gathers the same way an ID chunk does - copy the indexed
+// rows - on the ColumnOptVector<Primitive> instantiation of the gather template.
+NLGatherFunction NLExecutor::selectMaskGather() {
+    return &gatherColumn<ColumnMask::Bool_t, ColumnMask>;
+}
+
+NLAppendFunction NLExecutor::selectMaskAppend() {
+    return &appendColumn<ColumnMask::Bool_t, ColumnMask>;
+}
+
+NLCopyFunction NLExecutor::selectMaskCopy() {
+    return &copyRangeColumn<ColumnMask::Bool_t, ColumnMask>;
+}
+
+NLGroupKeyGatherFunction NLExecutor::selectMaskGroupKeyGather() {
+    return &groupGatherAppendColumn<ColumnMask::Bool_t, ColumnMask>;
+}
+
+NLCompareFunction NLExecutor::selectMaskCompare() {
+    return &compareColumn<ColumnMask::Bool_t, ColumnMask>;
+}
+
+NLKeyAppendFunction NLExecutor::selectMaskKeyAppend() {
+    return &distinctKeyAppendPlainColumn<ColumnMask::Bool_t, ColumnMask>;
+}
+
+NLBroadcastFunction NLExecutor::selectMaskBlockRepeat() {
+    return &blockRepeatColumn<ColumnMask::Bool_t, ColumnMask>;
+}
+
+NLBroadcastFunction NLExecutor::selectMaskTile() {
+    return &tileColumn<ColumnMask::Bool_t, ColumnMask>;
+}
+
+NLKeyAppendFunction NLExecutor::selectMaskMergeKeyAppend(ValueType keyType) {
+    throwUnlessKeyedAsItsOwnType(ValueType::Bool, keyType);
+    return &mergeKeyAppendPlainColumn<ColumnMask::Bool_t, ColumnMask>;
+}
+
+NLUnaryFn NLExecutor::selectMaskToNullable(LocalMemory* memory, Column*& result) {
+    result = memory->alloc<ColumnOptMask>();
+    return &toNullableColumn<types::Bool::Primitive, ColumnMask>;
+}
+
+NLGatherFunction NLExecutor::selectOptGatherFunction(ValueType valueType) {
+    NLGatherFunction gather = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        gather = &gatherColumn<std::optional<typename T::Primitive>>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return gather;
+}
+
+// The ID family of the optional selectors. A nullable ID chunk is a
+// ColumnOptVector<ID> - ColumnVector<std::optional<ID>> - so the same templates their
+// value-typed siblings name, instantiated on std::optional<ID>, carry value and null
+// together. A procedure return value declared nullable is the one producer of these.
+NLGatherFunction NLExecutor::selectOptGatherFunction(NLChunkKind kind) {
+    NLGatherFunction gather = nullptr;
+    dispatchIDChunkKind(kind, [&]<typename ID>() { gather = &gatherColumn<std::optional<ID>>; });
+
+    return gather;
+}
+
+NLAppendFunction NLExecutor::selectOptAppendFunction(NLChunkKind kind) {
+    NLAppendFunction append = nullptr;
+    dispatchIDChunkKind(kind, [&]<typename ID>() { append = &appendColumn<std::optional<ID>>; });
+
+    return append;
+}
+
+NLCopyFunction NLExecutor::selectOptCopyFunction(NLChunkKind kind) {
+    NLCopyFunction copy = nullptr;
+    dispatchIDChunkKind(kind, [&]<typename ID>() { copy = &copyRangeColumn<std::optional<ID>>; });
+
+    return copy;
+}
+
+NLCompareFunction NLExecutor::selectOptCompareFunction(NLChunkKind kind) {
+    NLCompareFunction compare = nullptr;
+    dispatchIDChunkKind(kind, [&]<typename ID>() { compare = &compareOptColumn<ID>; });
+
+    return compare;
+}
+
+NLKeyAppendFunction NLExecutor::selectOptKeyAppendFunction(NLChunkKind kind) {
+    NLKeyAppendFunction keyAppend = nullptr;
+    dispatchIDChunkKind(kind, [&]<typename ID>() { keyAppend = &distinctKeyAppendOptColumn<ID>; });
+
+    return keyAppend;
+}
+
+NLGroupKeyGatherFunction NLExecutor::selectOptGroupKeyGather(NLChunkKind kind) {
+    NLGroupKeyGatherFunction gather = nullptr;
+    dispatchIDChunkKind(kind, [&]<typename ID>() { gather = &groupGatherAppendColumn<std::optional<ID>>; });
+
+    return gather;
+}
+
+NLCountFunction NLExecutor::selectOptCountFunction(NLChunkKind kind) {
+    NLCountFunction count = nullptr;
+    dispatchIDChunkKind(kind, [&]<typename ID>() { count = &countPresentColumn<std::optional<ID>>; });
+
+    return count;
+}
+
+NLBroadcastFunction NLExecutor::selectOptBlockRepeatFunction(NLChunkKind kind) {
+    NLBroadcastFunction broadcast = nullptr;
+    dispatchIDChunkKind(kind, [&]<typename ID>() { broadcast = &blockRepeatColumn<std::optional<ID>>; });
+
+    return broadcast;
+}
+
+NLBroadcastFunction NLExecutor::selectOptTileFunction(NLChunkKind kind) {
+    NLBroadcastFunction broadcast = nullptr;
+    dispatchIDChunkKind(kind, [&]<typename ID>() { broadcast = &tileColumn<std::optional<ID>>; });
+
+    return broadcast;
+}
+
+NLAppendFunction NLExecutor::selectAppendFunction(NLChunkKind kind) {
+    NLAppendFunction selected = nullptr;
+    dispatchChunkKind(kind, [&]<typename ElementType>() { selected = &appendColumn<ElementType>; });
+
+    return selected;
+}
+
+NLAppendFunction NLExecutor::selectCountAppendFunction() {
+    return &appendColumn<uint64_t>;
+}
+
+// A nullable value chunk is a ColumnOptVector<Primitive> - that is,
+// ColumnVector<std::optional<Primitive>> - so the range copy template,
+// instantiated on std::optional<Primitive>, carries value and null together.
+NLCopyFunction NLExecutor::selectOptCopyFunction(ValueType valueType) {
+    NLCopyFunction copy = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        copy = &copyRangeColumn<std::optional<typename T::Primitive>>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return copy;
+}
+
+NLAppendFunction NLExecutor::selectOptAppendFunction(ValueType valueType) {
+    NLAppendFunction append = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        append = &appendColumn<std::optional<typename T::Primitive>>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return append;
+}
+
+NLKeyAppendFunction NLExecutor::selectKeyAppendFunction(NLChunkKind kind) {
+    switch (kind) {
+        case NLChunkKind::NodeID:
+            return &distinctKeyAppendColumn<NodeID>;
+        break;
+
+        case NLChunkKind::EdgeID:
+            return &distinctKeyAppendColumn<EdgeID>;
+        break;
+
+        case NLChunkKind::EdgeTypeID:
+            return &distinctKeyAppendColumn<EdgeTypeID>;
+        break;
+
+        case NLChunkKind::LabelID:
+            return &distinctKeyAppendColumn<LabelID>;
+        break;
+
+        case NLChunkKind::PropertyTypeID:
+            return &distinctKeyAppendColumn<PropertyTypeID>;
+        break;
+
+        case NLChunkKind::ValueTypeCode:
+            return &distinctKeyAppendPlainColumn<ValueType>;
+        break;
+
+        case NLChunkKind::UInt64:
+            return &distinctKeyAppendPlainColumn<types::UInt64::Primitive>;
+        break;
+
+        case NLChunkKind::Int64:
+            return &distinctKeyAppendPlainColumn<types::Int64::Primitive>;
+        break;
+
+        case NLChunkKind::Double:
+            return &distinctKeyAppendPlainColumn<types::Double::Primitive>;
+        break;
+
+        case NLChunkKind::Bool:
+            return &distinctKeyAppendPlainColumn<types::Bool::Primitive>;
+        break;
+
+        case NLChunkKind::String:
+            return &distinctKeyAppendPlainColumn<types::String::Primitive>;
+        break;
+
+        case NLChunkKind::List:
+            return &distinctKeyAppendListColumn;
+        break;
+
+        case NLChunkKind::Map:
+            return &distinctKeyAppendMapColumn;
+        break;
+
+        case NLChunkKind::Path:
+            throw IRException("A path column cannot be a DISTINCT or grouping key: a path has no scalar value to key on");
+        break;
+
+        case NLChunkKind::DateTime:
+            return &distinctKeyAppendPlainColumn<types::DateTime::Primitive>;
+        break;
+
+        case NLChunkKind::Duration:
+            return &distinctKeyAppendPlainColumn<types::Duration::Primitive>;
+        break;
+
+        case NLChunkKind::PathRef:
+            throw IRException("A path column cannot be a DISTINCT or grouping key: expand it into its list first");
+        break;
+
+        case NLChunkKind::EntityList:
+            return &distinctKeyAppendEntityListColumn;
+        break;
+    }
+
+    bioassert(false, "Unknown NLChunkKind");
+    return nullptr;
+}
+
+// Selected per column from its value type. A manual switch, not ValueTypeDispatcher,
+// because an embedding has no byte identity to key on: dispatching would instantiate
+// the serializer for std::span<const float> - a view, not owned bytes - which cannot
+// be a DISTINCT key. The embedding case throws instead, so that instantiation is
+// never named, the same shape as selectOptCompareFunction.
+NLKeyAppendFunction NLExecutor::selectOptKeyAppendFunction(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &distinctKeyAppendOptColumn<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &distinctKeyAppendOptColumn<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &distinctKeyAppendOptColumn<types::Double::Primitive>;
+        break;
+
+        case ValueType::Bool:
+            return &distinctKeyAppendOptColumn<types::Bool::Primitive>;
+        break;
+
+        case ValueType::String:
+            return &distinctKeyAppendOptColumn<types::String::Primitive>;
+        break;
+
+        case ValueType::Embedding:
+            throw IRException("cannot remove duplicates on an embedding column");
+        break;
+
+        case ValueType::List:
+            return &distinctKeyAppendOptListColumn;
+        break;
+
+        case ValueType::DateTime:
+            return &distinctKeyAppendOptColumn<types::DateTime::Primitive>;
+        break;
+
+        case ValueType::Duration:
+            return &distinctKeyAppendOptColumn<types::Duration::Primitive>;
+        break;
+
+        case ValueType::Map:
+            return &distinctKeyAppendOptMapColumn;
+        break;
+
+        case ValueType::Invalid:
+        case ValueType::_SIZE:
+            throw IRException("invalid distinct key value type");
+        break;
+    }
+
+    bioassert(false, "Unhandled value type");
+    return nullptr;
+}
+
+NLKeyIsMatchableFunction NLExecutor::everyKeyMatchable() {
+    return &everyRowMatchable;
+}
+
+// Selected per column from its value type. A double and an embedding answer their own way,
+// since neither a NaN nor a vector holding one equals itself; every other value type
+// matches on any present row.
+NLKeyIsMatchableFunction NLExecutor::selectOptKeyMatchableFunction(ValueType valueType) {
+    if (valueType == ValueType::Double) {
+        return &optDoubleColumnRowMatchable;
+    } else if (valueType == ValueType::Embedding) {
+        return &optEmbeddingColumnRowMatchable;
+    }
+
+    NLKeyIsMatchableFunction isMatchable = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        isMatchable = &optColumnRowMatchable<typename T::Primitive>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return isMatchable;
+}
+
+// A plainly-held value carries no present flag, so a double is the only such column with
+// a row a join cannot match on.
+NLKeyIsMatchableFunction NLExecutor::selectPlainKeyMatchableFunction(ValueType valueType) {
+    if (valueType == ValueType::Double) {
+        return &plainDoubleColumnRowMatchable;
+    }
+
+    return &everyRowMatchable;
+}
+
+NLKeyIsMatchableFunction NLExecutor::selectListElementKeyMatchableFunction() {
+    return &listElementColumnRowMatchable;
+}
+
+NLJoinKeyFunctions NLExecutor::selectJoinKeyFunctions(NLChunkKind kind) {
+    switch (kind) {
+        case NLChunkKind::NodeID:
+            return joinKeyFunctions<NodeID>();
+        break;
+
+        case NLChunkKind::EdgeID:
+            return joinKeyFunctions<EdgeID>();
+        break;
+
+        case NLChunkKind::EdgeTypeID:
+            return joinKeyFunctions<EdgeTypeID>();
+        break;
+
+        case NLChunkKind::LabelID:
+            return joinKeyFunctions<LabelID>();
+        break;
+
+        case NLChunkKind::PropertyTypeID:
+            return joinKeyFunctions<PropertyTypeID>();
+        break;
+
+        case NLChunkKind::ValueTypeCode:
+            return joinKeyFunctions<ValueType>();
+        break;
+
+        case NLChunkKind::UInt64:
+            return joinKeyFunctions<types::UInt64::Primitive>();
+        break;
+
+        case NLChunkKind::Int64:
+            return joinKeyFunctions<types::Int64::Primitive>();
+        break;
+
+        case NLChunkKind::Double:
+            return joinKeyFunctions<types::Double::Primitive>();
+        break;
+
+        case NLChunkKind::Bool:
+            return joinKeyFunctions<types::Bool::Primitive>();
+        break;
+
+        case NLChunkKind::String:
+            return joinKeyFunctions<types::String::Primitive>();
+        break;
+
+        case NLChunkKind::List:
+            return {&hashListKeyColumn, &keyEqualColumn<ListView>};
+        break;
+
+        case NLChunkKind::Map:
+            return joinKeyFunctions<MapView>();
+        break;
+
+        case NLChunkKind::Path:
+            throw IRException("A path column cannot be a join key: a path has no scalar value to key on");
+        break;
+
+        case NLChunkKind::DateTime:
+            return joinKeyFunctions<types::DateTime::Primitive>();
+        break;
+
+        case NLChunkKind::Duration:
+            return joinKeyFunctions<types::Duration::Primitive>();
+        break;
+
+        case NLChunkKind::PathRef:
+            throw IRException("A path column cannot be a join key: expand it into its list first");
+        break;
+
+        case NLChunkKind::EntityList:
+            throw IRException("A path column cannot be a join key: a path has no scalar value to key on");
+        break;
+    }
+
+    bioassert(false, "Unknown NLChunkKind");
+    return {};
+}
+
+NLJoinKeyFunctions NLExecutor::selectOptJoinKeyFunctions(ValueType valueType) {
+    NLJoinKeyFunctions functions;
+    const auto select = [&]<SupportedType T>() {
+        functions = optJoinKeyFunctions<typename T::Primitive>();
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return functions;
+}
+
+NLJoinKeyFunctions NLExecutor::selectPlainJoinKeyFunctions(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return joinKeyFunctions<types::Int64::Primitive>();
+        break;
+
+        case ValueType::UInt64:
+            return joinKeyFunctions<types::UInt64::Primitive>();
+        break;
+
+        case ValueType::Double:
+            return joinKeyFunctions<types::Double::Primitive>();
+        break;
+
+        default:
+            throw IRException("a plain value column must be numeric");
+        break;
+    }
+}
+
+NLJoinKeyFunctions NLExecutor::selectListElementJoinKeyFunctions() {
+    return {&hashListElementKeyColumn, &keyEqualColumn<ListElementView>};
+}
+
+// An ID chunk (node/edge/edge-type IDs) has no null rows, so every row counts,
+// regardless of kind. The count sibling of selectKeyAppendFunction, but kind is
+// irrelevant here - the row count is just the column size.
+size_t NLExecutor::countAllRows(const Column* column) {
+    return column->size();
+}
+
+// Selected per column from its kind, so count(n) tallies only the rows in which the node
+// or edge n is not null. A kind whose rows are never null - a label or edge-type ID, or a
+// scalar a procedure yielded - has no invalid value to skip and gets no handle here.
+NLCountFunction NLExecutor::selectIDCountFunction(NLChunkKind kind) {
+    switch (kind) {
+        case NLChunkKind::NodeID:
+            return &countValidIDs<NodeID>;
+        break;
+
+        case NLChunkKind::EdgeID:
+            return &countValidIDs<EdgeID>;
+        break;
+
+        default:
+            return nullptr;
+        break;
+    }
+
+    return nullptr;
+}
+
+// The grouped sibling of selectIDCountFunction, for count(n) inside a GROUP BY.
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountValidIDFold(NLChunkKind kind) {
+    switch (kind) {
+        case NLChunkKind::NodeID:
+            return &groupFoldCountValidID<NodeID>;
+        break;
+
+        case NLChunkKind::EdgeID:
+            return &groupFoldCountValidID<EdgeID>;
+        break;
+
+        default:
+            return nullptr;
+        break;
+    }
+
+    return nullptr;
+}
+
+NLCountFunction NLExecutor::selectPathCountFunction() {
+    return &countPresentPaths;
+}
+
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountPresentPathFold() {
+    return &groupFoldCountPresentPath;
+}
+
+// Selected per column from its value type, so count(x) tallies only the rows in
+// which x is not null. Every value type has a present/absent flag, so - unlike
+// selectOptKeyAppendFunction - an embedding is fine: counting reads has_value(),
+// never the value's bytes.
+NLCountFunction NLExecutor::selectOptCountFunction(ValueType valueType) {
+    NLCountFunction count = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        count = &countPresentColumn<std::optional<typename T::Primitive>>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return count;
+}
+
+NLAggregateResetFunction NLExecutor::selectAggregateReset(AggregateKind kind, ValueType accumulatorType) {
+    if (kind == AggregateKind::StDev || kind == AggregateKind::StDevP) {
+        return &aggregateResetDeviation;
+    }
+
+    // sum/avg reset to a present zero (their identity); min/max reset to null. Both
+    // resets compile for any value type and lowering has already validated the
+    // kind / type pairing (and the update selector re-checks it), so a single
+    // dispatch over the accumulator type suffices here.
+    const bool resetsToZero = (kind == AggregateKind::Sum || kind == AggregateKind::Avg);
+
+    NLAggregateResetFunction reset = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        reset = resetsToZero ? &aggregateResetZero<typename T::Primitive>
+                             : &aggregateResetNull<typename T::Primitive>;
+    };
+    ValueTypeDispatcher(accumulatorType).execute(select);
+
+    return reset;
+}
+
+NLAggregateUpdateFunction NLExecutor::selectAggregateUpdate(AggregateKind kind, ValueType inputType) {
+    switch (kind) {
+        case AggregateKind::Sum:
+            return selectSumUpdate(inputType);
+        break;
+
+        case AggregateKind::Avg:
+            return selectAvgUpdate(inputType);
+        break;
+
+        case AggregateKind::StDev:
+        case AggregateKind::StDevP:
+            return selectDeviationUpdate(inputType);
+        break;
+
+        case AggregateKind::Min:
+            return selectMinMaxUpdate</*IsMax=*/false>(inputType);
+        break;
+
+        case AggregateKind::Max:
+            return selectMinMaxUpdate</*IsMax=*/true>(inputType);
+        break;
+    }
+
+    bioassert(false, "Unhandled aggregate kind");
+    return nullptr;
+}
+
+NLAggregateUpdateFunction NLExecutor::selectTaggedAggregateUpdate(AggregateKind kind) {
+    return taggedAggregateUpdateFor<ListElementView>(kind);
+}
+
+NLAggregateUpdateFunction NLExecutor::selectOptTaggedAggregateUpdate(AggregateKind kind) {
+    return taggedAggregateUpdateFor<std::optional<ListElementView>>(kind);
+}
+
+NLAggregateResetFunction NLExecutor::selectTaggedAggregateReset() {
+    return &aggregateResetNull<ListElementView>;
+}
+
+NLAggregateResultFunction NLExecutor::selectTaggedAggregateResult() {
+    return &aggregateResultCopy<ListElementView>;
+}
+
+NLAggregateResultFunction NLExecutor::selectAggregateResult(AggregateKind kind, ValueType resultType) {
+    if (kind == AggregateKind::Avg) {
+        // avg always emits an f64 (the running sum divided by the count), whatever
+        // the input type was.
+        return &aggregateResultAvg;
+    } else if (kind == AggregateKind::StDev) {
+        return &aggregateResultDeviation</*Population=*/false>;
+    } else if (kind == AggregateKind::StDevP) {
+        return &aggregateResultDeviation</*Population=*/true>;
+    }
+
+    // sum/min/max hold the reduced value in the result's own type, so the emit is a
+    // copy of the accumulator's single row - valid for any value type.
+    NLAggregateResultFunction result = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        result = &aggregateResultCopy<typename T::Primitive>;
+    };
+    ValueTypeDispatcher(resultType).execute(select);
+
+    return result;
+}
+
+NLGroupAggregateGrowFunction NLExecutor::selectGroupAggregateGrow(GroupAggregateKind kind, ValueType accumulatorType) {
+    // count keeps only a per-group tally, so its grow ignores the accumulator type;
+    // avg carries a running f64 sum plus that tally, so its grow is always f64-typed
+    // and is the only value reduction besides count that grows the counts vector. A
+    // switch (not an if/else) over every kind so a new one is a compile error here
+    // rather than silently taking the sum/min/max path.
+    switch (kind) {
+        case GroupAggregateKind::Count:
+        case GroupAggregateKind::CountDistinct:
+        case GroupAggregateKind::CountRows:
+            return &groupGrowCount;
+        break;
+
+        case GroupAggregateKind::Avg:
+        case GroupAggregateKind::AvgDistinct:
+            return &groupGrowAvg;
+        break;
+
+        case GroupAggregateKind::StDev:
+        case GroupAggregateKind::StDevP:
+        case GroupAggregateKind::StDevDistinct:
+        case GroupAggregateKind::StDevPDistinct:
+            return &groupGrowDeviation;
+        break;
+
+        case GroupAggregateKind::Sum:
+        case GroupAggregateKind::SumDistinct:
+        case GroupAggregateKind::Min:
+        case GroupAggregateKind::Max:
+        case GroupAggregateKind::First: {
+            // sum grows each new group to a present zero (its additive identity),
+            // min/max/first to null (no value seen yet); neither carries a per-group
+            // tally. Both compile for any value type, and lowering has already
+            // validated the kind / type pairing (and the fold selector re-checks it),
+            // so one dispatch over the accumulator type suffices - the grouped sibling
+            // of selectAggregateReset.
+            const bool growsToZero = (kind == GroupAggregateKind::Sum) || (kind == GroupAggregateKind::SumDistinct);
+
+            NLGroupAggregateGrowFunction grow = nullptr;
+            const auto select = [&]<SupportedType T>() {
+                grow = growsToZero ? &groupGrowZero<typename T::Primitive>
+                                   : &groupGrowNull<typename T::Primitive>;
+            };
+            ValueTypeDispatcher(accumulatorType).execute(select);
+
+            return grow;
+        }
+        break;
+    }
+
+    bioassert(false, "Unhandled group aggregate kind");
+    return nullptr;
+}
+
+NLGroupAggregateFoldFunction NLExecutor::selectTaggedGroupAggregateFold(GroupAggregateKind kind) {
+    return taggedGroupAggregateFoldFor<ListElementView>(kind);
+}
+
+NLGroupAggregateFoldFunction NLExecutor::selectOptTaggedGroupAggregateFold(GroupAggregateKind kind) {
+    return taggedGroupAggregateFoldFor<std::optional<ListElementView>>(kind);
+}
+
+NLGroupAggregateGrowFunction NLExecutor::selectTaggedGroupAggregateGrow() {
+    return &groupGrowNull<ListElementView>;
+}
+
+NLGroupAggregateEmitFunction NLExecutor::selectTaggedGroupAggregateEmit() {
+    return &groupEmitCopy<ListElementView>;
+}
+
+NLGroupAggregateFoldFunction NLExecutor::selectGroupAggregateFold(GroupAggregateKind kind, ValueType inputType) {
+    switch (kind) {
+        case GroupAggregateKind::CountRows:
+            return selectGroupCountAllFold();
+        break;
+
+        case GroupAggregateKind::CountDistinct:
+            return selectGroupCountDistinctFold(inputType);
+        break;
+
+        case GroupAggregateKind::Count: {
+            // count(x) over a nullable value chunk: tally the present values. count(*)
+            // over an ID chunk goes through selectGroupCountAllFold instead. Every
+            // value type has a present flag, so - like selectOptCountFunction - an
+            // embedding is fine (the fold reads has_value(), never the bytes).
+            NLGroupAggregateFoldFunction fold = nullptr;
+            const auto select = [&]<SupportedType T>() {
+                fold = &groupFoldCountPresent<typename T::Primitive>;
+            };
+            ValueTypeDispatcher(inputType).execute(select);
+            return fold;
+        }
+        break;
+
+        case GroupAggregateKind::Sum:
+            return selectGroupSumFold(inputType);
+        break;
+
+        case GroupAggregateKind::SumDistinct:
+            return selectGroupSumDistinctFold(inputType);
+        break;
+
+        case GroupAggregateKind::Avg:
+            return selectGroupAvgFold(inputType);
+        break;
+
+        case GroupAggregateKind::AvgDistinct:
+            return selectGroupAvgDistinctFold(inputType);
+        break;
+
+        case GroupAggregateKind::StDev:
+        case GroupAggregateKind::StDevP:
+            return selectGroupDeviationFold</*Distinct=*/false>(inputType);
+        break;
+
+        case GroupAggregateKind::StDevDistinct:
+        case GroupAggregateKind::StDevPDistinct:
+            return selectGroupDeviationFold</*Distinct=*/true>(inputType);
+        break;
+
+        case GroupAggregateKind::Min:
+            return selectGroupMinMaxFold</*IsMax=*/false>(inputType);
+        break;
+
+        case GroupAggregateKind::Max:
+            return selectGroupMinMaxFold</*IsMax=*/true>(inputType);
+        break;
+
+        case GroupAggregateKind::First:
+            return selectGroupFirstFold(inputType);
+        break;
+    }
+
+    bioassert(false, "Unhandled group aggregate kind");
+    return nullptr;
+}
+
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountListElementFold() {
+    return &groupFoldCountPresentListElement<ListElementView>;
+}
+
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountOptListElementFold() {
+    return &groupFoldCountPresentListElement<std::optional<ListElementView>>;
+}
+
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctListElementFold() {
+    return &groupFoldCountDistinctListElement<ListElementView>;
+}
+
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctOptListElementFold() {
+    return &groupFoldCountDistinctListElement<std::optional<ListElementView>>;
+}
+
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountAllFold() {
+    // count(*) over an ID chunk (never null): every row charges its group.
+    return &groupFoldCountAll;
+}
+
+// Selected per column from its value type. A manual switch, not ValueTypeDispatcher,
+// because a distinct tally keys on the value's bytes and an embedding has none to key
+// on - the same reason selectOptKeyAppendFunction is written out by hand.
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctFold(ValueType inputType) {
+    switch (inputType) {
+        case ValueType::Int64:
+            return &groupFoldCountDistinctPresent<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &groupFoldCountDistinctPresent<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &groupFoldCountDistinctPresent<types::Double::Primitive>;
+        break;
+
+        case ValueType::Bool:
+            return &groupFoldCountDistinctPresent<types::Bool::Primitive>;
+        break;
+
+        case ValueType::String:
+            return &groupFoldCountDistinctPresent<types::String::Primitive>;
+        break;
+
+        case ValueType::Embedding:
+            throw IRException("cannot count the distinct values of an embedding column");
+        break;
+
+        case ValueType::List:
+            return &groupFoldCountDistinctPresentList;
+        break;
+
+        case ValueType::DateTime:
+            return &groupFoldCountDistinctPresent<types::DateTime::Primitive>;
+        break;
+
+        case ValueType::Duration:
+            return &groupFoldCountDistinctPresent<types::Duration::Primitive>;
+        break;
+
+        case ValueType::Map:
+            return &groupFoldCountDistinctPresentMap;
+        break;
+
+        case ValueType::Invalid:
+        case ValueType::_SIZE:
+            throw IRException("invalid count(DISTINCT) value type");
+        break;
+    }
+
+    bioassert(false, "Unhandled value type");
+    return nullptr;
+}
+
+// count(DISTINCT x) over a chunk that is never null - an ID column, or one a procedure
+// yielded: each group is charged once per distinct value it sees. The chunk kind picks
+// the column layout the key is read from, the way selectKeyAppendFunction does for a
+// DISTINCT row key. An ID keys on its integer, everything else on the value itself.
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctChunkFold(NLChunkKind kind) {
+    switch (kind) {
+        case NLChunkKind::NodeID:
+            return &groupFoldCountDistinctID<NodeID>;
+        break;
+
+        case NLChunkKind::EdgeID:
+            return &groupFoldCountDistinctID<EdgeID>;
+        break;
+
+        case NLChunkKind::EdgeTypeID:
+            return &groupFoldCountDistinctID<EdgeTypeID>;
+        break;
+
+        case NLChunkKind::LabelID:
+            return &groupFoldCountDistinctID<LabelID>;
+        break;
+
+        case NLChunkKind::PropertyTypeID:
+            return &groupFoldCountDistinctID<PropertyTypeID>;
+        break;
+
+        case NLChunkKind::ValueTypeCode:
+            return &groupFoldCountDistinctValue<ValueType>;
+        break;
+
+        case NLChunkKind::UInt64:
+            return &groupFoldCountDistinctValue<types::UInt64::Primitive>;
+        break;
+
+        case NLChunkKind::Int64:
+            return &groupFoldCountDistinctValue<types::Int64::Primitive>;
+        break;
+
+        case NLChunkKind::Double:
+            return &groupFoldCountDistinctValue<types::Double::Primitive>;
+        break;
+
+        case NLChunkKind::Bool:
+            return &groupFoldCountDistinctValue<types::Bool::Primitive>;
+        break;
+
+        case NLChunkKind::String:
+            return &groupFoldCountDistinctValue<types::String::Primitive>;
+        break;
+
+        case NLChunkKind::List:
+            return &groupFoldCountDistinctList;
+        break;
+
+        case NLChunkKind::Map:
+            throw IRException("count(DISTINCT) cannot key on a map column: a map has no scalar value to count distinct");
+        break;
+
+        case NLChunkKind::Path:
+            throw IRException("count(DISTINCT) cannot key on a path column: a path has no scalar value to count distinct");
+        break;
+
+        case NLChunkKind::DateTime:
+            return &groupFoldCountDistinctValue<types::DateTime::Primitive>;
+        break;
+
+        case NLChunkKind::Duration:
+            return &groupFoldCountDistinctValue<types::Duration::Primitive>;
+        break;
+
+        case NLChunkKind::PathRef:
+            throw IRException("count(DISTINCT) cannot key on a path column: expand it into its list first");
+        break;
+
+        case NLChunkKind::EntityList:
+            throw IRException("count(DISTINCT) cannot key on a path column: a path has no scalar value to count distinct");
+        break;
+    }
+
+    bioassert(false, "Unknown NLChunkKind");
+    return nullptr;
+}
+
+NLGroupAggregateEmitFunction NLExecutor::selectGroupAggregateEmit(GroupAggregateKind kind, ValueType resultType) {
+    // A switch (not an if/else) over every kind so a new one is a compile error here
+    // rather than silently taking the sum/min/max path.
+    switch (kind) {
+        case GroupAggregateKind::Count:
+        case GroupAggregateKind::CountDistinct:
+        case GroupAggregateKind::CountRows:
+            // count emits its per-group tally as an unsigned i64, whatever the input was.
+            return &groupEmitCount;
+        break;
+
+        case GroupAggregateKind::Avg:
+        case GroupAggregateKind::AvgDistinct:
+            // avg emits the running f64 sum divided by the count, per group.
+            return &groupEmitAvg;
+        break;
+
+        case GroupAggregateKind::StDev:
+        case GroupAggregateKind::StDevDistinct:
+            return &groupEmitDeviation</*Population=*/false>;
+        break;
+
+        case GroupAggregateKind::StDevP:
+        case GroupAggregateKind::StDevPDistinct:
+            return &groupEmitDeviation</*Population=*/true>;
+        break;
+
+        case GroupAggregateKind::Sum:
+        case GroupAggregateKind::SumDistinct:
+        case GroupAggregateKind::Min:
+        case GroupAggregateKind::Max:
+        case GroupAggregateKind::First: {
+            // sum/min/max/first hold each group's reduced value in the result's own type, so
+            // the emit copies the accumulator slice - valid for any value type, the
+            // grouped sibling of selectAggregateResult.
+            NLGroupAggregateEmitFunction emit = nullptr;
+            const auto select = [&]<SupportedType T>() {
+                emit = &groupEmitCopy<typename T::Primitive>;
+            };
+            ValueTypeDispatcher(resultType).execute(select);
+
+            return emit;
+        }
+        break;
+    }
+
+    bioassert(false, "Unhandled group aggregate kind");
+    return nullptr;
+}
+
+NLGroupKeyGatherFunction NLExecutor::selectGroupKeyGather(NLChunkKind kind) {
+    NLGroupKeyGatherFunction selected = nullptr;
+    dispatchChunkKind(kind, [&]<typename ElementType>() { selected = &groupGatherAppendColumn<ElementType>; });
+
+    return selected;
+}
+
+// A nullable key column appends the same way an ID key does - copy the chosen rows -
+// on the ColumnOptVector<Primitive> instantiation of the gather-append template.
+NLGroupKeyGatherFunction NLExecutor::selectOptGroupKeyGather(ValueType valueType) {
+    NLGroupKeyGatherFunction gather = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        gather = &groupGatherAppendColumn<std::optional<typename T::Primitive>>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return gather;
+}
+
+NLAppendFunction NLExecutor::selectPlainAppendFunction(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &appendColumn<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &appendColumn<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &appendColumn<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("a plain value column must be numeric");
+        break;
+    }
+}
+
+NLGatherFunction NLExecutor::selectPlainGatherFunction(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &gatherColumn<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &gatherColumn<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &gatherColumn<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("a plain value column must be numeric");
+        break;
+    }
+}
+
+NLCompareFunction NLExecutor::selectPlainCompareFunction(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &compareColumn<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &compareColumn<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &compareColumn<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("a plain value column must be numeric");
+        break;
+    }
+}
+
+NLCopyFunction NLExecutor::selectPlainCopyFunction(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &copyRangeColumn<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &copyRangeColumn<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &copyRangeColumn<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("a plain value column must be numeric");
+        break;
+    }
+}
+
+NLKeyAppendFunction NLExecutor::selectPlainMergeKeyAppendFunction(NLChunkKind kind, ValueType keyType) {
+    switch (kind) {
+        case NLChunkKind::UInt64:
+            return selectNumericMergeKeyAppend<types::UInt64::Primitive, MergeColumnShape::Plain>(keyType);
+        break;
+
+        case NLChunkKind::Int64:
+            return selectNumericMergeKeyAppend<types::Int64::Primitive, MergeColumnShape::Plain>(keyType);
+        break;
+
+        case NLChunkKind::Double:
+            return selectNumericMergeKeyAppend<types::Double::Primitive, MergeColumnShape::Plain>(keyType);
+        break;
+
+        case NLChunkKind::Bool:
+            throwUnlessKeyedAsItsOwnType(ValueType::Bool, keyType);
+            return &mergeKeyAppendPlainColumn<types::Bool::Primitive>;
+        break;
+
+        case NLChunkKind::String:
+            throwUnlessKeyedAsItsOwnType(ValueType::String, keyType);
+            return &mergeKeyAppendPlainColumn<types::String::Primitive>;
+        break;
+
+        case NLChunkKind::NodeID:
+        case NLChunkKind::EdgeID:
+        case NLChunkKind::EdgeTypeID:
+        case NLChunkKind::LabelID:
+        case NLChunkKind::PropertyTypeID:
+        case NLChunkKind::ValueTypeCode:
+        case NLChunkKind::List:
+        case NLChunkKind::Map:
+        case NLChunkKind::Path:
+        case NLChunkKind::PathRef:
+        case NLChunkKind::EntityList:
+            throw IRException("a MERGE pattern cannot constrain a property to this value");
+        break;
+
+        case NLChunkKind::DateTime:
+            throwUnlessKeyedAsItsOwnType(ValueType::DateTime, keyType);
+            return &mergeKeyAppendPlainColumn<types::DateTime::Primitive>;
+        break;
+
+        case NLChunkKind::Duration:
+            throwUnlessKeyedAsItsOwnType(ValueType::Duration, keyType);
+            return &mergeKeyAppendPlainColumn<types::Duration::Primitive>;
+        break;
+    }
+
+    bioassert(false, "Unknown NLChunkKind");
+    return nullptr;
+}
+
+NLKeyAppendFunction NLExecutor::selectConstMergeKeyAppendFunction(ValueType valueType, ValueType keyType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return selectNumericMergeKeyAppend<types::Int64::Primitive, MergeColumnShape::Const>(keyType);
+        break;
+
+        case ValueType::UInt64:
+            return selectNumericMergeKeyAppend<types::UInt64::Primitive, MergeColumnShape::Const>(keyType);
+        break;
+
+        case ValueType::Double:
+            return selectNumericMergeKeyAppend<types::Double::Primitive, MergeColumnShape::Const>(keyType);
+        break;
+
+        case ValueType::Bool:
+            throwUnlessKeyedAsItsOwnType(ValueType::Bool, keyType);
+            return &mergeKeyAppendConstColumn<types::Bool::Primitive>;
+        break;
+
+        case ValueType::String:
+            throwUnlessKeyedAsItsOwnType(ValueType::String, keyType);
+            return &mergeKeyAppendConstColumn<types::String::Primitive>;
+        break;
+
+        case ValueType::Embedding:
+            throw IRException("a MERGE pattern cannot constrain a property to an embedding");
+        break;
+
+        case ValueType::List:
+            throw IRException("a MERGE pattern cannot constrain a property to a list");
+        break;
+
+        case ValueType::DateTime:
+            throwUnlessKeyedAsItsOwnType(ValueType::DateTime, keyType);
+            return &mergeKeyAppendConstColumn<types::DateTime::Primitive>;
+        break;
+
+        case ValueType::Duration:
+            throwUnlessKeyedAsItsOwnType(ValueType::Duration, keyType);
+            return &mergeKeyAppendConstColumn<types::Duration::Primitive>;
+        break;
+
+        case ValueType::Map:
+            throw IRException("a MERGE pattern cannot constrain a property to a map");
+        break;
+
+        case ValueType::Invalid:
+        case ValueType::_SIZE:
+            throw IRException("invalid MERGE property value type");
+        break;
+    }
+
+    bioassert(false, "Unhandled value type");
+    return nullptr;
+}
+
+NLKeyAppendFunction NLExecutor::selectOptMergeKeyAppendFunction(ValueType valueType, ValueType keyType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return selectNumericMergeKeyAppend<types::Int64::Primitive, MergeColumnShape::Opt>(keyType);
+        break;
+
+        case ValueType::UInt64:
+            return selectNumericMergeKeyAppend<types::UInt64::Primitive, MergeColumnShape::Opt>(keyType);
+        break;
+
+        case ValueType::Double:
+            return selectNumericMergeKeyAppend<types::Double::Primitive, MergeColumnShape::Opt>(keyType);
+        break;
+
+        default:
+            throwUnlessKeyedAsItsOwnType(valueType, keyType);
+            return selectOptKeyAppendFunction(valueType);
+        break;
+    }
+}
+
+NLKeyAppendFunction NLExecutor::selectNullMergeKeyAppendFunction() {
+    return &mergeKeyAppendConstNull;
+}
+
+NLKeyAppendFunction NLExecutor::selectPlainKeyAppendFunction(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &distinctKeyAppendPlainColumn<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &distinctKeyAppendPlainColumn<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &distinctKeyAppendPlainColumn<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("a plain value column must be numeric");
+        break;
+    }
+}
+
+NLGroupKeyGatherFunction NLExecutor::selectPlainGroupKeyGather(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &groupGatherAppendColumn<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &groupGatherAppendColumn<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &groupGatherAppendColumn<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("a plain value column must be numeric");
+        break;
+    }
+}
+
+NLBroadcastFunction NLExecutor::selectPlainBlockRepeatFunction(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &blockRepeatColumn<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &blockRepeatColumn<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &blockRepeatColumn<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("a plain value column must be numeric");
+        break;
+    }
+}
+
+NLBroadcastFunction NLExecutor::selectPlainTileFunction(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &tileColumn<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &tileColumn<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &tileColumn<types::Double::Primitive>;
+        break;
+
+        default:
+            throw IRException("a plain value column must be numeric");
+        break;
+    }
+}
+
+NLCompareFunction NLExecutor::selectCompareFunction(NLChunkKind kind) {
+    switch (kind) {
+        case NLChunkKind::NodeID:
+            return &compareColumn<NodeID>;
+        break;
+
+        case NLChunkKind::EdgeID:
+            return &compareColumn<EdgeID>;
+        break;
+
+        case NLChunkKind::EdgeTypeID:
+            return &compareColumn<EdgeTypeID>;
+        break;
+
+        case NLChunkKind::LabelID:
+            return &compareColumn<LabelID>;
+        break;
+
+        case NLChunkKind::PropertyTypeID:
+            return &compareColumn<PropertyTypeID>;
+        break;
+
+        case NLChunkKind::ValueTypeCode:
+            return &compareColumn<ValueType>;
+        break;
+
+        case NLChunkKind::UInt64:
+            return &compareColumn<types::UInt64::Primitive>;
+        break;
+
+        case NLChunkKind::Int64:
+            return &compareColumn<types::Int64::Primitive>;
+        break;
+
+        case NLChunkKind::Double:
+            return &compareColumn<types::Double::Primitive>;
+        break;
+
+        case NLChunkKind::Bool:
+            return &compareColumn<types::Bool::Primitive>;
+        break;
+
+        case NLChunkKind::String:
+            return &compareColumn<types::String::Primitive>;
+        break;
+
+        case NLChunkKind::List:
+            return &compareContainerColumn<ListView>;
+        break;
+
+        case NLChunkKind::Map:
+            return &compareContainerColumn<MapView>;
+        break;
+
+        case NLChunkKind::Path:
+            throw IRException("A path column cannot be a sort key: a path has no order here");
+        break;
+
+        case NLChunkKind::DateTime:
+            return &compareColumn<types::DateTime::Primitive>;
+        break;
+
+        case NLChunkKind::Duration:
+            return &compareColumn<types::Duration::Primitive>;
+        break;
+
+        case NLChunkKind::PathRef:
+            throw IRException("A path column cannot be a sort key: expand it into its list first");
+        break;
+
+        case NLChunkKind::EntityList:
+            throw IRException("A path column cannot be a sort key: a path has no order here");
+        break;
+    }
+
+    bioassert(false, "Unknown NLChunkKind");
+    return nullptr;
+}
+
+// Selected per key from its value type. A manual switch, not ValueTypeDispatcher,
+// because an embedding has no order: dispatching would instantiate the comparator
+// for std::span<const float>, which does not compile. The embedding case throws
+// instead, so that instantiation is never named.
+NLCompareFunction NLExecutor::selectOptCompareFunction(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return &compareOptColumn<types::Int64::Primitive>;
+        break;
+
+        case ValueType::UInt64:
+            return &compareOptColumn<types::UInt64::Primitive>;
+        break;
+
+        case ValueType::Double:
+            return &compareOptColumn<types::Double::Primitive>;
+        break;
+
+        case ValueType::Bool:
+            return &compareOptColumn<types::Bool::Primitive>;
+        break;
+
+        case ValueType::String:
+            return &compareOptColumn<types::String::Primitive>;
+        break;
+
+        case ValueType::Embedding:
+            throw IRException("cannot sort by an embedding column");
+        break;
+
+        case ValueType::List:
+            return &compareOptContainerColumn<ListView>;
+        break;
+
+        case ValueType::DateTime:
+            return &compareOptColumn<types::DateTime::Primitive>;
+        break;
+
+        case ValueType::Duration:
+            return &compareOptColumn<types::Duration::Primitive>;
+        break;
+
+        case ValueType::Map:
+            return &compareOptContainerColumn<MapView>;
+        break;
+
+        case ValueType::Invalid:
+        case ValueType::_SIZE:
+            throw IRException("invalid sort key value type");
+        break;
+    }
+
+    bioassert(false, "Unhandled value type");
+    return nullptr;
+}
+
+// Read one property of the current input chunk into a nullable value column.
+// The with-null writer emits one value per input row (null where the row lacks
+// it), so no row is dropped and the value column lines up with the input chunk.
+// The PropertyTypeID was resolved from the name during translation.
+template <typename ID, typename T>
+void NLExecutor::runPropertyFetch(NLExecutionContext* context, NLFunctionData* data) {
+    NLPropertyFetchData* fetchData = static_cast<NLPropertyFetchData*>(data);
+
+    const GraphView& view = *context->getView();
+    const PropertyTypeID propertyTypeID = fetchData->getPropertyTypeID();
+    const auto* inputIDs = static_cast<const ColumnVector<ID>*>(fetchData->getInput());
+    auto* output = static_cast<ColumnOptVector<typename T::Primitive>*>(fetchData->getOutput());
+
+    GetPropertiesWithNullChunkWriter<ID, T> writer(view, propertyTypeID, inputIDs);
+    writer.setOutput(output);
+    writer.fill(inputIDs->size());
+
+    // The fetch above read the graph, which holds this change's writes nowhere: a row
+    // whose entity the change wrote holds a write-buffer offset rather than an ID the
+    // graph knows, and a row it merely updated still reads the value from before.
+    const ColumnMask* pending = fetchData->getPending();
+    const bool allPending = fetchData->isAllPending();
+    CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+
+    if (!writeBuffer) {
+        bioassert(!pending && !allPending,
+                  "a property fetch over written entities requires an active write transaction");
+        return;
+    }
+
+    NLWrittenValues& written = context->getWrittenValues();
+    written.indexUpdates(writeBuffer);
+
+    NLValueStore& fetchedValues = fetchData->fetchedValues();
+    fetchedValues.clear();
+
+    const bool isNode = std::is_same_v<ID, NodeID>;
+    const size_t committedCount = isNode ? committedNodeCount(&view) : committedEdgeCount(&view);
+    const size_t pendingCount = isNode ? writeBuffer->numPendingNodes() : writeBuffer->numPendingEdges();
+    const PendingRows pendingRows(pending, allPending, committedCount, pendingCount);
+
+    if (!pending && !allPending && !written.hasUpdates() && pendingCount == 0) {
+        return;
+    }
+
+    auto& raw = output->getRaw();
+    const auto& inputRaw = inputIDs->getRaw();
+    for (size_t row = 0; row < raw.size(); row++) {
+        if (pendingRows.has(row, inputRaw[row].getValue())) {
+            raw[row] = readPendingEntityProperty<ID, T>(writeBuffer,
+                                                        written,
+                                                        fetchedValues,
+                                                        &view,
+                                                        inputRaw[row].getValue(),
+                                                        propertyTypeID);
+            continue;
+        }
+
+        const CommitWriteBuffer::SupportedTypeVariant* update = written.findUpdate(inputRaw[row], propertyTypeID);
+        if (update) {
+            raw[row] = written.read<T>(*update, fetchedValues);
+        }
+    }
+}
+
+// The translator selects among these by the value type the property resolves
+// to, on the node or edge side; only these (ID, T) pairs are available as
+// handlers.
+template void NLExecutor::runPropertyFetch<NodeID, types::Int64>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<NodeID, types::UInt64>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<NodeID, types::Double>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<NodeID, types::Bool>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<NodeID, types::String>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<NodeID, types::Embedding>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<NodeID, types::List>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<NodeID, types::DateTime>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<NodeID, types::Duration>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<NodeID, types::Map>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<EdgeID, types::Int64>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<EdgeID, types::UInt64>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<EdgeID, types::Double>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<EdgeID, types::Bool>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<EdgeID, types::String>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<EdgeID, types::Embedding>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<EdgeID, types::List>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<EdgeID, types::DateTime>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<EdgeID, types::Duration>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<EdgeID, types::Map>(NLExecutionContext*, NLFunctionData*);
+
+void NLExecutor::runGetNodeLabelSet(NLExecutionContext* context, NLFunctionData* data) {
+    NLGetNodeLabelSetData* fetchData = static_cast<NLGetNodeLabelSetData*>(data);
+
+    const GraphView& view = *context->getView();
+    const ColumnNodeIDs* input = fetchData->getInput();
+    ColumnLabelSetIDs* output = fetchData->getOutput();
+
+    GetNodeLabelSetChunkWriter writer(view, input);
+    writer.setLabelSetIDs(output);
+    writer.fill(input->size());
+
+    // The graph holds no label set for a node this change wrote: the write buffer holds the
+    // handle the CREATE spelled, under the ID the commit will know the set by.
+    CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+    if (!writeBuffer || writeBuffer->numPendingNodes() == 0) {
+        return;
+    }
+
+    const size_t committedCount = committedNodeCount(&view);
+    const PendingRows pendingRows(nullptr, false, committedCount, writeBuffer->numPendingNodes());
+
+    auto& raw = output->getRaw();
+    const auto& inputRaw = input->getRaw();
+    for (size_t row = 0; row < raw.size(); row++) {
+        const uint64_t nodeID = inputRaw[row].getValue();
+        if (!pendingRows.has(row, nodeID)) {
+            continue;
+        }
+
+        raw[row] = writeBuffer->getPendingNode(nodeID - committedCount).labelsetHandle.getID();
+    }
+}
+
+void NLExecutor::runGetEdgeTypes(NLExecutionContext* context, NLFunctionData* data) {
+    NLGetEdgeTypesData* fetchData = static_cast<NLGetEdgeTypesData*>(data);
+
+    const GraphView& view = *context->getView();
+    const ColumnEdgeIDs* input = fetchData->getInput();
+    ColumnEdgeTypes* output = fetchData->getOutput();
+
+    GetEdgeTypesChunkWriter writer(view, input);
+    writer.setEdgeTypes(output);
+    writer.fill(input->size());
+
+    // The graph holds no type for an edge this change wrote: the write buffer holds the one
+    // the CREATE spelled, under the ID the commit will know the edge by.
+    CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+    if (!writeBuffer || writeBuffer->numPendingEdges() == 0) {
+        return;
+    }
+
+    const size_t committedCount = committedEdgeCount(&view);
+    const PendingRows pendingRows(nullptr, false, committedCount, writeBuffer->numPendingEdges());
+
+    auto& raw = output->getRaw();
+    const auto& inputRaw = input->getRaw();
+    for (size_t row = 0; row < raw.size(); row++) {
+        const uint64_t edgeID = inputRaw[row].getValue();
+        if (!pendingRows.has(row, edgeID)) {
+            continue;
+        }
+
+        raw[row] = writeBuffer->getPendingEdge(edgeID - committedCount).edgeType;
+    }
+}
+
+template <typename MaskColumn>
+void NLExecutor::runCheckLabelConstraint(NLExecutionContext* context, NLFunctionData* data) {
+    NLCheckLabelConstraintData* checkData = static_cast<NLCheckLabelConstraintData*>(data);
+
+    const ColumnLabelSetIDs* input = checkData->getInput();
+    MaskColumn* output = static_cast<MaskColumn*>(checkData->getOutput());
+
+    const size_t rowCount = input->size();
+    output->resize(rowCount);
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        const LabelSetID id = (*input)[rowIndex];
+
+        if constexpr (std::is_same_v<MaskColumn, ColumnOptMask>) {
+            if (!id.isValid()) {
+                (*output)[rowIndex] = std::nullopt;
+                continue;
+            }
+        }
+
+        (*output)[rowIndex] = checkData->isMatching(id);
+    }
+}
+
+template void NLExecutor::runCheckLabelConstraint<ColumnMask>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runCheckLabelConstraint<ColumnOptMask>(NLExecutionContext*, NLFunctionData*);
+
+template <typename MaskColumn>
+void NLExecutor::runCheckEdgeTypeConstraint(NLExecutionContext* context, NLFunctionData* data) {
+    NLCheckEdgeTypeConstraintData* checkData = static_cast<NLCheckEdgeTypeConstraintData*>(data);
+
+    const ColumnEdgeTypes* input = checkData->getInput();
+    MaskColumn* output = static_cast<MaskColumn*>(checkData->getOutput());
+
+    const size_t rowCount = input->size();
+    output->resize(rowCount);
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        const EdgeTypeID id = (*input)[rowIndex];
+
+        if constexpr (std::is_same_v<MaskColumn, ColumnOptMask>) {
+            if (!id.isValid()) {
+                (*output)[rowIndex] = std::nullopt;
+                continue;
+            }
+        }
+
+        (*output)[rowIndex] = checkData->isMatching(id);
+    }
+}
+
+template void NLExecutor::runCheckEdgeTypeConstraint<ColumnMask>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runCheckEdgeTypeConstraint<ColumnOptMask>(NLExecutionContext*, NLFunctionData*);
+
+template NLBinaryFn NLExecutor::selectBinary<OP_ADD>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_CONCAT>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_INDEX>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_SUB>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_MUL>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_DIV>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_MOD>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_POW>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_EQUAL>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_GREATER_THAN>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_LESS_THAN>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_GREATER_THAN_OR_EQUAL>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_LESS_THAN_OR_EQUAL>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_AND>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_OR>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_NOT_EQUAL>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_XOR>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_STARTS_WITH>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_ENDS_WITH>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_CONTAINS>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_IN>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_FUNC_COSINE_SIMILARITY>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_FUNC_EUCLIDEAN_DISTANCE>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);

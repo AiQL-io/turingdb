@@ -3,9 +3,8 @@
   "graph": "simpledb",
   "query": "return [(10 + 3), (true AND false)]",
   "expect": {
-    "plan": "ANALYZE ERROR\n-------* Query error\n     1 | return [(10 + 3), (true AND false)]\n       |         ^^^^^^^^\n-------* Non-literal list elements are not yet supported",
-    "result": "ANALYZE ERROR\n-------* Query error\n     1 | return [(10 + 3), (true AND false)]\n       |         ^^^^^^^^\n-------* Non-literal list elements are not yet supported",
-    "resultJson": "{\"error\":\"ANALYZE_ERROR\",\"error_details\":\"-------* Query error\\n     1 | return [(10 + 3), (true AND false)]\\n       |         ^^^^^^^^\\n-------* Non-literal list elements are not yet supported\"}"
+    "result": "\"[(10 + 3), (true AND false)]\"\n\"[13, false]\"",
+    "resultJson": "{\"header\":{\"column_names\":[\"[(10 + 3), (true AND false)]\"],\"column_types\":[\"List\"]},\"data\":[[[[13,false]]]]}"
   },
   "tags": [],
   "write-required": false

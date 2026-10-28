@@ -3,7 +3,9 @@
 #include <errno.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <string>
 
+#include "HTTP.h"
 #include "HTTPUtils.h"
 #include "NetException.h"
 #include "QueryStatus.h"
@@ -64,30 +66,31 @@ void TuringProtoWriter::startResponse(net::ConnectionHeader connection) {
     sendRaw(buffer.data(), offset);
 }
 
-void TuringProtoWriter::writeDataframeHeader(const db::Dataframe* frame) {
-    // Schema must fit in a single CHUNK_HEADER packet. The encoder's capacity
-    // check enforces that, so a buffer-full trigger here would be a bug.
+void TuringProtoWriter::writeColumnHeaders(std::span<const std::string_view> names,
+                                           std::span<const db::Column* const> columns) {
     _buffer.setOnBufferFullCallBack([]() {
-        bioassert(false, "Dataframe schema exceeded buffer capacity");
+        bioassert(false, "Column schema exceeded buffer capacity");
     });
 
-    _encoder.writeDataframeHeader(frame);
+    _encoder.writeColumnHeaders(names, columns);
 
     writePacket(MessageTypes::CHUNK_HEADER);
 }
 
-void TuringProtoWriter::writeDataframe(const db::Dataframe* frame) {
+void TuringProtoWriter::writeColumns(std::span<const db::Column* const> columns, size_t offset, size_t rowCount) {
     auto onBufferFull = [&]() {
         writePacket(MessageTypes::CHUNK);
     };
 
     _buffer.setOnBufferFullCallBack(onBufferFull);
 
-    _encoder.writeDataframe(frame);
+    _encoder.writeColumns(columns, offset, rowCount);
 
     if (_buffer.size() > 0) {
         writePacket(MessageTypes::CHUNK);
     }
+
+    _encoder.writeChunkFooter(rowCount);
     writePacket(MessageTypes::END_CHUNK);
 }
 
@@ -113,6 +116,21 @@ void TuringProtoWriter::writeProtocolError(std::string_view message) {
     _encoder.writeProtocolError(message);
 
     writePacket(MessageTypes::PROTOCOL_ERROR);
+}
+
+void TuringProtoWriter::writeAnalyzeError(int32_t error) {
+    std::string details;
+    net::HTTP::describeError(static_cast<net::HTTP::Error>(error), details);
+
+    // The request failed HTTP framing analysis before dispatch, so no response has been
+    // started yet. Open the 200 OK envelope, send one PROTOCOL_ERROR packet and the chunk
+    // terminator, and swallow a send failure: the connection is closed right after.
+    try {
+        startResponse(net::ConnectionHeader::CLOSE);
+        writeProtocolError(details);
+        flush();
+    } catch (const NetException&) {
+    }
 }
 
 void TuringProtoWriter::writeEndPacket(db::QueryCallbacks::ExecTimeMilliseconds milliseconds) {

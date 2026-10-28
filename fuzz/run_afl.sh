@@ -7,7 +7,7 @@
 #
 # Usage: ./fuzz/run_afl.sh [OPTIONS] [HARNESS...]
 #
-# Harnesses: --cypher  --csv  --gml  --http  (default: all)
+# Harnesses: --cypher  --csv  --http  --proto  (default: all)
 #
 # Options:
 #   --time SECS      Time per harness (default: 300)
@@ -35,28 +35,28 @@ NOSTOP=0
 REBUILD_AFL=0
 RUN_CYPHER=0
 RUN_CSV=0
-RUN_GML=0
 RUN_HTTP=0
+RUN_PROTO=0
 ANY_SELECTED=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --cypher)      RUN_CYPHER=1; ANY_SELECTED=1; shift ;;
         --csv)         RUN_CSV=1; ANY_SELECTED=1; shift ;;
-        --gml)         RUN_GML=1; ANY_SELECTED=1; shift ;;
         --http)        RUN_HTTP=1; ANY_SELECTED=1; shift ;;
+        --proto)       RUN_PROTO=1; ANY_SELECTED=1; shift ;;
         --time)        AFL_TIME="$2"; shift 2 ;;
         --nostop)      NOSTOP=1; shift ;;
         --build-only)  BUILD_ONLY=1; shift ;;
         --skip-build)  SKIP_BUILD=1; shift ;;
         --rebuild-afl) REBUILD_AFL=1; shift ;;
         -h|--help)
-            echo "Usage: $0 [--cypher] [--csv] [--gml] [--http] [--time SECS] [--nostop] [--build-only] [--skip-build] [--rebuild-afl]"
+            echo "Usage: $0 [--cypher] [--csv] [--http] [--proto] [--time SECS] [--nostop] [--build-only] [--skip-build] [--rebuild-afl]"
             echo ""
             echo "  --cypher       Fuzz the Cypher parser"
             echo "  --csv          Fuzz the CSV parser"
-            echo "  --gml          Fuzz the GML importer"
-            echo "  --http         Fuzz the HTTP parser"
+            echo "  --http         Fuzz the HTTP server"
+            echo "  --proto        Fuzz the binary-protocol server"
             echo "  --time SECS    Time per harness (default: 300)"
             echo "  --nostop       Run forever until Ctrl+C (ignores --time)"
             echo "  --build-only   Build but don't run"
@@ -72,7 +72,7 @@ done
 
 # Default: run all
 if [[ $ANY_SELECTED -eq 0 ]]; then
-    RUN_CYPHER=1; RUN_CSV=1; RUN_GML=1; RUN_HTTP=1
+    RUN_CYPHER=1; RUN_CSV=1; RUN_HTTP=1; RUN_PROTO=1
 fi
 
 # Build harness list
@@ -80,8 +80,8 @@ HARNESSES=()
 CORPORA=()
 if [[ $RUN_CYPHER -eq 1 ]]; then HARNESSES+=(fuzz_query_engine); CORPORA+=("$FUZZ_DIR/corpus/cypher"); fi
 if [[ $RUN_CSV -eq 1 ]];    then HARNESSES+=(fuzz_csv_parser);    CORPORA+=("$FUZZ_DIR/corpus/csv"); fi
-if [[ $RUN_GML -eq 1 ]];    then HARNESSES+=(fuzz_gml_importer);  CORPORA+=("$FUZZ_DIR/corpus/gml"); fi
 if [[ $RUN_HTTP -eq 1 ]];   then HARNESSES+=(fuzz_http_parser);   CORPORA+=("$FUZZ_DIR/corpus/http"); fi
+if [[ $RUN_PROTO -eq 1 ]];  then HARNESSES+=(fuzz_proto_parser);  CORPORA+=("$FUZZ_DIR/corpus/proto"); fi
 
 # =========================================================================
 # Require LLVM 21
@@ -124,7 +124,9 @@ if [[ $REBUILD_AFL -eq 1 ]] || [[ ! -x "$AFL_CC_BIN" ]]; then
     echo "Building AFL++ from source..."
     cd "$AFL_SRC"
     [[ $REBUILD_AFL -eq 1 ]] && make clean 2>/dev/null || true
-    LLVM_CONFIG="$LLVM_CONFIG_PATH" make -j$(nproc) source-only 2>&1
+    # NO_NYX: nyx_mode is for binary-only fuzzing in a VM. We only instrument
+    #         our own source, and its build clones QEMU-Nyx (~180 MB) over the network.
+    NO_NYX=1 LLVM_CONFIG="$LLVM_CONFIG_PATH" make -j$(nproc) source-only 2>&1
     if [[ $? -ne 0 ]]; then
         echo "ERROR: AFL++ build failed."
         exit 1
@@ -267,6 +269,8 @@ run_one() {
         DICT_FLAG="-x $FUZZ_DIR/cypher.dict"
     elif [[ "$HARNESS" == "fuzz_http_parser" ]] && [[ -f "$FUZZ_DIR/http.dict" ]]; then
         DICT_FLAG="-x $FUZZ_DIR/http.dict"
+    elif [[ "$HARNESS" == "fuzz_proto_parser" ]] && [[ -f "$FUZZ_DIR/cypher.dict" ]]; then
+        DICT_FLAG="-x $FUZZ_DIR/cypher.dict"
     fi
 
     # On first run, start fresh. On subsequent rounds, resume (AFL++ uses -i-).

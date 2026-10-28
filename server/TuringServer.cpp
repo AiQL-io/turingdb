@@ -39,6 +39,10 @@ TuringServer::~TuringServer() {
     if (_server) {
         _server->terminate();
     }
+
+    if (_serverThread.joinable()) {
+        _serverThread.join();
+    }
 }
 
 void TuringServer::start() {
@@ -52,7 +56,7 @@ void TuringServer::start() {
 
     if (useProto) {
         functions._processor =
-            [&](net::AbstractThreadContext* threadContext, net::TCPConnection& connection) {
+            [this](net::AbstractThreadContext* threadContext, net::TCPConnection& connection) {
                 TuringProtoServerProcessor processor(_db, connection);
                 processor.process(threadContext);
             };
@@ -63,8 +67,8 @@ void TuringServer::start() {
             return std::make_unique<net::proto::TuringProtoWriter>(bufferCapacity);
         };
     } else {
-        functions._processor = [&](net::AbstractThreadContext* threadContext,
-                                   net::TCPConnection& connection) {
+        functions._processor = [this](net::AbstractThreadContext* threadContext,
+                                      net::TCPConnection& connection) {
             DBServerProcessor processor(_db, connection);
             processor.process(threadContext);
         };
@@ -82,11 +86,7 @@ void TuringServer::start() {
     _server->setWorkerCount(_config.getWorkerCount());
     _server->setMaxConnections(_config.getMaxConnections());
 
-    const auto initRes = _server->initialize();
-    if (initRes != net::FlowStatus::OK) {
-        _server->terminate();
-        return;
-    }
+    _server->initialize();
 
     const auto serverFunc = [&]() {
         ThreadName::set(THREAD_NAME);

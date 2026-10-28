@@ -8,7 +8,9 @@
 #include "LocalMemory.h"
 #include "TuringProtoInBuf.h"
 #include "TuringProtoHeaders.h"
+#include "TuringProtoRequestBody.h"
 #include "list/ListBuffer.h"
+#include "map/MapBuffer.h"
 #include "QueryCallbacks.h"
 #include "QueryStatus.h"
 #include "versioning/ChangeID.h"
@@ -17,6 +19,7 @@
 namespace db {
 
 class LocalMemory;
+class ParameterMap;
 class DataframeManager;
 
 }
@@ -40,7 +43,8 @@ public:
     void disconnect();
 
     db::QueryStatus sendQuery(const std::string& query,
-                              const db::QueryCallbacks::OnOutputData& callback);
+                              const db::QueryCallbacks::OnOutputData& callback,
+                              const db::ParameterMap* parameters = nullptr);
 
     void setRemoteAddress(const std::string& remoteAddress) { _remoteAddress = remoteAddress; }
     void setRemotePort(const std::string& remotePort) { _remotePort = remotePort; }
@@ -57,7 +61,7 @@ public:
 
     net::proto::ChunkedBuffer<float>& getEmbeddingBuffer() { return _embeddingBuffer; }
     net::proto::ChunkedBuffer<char>& getStringBuffer() { return _stringBuffer; }
-    db::LocalMemory::DefaultListBuffer& getListBuffer() { return _listBuffer; }
+    db::QueryListBuffer& getListBuffer() { return _listBuffer; }
     db::CommitHash getCommitHash() const { return _commitHash; }
     db::ChangeID getChangeID() const { return _changeID; }
 
@@ -90,8 +94,11 @@ private:
     net::proto::ChunkedBuffer<float> _embeddingBuffer;
     net::proto::ChunkedBuffer<char> _stringBuffer;
     db::ListBuffer<> _listBuffer;
+    db::MapBuffer<> _mapBuffer;
 
-    void sendRequest(const std::string& query);
+    net::proto::TuringProtoRequestBody _requestBody;
+
+    void sendRequest(const std::string& query, const db::ParameterMap* parameters);
     void recvHttpResponseHeaders();
     size_t recvChunkSizeLine();
     void recvChunkBody(size_t chunkSize, net::proto::ProtoHeader* outHeader);

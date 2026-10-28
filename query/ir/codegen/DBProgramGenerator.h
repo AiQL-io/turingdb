@@ -1,16 +1,29 @@
 #pragma once
 
 #include <memory>
+#include <span>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
+#include "decl/PatternData.h"
+#include "llvm/ADT/ArrayRef.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Value.h"
 
 #include "DBOps.h"
+#include "DBPasses.h"
 #include "DBTypes.h"
+#include "expr/CaseExpr.h"
+#include "metadata/DateTime.h"
+#include "stmt/CallSubqueryStmt.h"
+
+#include "ExplainRequest.h"
 
 #include "VariableDependencyGraph.h"
 
@@ -24,13 +37,62 @@ class Region;
 namespace db {
 
 class BinaryExpr;
+class LogicalExpr;
+class DBPassPipeline;
+class ExplainReport;
+class FunctionInvocationExpr;
+class FunctionInvocation;
 class UnaryExpr;
+class CallStmt;
+class CreateStmt;
 class CypherAST;
+class DeleteStmt;
+class EdgePattern;
+class EmbeddingLiteral;
+class EntityTypeExpr;
 class Expr;
+class ExprChain;
+class IndexExpr;
+class LabelExpr;
 class Literal;
+class ListLiteral;
+class ListComprehensionExpr;
+class ListPredicateExpr;
+class ReduceExpr;
+class ExistsExpr;
+class CountSubqueryExpr;
+class CollectSubqueryExpr;
+class ListSliceExpr;
+class LoadCSVStmt;
+class MapLiteral;
+class MatchStmt;
+class MergeStmt;
+class NodePattern;
+class PatternComprehensionExpr;
+class PatternData;
+class PatternElement;
+class Projection;
 class PropertyExpr;
+class PropertyLookupExpr;
+class ReturnStmt;
+class ShortestPathStmt;
+class UnwindStmt;
+class VarDecl;
+class VectorSearchStmt;
 class VariableDependency;
 class DependencyEdge;
+class SetStmt;
+class RemoveStmt;
+class SinglePartQuery;
+class UnionQuery;
+class ConditionalQuery;
+class Stmt;
+class SymbolChain;
+class WhereClause;
+class WithStmt;
+class NextSegmentStmt;
+class YieldClause;
+class YieldItems;
 
 class DBProgramGenerator {
 public:
@@ -38,27 +100,238 @@ public:
     using VariableIdentityMap = std::unordered_map<const VariableDependency*, VariableIdentities>;
     using DefinedVars = std::unordered_set<const VariableDependency*>;
     using ExprValueMap = std::unordered_map<const Expr*, mlir::Value>;
+    using ProjectedColumnMap = std::unordered_map<const VarDecl*, mlir::Value>;
+    using ElementColumnMap = std::unordered_map<const VarDecl*, mlir::Value>;
+    using EdgeTypeColumnMap = std::unordered_map<const VariableDependency*, mlir::Value>;
+    using ColumnPredicate = llvm::function_ref<bool(mlir::Value)>;
+    using VariableColumnBinding = llvm::function_ref<void(const VarDecl*, std::string_view, mlir::Value)>;
+    using CaseRegionGenerator = llvm::function_ref<mlir::Value(mlir::Value)>;
+    using LabelSetCheck = llvm::function_ref<mlir::Value(const SymbolChain*)>;
 
-    explicit DBProgramGenerator(mlir::ModuleOp* mainModule);
+    // Maps a Cypher variable to the last column defined for it, the one the projection
+    // and its ORDER BY read
+    using VariableColumnMap = std::unordered_map<const VarDecl*, mlir::Value>;
+
+    // A column bound under a name rather than by a pattern - what a CALL or a VECTOR SEARCH
+    // yielded, what an UNWIND of an expression bound - under the declaration the query
+    // knows it by and the name it is output under. A standalone call naming no YIELD
+    // declares nothing, so its columns carry a null declaration. _isResult marks the ones
+    // that stand in for a projection.
+    struct YieldedColumn {
+        const VarDecl* _decl {nullptr};
+        std::string_view _name;
+        mlir::Value _column;
+        bool _isResult {false};
+    };
+
+    // A column a part cut hands to the part below it, under the declaration and the name
+    // it was bound to above. The name is owned, since publishing clears the variables the
+    // one in flight points into.
+    struct PublishedColumn {
+        const VarDecl* _decl {nullptr};
+        std::string _name;
+        mlir::Value _column;
+    };
+
+    // The columns a grouped aggregation produces, each under the expression it computes:
+    // the grouping keys and the aggregate results
+    using GroupedColumns = llvm::SmallVector<std::pair<const Expr*, mlir::Value>>;
+
+    // A null report is a query to run: nothing is dumped and the compilation is the
+    // one an unprefixed query gets
+    // The pass context carries what the optimisation pipeline reads from outside the IR:
+    // the graph the join cost model estimates from, and its overrides. Its default holds
+    // no graph, which leaves every cut the join pass matches fused.
+    explicit DBProgramGenerator(mlir::ModuleOp* mainModule,
+                                ExplainReport* explain = nullptr,
+                                const mlir::db::DBPassContext& passContext = mlir::db::DBPassContext {});
     ~DBProgramGenerator();
 
+    void setPassPipeline(DBPassPipeline* passPipeline) { _passPipeline = passPipeline; }
+
     void generate(const CypherAST* ast);
+
+    // Emits the program that reports a finished EXPLAIN: the db.explain holding the
+    // dumps its compilation collected, and the db.output naming its two columns
+    void generateExplainResult(const ExplainReport& report);
 
 private:
     mlir::ModuleOp* _module {nullptr};
     mlir::MLIRContext* _mlirCtxt {nullptr};
     mlir::OpBuilder _opBuilder;
 
-    // Maps a Cypher variable to all of its MLIR variable defs, in order of appearance
-    VariableIdentityMap _varMap;
+    ExplainReport* _explain {nullptr};
+    mlir::db::DBPassContext _passContext;
+    DBPassPipeline* _passPipeline {nullptr};
 
-    // Maps each edge VDG var to its MLIR type column
-    std::unordered_map<const VariableDependency*, mlir::Value> _edgeTypeMap;
+    // How many query parts have had their dependency graph dumped, which numbers the
+    // graphs a multi-part query reports
+    size_t _explainedParts {0};
 
-    // Maps each WHERE clause expression to the MLIR value it produces
-    ExprValueMap _exprMap;
+    // A WITH drops this whole object rather than naming its members one at a time, so a
+    // map added here is one the next part cannot read a stale binding out of
+    struct PartScope {
+        VariableIdentityMap _varMap;
 
+        EdgeTypeColumnMap _edgeTypeMap;
+
+        ExprValueMap _exprMap;
+
+        // Maps each projected item to the column it produced, under the declaration the
+        // alias of that item shares with it
+        ProjectedColumnMap _projectedColumns;
+
+        // Set while the keys of an ORDER BY are translated, the one place that reads the
+        // aliases of the projection before any variable is bound to their columns
+        bool _orderingProjection {false};
+
+        // The element column a list comprehension's variable holds while the body of that
+        // comprehension is translated: the block argument of the op's region. Nothing
+        // outside that body names the variable, so the binding stands only while it is
+        // being translated
+        ElementColumnMap _comprehensionElements;
+
+        // The column a CALL produced for each of its yielded return values. A yielded
+        // variable appears in no pattern, so it is not a VDG variable and cannot live in
+        // _varMap; the projection and symbol translation consult both. Kept in yield
+        // order, because a standalone CALL has no projection of its own and emits its
+        // columns in that order.
+        std::vector<YieldedColumn> _yieldedColumns;
+
+        // What a CREATE wrote for one of its named pattern entities: the column of
+        // provisional IDs and the value column of every property it set. A created entity
+        // is in no pattern the traversal walked, so it is no VDG variable, and its rows are
+        // not in the graph a fetch would read - both come from here instead
+        struct CreatedEntity {
+            mlir::Value _column;
+
+            // Which rows of the column hold a provisional ID: null when every one does,
+            // which is what a CREATE writes. A MERGE mixes the entities it wrote with
+            // the ones it bound, so its rows are told apart by a mask - and a property
+            // it did not write is read off the graph rather than being null.
+            mlir::Value _pending;
+
+            std::unordered_map<std::string_view, mlir::Value> _properties;
+        };
+
+        using CreatedEntityMap = std::unordered_map<const VarDecl*, CreatedEntity>;
+
+        CreatedEntityMap _createdEntities;
+
+        // The aggregate that reduced the rows the part matched, once one has. The columns
+        // bound above it hold those rows and are no longer the rows in flight, which are
+        // the groups: an op emitted below can carry only what this op bound or later.
+        mlir::Operation* _aggregateOp {nullptr};
+
+        // What a part cut leaves of an entity the query wrote: every row of it that is not
+        // null names one this change has not committed, so a read goes to the write buffer,
+        // and the labels or edge type the CREATE spelled are all there is to say what it is.
+        // Both are empty for a UNION column whose branches created different ones, and for
+        // an OPTIONAL CALL's, whose null rows have neither. No column is kept - the WITH
+        // publishes one, which a traversal below is free to cut
+        struct WrittenEntity {
+            std::vector<std::string> _labels;
+            std::string _edgeType;
+
+            // False when a label or the edge type of the entity is a parameter, so what it
+            // carries is only known once the program runs
+            bool _labelsKnown {true};
+            bool _edgeTypeKnown {true};
+
+            bool operator==(const WrittenEntity& other) const;
+        };
+
+        std::unordered_map<const VarDecl*, WrittenEntity> _writtenEntities;
+
+        // The mask of each entity a MERGE above the cut wrote, saying which of its rows name
+        // one this change wrote. It is bound as a column of its own, so every op the rows go
+        // through carries it along with them
+        std::unordered_map<const VarDecl*, const VariableDependency*> _pendingMasks;
+
+        // The traversal root a CALL ahead of the MATCH bound, when the query lets the
+        // traversal expand that column instead of scanning the graph and joining. Null
+        // otherwise, which leaves every call after the traversal and every root opening
+        // with a scan.
+        const VariableDependency* _drivenRoot {nullptr};
+
+        // The pattern variables a const scan opened from an UNWIND's node IDs. A seeded
+        // variable the traversal reached some other way holds rows that are not the listed
+        // nodes, so what it was seeded with has to be checked against what was walked
+        std::unordered_set<const VariableDependency*> _seededVars;
+
+        // The variables bound to a path column, with the list each one reads as, the
+        // variable holding the path and the seed variable a sources list opens with
+        struct PathBinding {
+            mlir::storage::PathExpansionKind _kind {mlir::storage::PathExpansionKind::Edges};
+            const VariableDependency* _seed {nullptr};
+            const VariableDependency* _path {nullptr};
+            // Whether the walk ran against the pattern, its far end having seeded it
+            bool _reversed {false};
+            // The step of the walk's body the list reads off each repetition
+            size_t _step {0};
+            size_t _steps {1};
+
+            bool readsAsItsEdges() const { return _kind == mlir::storage::PathExpansionKind::Edges && !_reversed && _steps == 1; }
+        };
+
+        std::unordered_map<const VarDecl*, PathBinding> _pathBindings;
+
+        // The walk a `MATCH p = ...` names when its element is one quantified relationship:
+        // the variable holding the seeds and the one holding the handles, which is the
+        // relationship's own column. The path is built from the two where it is read, so
+        // the rows carry a handle rather than a sequence of their own.
+        struct NamedPathWalk {
+            const VariableDependency* _seed {nullptr};
+            const VariableDependency* _path {nullptr};
+            bool _reversed {false};
+        };
+
+        std::unordered_map<const VarDecl*, NamedPathWalk> _namedPathWalks;
+
+        // The entity sequence each `MATCH p = ...` built for an element that names no
+        // single walk. A path variable appears in no pattern, so it is no VDG variable and
+        // cannot live in _varMap.
+        std::unordered_map<const VarDecl*, mlir::Value> _namedPaths;
+
+        // The quantified edge pattern each variable-length variable was declared by, whose
+        // hop constraints the exploration's region is generated from
+        std::unordered_map<const VarDecl*, const EdgePattern*> _quantifiedEdges;
+
+        // The block arguments of the hop region being generated, under the declarations of
+        // the hop's entities; empty outside a region
+        std::unordered_map<const VarDecl*, mlir::Value> _hopColumns;
+    };
+
+    PartScope _part;
+
+    // Of one part too, but emptied rather than replaced: its variables and edges point
+    // at each other
     VariableDependencyGraph _vdg;
+
+    // Held for the source locations its diagnostics manager resolves, so a rejection
+    // names the span of the query it came from
+    const CypherAST* _ast {nullptr};
+
+    // Whether a value holds the same value in every row, so a chain of clauses over one
+    // column is walked once rather than once per clause
+    llvm::DenseMap<mlir::Value, bool> _constantColumns;
+
+    // The branches of a union in a subquery body start from the rows of that body, so each
+    // branch block being generated maps to the body block whose columns are in flight in it
+    std::unordered_map<mlir::Block*, mlir::Block*> _unionBranchRowBlocks;
+
+    // The row each loaded field is read off, so a subquery body importing the row is
+    // handed the field's column with it
+    std::unordered_map<const VarDecl*, std::string_view> _csvFieldRows;
+
+    // The columns of the row the CALL body being generated runs for, as its block
+    // arguments and the constants it reads where they are bound
+    llvm::SmallVector<PublishedColumn> _subqueryRowColumns;
+
+    // The LOAD CSV rows the subquery body being generated imports. A body that groups or
+    // dedups runs one input row at a time, so such a row holds one record there and the
+    // columns of its fields tell its rows apart as the whole row would
+    std::unordered_set<std::string_view> _importedCSVRows;
 
     struct TranslatedComponent {
         std::unique_ptr<mlir::Region> _region;
@@ -66,15 +339,205 @@ private:
         llvm::SmallVector<mlir::Value> _columns;
     };
 
-    void generateTraversal(const CypherAST* ast);
+    // The columns an aggregate reads over the rows ahead of its reduction. The row
+    // percentile is null unless the call takes a percentile that reads a row.
+    struct AggregateArguments {
+        mlir::Value _values;
+        mlir::Value _rowPercentile;
+    };
+
+    [[noreturn]] void throwError(std::string_view msg, const void* obj = nullptr) const;
+
+    void createMain();
+
+    // What being one branch of a union asks of a query body's result: its projected
+    // constants laid out over its rows, so every branch emits the result table's columns
+    // in one shape, and - where the union dedups - the seen-set the branches it covers
+    // record their rows in. Null on a dedup-free branch.
+    struct UnionBranch {
+        mlir::Value _distinctSet;
+    };
+
+    // One whole query body: the parts its barriers cut it into, then the result those
+    // parts produce. @param branch is null for a query that is not part of a union.
+    void generateQuery(const SinglePartQuery* query, const UnionBranch* branch);
+
+    // Emits the db.union of a UNION, one region per branch, each generated as a query
+    // body in its own right
+    void generateUnion(const UnionQuery* unionQuery);
+
+    void generateConditionalQuery(const ConditionalQuery* query);
+
+    void generateQueryParts(const SinglePartQuery* query);
+
+    // One query part: its reading clauses, then the updating ones that write over the rows
+    // they matched
+    void generatePartStatements(std::span<Stmt* const> stmts);
+
+    // The statements between two WITH barriers, split again at each OPTIONAL MATCH: an
+    // optional pattern keeps the rows it does not match, so it cannot be walked with the
+    // mandatory patterns beside it and closes the traversal before it the way a barrier does
+    void generateOptionalParts(std::span<Stmt* const> stmts);
+
+    // One query part: the statements between two WITH barriers
+    void generatePart(std::span<Stmt* const> stmts);
+
+    // Emits the db.call_subquery of one CALL { ... }: the columns in flight become the
+    // inputs its body reads through block arguments, the body is generated into the op's
+    // region as a query of its own, and - for a returning body - the op's results, the
+    // inputs beside what the body returned, take the scope over
+    void generateCallSubquery(const CallSubqueryStmt* subquery);
+
+    void generateNextSegment(const NextSegmentStmt* segment);
+    void generateUnionSegment(const CallSubqueryStmt* body);
+    void generateConditionalSegment(const CallSubqueryStmt* body);
+    void generateUpdatingSegment(const NextSegmentStmt* segment);
+
+    void splitConstantColumns(llvm::ArrayRef<PublishedColumn> columns,
+                              llvm::SmallVectorImpl<PublishedColumn>& rowColumns,
+                              llvm::SmallVectorImpl<PublishedColumn>& constants);
+
+    // The table a segment reads: the columns in flight, the ones holding rows behind a
+    // db.materialize, which is null when none does
+    struct SegmentTable {
+        llvm::SmallVector<PublishedColumn> _rowColumns;
+        llvm::SmallVector<PublishedColumn> _constants;
+        mlir::Value _rows;
+    };
+
+    void materializeTable(SegmentTable& table);
+    void scanTable(const SegmentTable& table, mlir::Block* block, llvm::SmallVectorImpl<mlir::Value>& scanned);
+
+    // Whether the body's rows carry the columns it was given through to its RETURN: true
+    // unless a clause of it aggregates, sorts, cuts or dedups the rows, which is when the
+    // body has to run one input row at a time instead
+    static bool subqueryCarriesRows(const SinglePartQuery* body);
+
+    // Emits the source op of every LOAD CSV of this part. A load reads no column, so it
+    // is generated ahead of the predicates - a pattern constraint reading a field
+    // (MATCH (n {name: row[0]})) then has its column - and crossed with whatever the
+    // traversal bound.
+    void generateCSVLoads(std::span<Stmt* const> stmts);
+
+    // Whether this statement closes a part on the cut it carries: a MATCH whose ORDER BY,
+    // SKIP or LIMIT reads the rows that MATCH produced, which a later MATCH or UNWIND of
+    // the same part would otherwise have crossed into them first
+    bool closesPartOnItsCut(const Stmt* stmt, std::span<Stmt* const> following) const;
+
+    // Emits the db.optional_match of one OPTIONAL MATCH, given as the single-statement
+    // @param stmt: the columns in flight become the rows its pattern joins onto, the
+    // pattern is generated into the op's region as a part of its own, and the op's
+    // results - those rows with the ones the pattern missed added back - take the scope over
+    void generateOptionalMatch(std::span<Stmt* const> stmt);
+
+    void generateTraversal(std::span<Stmt* const> stmts);
+
+    bool holdsColumn(const VariableDependency* var) const;
+
+    // Rejects a pattern variable the traversal left without a column: a shape it cannot
+    // walk from the variables in scope
+    void throwOnUnboundPatternVariable() const;
+
+    // Rejects a variable an UNWIND seeds with node IDs that the traversal reached some
+    // other way, its list left unmatched: only the node a component opens from is seeded
+    void throwOnDroppedUnwindSeed() const;
+
+    void closeBoundJoins(std::vector<const VariableDependency*>& carriedSet,
+                         std::vector<const VariableDependency*>& dataflowVars);
+
+    // Walks one hop whose far end already holds a column, so the hop constrains the rows
+    // instead of fanning them out: the column it lands on is filtered against that one
+    void closeBoundJoin(const DependencyEdge* edgeProducer,
+                        const VariableDependency* edge,
+                        const VariableDependency* target,
+                        std::vector<const VariableDependency*>& carriedSet,
+                        std::vector<const VariableDependency*>& dataflowVars);
+
+    // The walk skips a merge target that already holds a column, so the equality closing
+    // a cycle through a bound variable is left to be emitted here
+    void closeBoundMerges();
+
+    void closeBoundEdges();
+
+    // Extends the dataflow the barrier left behind rather than opening one of its own,
+    // filling @param dataflowVars with every variable that dataflow carries a column for
+    void extendBoundDataflow(DefinedVars& defined,
+                             std::vector<const VariableDependency*>& dataflowVars);
+
+    // Turns the dataflow already standing in @param mainBlock into a cross product factor:
+    // every op emitted into it so far, bar the ones binding a constant
+    void takeMainDataflow(mlir::Block* mainBlock, TranslatedComponent& component);
+
+    // The columns in flight at the current insertion point, and what each belongs to so the
+    // results of an op taking them all can be rebound: the latest value of every Cypher
+    // variable, then every edge-type column, then every column a CALL yielded.
+    struct InFlightColumns {
+        llvm::SmallVector<mlir::Value> _columns;
+        llvm::SmallVector<const VariableDependency*> _variables;
+        llvm::SmallVector<const VariableDependency*> _edgeTypeVariables;
+        llvm::SmallVector<size_t> _yieldedIndices;
+        llvm::SmallVector<const VarDecl*> _comprehensionDecls;
+        llvm::SmallVector<const Expr*> _exprs;
+        llvm::SmallVector<const VarDecl*> _namedPathDecls;
+    };
+
+    // Generates the statements a part writes ahead of its first MATCH that bind variables
+    // of their own - its calls and its vector searches - when what they yield can drive the
+    // traversal, and names the root that will expand it. Generates nothing otherwise: rows
+    // the traversal does not consume have to be paired with it, which is what generating
+    // them after the traversal does.
+    void generateLeadingYields(std::span<Stmt* const> stmts);
+
+    // Emits the op of a system-level statement - LOAD GRAPH, CHANGE, COMMIT and
+    // their siblings - which is the whole program. False for an ordinary query,
+    // which then goes through the traversal pipeline
+    bool generateSystemCommand(const CypherAST* ast);
+
+    // Whether a variable can open a connected component: a node variable no traversal binds
+    bool isValidRoot(const VariableDependency& var) const;
+
+    // The variable each connected component of the graph opens with - the roots
+    // translateComponent is called with, one per component
+    void collectComponentRoots(llvm::SmallVectorImpl<const VariableDependency*>& roots) const;
+
+    // Whether a root reaches the ends of every merge it crosses without crossing it first
+    bool reachesTheMergesItCrosses(const VariableDependency& root) const;
+
+    // Every valid root, the ones a merge would stall translated last
+    void collectOrderedRoots(llvm::SmallVectorImpl<const VariableDependency*>& roots) const;
 
     // Adds filters for edges which should be equivalent (joined on)
     void resolveEdgeIdentities();
+
+    // Joins each pattern variable to the column a CALL yielded under its name: the two are
+    // one Cypher variable, and the call has already paired its rows with the ones the
+    // pattern matched, so keeping the rows where the two columns agree is that join.
+    void resolveYieldedIdentities();
+
+    void openComponent(const VariableDependency* root);
 
     // Translate a connected component of @ref _vdg, fills @param outVars
     void translateComponent(const VariableDependency* root,
                             std::unordered_set<const VariableDependency*>& defined,
                             std::vector<const VariableDependency*>& outVars);
+
+    void collectComponentVars(const VariableDependency* root, DefinedVars& componentVars) const;
+
+    void collectVarsOfDecl(const VarDecl* decl, llvm::SmallVectorImpl<const VariableDependency*>& vars) const;
+
+    bool walkReadsAnotherComponent(const DefinedVars& componentVars);
+
+    void expandCrossedComponents(llvm::ArrayRef<const VariableDependency*> roots,
+                                 const std::vector<TranslatedComponent>& components,
+                                 DefinedVars& defined);
+
+    // Walks a component out from @param root, one edge traversal per hop. The root has to
+    // hold a column already: translateComponent opens one with a scan, and a variable a
+    // WITH bound carries the one the barrier published
+    void expandComponent(const VariableDependency* root,
+                         std::unordered_set<const VariableDependency*>& defined,
+                         std::vector<const VariableDependency*>& carriedSet,
+                         std::vector<const VariableDependency*>& outVars);
 
     // Converts an arbitrary number of connected components into a cascading nest of
     // CrossProducts
@@ -85,25 +548,908 @@ private:
     // Moves a translated connected component into a CrossProduct factor
     void moveComponentToFactor(TranslatedComponent& component, mlir::Block* factorBlock);
 
-    void generateCreate(const CypherAST* ast);
-    void generateOutput(const CypherAST* ast);
+    // Every row of the variable's column names an entity this change wrote and has not
+    // committed, so a read of one is answered by the write buffer and not by the graph
+    bool isPendingThroughout(const VarDecl* decl) const;
 
-    void generatePropertyConstraints(const CypherAST* ast);
-    void generateLabelConstraints(const CypherAST* ast);
-    void generateEdgeTypeConstraints(const CypherAST* ast);
-    void generateFilters(const CypherAST* ast);
+    const PartScope::WrittenEntity* findWrittenEntity(const VarDecl* decl) const;
+
+    static bool writtenEntityPasses(const PartScope::WrittenEntity& written,
+                                    const LabelExpr* labelExpr,
+                                    bool isNode);
+
+    using CarriedEntities = llvm::SmallVector<std::pair<const VarDecl*, PartScope::WrittenEntity>>;
+
+    // What a db.call_subquery hands back, bound to its results: the rows in flight it was
+    // given, the columns its body returned, and the constants, which it never took
+    struct SubqueryResults {
+        llvm::SmallVector<PublishedColumn> _inputs;
+        llvm::SmallVector<PublishedColumn> _returned;
+        llvm::SmallVector<PublishedColumn> _constants;
+        CarriedEntities _returnedEntities;
+    };
+
+    // Emits the db.call_subquery of @param subquery, leaving the scope as it was, and fills
+    // @param results when the body returns
+    void emitCallSubquery(const CallSubqueryStmt* subquery, SubqueryResults& results);
+
+    void bindReturnedEntities(CarriedEntities& returnedEntities);
+
+    // The scope one branch of a CALL body opens with: the imports it names, read through
+    // @param inputArguments or where they are bound as constants, and - for a body carrying
+    // the scope - every input under a hidden name
+    void collectSubqueryBranchScope(const CallSubqueryStmt::Branch& branch,
+                                    llvm::ArrayRef<PublishedColumn> inputs,
+                                    llvm::ArrayRef<mlir::Value> inputArguments,
+                                    mlir::Value tagArgument,
+                                    llvm::ArrayRef<PublishedColumn> constants,
+                                    bool bindsHidden,
+                                    llvm::SmallVectorImpl<PublishedColumn>& scope,
+                                    CarriedEntities& importedEntities) const;
+
+    // Emits the db.union of a CALL or COUNT body that is a UNION, and fills @param yielded
+    // with its results under the names and declarations the body returns them as
+    void generateSubqueryUnion(llvm::ArrayRef<const SinglePartQuery*> branches,
+                               size_t dedupedBranches,
+                               std::span<const llvm::SmallVector<PublishedColumn>> branchScopes,
+                               std::span<const CarriedEntities> importedEntities,
+                               llvm::SmallVectorImpl<PublishedColumn>& yielded,
+                               CarriedEntities& returnedEntities);
+
+    // Emits the db.conditional of a WHEN body and fills @param yielded as
+    // generateSubqueryUnion does
+    void generateSubqueryConditional(llvm::ArrayRef<CallSubqueryStmt::Branch> branches,
+                                     std::span<const llvm::SmallVector<PublishedColumn>> branchScopes,
+                                     std::span<const CarriedEntities> importedEntities,
+                                     llvm::SmallVectorImpl<PublishedColumn>& yielded,
+                                     CarriedEntities& returnedEntities);
+
+    // What the branches build before the db.union or db.conditional holding them exists
+    struct SubqueryBranchResults {
+        std::vector<std::unique_ptr<mlir::Region>> _regions;
+        std::vector<llvm::SmallVector<PublishedColumn>> _branchColumns;
+        llvm::SmallVector<mlir::Type> _resultTypes;
+        std::vector<std::vector<std::optional<PartScope::WrittenEntity>>> _writtenColumns;
+    };
+
+    void rebindSubqueryBranchScope(llvm::ArrayRef<PublishedColumn> scope, const CarriedEntities& importedEntities);
+
+    void generateConditionRegion(const Expr* predicate,
+                                 mlir::Block* bodyBlock,
+                                 std::vector<std::unique_ptr<mlir::Region>>& regions);
+
+    mlir::Block* openSubqueryBranch(SubqueryBranchResults& branchResults);
+
+    // Generates one branch into @param block, opened by openSubqueryBranch, ending in a
+    // db.yield of what its RETURN publishes, none for a branch ending on a write
+    void generateSubqueryBranch(const SinglePartQuery* query,
+                                mlir::Block* block,
+                                mlir::Block* bodyBlock,
+                                SubqueryBranchResults& branchResults);
+
+    void generateUnionOverBranches(mlir::Value distinctSet,
+                                   size_t dedupedBranches,
+                                   mlir::Block* bodyBlock,
+                                   SubqueryBranchResults& branchResults,
+                                   llvm::SmallVectorImpl<PublishedColumn>& yielded,
+                                   CarriedEntities& returnedEntities);
+
+    // Makes every branch yield the mask of each entity a MERGE wrote in any of them, or a
+    // CREATE wrote in some of them
+    void yieldEveryPendingMask(SubqueryBranchResults& branchResults);
+
+    void dedupSubqueryBranch(mlir::Value distinctSet, size_t branchIndex, SubqueryBranchResults& branchResults);
+
+    static void typeSubqueryBranchResults(SubqueryBranchResults& branchResults);
+
+    void publishSubqueryBranchResults(mlir::ResultRange results,
+                                      const SubqueryBranchResults& branchResults,
+                                      llvm::SmallVectorImpl<PublishedColumn>& yielded,
+                                      CarriedEntities& returnedEntities);
+
+    // Re-keys what the query has written to the declarations a WITH publishes it under,
+    // so the part below the cut still reads it as this change's own
+    void carryWrittenEntities(const Projection* projection,
+                              llvm::ArrayRef<PublishedColumn> published,
+                              CarriedEntities& carried) const;
+
+    // Rejects an item of @param projection naming an entity a MERGE wrote, where no mask can
+    // go along with it: out of a COUNT subquery
+    void throwOnPublishedMerge(const Projection* projection) const;
+
+    // Rejects a pattern of @param matchStmt that names an entity a CREATE of the same
+    // query wrote, which the clause named by @param clause cannot read
+    void throwOnMatchOverWrittenEntity(const MatchStmt* matchStmt, std::string_view clause) const;
+
+    // Records what a CREATE wrote for one named entity of its pattern, so the projection
+    // reads that back rather than fetching an ID the graph does not hold yet
+    void publishCreatedEntity(const VarDecl* decl,
+                              mlir::Value column,
+                              std::span<const LabelRef> labels,
+                              const EdgeTypeRef& edgeType,
+                              llvm::ArrayRef<llvm::StringRef> propNames,
+                              llvm::ArrayRef<mlir::Value> propValues);
+
+    // The chain of one MERGE pattern, as db.merge carries it: one entry per node and
+    // one per hop, with the attribute lists and operand groups they fill
+    struct MergeEntity {
+        const VarDecl* _decl {nullptr};
+        llvm::SmallVector<llvm::StringRef> _propNames;
+        llvm::SmallVector<mlir::Value> _propValues;
+
+        // A node the query already bound, whose rows come in through a column rather
+        // than from labels and property values. Never true of a hop.
+        bool _bound {false};
+    };
+
+    struct MergePattern {
+        llvm::SmallVector<MergeEntity> _nodes;
+        llvm::SmallVector<MergeEntity> _hops;
+
+        llvm::SmallVector<mlir::Attribute> _nodeLabels;
+        llvm::SmallVector<mlir::Attribute> _nodePropNames;
+        llvm::SmallVector<mlir::Attribute> _edgeTypes;
+        llvm::SmallVector<mlir::Attribute> _edgePropNames;
+        llvm::SmallVector<int64_t> _directions;
+        llvm::SmallVector<int64_t> _pendingNodes;
+
+        llvm::SmallVector<mlir::Value> _boundNodes;
+        llvm::SmallVector<mlir::Value> _boundPending;
+        llvm::SmallVector<mlir::Value> _nodePropValues;
+        llvm::SmallVector<mlir::Value> _edgePropValues;
+    };
+
+    // One entity an earlier write bound that an op takes along over the rows it hands its
+    // body: its ID column, its pending mask when it has one, then the value column of each
+    // property the write recorded, under the names sorted here
+    struct CarriedEntity {
+        const VarDecl* _decl {nullptr};
+        llvm::SmallVector<std::string_view> _propNames;
+    };
+
+    // Every column an op taking the whole row set carries: the columns in flight, then the
+    // columns of every entity an earlier write bound, which are in no VDG variable and so
+    // in no in-flight set
+    struct CarrySet {
+        InFlightColumns _inFlight;
+        llvm::SmallVector<mlir::Value> _columns;
+        llvm::SmallVector<CarriedEntity> _writtenEntities;
+    };
+
+    // Emits each update statement of a part in the order the query writes them, so a
+    // statement reading what an earlier one wrote is generated behind it
+    void generateUpdates(std::span<Stmt* const> stmts);
+    void generateCreateStmt(const CreateStmt* createStmt);
+    void generateMergeStmt(const MergeStmt* mergeStmt);
+
+    void collectMergePattern(const MergeStmt* mergeStmt, MergePattern& pattern);
+    void collectMergeNode(const NodePattern* nodePattern, MergePattern& pattern);
+    void collectMergeHop(const EdgePattern* edgePattern, MergePattern& pattern);
+    void collectMergeProperties(const PatternData* data, MergeEntity& entity);
+
+    void collectCarrySet(CarrySet& carrySet);
+
+    // The columns of the grouped rows, in the order the program computes them: once an
+    // aggregate has reduced the matched rows, what an op below carries is what the
+    // grouping bound - the key columns a sort key reads, under the expressions naming them
+    void collectGroupedColumns(CarrySet& carrySet);
+    void rebindCarrySet(mlir::ValueRange columns, size_t firstColumn, const CarrySet& carrySet);
+
+    // Moves every projected column the carry set took along onto the column standing for
+    // it here: @param from and @param to are the columns as they were bound and as they
+    // are bound now, one for one
+    void rebindProjectedColumns(mlir::ValueRange from, mlir::ValueRange to);
+
+    // Emits the ON CREATE and ON MATCH clauses of a merge, each over the rows @param
+    // created selects: the rows the merge wrote, and - through its negation - the rows
+    // it bound
+    void generateMergeActions(const MergeStmt* mergeStmt, mlir::Value created);
+
+    static mlir::storage::EdgeDirection mergeDirectionOf(const EdgePattern* edgePattern);
+
+    // Records what a MERGE bound for one named entity of its pattern: its column and the
+    // mask telling the rows it wrote from the rows it bound. Its properties are not
+    // recorded the way a CREATE's are - a merge row reads them where its own entity
+    // lives, off the graph or out of the write buffer.
+    void publishMergedEntity(const VarDecl* decl, mlir::Value column, mlir::Value pending);
+
+    // The mask saying which of a variable's rows hold a provisional ID, or a null Value
+    // for a variable no write bound and for one a CREATE bound - whose every row does
+    mlir::Value findPendingMask(const VarDecl* decl) const;
+
+    // Points what a write bound of @param decl at the grouped columns of an aggregate keyed
+    // on it. The property values a CREATE recorded hold the ungrouped rows, so they are
+    // dropped and a read goes to the write buffer
+    void rebindGroupedWrittenEntity(const VarDecl* decl, mlir::Value column, mlir::Value pending);
+
+    void generatePropertyWrite(const PropertyExpr* propertyExpr,
+                               mlir::Value valueColumn,
+                               mlir::Value rows);
+
+    void generateSetItems(const SetStmt* setStmt, mlir::Value rows);
+
+    void generateRemoveProperties(const RemoveStmt* removeStmt);
+    void generateDeleteStmt(const DeleteStmt* deleteStmt);
+    void generateOutput(const Projection* projection, const UnionBranch* branch);
+
+    // Lays every constant of a union branch's projection out over its rows. A constant
+    // column holds one value standing for every row, which is a shape of its own on the
+    // wire, and the result table declares one shape per column for every branch.
+    void broadcastUnionProjection(llvm::SmallVectorImpl<mlir::Value>& projected);
+
+    // Emits the dedup of @param keyColumns against @param distinctSet - the set a union's
+    // branches share, null for a dedup keeping one of its own - and fills @param deduped
+    // with the column it hands back for each one it read
+    void emitRemoveDuplicates(llvm::ArrayRef<mlir::Value> keyColumns,
+                              mlir::Value distinctSet,
+                              llvm::SmallVectorImpl<mlir::Value>& deduped);
+
+    // Records the rows a union branch contributes in the set its siblings share, so
+    // the dedup spans the branches rather than each of them
+    void dedupUnionBranch(mlir::Value distinctSet, llvm::SmallVectorImpl<mlir::Value>& projected);
+
+    // The relation a projected constant is laid out over: a column of the projection
+    // itself where one carries rows - the rows a cut left, where a cut ran - and otherwise
+    // the relation driving the scope. Null where no relation drives it at all, as for a
+    // bare `RETURN 1`, whose projection is the single row its constants are.
+    mlir::Value resolveProjectionDriver(llvm::ArrayRef<mlir::Value> projected);
+
+    // A standalone CALL ends no projection: what it yielded is the result
+    void generateYieldedOutput(const SinglePartQuery* query);
+
+    // Emits what each statement of a part contributes over the rows the traversal matched -
+    // a MATCH's constraints, WHERE and cuts, a CALL, a VECTOR SEARCH, an UNWIND - in the
+    // order the query writes them, so a statement reading what an earlier one bound is
+    // generated once that one has bound it.
+    void generateStatementOperations(std::span<Stmt* const> stmts);
+
+    // Emits the filters a MATCH's inline property constraints ask for - `(n {age: 32})` -
+    // one predicate per constrained property of its pattern
+    void generateMatchConstraints(const MatchStmt* matchStmt);
+
+    // Emit db.shortest_path for a SHORTESTPATH statement in this part: feed it the source
+    // and target columns bound by the preceding matches and publish its distance and path
+    // results under the declared variable names. A no-op when the part has no such statement.
+    void generateShortestPath(std::span<Stmt* const> stmts);
+
+    // The SHORTESTPATH statement among the part's statements, or null.
+    const ShortestPathStmt* findShortestPathStmt(std::span<Stmt* const> stmts) const;
+
+    void generateMatchFilter(const MatchStmt* matchStmt);
+
+    // Binds every element a `MATCH p = ...` named: to the walk when the element is one
+    // quantified relationship, and otherwise to the entity sequence built here out of the
+    // columns its entities are bound to
+    void generateNamedPaths(const MatchStmt* matchStmt);
+    void generateNamedPath(const PatternElement* element, const VarDecl* pathDecl);
+
+    // The one quantified relationship an element is, or null for every other shape:
+    // a fixed hop, a chain of them, or a walk with hops written beside it
+    static const EdgePattern* singleQuantifiedRelationship(const PatternElement* element);
+
+    // The handle column a quantified relationship bound, which is what its walk
+    // contributes to the path its element is named by
+    mlir::Value pathHandleColumn(const VarDecl* edgeDecl);
+
+    // Builds the path of a walk out of its seeds and its handles, at the point it is read
+    mlir::Value namedPathColumn(const PartScope::NamedPathWalk& walk);
+    mlir::Value makePathColumn(llvm::ArrayRef<mlir::Value> entities, llvm::ArrayRef<int64_t> reversedPaths = {});
+
+    // The entities a walk stands for, for an aggregate that reads its input's values rather
+    // than counting the rows the handles are
+    mlir::Value readWalkEntities(const Expr* argExpr, mlir::Value column);
+
+    // Builds the path of every named-path item a projection publishes or outputs. A handle
+    // column says nothing about which of a path's lists it stands for, so the sink would
+    // read it as the walk's edges.
+    void buildNamedPathItems(const Projection* projection, llvm::SmallVectorImpl<mlir::Value>& projected);
+
+    // Emits the Sort a MATCH's ORDER BY asks for, over everything in flight: the rows the
+    // rest of the query reads are then the ordered ones.
+    void generateMatchOrderBy(const MatchStmt* matchStmt);
+
+    // Emits the cuts a MATCH's SKIP and LIMIT ask for, the SKIP first: what the rest of the
+    // query reads is then the window rather than every row matched.
+    void generateMatchWindow(const MatchStmt* matchStmt);
+    void generateCall(const CallStmt* callStmt);
+
+    void generateVectorSearch(const VectorSearchStmt* vectorSearchStmt);
+
+    // Emits the source op a LOAD CSV opens its rows with, one column per field the query
+    // reads, and names each of them as the query knows it. A load reading a file that the
+    // rows already in flight have nothing to do with is crossed with them, the way a
+    // search reading no column is.
+    void generateLoadCSV(const LoadCSVStmt* loadCSVStmt);
+
+    // Names the columns a load produced under the declarations its accesses share
+    void publishLoadCSVFields(const LoadCSVStmt* loadCSVStmt,
+                              llvm::ArrayRef<const VarDecl*> fieldDecls,
+                              mlir::ResultRange fields);
+
+    // Names the two columns a search produced as the query knows them - the yielded
+    // variables of the statement, in the order it wrote them
+    void publishVectorSearchYields(const YieldItems* yieldItems, mlir::Value ids, mlir::Value scores);
+
+    // Generate the filter a CALL's YIELD ... WHERE asks for, over everything in flight once
+    // the call has run - so the predicate reads the rows the procedure emitted.
+    void generateYieldFilter(const YieldItems* yieldItems);
+
+    // Fills the column of each entry of @param yielded and appends them to _yieldedColumns
+    void generateCrossedCall(std::string_view procedureName,
+                             llvm::ArrayRef<mlir::Attribute> yieldedNames,
+                             llvm::SmallVectorImpl<YieldedColumn>& yielded,
+                             mlir::ValueRange inputs,
+                             const InFlightColumns& inFlight);
+
+    // Move the dataflow built so far into the product's left factor: it is a self-contained
+    // dataflow already, so every op of the block ahead of the product moves wholesale.
+    void moveDataflowIntoLeftFactor(mlir::db::CrossProduct crossProduct);
+
+    // Move the constants the left factor swallowed back out, ahead of the product.
+    // collectInFlightColumns leaves a constant out of the factor's yield, so the product
+    // carries no column for it and its definition has to stay where the ops after the
+    // product can still read it.
+    void hoistConstantsOutOfLeftFactor(mlir::db::CrossProduct crossProduct);
+
+    // Whether a column holds the rows flowing past the current insertion point, which is
+    // what an op consuming a whole row set needs of each of its operands.
+    bool isRowAlignedHere(mlir::Value column) const;
+    bool holdsTheRowsInFlight(mlir::Value column) const;
+
+    // Collect those columns. One bound in another block is skipped: an op here can only
+    // take what this block binds.
+    void collectInFlightColumns(InFlightColumns& inFlight);
+    void collectElementColumns(InFlightColumns& inFlight);
+
+    // Cut the rows in flight with a db.skip or a db.limit, given as @tparam CutOp
+    template <typename CutOp>
+    void cutAllColumns(uint64_t count);
+
+    // Rebind them to an op's results, so later ops read what it produced. firstResult is
+    // where its pass-through results start - zero for an op that only takes them (a
+    // filter), past its own results for one that adds some (a call).
+    void rebindInFlightColumns(mlir::ValueRange columns,
+                               size_t firstColumn,
+                               const InFlightColumns& inFlight);
+
+    // The column a yielded variable holds, or a null Value when no CALL yielded it.
+    mlir::Value findYieldedColumn(const VarDecl* decl) const;
+
+    // The name of the row a loaded field is read off; empty for any other declaration
+    std::string_view findCSVFieldRow(const VarDecl* decl) const;
+
+    void generateWith(const WithStmt* with);
+
+    // Emits a projection that ends no query - a WITH's, or the RETURN of a subquery body -
+    // and publishes its columns as the scope of what follows. A WITH carries columns beside
+    // them: the variables its WHERE reads that the projection drops, and the mask of each
+    // entity a MERGE wrote
+    void publishProjection(const Projection* projection,
+                           const WithStmt* with = nullptr,
+                           bool returnsOutOfCall = false);
+
+    void collectFilterColumns(std::span<const VarDecl* const> filterImports,
+                              const VariableColumnMap& variableColumns,
+                              llvm::SmallVectorImpl<PublishedColumn>& carriedColumns);
+
+    void collectCSVFieldColumns(const VarDecl* row,
+                                llvm::SmallVectorImpl<PublishedColumn>& carriedColumns) const;
+
+    [[noreturn]] void throwCSVRowRead(const Expr* expr, std::string_view rowName) const;
+
+    void bindCSVRowItems(const Projection* projection,
+                         VariableColumnMap& itemColumns,
+                         llvm::SmallVectorImpl<PublishedColumn>& carriedColumns);
+
+    mlir::Value findCSVRowColumn(const VarDecl* row);
+
+    bool carriesCSVRow(const VarDecl* row, const VarDecl* decl, std::string_view name) const;
+
+    void collectCSVRowVariables(const VarDecl* row,
+                                llvm::SmallVectorImpl<const VariableDependency*>& rowVars) const;
+
+    void collectPendingMasks(const Projection* projection,
+                             llvm::ArrayRef<llvm::StringRef> names,
+                             llvm::SmallVectorImpl<PublishedColumn>& carriedColumns) const;
+
+    // Rebinds the scope to what the WITH published, once its WHERE has read the rest
+    void dropFilterColumns(std::span<const VarDecl* const> filterImports);
+
+    // Adds the columns a CALL subquery body carries under hidden names to what a barrier
+    // inside it publishes: a name no clause of the body can spell is one it cannot drop
+    void appendHiddenColumns(llvm::SmallVectorImpl<PublishedColumn>& published) const;
+
+    // A barrier publishes one row per row it read, not the single row its literals are:
+    // this binds a projection of constants alone to the rows of the match under it
+    void broadcastConstantProjection(llvm::SmallVectorImpl<mlir::Value>& projected);
+
+    void publishBoundColumns(const Projection* projection,
+                             llvm::ArrayRef<llvm::StringRef> names,
+                             llvm::ArrayRef<mlir::Value> columns,
+                             llvm::ArrayRef<PublishedColumn> carriedColumns);
+
+    // Publishes every column in scope under the name it already carries, so the part that
+    // follows a cut reads them the way it reads what a WITH published
+    void publishInFlightColumns();
+
+    // Every column in scope, deduplicated by name and in name order so the columns a cut
+    // or an OPTIONAL MATCH carries are the query's choice and not the addresses'
+    void collectPublishedColumns(llvm::SmallVectorImpl<PublishedColumn>& published);
+
+    // Drops the scope and opens a fresh one holding these columns alone: what a barrier or
+    // a cut publishes, and what an OPTIONAL MATCH hands to its pattern and then to the rest
+    // of the query
+    void rebindScope(llvm::ArrayRef<PublishedColumn> published);
+
+    // The same, keeping what the query has written under the declarations these columns
+    // already carry - where a WITH re-keys it to the ones its projection declares
+    void rebindScopeKeepingWrittenEntities(llvm::ArrayRef<PublishedColumn> published);
+
+    // The column each variable in scope is bound to, under the declaration and the name
+    // it carries: the traversal variables, what a CALL yielded, what a CREATE wrote, and
+    // each edge identity under its own declaration. A variable a later source rebinds is
+    // visited twice, with the binding that wins last, so a map filled from it holds what
+    // the query reads. A standalone CALL declares nothing, so its columns are bound under
+    // a null declaration.
+    void forEachVariableColumn(const VariableColumnBinding& bind) const;
+    void collectVariableColumns(VariableColumnMap& variableColumns) const;
+
+    // The column one variable is bound to, over the same bindings, for a caller that reads
+    // a single variable rather than every one in scope
+    mlir::Value findVariableColumn(const VarDecl* decl) const;
+
+    void translateProjection(const Projection* projection,
+                             const VariableColumnMap& variableColumns,
+                             llvm::SmallVectorImpl<mlir::Value>& projected,
+                             llvm::SmallVectorImpl<llvm::StringRef>& names);
+
+    void translateProjectionTail(const Projection* projection,
+                                 const VariableColumnMap& variableColumns,
+                                 llvm::SmallVectorImpl<mlir::Value>& projected,
+                                 llvm::MutableArrayRef<PublishedColumn> carriedColumns);
+
+    template <typename CutOp>
+    void translateCut(const Projection* projection,
+                      const Expr* countExpr,
+                      std::string_view clauseName,
+                      llvm::SmallVectorImpl<mlir::Value>& projected,
+                      llvm::MutableArrayRef<PublishedColumn> carriedColumns);
+
+    void translateDistinct(const Projection* projection,
+                           llvm::SmallVectorImpl<mlir::Value>& projected,
+                           llvm::MutableArrayRef<PublishedColumn> carriedColumns);
+
+    // Dedups a projection of constants alone, whose rows are one row repeated, by
+    // capping @param projected at the single row the dedup would keep
+    void translateDistinctOverConstants(const Projection* projection,
+                                        llvm::SmallVectorImpl<mlir::Value>& projected);
+
+    // Binds every variable a dedup projected to the column the dedup handed back, so that
+    // a key read off one - the c.name of WITH DISTINCT c, p ORDER BY c.name - is computed
+    // over the rows that survived rather than over the ones the match produced
+    void rebindDistinctColumns(const Projection* projection, llvm::ArrayRef<mlir::Value> projected);
+
+    // Replaces the column @param decl is read through, wherever the part publishes it
+    void rebindVariableColumn(const VarDecl* decl, mlir::Value column);
+
+    void runPasses();
+
+    // Whether the EXPLAIN prefix asked about a pass at all, which is what decides
+    // between running the pipeline in one go and running it a pass at a time
+    bool explainsPasses() const;
+
+    // The pipeline of runPasses, one pass at a time, rendering the module on the sides
+    // of each pass the prefix asked about
+    void runExplainedPasses();
+
+    void throwOnUnknownExplainPass() const;
+
+    // Offers the module under construction, and the dependency graph of the part being
+    // generated, to the report. Both drop the stages the prefix did not ask for, and
+    // both are no-ops for a query with no prefix at all
+    void explainModule(ExplainStage stage);
+    void explainDependencyGraph();
+
+    void translateOrderBy(const Projection* projection,
+                          const VariableColumnMap& variableColumns,
+                          llvm::SmallVectorImpl<mlir::Value>& projected,
+                          llvm::MutableArrayRef<PublishedColumn> carriedColumns);
+
+    // The column holding the values of an expression: the column already published for
+    // the traversal variable it names, when the expression is nothing but that variable,
+    // otherwise the column its translation computes
+    mlir::Value getOrTranslateExprColumn(const VariableColumnMap& variableColumns, const Expr* expr);
+    mlir::Value getOrTranslateExprColumn(const Expr* expr);
+    mlir::Value getOrTranslateBoundColumn(const VariableColumnMap& variableColumns, const Expr* expr);
+    mlir::Value getOrTranslateBoundColumn(const Expr* expr);
+
+    mlir::Value resolveEntityColumn(const VarDecl* decl);
+
+    // Whether the entity of each row carries the named types: every one of them for a
+    // node, since labels are a conjunction, any one of them for an edge.
+    mlir::Value checkNodeLabels(mlir::Value nodeColumn, std::span<const LabelRef> labels, bool nullable);
+    mlir::Value checkEdgeType(mlir::Value edgeTypeColumn, std::span<const EdgeTypeRef> edgeTypes, bool nullable);
+
+    // One check per set of names in the expression, joined by db.and, db.or and db.not. A
+    // set is a conjunction for an edge too: e:A:B is two type checks joined by db.and.
+    mlir::Value checkNodeLabelExpr(mlir::Value nodeColumn, const LabelExpr* labelExpr, bool nullable);
+    mlir::Value checkEdgeTypeExpr(mlir::Value edgeTypeColumn, const LabelExpr* labelExpr, bool nullable);
+    mlir::Value combineLabelSetChecks(const LabelExpr* labelExpr, LabelSetCheck checkLabelSet);
+
+    // A named edge variable has one occurrence per time the pattern walks it, all equated
+    // by the identity filter, so the first one's type column answers for the variable. Null
+    // where no traversal published one, as below a barrier that republished only the edge.
+    mlir::Value resolveEdgeTypeColumn(const VarDecl* decl) const;
+
+    // That column where a traversal published one, otherwise a read of the type of the
+    // edge each row holds
+    mlir::Value resolveOrFetchEdgeTypeColumn(const VarDecl* decl, std::string_view varName);
+    mlir::Value fetchEdgeTypeColumn(mlir::Value edgeColumn);
+
+    mlir::Value nullConstantColumn();
+
+    // The one-element list a column makes, the shape a scalar takes to join a list
+    mlir::Value singletonList(mlir::Value column);
+
+    // The comparison of two types that can never hold equal values: false where both
+    // operands hold a value, and null where either is absent, since nothing compares to a
+    // null. The null constant rides the three-valued tables of AND and OR as the unknown
+    mlir::Value disjointComparison(mlir::Value lhs, mlir::Value rhs, bool equality);
+
+    mlir::Value constantBool(bool value);
+    mlir::Value constantDouble(double value);
+    mlir::Value constantString(llvm::StringRef value);
+    mlir::Value constantLabelList(llvm::ArrayRef<std::string> labels);
+
+    // Taken in the order the query declares its variables, so the choice is the query's
+    // and not the addresses'
+    mlir::Value resolveColumnInScope(ColumnPredicate accept) const;
+
+    mlir::Value resolveRowCarryingColumn();
+
+    // Pins a constant column to the relation whose rows it stands for. Left unpinned, a
+    // constant is aligned during lowering against whichever loop is innermost by then,
+    // which a collect in the same projection has already repointed at its own emit loop
+    mlir::Value alignConstantToDriver(mlir::Value column);
+
+    // An op that runs once per row, such as db.range, reads no row of its own when every
+    // operand is a constant, so nothing ties it to the relation it runs over: a pass erasing
+    // that relation's scan would leave it one row. Pins the constant operands of each such
+    // op in [@param first, @param last) to the driver instead.
+    void alignConstantOperandsToDriver(mlir::Block::iterator first, mlir::Block::iterator last);
+
+    // Translates @param expr for a clause over the rows in flight, with the ops it emits
+    // aligned to the driver as alignConstantOperandsToDriver does
+    void translateExprOverRows(const Expr* expr);
+
+    // The column count(*) counts: the first variable bound to a column holding the rows
+    // flowing past the insertion point. A scope of constants alone is the single row those
+    // constants are, which is what count(*) counts there
+    mlir::Value resolveWildcardColumn();
+
+    // The column an aggregate folds over: the column count(*) counts, or the one its
+    // argument's translation computes. @param variableColumns resolves an entity
+    // argument, and may be null, in which case a map is built to resolve it through
+    mlir::Value translateAggregateInput(const Expr* argExpr,
+                                        const VariableColumnMap* variableColumns);
+
+    void applyPredicateFilters(std::span<const Expr* const> predicates);
+
+    void generateGroupAggregate(const Projection* projection);
+
+    // Publishes the grouped column of every grouping key and aggregate result an ORDER BY
+    // key reads, so the key computes over one value per group rather than over the
+    // ungrouped column the group aggregate consumed
+    void bindOrderByKeyColumns(const Projection* projection, const GroupedColumns& groupedColumns);
+    void bindGroupedKeyColumn(const Expr* expr, const GroupedColumns& groupedColumns);
+
+    bool collectAggregateInvocations(const Expr* expr,
+                                     llvm::SmallVectorImpl<const FunctionInvocationExpr*>& found);
+
+    // One db.collect gathering every list the projection returns: the collects share the
+    // group table, so a second list is another value column rather than another op
+    mlir::db::Collect createCollect(llvm::ArrayRef<mlir::Value> keyColumns,
+                                    llvm::ArrayRef<mlir::Value> valueColumns,
+                                    llvm::ArrayRef<int64_t> distinctValues,
+                                    llvm::ArrayRef<mlir::Value> aggregateColumns = {},
+                                    llvm::ArrayRef<mlir::storage::GroupAggregateKind> aggregateKinds = {});
+
+    // The collects a keyless projection returns, built as one op so a single drain emits
+    // them all. One collect needs no help: its own translation is that op.
+    void emitKeylessCollect(llvm::ArrayRef<const FunctionInvocationExpr*> collectExprs,
+                            llvm::ArrayRef<AggregateArguments> collectArguments);
+
+    // What an aggregate gathering its values answers from @param listColumn, the list of a
+    // group's values: collect the list itself, percentileCont and percentileDisc its percentile.
+    // @param groupPercentile is the group's percentile when it reads a row, null otherwise.
+    mlir::Value reduceGatheredValues(const FunctionInvocation* invocation,
+                                     mlir::Value listColumn,
+                                     mlir::Value groupPercentile);
+
+    // The percentile of each row holding one of @param valueColumn's values, null on the
+    // others, whose first per group is the group's percentile; null when the call takes no
+    // percentile or one reading no row.
+    mlir::Value translateRowPercentile(const FunctionInvocation* invocation,
+                                       mlir::Value valueColumn,
+                                       const VariableColumnMap* variableColumns);
+
+    // Reduces every aggregate of a keyless projection before its items are built, so what an
+    // item computes beside an aggregate reads the one row the reduction leaves. Every input
+    // is translated ahead of the first reduction: the lowering reads a computation placed
+    // after a reduction, such as range(1, 4), over the one row that reduction leaves.
+    void generateKeylessAggregates(const Projection* projection);
+
+    void translateAggregateArguments(const FunctionInvocation* invocation,
+                                     const VariableColumnMap* variableColumns,
+                                     AggregateArguments& arguments);
+    void emitAggregate(const Expr* expr,
+                       const FunctionInvocation* invocation,
+                       const AggregateArguments& arguments);
 
     void translateExpr(const Expr* expr);
     void translateUnaryExpr(const Expr* expr, const UnaryExpr* unaryExpr);
     void translateBinaryExpr(const Expr* expr, const BinaryExpr* binExpr);
+    void translateLogicalExpr(const Expr* expr, const LogicalExpr* logicalExpr);
+    mlir::Value translateLogicalOperator(LogicalOperator op, mlir::Value lhs, mlir::Value rhs);
+    void translateStringExpr(const Expr* expr);
+    void translateCaseExpr(const Expr* expr, const CaseExpr* caseExpr);
+
+    // Emits the boolean `EXISTS { ... }` stands for: one db.exists_subquery per query of
+    // its body, ORed together
+    void translateExistsExpr(const Expr* expr, const ExistsExpr* existsExpr);
+
+    // Emits the count `COUNT { ... }` stands for: one db.count_subquery per branch of a
+    // UNION ALL, summed, and one over the whole body of a UNION that dedups
+    void translateCountSubqueryExpr(const Expr* expr, const CountSubqueryExpr* countExpr);
+
+    // Emits the lists `COLLECT { ... }` stands for: one db.collect_subquery per branch of a
+    // UNION ALL, concatenated, and one over the whole body of a UNION that dedups
+    void translateCollectSubqueryExpr(const Expr* expr, const CollectSubqueryExpr* collectExpr);
+
+    // Emits the db.exists_subquery, db.count_subquery or db.collect_subquery of @param
+    // branches: the columns in flight become the inputs it reads through block arguments,
+    // one query is generated into the op's region as a correlated query of its own, or the
+    // db.union of several, and the op's one result is returned
+    template <typename SubqueryOp, typename YieldOp>
+    mlir::Value generateSubqueryExpression(llvm::ArrayRef<const SinglePartQuery*> branches,
+                                           size_t dedupedBranches,
+                                           mlir::Type resultType,
+                                           std::string_view tagName);
+
+    // Emits the db.list_comprehension of `[x IN xs WHERE p(x) | f(x)]`: the source column,
+    // the columns in flight its body reads as its carry set, and a body region binding the
+    // element to the variable and yielding what each one contributes
+    void translateListComprehensionExpr(const Expr* expr, const ListComprehensionExpr* comprehension);
+
+    // Emits the db.list_predicate of `all(x IN xs WHERE p(x))` and its three siblings: the
+    // same source, carry set and body, yielding the predicate's value for each element
+    void translateListPredicateExpr(const Expr* expr, const ListPredicateExpr* predicate);
+
+    // Emits the db.reduce of `reduce(acc = init, x IN xs | f(acc, x))`: the source and
+    // initial value columns, the columns in flight its body reads as its carry set, and a
+    // body region binding the element and the accumulator, yielding the next accumulator
+    void translateReduceExpr(const Expr* expr, const ReduceExpr* reduce);
+
+    // The columns an op over the elements of one row's list may carry: every column in
+    // flight, since the body reads the elements rather than the rows
+    void collectElementCarrySet(CarrySet& carrySet);
+
+    // Drops from @param op's carry set every column none of its regions reads, so an op
+    // whose regions read only constants is a constant itself
+    void dropUnreadCarriedColumns(mlir::Operation* op, mlir::OperandRange carried);
+
+    // Rebuilds @param filter without the columns nothing reads past it
+    void dropUnreadFilteredColumns(mlir::db::FilterOp filter);
+
+    // Generates the body region of such an op: the entry block binds the element to the
+    // comprehension's variable, the row tag and the carry set. With @param cutsElements the
+    // comprehension's WHERE cuts the elements as a filter; the yield names the tag and what
+    // @param valueExpr computes for each element, the element itself when it is null
+    void generateElementRegion(mlir::Region& region,
+                               const ListComprehensionExpr* comprehension,
+                               const CarrySet& carrySet,
+                               bool cutsElements,
+                               const Expr* valueExpr);
+
+    // Emits the db.pattern_comprehension of `[(a)-[:KNOWS]->(b) WHERE p(b) | f(b)]`: the
+    // columns in flight as its inputs, and a pattern region generated as a MATCH of its
+    // own, ending on what each match contributes to the list of the row it came from
+    void translatePatternComprehensionExpr(const Expr* expr,
+                                           const PatternComprehensionExpr* comprehension);
+
+    // Generates one region of a db.lazy_case: its block takes @param carried, the carry set
+    // and the subject when it is carried, and yields what @param generateValue computes
+    // over them, handed the subject as the region sees it
+    void generateCaseRegion(mlir::Region& region,
+                            llvm::ArrayRef<mlir::Value> carried,
+                            const CarrySet& carrySet,
+                            mlir::Value subject,
+                            CaseRegionGenerator generateValue);
+
+    // The condition one WHEN value puts on a row: the value itself in the generic form,
+    // and the comparison of @param subject against it in the simple one
+    mlir::Value translateCaseTest(const Expr* subjectExpr, mlir::Value subject, const CaseExpr::Test& test);
+
+    void translateIndexExpr(const Expr* expr, const IndexExpr* indexExpr);
+
+    // Emits the db.list_slice of `xs[1..3]`: the list column and the bounds the query
+    // gave, each an operand of its own
+    void translateListSliceExpr(const Expr* expr, const ListSliceExpr* slice);
+
+    void translateFunctionInvocationExpr(const Expr* expr, const FunctionInvocationExpr* funcExpr);
+
+    void translateFunctionExpr(const Expr* expr, const FunctionInvocation* invocation);
+
+    // coalesce over @param args, emitted as the selection it is: every argument but the
+    // last guarded by its own presence, the last standing as the default
+    void translateCoalesce(const Expr* expr, const ExprChain* args);
+
+    void translateRange(const Expr* expr, const ExprChain* args);
+    void translateSubstring(const Expr* expr, const ExprChain* args);
+    void translateSplit(const Expr* expr, const ExprChain* args);
+    void translateReplace(const Expr* expr, const ExprChain* args);
+
+    template <typename StringEndOp>
+    void translateStringEnd(const Expr* expr, const ExprChain* args);
+
+    template <typename NormalFormOp>
+    void translateNormalFormFunction(const Expr* expr, const ExprChain* args, mlir::Type resultElement);
+
+    mlir::Value translateArg(const Expr* argExpr);
     mlir::Value translateLiteralExpr(const Literal* literal);
+    mlir::Type propertyValueType(ValueType valueType);
     mlir::Value translatePropertyExpr(const PropertyExpr* propExpr);
+    mlir::Value emitComponentOf(const PropertyExpr* propExpr, mlir::Value value);
+
+    // The instant a dotted access reads, before any component is taken off it: a field of
+    // a loaded row, a property of an entity, or the column a value variable was bound to
+    mlir::Value translatePropertyRead(const PropertyExpr* propExpr);
+    mlir::Value translatePropertyLookupExpr(const PropertyLookupExpr* lookupExpr);
+    mlir::Value emitStaticMapKey(mlir::Value map, std::string_view key);
+    mlir::Value emitDynamicMapKey(mlir::Value map, mlir::Value key);
+    mlir::Value emitDateTimeComponent(DateTimePart part, mlir::Value instant);
+    mlir::Value emitDurationComponent(DurationPart part, mlir::Value duration);
+    mlir::Value translateEntityTypeExpr(const EntityTypeExpr* typeExpr);
+
+    // labels() / type() of an entity the CREATE wrote, as the constant string it reads:
+    // its provisional ID is in no committed graph the runtime read would consult. Null when
+    // the argument is not a created entity, so a matched entity falls through to db.labels /
+    // db.edge_type.
+    mlir::Value translateCreatedMetadata(std::string_view funcName, const Expr* argExpr);
+
+    // The attribute carrying a scalar literal's value and type, or a null attribute for
+    // any other literal kind
+    mlir::TypedAttr scalarLiteralAttr(const Literal* literal);
+
+    // The attribute carrying an embedding literal's floats: a dense f32 array, which -
+    // unlike a dense tensor - stores a repeated run element by element rather than
+    // uniquing it down to the one value every element holds
+    mlir::Attribute embeddingLiteralAttr(const EmbeddingLiteral* literal);
+
+    // Fills one attribute per element of a literal list, each keeping its literal's type
+    void translateListElements(const ListLiteral* list,
+                               llvm::SmallVectorImpl<mlir::Attribute>& elements);
+
+    // The attribute a literal rides on: a typed attribute for a scalar, a unit attribute
+    // for a null, a dense array for an embedding, a nested array attribute for a list -
+    // and a null attribute for a literal kind no attribute carries
+    mlir::Attribute literalAttr(const Literal* literal);
+
+    // The same attribute, for a literal written as one element of a list, which every
+    // element has to have
+    mlir::Attribute listElementAttr(const Literal* literal);
+
+    // The column holding a list literal's value: the one list, standing for every row -
+    // or, where an item is read per row, one list per row
+    mlir::Value translateListLiteral(const ListLiteral* list);
+
+    mlir::Value translateMapLiteral(const MapLiteral* map);
+    void translateMapEntries(const MapLiteral* map,
+                             llvm::SmallVectorImpl<mlir::NamedAttribute>& entries);
+
+    // The column of the lists a db.make_list builds out of the column each item rides:
+    // what a list whose items are not all literals evaluates to
+    mlir::Value translateListOfColumns(const ListLiteral* list);
+
+    mlir::Value translateMapOfColumns(const MapLiteral* map);
 
     void addScanNodes(const VariableDependency* var);
+
+    // Opens a dataflow from the column a CALL yielded, the way addScanNodes opens one from
+    // the graph's nodes: the variable takes those rows over as its own
+    void addYieldedColumn(const VariableDependency* var, mlir::Value column);
+
+    // Opens a dataflow from an UNWIND's literal elements, the way addScanNodes opens one
+    // from the graph's nodes
+    void addUnwindConst(const VariableDependency* var, const UnwindStmt* unwind);
+
+    // Opens a dataflow from the nodes an UNWIND's literal list names, for a variable a
+    // pattern uses as a node: the list seeds the traversal instead of feeding it values
+    void addConstScanNodes(const VariableDependency* var, const UnwindStmt* unwind);
+
+    // Expands the rows in flight through an UNWIND whose expression is evaluated per row,
+    // binding its variable to the elements those rows unwound into
+    void generateUnwind(const UnwindStmt* unwind);
+
     void filterAllColumns(mlir::Value predicate);
+
+    // Such a scope is the single row those constants are: the predicate and the columns
+    // are laid out over that row
+    void filterConstantScope(mlir::Value predicate);
+
+    void applyConstraints(const VariableDependency* var);
 
     void addMergeFilter(const VariableDependency* var,
                         std::vector<const VariableDependency*>& carriedSet);
+
+    // The columns a hop from @param src carries along: every variable of the carry set but
+    // the source, then the edge-type columns and the CALL-yielded columns in flight here
+    void collectHopCarrySet(const VariableDependency* src,
+                            const std::vector<const VariableDependency*>& carrySet,
+                            InFlightColumns& inFlight);
+
+    // Walks a variable-length hop: one db.explore_paths binding @param src to its seeds,
+    // @param edge to the path column and the far end to @param tgt, or to
+    // @param joinedTarget when the caller closes a join with it
+    void addExplorePaths(const VariableDependency* src,
+                         const VariableDependency* edge,
+                         const VariableDependency* tgt,
+                         const std::vector<const VariableDependency*>& carrySet,
+                         const EdgeMetadata& metadata,
+                         bool reversed,
+                         mlir::Value* joinedTarget);
+
+    // Indexes the quantified edge patterns of a part by their declaration
+    void collectQuantifiedEdges(std::span<Stmt* const> stmts);
+
+    // Generates the hop predicate of an exploration from the pattern's hop constraints: the
+    // inner nodes' labels and properties and every hop predicate, in the region of the body's
+    // last step, which takes every node and edge of a repetition. HoistHopConjuncts moves each
+    // conjunct to the earliest step binding what it reads.
+    void generateHopRegion(mlir::db::ExplorePaths exploration,
+                           const EdgePattern* pattern,
+                           llvm::ArrayRef<const VarDecl*> imports,
+                           bool reversed);
+
+    // The columns a hop predicate reads from outside the hop, in the order the region's
+    // arguments take them
+    void collectHopImports(const EdgePattern* pattern,
+                           llvm::SmallVectorImpl<const VarDecl*>& imports,
+                           llvm::SmallVectorImpl<mlir::Value>& columns);
+
+    // Appends the masks of one inner node's label constraints, or of one hop's type
+    // constraints, read over the hop column that node or edge is bound to
+    void collectHopLabelMask(const NodePattern* node, mlir::Value column, llvm::SmallVectorImpl<mlir::Value>& masks);
+    void collectHopTypeMask(const EdgePattern* hop, mlir::Value column, llvm::SmallVectorImpl<mlir::Value>& masks);
+
+    // The column a consumer reading a list is handed for @param column: the column itself,
+    // or - when it holds paths - the list each path expands to for the variable of
+    // @param decl
+    mlir::Value listColumnOf(const VarDecl* decl, mlir::Value column);
+
+    // The column a variable leaves its scope as: a path column goes out as its list unless
+    // it reads as its edges, the one reading a path column keeps once its binding is gone
+    mlir::Value columnLeavingScope(const VarDecl* decl, mlir::Value column);
+
+    // Expands every projected path column into its list, for the consumers that key on
+    // the projection's rows
+    void expandPathItems(const Projection* projection, llvm::SmallVectorImpl<mlir::Value>& projected);
+
+    // The column size() reads over a path column: the hop count of each path
+    mlir::Value pathLengthColumn(const Expr* argExpr, mlir::Value column);
+
+    // The column nodes(), relationships() or length() reads over a named path
+    mlir::Value pathElementsColumn(mlir::Value column, mlir::storage::PathElementsKind kind);
+
+    // @param joinedTarget is where the column the hop lands on is written when the caller
+    // closes a join with it, and null when the hop binds it to @param tgt - the two forms
+    // below, which are what callers reach for
+    template<typename EdgeOp>
+    void walkEdge(const VariableDependency* src,
+                  const VariableDependency* edge,
+                  const VariableDependency* tgt,
+                  const std::vector<const VariableDependency*>& carrySet,
+                  mlir::Value* joinedTarget);
 
     template<typename EdgeOp>
     void addEdgeTraversal(const VariableDependency* src,
@@ -111,18 +1457,41 @@ private:
                           const VariableDependency* tgt,
                           const std::vector<const VariableDependency*>& carrySet);
 
-    template <typename... Args>
-    void addGetOutEdges(Args&&... args) {
-        return addEdgeTraversal<mlir::db::GetOutEdges>(std::forward<Args>(args)...);
+    // The target already holds a column, so the hop constrains the rows instead of
+    // fanning them out: the column it lands on is returned for the caller to filter
+    // against the one @param tgt keeps
+    template<typename EdgeOp>
+    mlir::Value addJoiningEdgeTraversal(const VariableDependency* src,
+                                        const VariableDependency* edge,
+                                        const VariableDependency* tgt,
+                                        const std::vector<const VariableDependency*>& carrySet);
+
+    void addGetOutEdges(const VariableDependency* src,
+                        const VariableDependency* edge,
+                        const VariableDependency* tgt,
+                        const std::vector<const VariableDependency*>& carrySet) {
+        addEdgeTraversal<mlir::db::GetOutEdges>(src, edge, tgt, carrySet);
     }
 
-    template <typename... Args>
-    void addGetInEdges(Args&&... args) {
-        return addEdgeTraversal<mlir::db::GetInEdges>(std::forward<Args>(args)...);
+    void addGetInEdges(const VariableDependency* src,
+                       const VariableDependency* edge,
+                       const VariableDependency* tgt,
+                       const std::vector<const VariableDependency*>& carrySet) {
+        addEdgeTraversal<mlir::db::GetInEdges>(src, edge, tgt, carrySet);
+    }
+
+    void addGetEdges(const VariableDependency* src,
+                     const VariableDependency* edge,
+                     const VariableDependency* tgt,
+                     const std::vector<const VariableDependency*>& carrySet) {
+        addEdgeTraversal<mlir::db::GetEdges>(src, edge, tgt, carrySet);
     }
 
     mlir::db::ColumnType allocColumnType(mlir::Type type);
     void registerValue(const VariableDependency* var, mlir::TypedValue<mlir::Type> val);
+    void rebindYieldedColumn(const VarDecl* decl, mlir::TypedValue<mlir::Type> val);
+    void rebindNamedPath(const VarDecl* decl, mlir::Value column);
+    void rebindGroupVariable(const VarDecl* decl, mlir::Value column);
 };
 
 }

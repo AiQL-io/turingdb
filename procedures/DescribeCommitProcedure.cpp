@@ -2,9 +2,11 @@
 
 #include "ProcedureContext.h"
 #include "FatalException.h"
+#include "ProcedureData.h"
 #include "ProcedureState.h"
 #include "Procedure.h"
 #include "ProcedureNamespace.h"
+#include "TypedProcedure.h"
 #include "Graph.h"
 #include "columns/ColumnVector.h"
 #include "columns/ColumnConst.h"
@@ -17,9 +19,7 @@ using namespace db;
 
 namespace {
 
-using UInt64Col = ColumnVector<types::UInt64::Primitive>;
-
-struct Data : public ProcedureData {
+struct Data : public TypedProcedureData<DescribeCommitProcedure, IndexedProcedureData> {
     size_t _i {0};
     const Commit* _headCommit {nullptr};
 };
@@ -37,23 +37,19 @@ void getCommitStats(CommitStats* stats,
     stats->_edgeCount = 0;
     stats->_partCount = 0;
 
-    std::string lower(inputHash);
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](char c) { return std::tolower(c); });
-
     //Strip away the '(HEAD)' substring from the head hash value
-    const size_t parenPos = lower.find('(');
-    if (parenPos != std::string::npos) {
-        lower.resize(parenPos);
+    const std::string_view hashText = inputHash.substr(0, inputHash.find('('));
+
+    const auto hash = CommitHash::fromString(hashText);
+    if (!hash) {
+        return;
     }
 
     const Commit* commit = headCommit;
 
     // Traverse the commit history chain to find the relevant commit
     while (commit) {
-        const std::string hashStr = fmt::format("{:x}", commit->hash().get());
-
-        if (lower == hashStr) {
+        if (commit->hash() == hash.value()) {
             stats->_nodeCount = commit->getNumNodes();
             stats->_edgeCount = commit->getNumEdges();
             stats->_partCount = commit->getNumDataParts();
@@ -76,16 +72,8 @@ void extractString(std::string& result, const T& val) {
 template <template <typename> class ColType, typename F>
 void dispatchStringInternal(const Column* col, const F& fn) {
     switch (col->getKind()) {
-        case ColType<std::string>::staticKind():
-            fn(static_cast<const ColType<std::string>*>(col));
-        break;
-
         case ColType<std::string_view>::staticKind():
             fn(static_cast<const ColType<std::string_view>*>(col));
-        break;
-
-        case ColType<std::optional<std::string>>::staticKind():
-            fn(static_cast<const ColType<std::optional<std::string>>*>(col));
         break;
 
         case ColType<std::optional<std::string_view>>::staticKind():
@@ -101,23 +89,9 @@ void dispatchStringInternal(const Column* col, const F& fn) {
 
 }
 
-ProcedureData* DescribeCommitProcedure::allocData() {
-    return new Data();
-}
-
-void DescribeCommitProcedure::deallocData(ProcedureData* data) {
-    delete data;
-}
-
 void DescribeCommitProcedure::registerProcedure(ProcedureNamespace* ns) {
-    Procedure* proc = new Procedure("describeCommit");
-    proc->setExecuteCallback(&execute);
-    proc->setAllocCallback(&allocData);
-    proc->setDeallocCallback(&deallocData);
-    proc->addArgument("commit", ProcedureType::STRING);
-    proc->addReturnValue("nodeCount", ProcedureType::UINT_64);
-    proc->addReturnValue("edgeCount", ProcedureType::UINT_64);
-    proc->addReturnValue("partCount", ProcedureType::UINT_64);
+    Procedure* proc = createTypedProcedure<Data>("describeCommit");
+    proc->addArgument("commit", ProcedureType::STRING_VIEW);
     ns->addProcedure(proc);
 }
 
@@ -126,9 +100,9 @@ void DescribeCommitProcedure::execute(ProcedureState* proc) {
     const ProcedureContext* ctxt = proc->getContext();
 
     const Column* rawCommitCol = data.getInputColumn(0);
-    auto* nodeCountCol = static_cast<UInt64Col*>(data.getReturnColumn(0));
-    auto* edgeCountCol = static_cast<UInt64Col*>(data.getReturnColumn(1));
-    auto* partCountCol = static_cast<UInt64Col*>(data.getReturnColumn(2));
+    auto* nodeCountCol = data.getReturnColumn<0>();
+    auto* edgeCountCol = data.getReturnColumn<1>();
+    auto* partCountCol = data.getReturnColumn<2>();
 
     switch (proc->getStep()) {
         case ProcedureState::Step::PREPARE: {
@@ -156,14 +130,13 @@ void DescribeCommitProcedure::execute(ProcedureState* proc) {
                        || containerKind == ContainerKind::code<ColumnConst<void>>(),
                       "db.describeCommit: commit hash must be a vector or const column");
             bioassert(internalKind == InternalKind::code<std::string_view>()
-                       || internalKind == InternalKind::code<std::string>()
-                       || internalKind == InternalKind::code<std::optional<std::string_view>>()
-                       || internalKind == InternalKind::code<std::optional<std::string>>(),
-                      "db.describeCommit: commit hash must be a string or string_view");
+                       || internalKind == InternalKind::code<std::optional<std::string_view>>(),
+                      "db.describeCommit: commit hash must be a string");
         }
         break;
 
         case ProcedureState::Step::RESET:
+            data._i = 0;
         break;
 
         case ProcedureState::Step::EXECUTE: {
@@ -179,7 +152,12 @@ void DescribeCommitProcedure::execute(ProcedureState* proc) {
                 partCountCol->clear();
             }
 
-            const auto pushStats = [&](const CommitStats* stats) {
+            ColumnIndices* indices = data.indices();
+            if (indices) {
+                indices->clear();
+            }
+
+            const auto pushStats = [&](const CommitStats* stats, size_t inputRow) {
                 if (nodeCountCol) {
                     nodeCountCol->push_back(stats->_nodeCount);
                 }
@@ -191,24 +169,28 @@ void DescribeCommitProcedure::execute(ProcedureState* proc) {
                 if (partCountCol) {
                     partCountCol->push_back(stats->_partCount);
                 }
+
+                if (indices) {
+                    indices->push_back(inputRow);
+                }
             };
 
             const auto treatVector = [&]<typename T>(const ColumnVector<T>* col) {
                 const auto& colVec = *col;
                 const size_t remaining =
-                    std::min(rawCommitCol->size(), ctxt->getChunkSize());
+                    std::min(colVec.size() - data._i, ctxt->getChunkSize());
 
                 std::string input;
                 CommitStats stats;
                 for (size_t i = data._i; i < remaining + data._i; ++i) {
                     extractString(input, colVec[i]);
                     getCommitStats(&stats, input, data._headCommit);
-                    pushStats(&stats);
+                    pushStats(&stats, i);
                 }
 
                 data._i += remaining;
 
-                if (data._i == colVec.size()) {
+                if (data._i >= colVec.size()) {
                     proc->finish();
                 }
             };
@@ -218,7 +200,7 @@ void DescribeCommitProcedure::execute(ProcedureState* proc) {
                 CommitStats stats;
                 extractString(input, col->getRaw());
                 getCommitStats(&stats, input, data._headCommit);
-                pushStats(&stats);
+                pushStats(&stats, 0);
                 proc->finish();
             };
 

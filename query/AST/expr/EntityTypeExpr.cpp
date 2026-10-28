@@ -4,10 +4,11 @@
 
 using namespace db;
 
-EntityTypeExpr::EntityTypeExpr(Symbol* symbol, SymbolChain* types)
+EntityTypeExpr::EntityTypeExpr(Symbol* symbol, Expr* operand, LabelExpr* labelExpr)
     : Expr(Kind::ENTITY_TYPES),
     _symbol(symbol),
-    _types(types)
+    _operand(operand),
+    _labelExpr(labelExpr)
 {
 }
 
@@ -16,8 +17,14 @@ EntityTypeExpr::~EntityTypeExpr() {
 
 EntityTypeExpr* EntityTypeExpr::create(CypherAST* ast, 
                                        Symbol* symbol,
-                                       SymbolChain* types) {
-    EntityTypeExpr* expr = new EntityTypeExpr(symbol, types);
+                                       LabelExpr* labelExpr) {
+    EntityTypeExpr* expr = new EntityTypeExpr(symbol, nullptr, labelExpr);
+    ast->addExpr(expr);
+    return expr;
+}
+
+EntityTypeExpr* EntityTypeExpr::create(CypherAST* ast, Expr* operand, LabelExpr* labelExpr) {
+    EntityTypeExpr* expr = new EntityTypeExpr(nullptr, operand, labelExpr);
     ast->addExpr(expr);
     return expr;
 }

@@ -1,0 +1,250 @@
+#include "ExprChildren.h"
+
+#include "FunctionInvocation.h"
+#include "Literal.h"
+
+#include "BinaryExpr.h"
+#include "CaseExpr.h"
+#include "EntityTypeExpr.h"
+#include "Expr.h"
+#include "ExprChain.h"
+#include "FunctionInvocationExpr.h"
+#include "IndexExpr.h"
+#include "ListComprehensionExpr.h"
+#include "ListPredicateExpr.h"
+#include "ListSliceExpr.h"
+#include "ListExpr.h"
+#include "LiteralExpr.h"
+#include "LogicalExpr.h"
+#include "PropertyLookupExpr.h"
+#include "ReduceExpr.h"
+#include "StringExpr.h"
+#include "UnaryExpr.h"
+
+using namespace db;
+
+bool ExprChildren::collect(const Expr* expr, std::vector<const Expr*>& children) {
+    children.clear();
+
+    if (!expr) {
+        return true;
+    }
+
+    switch (expr->getKind()) {
+        case Expr::Kind::BINARY: {
+            const BinaryExpr* binary = static_cast<const BinaryExpr*>(expr);
+
+            children.push_back(binary->getLHS());
+            children.push_back(binary->getRHS());
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::LOGICAL: {
+            const LogicalExpr* logical = static_cast<const LogicalExpr*>(expr);
+
+            for (const Expr* operand : logical->getOperands()) {
+                children.push_back(operand);
+            }
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::UNARY: {
+            const UnaryExpr* unary = static_cast<const UnaryExpr*>(expr);
+
+            children.push_back(unary->getSubExpr());
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::STRING: {
+            const StringExpr* string = static_cast<const StringExpr*>(expr);
+
+            children.push_back(string->getLHS());
+            children.push_back(string->getRHS());
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::INDEX: {
+            const IndexExpr* index = static_cast<const IndexExpr*>(expr);
+
+            children.push_back(index->getBase());
+            children.push_back(index->getIndexExpr());
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::LIST: {
+            const ListExpr* list = static_cast<const ListExpr*>(expr);
+
+            for (const Expr* element : list->getElements()) {
+                children.push_back(element);
+            }
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::PROPERTY_LOOKUP: {
+            const PropertyLookupExpr* lookup = static_cast<const PropertyLookupExpr*>(expr);
+
+            children.push_back(lookup->getBase());
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::LIST_SLICE: {
+            const ListSliceExpr* slice = static_cast<const ListSliceExpr*>(expr);
+
+            children.push_back(slice->getBase());
+
+            if (const Expr* from = slice->getFrom()) {
+                children.push_back(from);
+            }
+
+            if (const Expr* to = slice->getTo()) {
+                children.push_back(to);
+            }
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::LIST_COMPREHENSION: {
+            const ListComprehensionExpr* comprehension = static_cast<const ListComprehensionExpr*>(expr);
+
+            children.push_back(comprehension->getSource());
+
+            if (const Expr* predicate = comprehension->getPredicate()) {
+                children.push_back(predicate);
+            }
+
+            if (const Expr* projection = comprehension->getProjection()) {
+                children.push_back(projection);
+            }
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::LIST_PREDICATE: {
+            const ListPredicateExpr* predicate = static_cast<const ListPredicateExpr*>(expr);
+
+            children.push_back(predicate->getComprehension());
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::REDUCE: {
+            const ReduceExpr* reduce = static_cast<const ReduceExpr*>(expr);
+
+            children.push_back(reduce->getInitialValue());
+            children.push_back(reduce->getSource());
+            children.push_back(reduce->getExpression());
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::CASE: {
+            const CaseExpr* caseExpr = static_cast<const CaseExpr*>(expr);
+
+            if (const Expr* subject = caseExpr->getSubject()) {
+                children.push_back(subject);
+            }
+
+            for (const CaseExpr::Branch& branch : caseExpr->getBranches()) {
+                for (const CaseExpr::Test& test : branch._tests) {
+                    if (test._value) {
+                        children.push_back(test._value);
+                    }
+                }
+
+                children.push_back(branch._then);
+            }
+
+            if (const Expr* elseExpr = caseExpr->getElseExpr()) {
+                children.push_back(elseExpr);
+            }
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::FUNCTION_INVOCATION: {
+            const FunctionInvocationExpr* call = static_cast<const FunctionInvocationExpr*>(expr);
+            const ExprChain* arguments = call->getFunctionInvocation()->getArguments();
+            if (!arguments) {
+                return true;
+            }
+
+            for (const Expr* argument : arguments->getExprs()) {
+                children.push_back(argument);
+            }
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::LITERAL: {
+            const Literal* literal = static_cast<const LiteralExpr*>(expr)->getLiteral();
+            const Literal::Kind literalKind = literal->getKind();
+
+            if (literalKind == Literal::Kind::LIST) {
+                for (const Expr* item : static_cast<const ListLiteral*>(literal)->items()) {
+                    children.push_back(item);
+                }
+
+                return true;
+            } else if (literalKind == Literal::Kind::MAP) {
+                for (const auto& [key, value] : *static_cast<const MapLiteral*>(literal)) {
+                    children.push_back(value);
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+        break;
+
+        case Expr::Kind::SYMBOL:
+        case Expr::Kind::PROPERTY:
+            // A leaf as far as expressions go: what it reads is a variable, not another
+            // expression
+            return true;
+        break;
+
+        case Expr::Kind::ENTITY_TYPES: {
+            const EntityTypeExpr* typeTest = static_cast<const EntityTypeExpr*>(expr);
+
+            if (const Expr* operand = typeTest->getOperand()) {
+                children.push_back(operand);
+            }
+
+            return true;
+        }
+        break;
+
+        case Expr::Kind::PATTERN_COMPREHENSION:
+            // Its WHERE and its projection read the variables its pattern binds, which
+            // name nothing in the expression around it
+            return false;
+        break;
+
+        default:
+            // An EXISTS holds a query, which is not a list of sub-expressions this can
+            // hand back
+            return false;
+        break;
+    }
+}

@@ -216,6 +216,10 @@ template void GraphWriter::addNodeProperty<types::Double>(NodeID, std::string_vi
 template void GraphWriter::addNodeProperty<types::String>(NodeID, std::string_view, types::String::Primitive&&);
 template void GraphWriter::addNodeProperty<types::Bool>(NodeID, std::string_view, types::Bool::Primitive&&);
 template void GraphWriter::addNodeProperty<types::Embedding>(NodeID, std::string_view, types::Embedding::Primitive&&);
+template void GraphWriter::addNodeProperty<types::List>(NodeID, std::string_view, types::List::Primitive&&);
+template void GraphWriter::addNodeProperty<types::DateTime>(NodeID, std::string_view, types::DateTime::Primitive&&);
+template void GraphWriter::addNodeProperty<types::Duration>(NodeID, std::string_view, types::Duration::Primitive&&);
+template void GraphWriter::addNodeProperty<types::Map>(NodeID, std::string_view, types::Map::Primitive&&);
 
 template void GraphWriter::addNodeProperty<types::Int64>(NodeID, PropertyType, types::Int64::Primitive&&);
 template void GraphWriter::addNodeProperty<types::UInt64>(NodeID, PropertyType, types::UInt64::Primitive&&);
@@ -223,6 +227,10 @@ template void GraphWriter::addNodeProperty<types::Double>(NodeID, PropertyType, 
 template void GraphWriter::addNodeProperty<types::String>(NodeID, PropertyType, types::String::Primitive&&);
 template void GraphWriter::addNodeProperty<types::Bool>(NodeID, PropertyType, types::Bool::Primitive&&);
 template void GraphWriter::addNodeProperty<types::Embedding>(NodeID, PropertyType, types::Embedding::Primitive&&);
+template void GraphWriter::addNodeProperty<types::List>(NodeID, PropertyType, types::List::Primitive&&);
+template void GraphWriter::addNodeProperty<types::DateTime>(NodeID, PropertyType, types::DateTime::Primitive&&);
+template void GraphWriter::addNodeProperty<types::Duration>(NodeID, PropertyType, types::Duration::Primitive&&);
+template void GraphWriter::addNodeProperty<types::Map>(NodeID, PropertyType, types::Map::Primitive&&);
 
 template void GraphWriter::addEdgeProperty<types::Int64>(const EdgeRecord&, std::string_view, types::Int64::Primitive&&);
 template void GraphWriter::addEdgeProperty<types::UInt64>(const EdgeRecord&, std::string_view, types::UInt64::Primitive&&);
@@ -230,6 +238,10 @@ template void GraphWriter::addEdgeProperty<types::Double>(const EdgeRecord&, std
 template void GraphWriter::addEdgeProperty<types::String>(const EdgeRecord&, std::string_view, types::String::Primitive&&);
 template void GraphWriter::addEdgeProperty<types::Bool>(const EdgeRecord&, std::string_view, types::Bool::Primitive&&);
 template void GraphWriter::addEdgeProperty<types::Embedding>(const EdgeRecord&, std::string_view, types::Embedding::Primitive&&);
+template void GraphWriter::addEdgeProperty<types::DateTime>(const EdgeRecord&, std::string_view, types::DateTime::Primitive&&);
+template void GraphWriter::addEdgeProperty<types::Duration>(const EdgeRecord&, std::string_view, types::Duration::Primitive&&);
+template void GraphWriter::addEdgeProperty<types::List>(const EdgeRecord&, std::string_view, types::List::Primitive&&);
+template void GraphWriter::addEdgeProperty<types::Map>(const EdgeRecord&, std::string_view, types::Map::Primitive&&);
 
 template void GraphWriter::addEdgeProperty<types::Int64>(const EdgeRecord&, PropertyType, types::Int64::Primitive&&);
 template void GraphWriter::addEdgeProperty<types::UInt64>(const EdgeRecord&, PropertyType, types::UInt64::Primitive&&);
@@ -237,3 +249,7 @@ template void GraphWriter::addEdgeProperty<types::Double>(const EdgeRecord&, Pro
 template void GraphWriter::addEdgeProperty<types::String>(const EdgeRecord&, PropertyType, types::String::Primitive&&);
 template void GraphWriter::addEdgeProperty<types::Bool>(const EdgeRecord&, PropertyType, types::Bool::Primitive&&);
 template void GraphWriter::addEdgeProperty<types::Embedding>(const EdgeRecord&, PropertyType, types::Embedding::Primitive&&);
+template void GraphWriter::addEdgeProperty<types::List>(const EdgeRecord&, PropertyType, types::List::Primitive&&);
+template void GraphWriter::addEdgeProperty<types::DateTime>(const EdgeRecord&, PropertyType, types::DateTime::Primitive&&);
+template void GraphWriter::addEdgeProperty<types::Duration>(const EdgeRecord&, PropertyType, types::Duration::Primitive&&);
+template void GraphWriter::addEdgeProperty<types::Map>(const EdgeRecord&, PropertyType, types::Map::Primitive&&);

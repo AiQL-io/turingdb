@@ -1,20 +1,22 @@
 add_turing_test(test_net_http_parser HTTPParserTest.cpp)
-target_link_libraries(test_net_http_parser PRIVATE
-    turing_db_http_common_s
-    turing_db_http_parser_s)
 
 add_turing_test(test_net_turing_proto_framing TuringProtoFramingTest.cpp)
-target_link_libraries(test_net_turing_proto_framing PRIVATE
-    turing_db_proto_common_s)
 
 add_turing_test(test_net_turing_proto_roundtrip TuringProtoRoundTripTest.cpp)
-target_link_libraries(test_net_turing_proto_roundtrip PRIVATE
-    turing_db_net_encoders
-    turing_db_proto_client_s)
+
+add_turing_test(test_net_turing_proto_parameter_writer TuringProtoParameterWriterTest.cpp)
+
+add_turing_test(test_net_turing_proto_parameter_reader TuringProtoParameterReaderTest.cpp)
+
+add_turing_test(test_net_turing_proto_request_body TuringProtoRequestBodyTest.cpp)
+
+add_turing_test(test_net_json_encoder JsonEncoderTest.cpp)
+
+add_turing_test(test_net_proto_analyze_error ProtoAnalyzeErrorTest.cpp)
 
 add_turing_test(test_net_turing_client TuringClientTest.cpp)
-target_link_libraries(test_net_turing_client PRIVATE
-    turing_db_proto_client_s)
+
+add_turing_test(test_net_turing_async_client_connect TuringAsyncClientConnectTest.cpp)
 
 add_turing_test(test_net_turing_proto_endtoend TuringProtoEndToEndTest.cpp)
 target_sources(test_net_turing_proto_endtoend PRIVATE
@@ -22,7 +24,21 @@ target_sources(test_net_turing_proto_endtoend PRIVATE
 
 target_include_directories(test_net_turing_proto_endtoend PRIVATE
     ${CMAKE_SOURCE_DIR}/test/query-test-suite)
-target_link_libraries(test_net_turing_proto_endtoend PRIVATE
-    turing_db_server_s
-    turing_db_proto_client_s
-    turing_testenv_s)
+
+add_turing_test(test_net_turing_proto_empty_result TuringProtoEmptyResultTest.cpp)
+
+add_turing_test(test_net_json_encoder_double JsonEncoderDoubleTest.cpp)
+
+add_turing_test(test_net_request_too_large RequestTooLargeTest.cpp)
+
+add_turing_test(test_net_version_param VersionParamTest.cpp)
+
+add_turing_test(test_net_change_id_param ChangeIDParamTest.cpp)
+
+add_turing_test(test_net_json_parameters JsonParametersTest.cpp)
+
+add_turing_test(test_net_turing_proto_parameters TuringProtoParametersTest.cpp)
+target_sources(test_net_turing_proto_parameters PRIVATE
+    ${CMAKE_SOURCE_DIR}/test/query-test-suite/QueryResultFormatter.cpp)
+target_include_directories(test_net_turing_proto_parameters PRIVATE
+    ${CMAKE_SOURCE_DIR}/test/query-test-suite)

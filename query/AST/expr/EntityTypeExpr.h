@@ -5,18 +5,21 @@
 namespace db {
 
 class CypherAST;
+class LabelExpr;
 class Symbol;
-class SymbolChain;
 class VarDecl;
 
 class EntityTypeExpr : public Expr {
 public:
     Symbol* getSymbol() const { return _symbol; }
-    SymbolChain* getTypes() const { return _types; }
+    Expr* getOperand() const { return _operand; }
+    LabelExpr* getLabelExpr() const { return _labelExpr; }
 
     static EntityTypeExpr* create(CypherAST* ast, 
                                  Symbol* symbol,
-                                 SymbolChain* types);
+                                 LabelExpr* labelExpr);
+
+    static EntityTypeExpr* create(CypherAST* ast, Expr* operand, LabelExpr* labelExpr);
 
     void setEntityDecl(VarDecl* decl) { _entityDecl = decl; }
 
@@ -24,10 +27,11 @@ public:
 
 private:
     Symbol* _symbol {nullptr};
-    SymbolChain* _types {nullptr};
+    Expr* _operand {nullptr};
+    LabelExpr* _labelExpr {nullptr};
     VarDecl* _entityDecl {nullptr};
 
-    EntityTypeExpr(Symbol* symbol, SymbolChain* types);
+    EntityTypeExpr(Symbol* symbol, Expr* operand, LabelExpr* labelExpr);
     ~EntityTypeExpr() override;
 };
 

@@ -1,6 +1,10 @@
 #pragma once
 
+#include <math.h>
+#include <charconv>
 #include <ranges>
+#include <span>
+#include <string_view>
 #include <spdlog/fmt/bundled/format.h>
 #include <range/v3/view/drop.hpp>
 
@@ -9,14 +13,20 @@
 #include "list/ListElementView.h"
 #include "list/ListUtils.h"
 
+#include "map/MapEntryView.h"
+#include "map/MapUtils.h"
+#include "map/MapView.h"
+
 #include "columns/AllowedKinds.h"
+#include "columns/ColumnMask.h"
 #include "columns/ColumnOperatorDispatcher.h"
-#include "dataframe/Dataframe.h"
 
 #include "OutputWriter.h"
 #include "OutputValues.h"
 
-#include "ControlCharacters.h"
+#include "JsonStringEscaper.h"
+
+#include "BioAssert.h"
 
 namespace rg = ranges;
 namespace rv = ranges::views;
@@ -26,9 +36,10 @@ namespace db {
 template <Writer WriterT>
 class ChunkJsonEncoder {
 public:
-    ChunkJsonEncoder(WriterT& writer, size_t rowcnt)
+    ChunkJsonEncoder(WriterT& writer, size_t offset, size_t rowCount)
         : _writer(writer),
-        _logicalRowCount(rowcnt)
+        _offset(offset),
+        _rowCount(rowCount)
     {
     }
 
@@ -36,14 +47,15 @@ public:
 
     template <typename T>
     void operator()(const ColumnVector<T>* col) {
-        if (_logicalRowCount == 0) {
+        if (_rowCount == 0) {
             return;
         }
 
-        const T& firstValue = col->operator[](0);
+        const T& firstValue = col->operator[](_offset);
         encodeValue(firstValue);
 
-        for (size_t row = 1; row < _logicalRowCount; row++) {
+        const size_t rowEnd = _offset + _rowCount;
+        for (size_t row = _offset + 1; row < rowEnd; row++) {
             _writer.write(",");
 
             const T& value = col->operator[](row);
@@ -54,14 +66,14 @@ public:
 
     template <typename T>
     void operator()(const ColumnConst<T>* col) {
-        if (_logicalRowCount == 0) {
+        if (_rowCount == 0) {
             return;
         }
 
         const T& firstValue = col->operator[](0);
         encodeValue(firstValue);
 
-        for (size_t row = 1; row < _logicalRowCount; row++) {
+        for (size_t row = 1; row < _rowCount; row++) {
             _writer.write(",");
 
             const T& value = col->operator[](row);
@@ -70,10 +82,27 @@ public:
         }
     }
 
+    void operator()(const ColumnMask* col) {
+        if (_rowCount == 0) {
+            return;
+        }
+
+        encodeValue(col->operator[](_offset));
+
+        const size_t rowEnd = _offset + _rowCount;
+        for (size_t row = _offset + 1; row < rowEnd; row++) {
+            _writer.write(",");
+
+            encodeValue(col->operator[](row));
+        }
+    }
+
 private:
     WriterT& _writer;
-    const size_t _logicalRowCount {0};
+    const size_t _offset {0};
+    const size_t _rowCount {0};
     std::string _sanitized;
+    std::string _formatted;
 
     template <Optional T>
     void encodeValue(const T& value) {
@@ -86,7 +115,11 @@ private:
 
     template <IDLike T>
     void encodeValue(const T& value) {
-        _writer.write(std::to_string(value.getValue()));
+        if (!value.isValid()) {
+            _writer.write("null");
+        } else {
+            _writer.write(std::to_string(value.getValue()));
+        }
     }
 
     template <Hash T>
@@ -101,7 +134,21 @@ private:
 
     template <std::floating_point T>
     void encodeValue(const T& value) {
-        _writer.write(std::to_string(value));
+        if (std::isnan(value)) {
+            _writer.write("NaN");
+        } else if (std::isinf(value)) {
+            _writer.write(value > 0 ? "Infinity" : "-Infinity");
+        } else {
+            char buffer[32];
+            const std::to_chars_result result = std::to_chars(buffer, buffer + sizeof(buffer), value);
+            const std::string_view text {buffer, result.ptr};
+            _writer.write(text);
+
+            const bool readsAsInteger = text.find_first_of(".e") == std::string_view::npos;
+            if (readsAsInteger) {
+                _writer.write(".0");
+            }
+        }
     }
 
     void encodeValue(bool value) {
@@ -124,7 +171,23 @@ private:
     }
 
     void encodeValue(ValueType value) {
-        ControlCharactersEscaper::escapeAndSurroundByQuotes(ValueTypeName::value(value), _sanitized);
+        JsonStringEscaper::escapeAndSurroundByQuotes(ValueTypeName::value(value), _sanitized);
+        _writer.write(_sanitized);
+    }
+
+    void encodeValue(types::DateTime::Primitive value) {
+        _formatted.clear();
+        DateTime::format(_formatted, value);
+
+        JsonStringEscaper::escapeAndSurroundByQuotes(_formatted, _sanitized);
+        _writer.write(_sanitized);
+    }
+
+    void encodeValue(types::Duration::Primitive value) {
+        _formatted.clear();
+        Duration::format(_formatted, value);
+
+        JsonStringEscaper::escapeAndSurroundByQuotes(_formatted, _sanitized);
         _writer.write(_sanitized);
     }
 
@@ -135,10 +198,10 @@ private:
     void encodeValue(types::Embedding::Primitive value) {
         _writer.write("[");
         if (value.size() > 0) {
-            _writer.write(std::to_string(value[0]));
+            encodeValue(value[0]);
             for (size_t i = 1; i < value.size(); i++) {
                 _writer.write(",");
-                _writer.write(std::to_string(value[i]));
+                encodeValue(value[i]);
             }
         }
         _writer.write("]");
@@ -154,13 +217,13 @@ private:
 
     template <std::convertible_to<std::string_view> T>
     void encodeValue(const T& value) {
-        ControlCharactersEscaper::escapeAndSurroundByQuotes(value, _sanitized);
+        JsonStringEscaper::escapeAndSurroundByQuotes(value, _sanitized);
         _writer.write(_sanitized);
     }
 
     void encodeValue(const EntityList& value) {
         if (value.empty()) {
-            _writer.write("[]");
+            _writer.write("null");
             return;
         }
 
@@ -214,6 +277,43 @@ private:
 
         _writer.write(']');
     }
+
+    // The value of one entry, which is what a map_element column's cell is. The key is
+    // written by encodeEntry, for an entry read as a member of its map rather than alone.
+    void encodeValue(const MapEntryView entry) {
+        const auto writeTyped = [this]<typename T>(const MapEntryView entry) {
+            const T typed = entry.getValueAs<T>();
+            this->encodeValue(typed);
+        };
+
+        dispatchMapEntry(writeTyped, entry);
+    }
+
+    void encodeEntry(const MapEntryView entry) {
+        encodeValue(entry.getKey());
+        _writer.write(": ");
+
+        encodeValue(entry);
+    }
+
+    void encodeValue(const MapView mv) {
+        if (mv.empty()) {
+            _writer.write("{}");
+            return;
+        }
+
+        _writer.write('{');
+
+        const MapEntryView fst = mv.front();
+        encodeEntry(fst);
+
+        for (const MapEntryView entry : mv.entries() | rv::drop(1)) {
+            _writer.write(", ");
+            encodeEntry(entry);
+        }
+
+        _writer.write('}');
+    }
 };
 
 template <Writer WriterT>
@@ -253,25 +353,20 @@ public:
         arr();
     }
 
-    void writeDataframeHeader(const Dataframe& df) {
+    void writeColumnHeaders(std::span<const std::string_view> names, std::span<const Column* const> columns) {
+        bioassert(names.size() == columns.size(), "The JSON schema needs one name per column");
+
         key("header");
         obj();
 
         key("column_names");
         arr();
 
-        for (const NamedColumn* namedCol : df.cols()) {
-            const std::string_view name = namedCol->getName();
-
-            if (name.empty()) {
-                const ColumnTag tag = namedCol->getTag();
-                value(fmt::format("${}", tag.getValue()));
-            } else {
-                value(name);
-            }
+        for (const std::string_view name : names) {
+            value(name);
         }
 
-        end(); // column_names
+        end();
 
         key("column_types");
         arr();
@@ -282,36 +377,30 @@ public:
         using Types = OutputtedTypes;
         using ColTypeGen = ColumnSingleDispatcher<Types::Allowed, ColumnTypeGenerator, Types::Excluded>;
 
-        for (const NamedColumn* namedCol : df.cols()) {
-            const Column* col = namedCol->getColumn();
-
-            ColTypeGen::dispatch(col, generator);
+        for (const Column* column : columns) {
+            ColTypeGen::dispatch(column, generator);
 
             value(columnType);
         }
 
-        end(); // column_types
-        end(); // header
+        end();
+        end();
 
         startData();
     }
 
-    void writeDataframe(const Dataframe& df) {
+    void writeColumns(std::span<const Column* const> columns, size_t offset, size_t rowCount) {
         arr();
-
-        const size_t logicalRowCount = df.getLogicalRowCount();
 
         using JsonWriter = ChunkJsonEncoder<WriterT>;
         using Types = OutputtedTypes;
         using Encoder = ColumnSingleDispatcher<Types::Allowed, JsonWriter, Types::Excluded>;
 
-        JsonWriter encoder(_writer, logicalRowCount);
-        for (const NamedColumn* namedCol : df.cols()) {
+        JsonWriter encoder(_writer, offset, rowCount);
+        for (const Column* column : columns) {
             arr();
 
-            const Column* col = namedCol->getColumn();
-
-            Encoder::dispatch(col, encoder);
+            Encoder::dispatch(column, encoder);
 
             end();
         }
@@ -352,7 +441,7 @@ public:
     }
 
     void key(std::string_view k) {
-        ControlCharactersEscaper::escape(k, _sanitized);
+        JsonStringEscaper::escape(k, _sanitized);
         if (_comma) {
             _writer.write(fmt::format(",\"{}\":", _sanitized));
         } else {
@@ -387,7 +476,7 @@ public:
     }
 
     void value(std::string_view v) {
-        ControlCharactersEscaper::escapeAndSurroundByQuotes(v, _sanitized);
+        JsonStringEscaper::escapeAndSurroundByQuotes(v, _sanitized);
         if (_comma) {
             _writer.write(',');
             _writer.write(_sanitized);

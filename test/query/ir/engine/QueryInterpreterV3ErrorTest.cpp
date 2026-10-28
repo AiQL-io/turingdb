@@ -1,0 +1,109 @@
+#include <gtest/gtest.h>
+
+#include <memory>
+#include <span>
+#include <string>
+#include <string_view>
+
+#include "NLOutputSink.h"
+#include "QueryInterpreterV3.h"
+#include "QueryStatus.h"
+
+#include "Graph.h"
+#include "SimpleGraph.h"
+#include "SystemAccessor.h"
+#include "SystemManager.h"
+#include "versioning/ChangeID.h"
+#include "versioning/CommitHash.h"
+
+#include "TuringTest.h"
+#include "TuringTestEnv.h"
+
+using namespace db;
+using namespace turing::test;
+
+namespace {
+
+// Discards output — the queries under test are rejected before producing rows.
+class NullSink : public NLOutputSink {
+public:
+    void appendChunks(std::span<const Column* const>, size_t, size_t) override {}
+};
+
+}
+
+class QueryInterpreterV3ErrorTest : public TuringTest {
+public:
+    void initialize() override {
+        _env = TuringTestEnv::create(fs::Path {_outDir} / "turing");
+
+        SystemAccessor system = _env->getSystemManager().accessUnique();
+        Graph* graph = system.createGraph(_graphName);
+        SimpleGraph::createSimpleGraph(graph);
+
+        _interpreter = std::make_unique<QueryInterpreterV3>(&_env->getSystemManager(), &_env->getMem(), &_env->getCompilerContext());
+    }
+
+protected:
+    void runQuery(std::string_view query, QueryStatus& status) {
+        NullSink sink;
+
+        _interpreter->execute(status,
+                              query,
+                              _graphName,
+                              CommitHash::head(),
+                              ChangeID::head(),
+                              &sink);
+    }
+
+    const std::string _graphName = "simpledb";
+    std::unique_ptr<TuringTestEnv> _env;
+    std::unique_ptr<QueryInterpreterV3> _interpreter;
+};
+
+// A codegen rejection carries the span of the query it came from, so an expression the
+// generator turns away is reported under the caret naming it.
+TEST_F(QueryInterpreterV3ErrorTest, reportsRejectedExpressionWithItsLocation) {
+    QueryStatus status;
+    runQuery("MATCH (n) DELETE n.name", status);
+
+    EXPECT_EQ(status.getStatus(), QueryStatus::Status::PLAN_ERROR);
+    EXPECT_EQ(status.getError(),
+              "-------* Query error\n"
+              "     1 | MATCH (n) DELETE n.name\n"
+              "       |                  ^^^^^^\n"
+              "-------* Expressions in DELETE statements can only be symbols");
+}
+
+TEST_F(QueryInterpreterV3ErrorTest, deleteOutsideWrite) {
+    QueryStatus status;
+    runQuery("MATCH (n) DELETE n", status);
+
+    EXPECT_EQ(status.getStatus(), QueryStatus::Status::EXEC_ERROR);
+    EXPECT_EQ(status.getError(), "Cannot perform DELETE outside of a write transaction.");
+}
+
+TEST_F(QueryInterpreterV3ErrorTest, setOutsideWrite) {
+    QueryStatus status;
+    runQuery("MATCH (n) SET n.age = 0", status);
+
+    EXPECT_EQ(status.getStatus(), QueryStatus::Status::EXEC_ERROR);
+    EXPECT_EQ(status.getError(), "Cannot perform SET or REMOVE outside of a write transaction.");
+}
+
+TEST_F(QueryInterpreterV3ErrorTest, createOutsideWrite) {
+    QueryStatus status;
+    runQuery("MATCH (n) CREATE (m:M)", status);
+
+    EXPECT_EQ(status.getStatus(), QueryStatus::Status::EXEC_ERROR);
+    EXPECT_EQ(status.getError(), "Cannot perform CREATE outside of a write transaction.");
+}
+
+TEST_F(QueryInterpreterV3ErrorTest, mergeOutsideWrite) {
+    QueryStatus status;
+    runQuery("MERGE (n:P {k: 1})", status);
+
+    EXPECT_EQ(status.getStatus(), QueryStatus::Status::EXEC_ERROR);
+    EXPECT_EQ(status.getError(), "Cannot perform MERGE outside of a write transaction.");
+}
+

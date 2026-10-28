@@ -73,10 +73,7 @@ DataPartBuilder& CommitBuilder::newBuilder() {
 
     const GraphView view = GraphView(_commitData.get());
     const size_t partIndex = view.dataparts().size() + _builders.size();
-    auto& builder = _builders.emplace_back(DataPartBuilder::prepare(*_metadataBuilder,
-                                                                    view.read().getTotalNodesAllocated(),
-                                                                    view.read().getTotalEdgesAllocated(),
-                                                                    partIndex));
+    auto& builder = _builders.emplace_back(DataPartBuilder::prepare(*_metadataBuilder, view, partIndex));
 
     return *builder;
 }
@@ -160,7 +157,7 @@ void CommitBuilder::flushWriteBuffer([[maybe_unused]] JobSystem& jobsystem) {
         // We create a single datapart when flushing the buffer,
         // to ensure it is synced with the metadata provided when rebasing main
         DataPartBuilder& dpBuilder = newBuilder();
-        wb.buildPending(dpBuilder);
+        wb.buildPending(dpBuilder, tombstones);
     }
 
     if (wb.containsUpdates()) {
@@ -283,6 +280,10 @@ template WeakArc<Index> CommitBuilder::newNodePropertyIndex<types::Double>(std::
 template WeakArc<Index> CommitBuilder::newNodePropertyIndex<types::String>(std::string_view indexName, PropertyTypeID ptID);
 template WeakArc<Index> CommitBuilder::newNodePropertyIndex<types::Bool>(std::string_view indexName, PropertyTypeID ptID);
 template WeakArc<Index> CommitBuilder::newNodePropertyIndex<types::Embedding>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> CommitBuilder::newNodePropertyIndex<types::List>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> CommitBuilder::newNodePropertyIndex<types::DateTime>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> CommitBuilder::newNodePropertyIndex<types::Duration>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> CommitBuilder::newNodePropertyIndex<types::Map>(std::string_view indexName, PropertyTypeID ptID);
 
 template WeakArc<Index> CommitBuilder::newEdgePropertyIndex<types::Int64>(std::string_view indexName, PropertyTypeID ptID);
 template WeakArc<Index> CommitBuilder::newEdgePropertyIndex<types::UInt64>(std::string_view indexName, PropertyTypeID ptID);
@@ -290,4 +291,8 @@ template WeakArc<Index> CommitBuilder::newEdgePropertyIndex<types::Double>(std::
 template WeakArc<Index> CommitBuilder::newEdgePropertyIndex<types::String>(std::string_view indexName, PropertyTypeID ptID);
 template WeakArc<Index> CommitBuilder::newEdgePropertyIndex<types::Bool>(std::string_view indexName, PropertyTypeID ptID);
 template WeakArc<Index> CommitBuilder::newEdgePropertyIndex<types::Embedding>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> CommitBuilder::newEdgePropertyIndex<types::List>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> CommitBuilder::newEdgePropertyIndex<types::DateTime>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> CommitBuilder::newEdgePropertyIndex<types::Duration>(std::string_view indexName, PropertyTypeID ptID);
+template WeakArc<Index> CommitBuilder::newEdgePropertyIndex<types::Map>(std::string_view indexName, PropertyTypeID ptID);
 }

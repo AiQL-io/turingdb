@@ -1,0 +1,429 @@
+#include "StructuralExpressionComparator.h"
+
+#include <algorithm>
+#include <utility>
+#include <vector>
+
+#include "FunctionInvocation.h"
+#include "LabelExpr.h"
+#include "Literal.h"
+#include "QualifiedName.h"
+#include "Parameter.h"
+#include "Symbol.h"
+#include "SymbolChain.h"
+
+#include "BinaryExpr.h"
+#include "CaseExpr.h"
+#include "EntityTypeExpr.h"
+#include "Expr.h"
+#include "ExprChain.h"
+#include "FunctionInvocationExpr.h"
+#include "IndexExpr.h"
+#include "ListExpr.h"
+#include "LiteralExpr.h"
+#include "LogicalExpr.h"
+#include "PropertyExpr.h"
+#include "PropertyLookupExpr.h"
+#include "StringExpr.h"
+#include "SymbolExpr.h"
+#include "UnaryExpr.h"
+
+using namespace db;
+
+bool StructuralExpressionComparator::equal(const Expr* lhs, const Expr* rhs) {
+    // The same node, or two null operands of the same shape, need no further comparison
+    if (lhs == rhs) {
+        return true;
+    }
+
+    if (!lhs || !rhs) {
+        return false;
+    }
+
+    const Expr::Kind kind = lhs->getKind();
+    if (kind != rhs->getKind()) {
+        return false;
+    }
+
+    switch (kind) {
+        case Expr::Kind::BINARY: {
+            const BinaryExpr* lhsBinary = static_cast<const BinaryExpr*>(lhs);
+            const BinaryExpr* rhsBinary = static_cast<const BinaryExpr*>(rhs);
+
+            const bool sameOperator = lhsBinary->getOperator() == rhsBinary->getOperator();
+
+            return sameOperator
+                   && equal(lhsBinary->getLHS(), rhsBinary->getLHS())
+                   && equal(lhsBinary->getRHS(), rhsBinary->getRHS());
+        }
+        break;
+
+        case Expr::Kind::LOGICAL: {
+            const LogicalExpr* lhsLogical = static_cast<const LogicalExpr*>(lhs);
+            const LogicalExpr* rhsLogical = static_cast<const LogicalExpr*>(rhs);
+
+            const bool sameOperator = lhsLogical->getOperator() == rhsLogical->getOperator();
+
+            return sameOperator && equalExprLists(lhsLogical->getOperands(), rhsLogical->getOperands());
+        }
+        break;
+
+        case Expr::Kind::UNARY: {
+            const UnaryExpr* lhsUnary = static_cast<const UnaryExpr*>(lhs);
+            const UnaryExpr* rhsUnary = static_cast<const UnaryExpr*>(rhs);
+
+            const bool sameOperator = lhsUnary->getOperator() == rhsUnary->getOperator();
+
+            return sameOperator && equal(lhsUnary->getSubExpr(), rhsUnary->getSubExpr());
+        }
+        break;
+
+        case Expr::Kind::STRING: {
+            const StringExpr* lhsString = static_cast<const StringExpr*>(lhs);
+            const StringExpr* rhsString = static_cast<const StringExpr*>(rhs);
+
+            const bool sameOperator = lhsString->getStringOperator() == rhsString->getStringOperator();
+
+            return sameOperator
+                   && equal(lhsString->getLHS(), rhsString->getLHS())
+                   && equal(lhsString->getRHS(), rhsString->getRHS());
+        }
+        break;
+
+        case Expr::Kind::PROPERTY: {
+            const PropertyExpr* lhsProperty = static_cast<const PropertyExpr*>(lhs);
+            const PropertyExpr* rhsProperty = static_cast<const PropertyExpr*>(rhs);
+
+            const bool sameEntity = lhsProperty->getEntityVarDecl() == rhsProperty->getEntityVarDecl();
+            const bool sameProperty = lhsProperty->getPropName() == rhsProperty->getPropName();
+
+            // Two components of one value are two values, so the component is part of
+            // what the access reads: n.at.year and n.at.day name the same property
+            const bool lhsReadsADateTime = lhsProperty->readsADateTimeComponent();
+            const bool rhsReadsADateTime = rhsProperty->readsADateTimeComponent();
+            const bool lhsReadsADuration = lhsProperty->readsADurationComponent();
+            const bool rhsReadsADuration = rhsProperty->readsADurationComponent();
+
+            const bool neitherReadsAComponent = !lhsReadsADateTime
+                                             && !rhsReadsADateTime
+                                             && !lhsReadsADuration
+                                             && !rhsReadsADuration;
+
+            const bool sameDateTimeComponent = lhsReadsADateTime
+                                            && rhsReadsADateTime
+                                            && lhsProperty->getDateTimePart() == rhsProperty->getDateTimePart();
+
+            const bool sameDurationComponent = lhsReadsADuration
+                                            && rhsReadsADuration
+                                            && lhsProperty->getDurationPart() == rhsProperty->getDurationPart();
+
+            const bool sameComponent = neitherReadsAComponent || sameDateTimeComponent || sameDurationComponent;
+
+            // And two keys of one map are two values for the same reason. The key is empty
+            // on every read that is not one, so the comparison stands for all of them.
+            const bool sameKey = lhsProperty->getMapKey() == rhsProperty->getMapKey();
+
+            return sameEntity && sameProperty && sameComponent && sameKey;
+        }
+        break;
+
+        case Expr::Kind::PROPERTY_LOOKUP: {
+            const PropertyLookupExpr* lhsLookup = static_cast<const PropertyLookupExpr*>(lhs);
+            const PropertyLookupExpr* rhsLookup = static_cast<const PropertyLookupExpr*>(rhs);
+
+            const bool sameProperty = lhsLookup->getPropName() == rhsLookup->getPropName();
+
+            return sameProperty && equal(lhsLookup->getBase(), rhsLookup->getBase());
+        }
+        break;
+
+        case Expr::Kind::SYMBOL: {
+            const SymbolExpr* lhsSymbol = static_cast<const SymbolExpr*>(lhs);
+            const SymbolExpr* rhsSymbol = static_cast<const SymbolExpr*>(rhs);
+
+            return lhsSymbol->getDecl() == rhsSymbol->getDecl();
+        }
+        break;
+
+        case Expr::Kind::LITERAL: {
+            const LiteralExpr* lhsLiteral = static_cast<const LiteralExpr*>(lhs);
+            const LiteralExpr* rhsLiteral = static_cast<const LiteralExpr*>(rhs);
+
+            return equalLiterals(lhsLiteral->getLiteral(), rhsLiteral->getLiteral());
+        }
+        break;
+
+        case Expr::Kind::INDEX: {
+            const IndexExpr* lhsIndex = static_cast<const IndexExpr*>(lhs);
+            const IndexExpr* rhsIndex = static_cast<const IndexExpr*>(rhs);
+
+            return equal(lhsIndex->getBase(), rhsIndex->getBase())
+                   && equal(lhsIndex->getIndexExpr(), rhsIndex->getIndexExpr());
+        }
+        break;
+
+        case Expr::Kind::LIST: {
+            const ListExpr* lhsList = static_cast<const ListExpr*>(lhs);
+            const ListExpr* rhsList = static_cast<const ListExpr*>(rhs);
+
+            return equalExprLists(lhsList->getElements(), rhsList->getElements());
+        }
+        break;
+
+        case Expr::Kind::CASE: {
+            const CaseExpr* lhsCase = static_cast<const CaseExpr*>(lhs);
+            const CaseExpr* rhsCase = static_cast<const CaseExpr*>(rhs);
+
+            const CaseExpr::Branches& lhsBranches = lhsCase->getBranches();
+            const CaseExpr::Branches& rhsBranches = rhsCase->getBranches();
+
+            if (lhsBranches.size() != rhsBranches.size()) {
+                return false;
+            }
+
+            for (size_t branchIndex = 0; branchIndex < lhsBranches.size(); branchIndex++) {
+                const CaseExpr::Tests& lhsTests = lhsBranches[branchIndex]._tests;
+                const CaseExpr::Tests& rhsTests = rhsBranches[branchIndex]._tests;
+
+                if (lhsTests.size() != rhsTests.size()) {
+                    return false;
+                }
+
+                for (size_t testIndex = 0; testIndex < lhsTests.size(); testIndex++) {
+                    const bool sameKind = lhsTests[testIndex]._kind == rhsTests[testIndex]._kind;
+                    const bool sameOperator = lhsTests[testIndex]._operator == rhsTests[testIndex]._operator;
+                    const bool sameValue = equal(lhsTests[testIndex]._value, rhsTests[testIndex]._value);
+
+                    if (!sameKind || !sameOperator || !sameValue) {
+                        return false;
+                    }
+                }
+
+                if (!equal(lhsBranches[branchIndex]._then, rhsBranches[branchIndex]._then)) {
+                    return false;
+                }
+            }
+
+            return equal(lhsCase->getSubject(), rhsCase->getSubject())
+                   && equal(lhsCase->getElseExpr(), rhsCase->getElseExpr());
+        }
+        break;
+
+        case Expr::Kind::FUNCTION_INVOCATION: {
+            const FunctionInvocationExpr* lhsCall = static_cast<const FunctionInvocationExpr*>(lhs);
+            const FunctionInvocationExpr* rhsCall = static_cast<const FunctionInvocationExpr*>(rhs);
+
+            return equalInvocations(lhsCall->getFunctionInvocation(),
+                                    rhsCall->getFunctionInvocation());
+        }
+        break;
+
+        case Expr::Kind::ENTITY_TYPES: {
+            const EntityTypeExpr* lhsTypes = static_cast<const EntityTypeExpr*>(lhs);
+            const EntityTypeExpr* rhsTypes = static_cast<const EntityTypeExpr*>(rhs);
+
+            const bool sameEntity = lhsTypes->getEntityVarDecl() == rhsTypes->getEntityVarDecl()
+                                 && equal(lhsTypes->getOperand(), rhsTypes->getOperand());
+
+            return sameEntity && equalLabelExprs(lhsTypes->getLabelExpr(), rhsTypes->getLabelExpr());
+        }
+        break;
+
+        default:
+            // PATH carries a pattern, which this comparator does not take apart, so such
+            // an expression equals only itself
+            return false;
+        break;
+    }
+}
+
+bool StructuralExpressionComparator::equalSymbolChains(const SymbolChain* lhs, const SymbolChain* rhs) {
+    if (lhs == rhs) {
+        return true;
+    }
+
+    if (!lhs || !rhs) {
+        return false;
+    }
+
+    const auto sameName = [](const Symbol* left, const Symbol* right) {
+        return left->getName() == right->getName();
+    };
+
+    const auto sameParameter = [](const Parameter* left, const Parameter* right) {
+        return left->getName() == right->getName();
+    };
+
+    return std::ranges::equal(*lhs, *rhs, sameName)
+        && std::ranges::equal(lhs->getParameters(), rhs->getParameters(), sameParameter);
+}
+
+bool StructuralExpressionComparator::equalLabelExprs(const LabelExpr* lhs, const LabelExpr* rhs) {
+    std::vector<std::pair<const LabelExpr*, const LabelExpr*>> worklist {{lhs, rhs}};
+
+    while (!worklist.empty()) {
+        const auto [left, right] = worklist.back();
+        worklist.pop_back();
+
+        const LabelExpr::Operands& leftOperands = left->getOperands();
+        const LabelExpr::Operands& rightOperands = right->getOperands();
+
+        const LabelExpr::Kind kind = left->getKind();
+        const bool sameShape = kind == right->getKind() && leftOperands.size() == rightOperands.size();
+        const bool sameLabels = kind != LabelExpr::Kind::LABELS || equalSymbolChains(left->getLabels(), right->getLabels());
+        if (!sameShape || !sameLabels) {
+            return false;
+        }
+
+        for (size_t operand = 0; operand < leftOperands.size(); operand++) {
+            worklist.emplace_back(leftOperands[operand], rightOperands[operand]);
+        }
+    }
+
+    return true;
+}
+
+bool StructuralExpressionComparator::readsThePropertyOfComponent(const Expr* candidate, const PropertyExpr* component) {
+    if (candidate->getKind() != Expr::Kind::PROPERTY) {
+        return false;
+    } 
+
+    if (!component->readsAComponent()) {
+        return false;
+    }
+
+    const PropertyExpr* property = static_cast<const PropertyExpr*>(candidate);
+
+    const bool candidateReadsAComponent = property->readsAComponent();
+    const bool sameEntity = property->getEntityVarDecl() == component->getEntityVarDecl();
+    const bool sameProperty = property->getPropName() == component->getPropName();
+
+    return !candidateReadsAComponent && sameEntity && sameProperty;
+}
+
+bool StructuralExpressionComparator::equalLiterals(const Literal* lhs, const Literal* rhs) {
+    if (lhs == rhs) {
+        return true;
+    }
+
+    if (!lhs || !rhs) {
+        return false;
+    }
+
+    const Literal::Kind kind = lhs->getKind();
+    if (kind != rhs->getKind()) {
+        return false;
+    }
+
+    switch (kind) {
+        case Literal::Kind::NULL_LITERAL:
+            // Neither null nor wildcard carries a value, so every one is the same one
+            return true;
+        break;
+
+        case Literal::Kind::WILDCARD:
+            return true;
+        break;
+
+        case Literal::Kind::BOOL:
+            return static_cast<const BoolLiteral*>(lhs)->getValue()
+                   == static_cast<const BoolLiteral*>(rhs)->getValue();
+        break;
+
+        case Literal::Kind::INTEGER:
+            return static_cast<const IntegerLiteral*>(lhs)->getValue()
+                   == static_cast<const IntegerLiteral*>(rhs)->getValue();
+        break;
+
+        case Literal::Kind::DOUBLE:
+            // A NaN literal compares equal to nothing, itself included, which leaves it
+            // on the conservative side of the contract
+            return static_cast<const DoubleLiteral*>(lhs)->getValue()
+                   == static_cast<const DoubleLiteral*>(rhs)->getValue();
+        break;
+
+        case Literal::Kind::STRING:
+            return static_cast<const StringLiteral*>(lhs)->getValue()
+                   == static_cast<const StringLiteral*>(rhs)->getValue();
+        break;
+
+        case Literal::Kind::CHAR:
+            return static_cast<const CharLiteral*>(lhs)->getValue()
+                   == static_cast<const CharLiteral*>(rhs)->getValue();
+        break;
+
+        case Literal::Kind::NORMAL_FORM:
+            return static_cast<const NormalFormLiteral*>(lhs)->getForm()
+                   == static_cast<const NormalFormLiteral*>(rhs)->getForm();
+        break;
+
+        case Literal::Kind::EMBEDDING:
+            return std::ranges::equal(static_cast<const EmbeddingLiteral*>(lhs)->getValue(),
+                                      static_cast<const EmbeddingLiteral*>(rhs)->getValue());
+        break;
+
+        case Literal::Kind::LIST:
+            return equalExprLists(static_cast<const ListLiteral*>(lhs)->items(),
+                                  static_cast<const ListLiteral*>(rhs)->items());
+        break;
+
+        default:
+            // A map literal keys its entries by Symbol identity, so two maps written the
+            // same way do not compare equal entry by entry
+            return false;
+        break;
+    }
+}
+
+bool StructuralExpressionComparator::equalInvocations(const FunctionInvocation* lhs,
+                                                      const FunctionInvocation* rhs) {
+    if (lhs == rhs) {
+        return true;
+    }
+
+    if (!lhs || !rhs) {
+        return false;
+    }
+
+    // count(x) and count(DISTINCT x) reduce the same argument to different values, so the
+    // modifier is part of what the call is, not decoration on it
+    if (lhs->isDistinct() != rhs->isDistinct()) {
+        return false;
+    }
+
+    const QualifiedName* lhsName = lhs->getName();
+    const QualifiedName* rhsName = rhs->getName();
+    if (!lhsName || !rhsName || lhsName->size() != rhsName->size()) {
+        return false;
+    }
+
+    for (size_t index = 0; index < lhsName->size(); index++) {
+        if (lhsName->get(index)->getName() != rhsName->get(index)->getName()) {
+            return false;
+        }
+    }
+
+    // A call with no argument list has none to compare, so two of them match on name
+    const ExprChain* lhsArguments = lhs->getArguments();
+    const ExprChain* rhsArguments = rhs->getArguments();
+    if (!lhsArguments || !rhsArguments) {
+        return lhsArguments == rhsArguments;
+    }
+
+    return equalExprLists(lhsArguments->getExprs(), rhsArguments->getExprs());
+}
+
+bool StructuralExpressionComparator::equalExprLists(std::span<Expr* const> lhs,
+                                                    std::span<Expr* const> rhs) {
+    if (lhs.size() != rhs.size()) {
+        return false;
+    }
+
+    for (size_t index = 0; index < lhs.size(); index++) {
+        if (!equal(lhs[index], rhs[index])) {
+            return false;
+        }
+    }
+
+    return true;
+}

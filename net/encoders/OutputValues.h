@@ -8,6 +8,8 @@
 #include "list/ListElementView.h"
 #include "OptionalLike.h"
 #include "TypeUtils.h"
+#include "map/MapEntryView.h"
+#include "map/MapView.h"
 #include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
 #include "versioning/CommitHash.h"
@@ -16,13 +18,14 @@
 
 namespace db {
 
+class ColumnMask;
 class EntityList;
 
 template <typename T>
 struct IsHash : std::false_type {};
 
-template <int N>
-struct IsHash<TemplateCommitHash<N>> : std::true_type {};
+template <int N, int Radix>
+struct IsHash<TemplateCommitHash<N, Radix>> : std::true_type {};
 
 template <typename T>
 concept Hash = IsHash<T>::value;
@@ -31,7 +34,10 @@ template <typename T>
 concept IDLike = IsID<T>::value;
 
 template <typename T>
-concept IsUInt64 = IsID<T>::value
+concept EntityIDLike = std::is_same_v<T, NodeID> || std::is_same_v<T, EdgeID>;
+
+template <typename T>
+concept IsUInt64 = IsID<TypeUtils::unwrap_optional_t<T>>::value
                 || std::unsigned_integral<T>
                 || IsHash<T>::value
                 || OptionalUnsignedInteger<T>;
@@ -49,7 +55,7 @@ concept IsString = std::is_convertible_v<T, std::string_view>
                 || OptionalString<T>;
 
 template <typename T>
-concept IsValueType = std::is_same_v<T, ValueType>;
+concept IsValueType = std::is_same_v<TypeUtils::unwrap_optional_t<T>, ValueType>;
 
 template <typename T>
 concept IsBool = std::is_same_v<T, CustomBool>
@@ -63,16 +69,28 @@ template <typename T>
 concept IsEntityList = std::is_same_v<T, EntityList>;
 
 template <typename T>
-concept IsListView = std::is_same_v<T, ListView>;
+concept IsListView = std::is_same_v<TypeUtils::unwrap_optional_t<T>, ListView>;
 
 template <typename T>
-concept IsListElement = std::is_same_v<T, ListElementView>;
+concept IsListElement = std::is_same_v<TypeUtils::unwrap_optional_t<T>, ListElementView>;
+
+template <typename T>
+concept IsMap = std::is_same_v<TypeUtils::unwrap_optional_t<T>, MapView>;
+
+template <typename T>
+concept IsMapEntry = std::is_same_v<T, MapEntryView>;
 
 template <typename T>
 concept IsNull = std::is_same_v<T, PropertyNull>;
 
 template <typename T>
 concept IsEmbedding = std::is_same_v<TypeUtils::unwrap_optional_t<T>, types::Embedding::Primitive>;
+
+template <typename T>
+concept IsDateTime = std::is_same_v<TypeUtils::unwrap_optional_t<T>, types::DateTime::Primitive>;
+
+template <typename T>
+concept IsDuration = std::is_same_v<TypeUtils::unwrap_optional_t<T>, types::Duration::Primitive>;
 
 struct ColumnTypeGenerator {
     std::string& _name;
@@ -81,6 +99,10 @@ struct ColumnTypeGenerator {
     void operator()(const U<T>*) {
         if constexpr (IsEmbedding<T>) {
             _name = fmt::format("Embedding");
+        } else if constexpr (IsDateTime<T>) {
+            _name = fmt::format("DateTime");
+        } else if constexpr (IsDuration<T>) {
+            _name = fmt::format("Duration");
         } else if constexpr (IsUInt64<T>) {
             _name = fmt::format("UInt64");
         } else if constexpr (IsInt64<T>) {
@@ -103,9 +125,17 @@ struct ColumnTypeGenerator {
             _name = fmt::format("List");
         } else if constexpr (IsListElement<T>) {
             _name = fmt::format("ListElement");
+        } else if constexpr (IsMap<T>) {
+            _name = fmt::format("Map");
+        } else if constexpr (IsMapEntry<T>) {
+            _name = fmt::format("MapValue");
         } else {
             COMPILE_ERROR("Unknown column type");
         }
+    }
+
+    void operator()(const ColumnMask*) {
+        _name = "Bool";
     }
 };
 

@@ -1,13 +1,19 @@
 #pragma once
 
+#include <span>
+#include <string_view>
 #include <vector>
 
 #include "metadata/PropertyType.h"
+
+#include "SchemaNameRef.h"
 
 namespace db {
 
 class CypherAST;
 class Expr;
+class LabelExpr;
+class SymbolChain;
 
 struct EntityPropertyConstraint {
     std::string_view _propTypeName;
@@ -36,12 +42,18 @@ public:
 
     static NodePatternData* create(CypherAST* ast);
 
-    std::span<const std::string_view> labelConstraints() const { return _labelConstraints; }
+    std::span<const LabelRef> labelConstraints() const { return _labelConstraints; }
 
-    void addLabelConstraint(std::string_view label);
+    // What the node's label expression asks beyond the labels it must carry
+    std::span<const LabelExpr* const> labelExprConstraints() const { return _labelExprConstraints; }
+
+    void addLabelConstraints(const SymbolChain* labels);
+
+    void addLabelExpr(const LabelExpr* labelExpr);
 
 private:
-    std::vector<std::string_view> _labelConstraints;
+    std::vector<LabelRef> _labelConstraints;
+    std::vector<const LabelExpr*> _labelExprConstraints;
 
     NodePatternData();
     ~NodePatternData() override;
@@ -53,12 +65,18 @@ public:
 
     static EdgePatternData* create(CypherAST* ast);
 
-    std::span<const std::string_view> edgeTypeConstraints() const { return _edgeTypeConstraints; }
+    std::span<const EdgeTypeRef> edgeTypeConstraints() const { return _edgeTypeConstraints; }
 
-    void addEdgeTypeConstraint(std::string_view edgeType);
+    // What the edge's type expression asks beyond the types it may have
+    std::span<const LabelExpr* const> edgeTypeExprConstraints() const { return _edgeTypeExprConstraints; }
+
+    void addEdgeTypeConstraints(const SymbolChain* edgeTypes);
+
+    void addEdgeTypeExpr(const LabelExpr* typeExpr);
 
 private:
-    std::vector<std::string_view> _edgeTypeConstraints;
+    std::vector<EdgeTypeRef> _edgeTypeConstraints;
+    std::vector<const LabelExpr*> _edgeTypeExprConstraints;
 
     EdgePatternData();
     ~EdgePatternData() override;

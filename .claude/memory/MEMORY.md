@@ -40,7 +40,7 @@
 
 ## Build
 - Always build from `build/` directory: `make -j8`
-- Regression tests: `make run_regress`
+- Regression tests: `make run_regress` (classic pipeline only -- proves nothing about v3/MLIR work)
 - Unit tests: `ctest` or `ctest --output-on-failure`
 
 ## Code Style Feedback
@@ -60,7 +60,7 @@
 - @feedback_size_t_for_indices.md — size_t for indices and counts in new code, narrow at API boundaries
 - @feedback_switch_case_break.md — return inside the case body, break still written aligned to case
 - @feedback_naming_throw.md — throw-prefixed names (throwError) for helpers that always throw
-- @feedback_no_k_prefix_constants.md — no Google-style k-prefix; use descriptive constant names
+- @feedback_no_k_prefix_constants.md — constexpr constants are UPPER_SNAKE_CASE (DB_PASS_COUNT); never a k-prefix
 - @feedback_exit_status_macros.md — return EXIT_SUCCESS / EXIT_FAILURE from main, not 0 / 1
 - @feedback_cpp_using_namespace.md — `using namespace db;` at top of .cpp, no body-wrapping namespace
 - @feedback_call_arg_alignment.md — wrapping a call: one argument per line, aligned under the first
@@ -75,6 +75,10 @@
 - @feedback_parquet_helpers.md — tools/turing-parquet: multi-step ops on Parquet types get a dedicated ParquetXxx class
 - @feedback_dump_object_bytes.md — bulk-write trivially-copyable object bytes, layouts pinned by central static_asserts; no staging
 - @feedback_doc_utility_functions.md — one-line WHAT comment above each free function in tool .cpp drivers
+- @feedback_minimal_comments.md — write almost no comments; default is none, hard cap 2-4 lines when one is justified
+- @feedback_plain_prose.md — write plainly: one claim per sentence, concrete numbers, no ornament
+- @feedback_no_optimisation_in_codegen.md — no liveness/dead-column/use-later analysis in DBProgramGenerator; optimisation belongs in an MLIR pass
+- @feedback_worklist_in_passes.md — MLIR pass helpers walk IR with an explicit worklist, never by recursing once per op
 
 ## Workflow Preferences
 - @feedback_test_first.md — write failing test before fix
@@ -83,6 +87,8 @@
 - @feedback_explicit_ci_runner_labels.md — put real runner labels in each workflow's os_list + `runs-on: ${{ matrix.os }}`, not a computed ternary / runner-group object
 - @feedback_no_build_during_iteration.md — don't build after every micro-edit; wait until the user asks
 - @feedback_no_redundant_cmake.md — don't run `cmake ..` before `make`; make reconfigures itself
+- @feedback_pr_body_plain_sentence.md — PR body is a bare imperative sentence ("Implement X."), not a one-sentence summary of scope or design
+- @feedback_pr_title_ticket_code.md — PR title starts with the Linear ticket code ("TUR-124: ...") when there is one; commit subjects stay area-prefixed
 
 ## Project context
 - @project_partitioning.md — partitioning is near-term; some customers asked for METIS-style structural partitioning
@@ -90,9 +96,11 @@
 
 ## Build & CI
 - @feedback_no_macos_strip.md — wheel build's `_strip_binary` is Linux-only; skip strip on macOS (dylib/codesign issues)
+- @reference_ci_runner_hosts.md — self-hosted Linux runner hosts: labels, cores, HOST_BUILD_JOBS, /opt layout, watchdog, icecream gate
 
 ## Codebase references
 - @reference_bioassert_throws.md — bioassert throws a catchable FatalException (TuringException); the abort() is dead code
 - @reference_gcc_maybe_uninit_sort.md — sort an index permutation to dodge GCC's -Wmaybe-uninitialized; a call-site pragma can't suppress it
-- @reference_no_string_predicates.md — no CONTAINS / STARTS WITH / ENDS WITH; StringOperator existing in the AST does NOT imply support
+- @reference_v3_cross_product_chunked.md — v3 nl.cross_product is an iterator driving its own nl.for; one chunk of pairs per step, like v2's cursor
 - @reference_change_visibility.md — within a change MATCH sees the COMMITted tip (read-your-own-writes works after COMMIT); after SUBMIT the change is gone, checkout head to see committed data
+- @reference_regress_not_v3.md — regress does not exercise the v3 MLIR engine; verify v3 work with ctest, not run_regress

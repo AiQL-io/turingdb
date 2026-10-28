@@ -1,11 +1,23 @@
 #include "NLOps.h"
 #include "NLDialect.h"
 
+#include <optional>
+
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include "IRLiteralList.h"
 #include "StorageEnums.h"
+#include "ColumnIndicesFormat.h"
+#include "EdgeDirectionsFormat.h"
+#include "PathStepsFormat.h"
+#include "PathHopArguments.h"
+#include "LabelAlternativesFormat.h"
+#include "StorageAttributes.h"
+#include "MergePatternShape.h"
 #include "GroupAggregateKindsFormat.h"
+#include "PropertyScanLiteral.h"
 
 using namespace mlir;
 using namespace mlir::nl;
@@ -21,12 +33,37 @@ Type getNodeIDChunkType(MLIRContext* context) {
     return ChunkType::get(context, storage::NodeIDType::get(context));
 }
 
+Type valueElementOf(Type chunkType) {
+    const Type element = llvm::cast<ChunkType>(chunkType).getElementType();
+    const auto nullable = llvm::dyn_cast<storage::NullableType>(element);
+
+    return nullable ? nullable.getValueType() : element;
+}
+
 Type getEdgeIDChunkType(MLIRContext* context) {
     return ChunkType::get(context, storage::EdgeIDType::get(context));
 }
 
 Type getEdgeTypeIDChunkType(MLIRContext* context) {
     return ChunkType::get(context, storage::EdgeTypeIDType::get(context));
+}
+
+Type getNullableChunkType(MLIRContext* context, Type valueType) {
+    return ChunkType::get(context, storage::NullableType::get(context, valueType));
+}
+
+// Whether a key read can be answered over this chunk: a chunk of maps, or one of tagged
+// cells, which a read of a nested container hands back and whose row says what it holds
+bool holdsAMapPerRow(Type chunkType) {
+    const auto chunk = dyn_cast<ChunkType>(chunkType);
+    if (!chunk) {
+        return false;
+    }
+
+    const auto nullable = dyn_cast<storage::NullableType>(chunk.getElementType());
+    const Type read = nullable ? nullable.getValueType() : chunk.getElementType();
+
+    return isa<storage::MapType, storage::AnyType, storage::MapElementType>(read);
 }
 
 // The value type an aggregate reduces: the T in a !nl.chunk<!storage.nullable<T>>.
@@ -72,6 +109,57 @@ Type getEdgeIteratorType(MLIRContext* context, TypeRange carriedChunkTypes) {
     return IteratorType::get(context, chunkTypes);
 }
 
+// A path exploration exposes the seed node IDs, the end node IDs and the path handles,
+// followed by one filtered chunk per carried column, mirroring db.explore_paths
+Type getPathIteratorType(MLIRContext* context, TypeRange carriedChunkTypes) {
+    const Type seeds = getNodeIDChunkType(context);
+    const Type ends = getNodeIDChunkType(context);
+    const Type paths = ChunkType::get(context, storage::PathRefType::get(context));
+
+    llvm::SmallVector<Type> chunkTypes {seeds, ends, paths};
+    chunkTypes.append(carriedChunkTypes.begin(), carriedChunkTypes.end());
+
+    return IteratorType::get(context, chunkTypes);
+}
+
+// The body of an op over the elements of one row's list: one block taking the element,
+// the row tag and one chunk per carried column, ending in a yield
+LogicalResult verifyElementBody(Operation* op, Block& bodyBlock, OperandRange carried) {
+    auto yield = dyn_cast_or_null<ComprehensionYield>(bodyBlock.empty() ? nullptr : &bodyBlock.back());
+    if (!yield) {
+        return op->emitOpError("body region must end with an nl.comprehension_yield");
+    }
+
+    const size_t expectedArguments = carried.size() + 2;
+
+    if (bodyBlock.getNumArguments() != expectedArguments) {
+        return op->emitOpError("body region takes the element and the row tag plus one chunk per "
+                               "carried column, ")
+               << "expected " << expectedArguments << " but has " << bodyBlock.getNumArguments();
+    }
+
+    if (!llvm::isa<ChunkType>(bodyBlock.getArgument(0).getType())) {
+        return op->emitOpError("body argument 0 must be the chunk of elements");
+    }
+
+    const auto rowTagType = llvm::dyn_cast<ChunkType>(bodyBlock.getArgument(1).getType());
+
+    if (!rowTagType || !rowTagType.getElementType().isUnsignedInteger(64)) {
+        return op->emitOpError("body argument 1 must be the ui64 chunk of row tags");
+    }
+
+    for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
+        const Type argumentType = bodyBlock.getArgument(carriedIndex + 2).getType();
+
+        if (argumentType != carried[carriedIndex].getType()) {
+            return op->emitOpError("body argument ") << carriedIndex + 2
+                                                     << " must have the type of carried chunk "
+                                                     << carriedIndex;
+        }
+    }
+
+    return success();
+}
 }
 
 // A node scan always produces one chunk of node IDs per step
@@ -105,6 +193,65 @@ LogicalResult ConstScanNodes::inferReturnTypes(MLIRContext* context,
     return success();
 }
 
+LogicalResult ScanNodesByPropertyValue::verify() {
+    if (getProperty().empty()) {
+        return emitOpError("requires a non-empty property name");
+    }
+
+    const TypedAttr literal = getValue();
+    if (!storage::isPropertyScanLiteral(literal)) {
+        return emitOpError(storage::propertyScanLiteralKinds()) << literal.getType();
+    }
+
+    const std::optional<ArrayAttr> labels = getLabels();
+    if (labels && labels->empty()) {
+        return emitOpError("requires at least one label when labels are given");
+    }
+
+    return success();
+}
+
+// A property-value scan filters the rows a plain scan would produce, never their
+// shape, so it produces the same single chunk of node IDs per step - the name and
+// literal are a filter, not a result type.
+LogicalResult ScanNodesByPropertyValue::inferReturnTypes(MLIRContext* context,
+                                                         std::optional<Location> location,
+                                                         ScanNodesByPropertyValue::Adaptor adaptor,
+                                                         SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(IteratorType::get(context, {getNodeIDChunkType(context)}));
+    return success();
+}
+
+// A vector search produces the two fixed neighbour chunks per step - the nodes the index
+// holds the vectors under and the distances they scored - and reads no input, so the
+// iterator has exactly those two chunks and no carried tail. The neighbours ride the same
+// node ID chunk a scan binds, the distances a nullable value chunk.
+LogicalResult VectorSearch::inferReturnTypes(MLIRContext* context,
+                                             std::optional<Location> location,
+                                             VectorSearch::Adaptor adaptor,
+                                             SmallVectorImpl<Type>& inferredReturnTypes) {
+    const Type ids = getNodeIDChunkType(context);
+    const Type scores = getNullableChunkType(context, Float64Type::get(context));
+
+    inferredReturnTypes.push_back(IteratorType::get(context, {ids, scores}));
+    return success();
+}
+
+// The parameters db.vector_search rejects reach the index through this op unchanged: a
+// search reporting no neighbour sizes its result buffers at zero, and a query vector of
+// no dimension has nothing to score the neighbours against.
+LogicalResult VectorSearch::verify() {
+    if (getK() == 0) {
+        return emitOpError("must report at least one neighbour");
+    }
+
+    if (getQueryVector().empty()) {
+        return emitOpError("must search for a vector of at least one dimension");
+    }
+
+    return success();
+}
+
 // An edge scan produces the same four fixed edge chunks per step as an
 // out-edges fetch, but reads no input and carries nothing, so the iterator has
 // exactly those four chunks and no carried tail.
@@ -112,6 +259,66 @@ LogicalResult ScanEdges::inferReturnTypes(MLIRContext* context,
                                          std::optional<Location> location,
                                          ScanEdges::Adaptor adaptor,
                                          SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, {}));
+    return success();
+}
+
+// Keeping one edge type narrows only the rows, never their shape, so a by-type
+// scan produces the same four-chunk edge iterator as ScanEdges.
+LogicalResult ScanEdgesByType::inferReturnTypes(MLIRContext* context,
+                                                std::optional<Location> location,
+                                                ScanEdgesByType::Adaptor adaptor,
+                                                SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, {}));
+    return success();
+}
+
+// Keeping the edges of one label's nodes narrows only the rows, never their shape,
+// so a by-label out-edge scan produces the same four-chunk edge iterator as ScanEdges.
+LogicalResult ScanOutEdgesByLabelSrc::inferReturnTypes(MLIRContext* context,
+                                                       std::optional<Location> location,
+                                                       ScanOutEdgesByLabelSrc::Adaptor adaptor,
+                                                       SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, {}));
+    return success();
+}
+
+LogicalResult ScanInEdgesByLabelTgt::inferReturnTypes(MLIRContext* context,
+                                                      std::optional<Location> location,
+                                                      ScanInEdgesByLabelTgt::Adaptor adaptor,
+                                                      SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, {}));
+    return success();
+}
+
+LogicalResult ScanOutEdgesByLabelTgt::inferReturnTypes(MLIRContext* context,
+                                                       std::optional<Location> location,
+                                                       ScanOutEdgesByLabelTgt::Adaptor adaptor,
+                                                       SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, {}));
+    return success();
+}
+
+LogicalResult ScanInEdgesByLabelSrc::inferReturnTypes(MLIRContext* context,
+                                                      std::optional<Location> location,
+                                                      ScanInEdgesByLabelSrc::Adaptor adaptor,
+                                                      SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, {}));
+    return success();
+}
+
+LogicalResult ScanOutEdgesByLabelSrcTgt::inferReturnTypes(MLIRContext* context,
+                                                          std::optional<Location> location,
+                                                          ScanOutEdgesByLabelSrcTgt::Adaptor adaptor,
+                                                          SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, {}));
+    return success();
+}
+
+LogicalResult ScanInEdgesByLabelSrcTgt::inferReturnTypes(MLIRContext* context,
+                                                         std::optional<Location> location,
+                                                         ScanInEdgesByLabelSrcTgt::Adaptor adaptor,
+                                                         SmallVectorImpl<Type>& inferredReturnTypes) {
     inferredReturnTypes.push_back(getEdgeIteratorType(context, {}));
     return success();
 }
@@ -136,6 +343,14 @@ LogicalResult GetInEdges::inferReturnTypes(MLIRContext* context,
     return success();
 }
 
+LogicalResult GetEdges::inferReturnTypes(MLIRContext* context,
+                                         std::optional<Location> location,
+                                         GetEdges::Adaptor adaptor,
+                                         SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, adaptor.getColumnsToFilter()));
+    return success();
+}
+
 // Filtering out-edges by type narrows only the rows, never their shape, so a
 // by-type fetch produces the same iterator as GetOutEdges - the edge type name is
 // a filter, not a result type.
@@ -156,6 +371,162 @@ LogicalResult GetInEdgesByType::inferReturnTypes(MLIRContext* context,
     return success();
 }
 
+// The by-label hops: same iterator shape again, narrowed by the label set of the endpoint
+// the hop reaches.
+LogicalResult GetOutEdgesByLabel::inferReturnTypes(MLIRContext* context,
+                                                   std::optional<Location> location,
+                                                   GetOutEdgesByLabel::Adaptor adaptor,
+                                                   SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, adaptor.getColumnsToFilter()));
+    return success();
+}
+
+LogicalResult GetInEdgesByLabel::inferReturnTypes(MLIRContext* context,
+                                                  std::optional<Location> location,
+                                                  GetInEdgesByLabel::Adaptor adaptor,
+                                                  SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, adaptor.getColumnsToFilter()));
+    return success();
+}
+
+LogicalResult GetOutEdgesByTypeAndLabel::inferReturnTypes(MLIRContext* context,
+                                                          std::optional<Location> location,
+                                                          GetOutEdgesByTypeAndLabel::Adaptor adaptor,
+                                                          SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, adaptor.getColumnsToFilter()));
+    return success();
+}
+
+LogicalResult GetInEdgesByTypeAndLabel::inferReturnTypes(MLIRContext* context,
+                                                         std::optional<Location> location,
+                                                         GetInEdgesByTypeAndLabel::Adaptor adaptor,
+                                                         SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getEdgeIteratorType(context, adaptor.getColumnsToFilter()));
+    return success();
+}
+
+void Yield::build(OpBuilder& builder, OperationState& state) {
+}
+
+LogicalResult ExplorePaths::inferReturnTypes(MLIRContext* context,
+                                             std::optional<Location> location,
+                                             ExplorePaths::Adaptor adaptor,
+                                             SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(getPathIteratorType(context, adaptor.getColumnsToFilter()));
+    return success();
+}
+
+storage::PathDirection ExplorePaths::getStepDirection(size_t step) {
+    return static_cast<storage::PathDirection>(getDirections()[step]);
+}
+
+Value ExplorePaths::getStepEdgeTypes(size_t step) {
+    const OperandRange edgeTypes = getEdgeTypes();
+    const std::optional<llvm::ArrayRef<int64_t>> typedSteps = getEdgeTypeSteps();
+    if (!typedSteps) {
+        return edgeTypes.empty() ? Value() : edgeTypes[step];
+    }
+
+    const auto typed = llvm::find(*typedSteps, static_cast<int64_t>(step));
+
+    return typed == typedSteps->end() ? Value() : edgeTypes[typed - typedSteps->begin()];
+}
+
+// The hop regions mirror the db op's: one block per step over the node and edge chunks of
+// the repetition up to its hop, ending in an nl.yield of one mask chunk
+LogicalResult ExplorePaths::verify() {
+    const std::optional<uint64_t> maxHops = getMaxHops();
+    if (maxHops && *maxHops < getMinHops()) {
+        return emitOpError("max_hops must be at least min_hops");
+    }
+
+    MutableArrayRef<Region> hops = getHops();
+    if (failed(verifyPathSteps(getOperation(), getDirections(), hops.size()))) {
+        return failure();
+    }
+
+    const size_t stepCount = getStepCount();
+    const size_t edgeTypeCount = getEdgeTypes().size();
+    if (const std::optional<llvm::ArrayRef<int64_t>> typedSteps = getEdgeTypeSteps()) {
+        if (typedSteps->size() != edgeTypeCount) {
+            return emitOpError("edge_type_steps must name one step per edge type handle");
+        }
+
+        for (size_t index = 0; index < typedSteps->size(); index++) {
+            const int64_t step = (*typedSteps)[index];
+            const bool ascends = index == 0 || (*typedSteps)[index - 1] < step;
+            const bool namesAStep = step >= 0 && static_cast<size_t>(step) < stepCount;
+            if (!namesAStep || !ascends) {
+                return emitOpError("edge_type_steps must name steps in ascending order");
+            }
+        }
+    } else if (edgeTypeCount != 0 && edgeTypeCount != stepCount) {
+        return emitOpError("expects one edge type handle per step, or edge_type_steps naming theirs");
+    }
+
+    const std::optional<ArrayAttr> endLabels = getEndLabels();
+    if (endLabels && endLabels->empty()) {
+        return emitOpError("end_labels must name at least one label");
+    }
+
+    const std::optional<ArrayAttr> hopLabels = getHopLabels();
+    if (hopLabels && hopLabels->size() != stepCount) {
+        return emitOpError("hop_labels must hold one list per step");
+    }
+
+    const std::optional<uint64_t> endColumn = getEndColumn();
+    if (endColumn && *endColumn >= getColumnsToFilter().size()) {
+        return emitOpError("end_column ") << *endColumn << " is not a carried column";
+    }
+
+    if (getEndsOnSeed() && endColumn) {
+        return emitOpError("ends_on_seed names the end already named by end_column");
+    }
+
+    if (getEndNodes() && (endColumn || getEndsOnSeed())) {
+        return emitOpError("end_nodes names the end already named by end_column or ends_on_seed");
+    }
+
+    const OperandRange imports = getHopImports();
+
+    const bool hasPredicate = hasHopPredicate(hops);
+    if (!hasPredicate) {
+        if (!imports.empty()) {
+            return emitOpError("hop imports without a hop region to read them");
+        }
+
+        return success();
+    }
+
+    if (getDistinct() && !imports.empty()) {
+        return emitOpError("a distinct search expands many seeds at one level, so it cannot "
+                           "read a chunk that holds one value per seed");
+    }
+
+    MLIRContext* context = getContext();
+    const Type nodeChunk = getNodeIDChunkType(context);
+    const Type edgeChunk = getEdgeIDChunkType(context);
+
+    for (size_t step = 0; step < stepCount; step++) {
+        Region& hop = hops[step];
+        if (hop.empty()) {
+            continue;
+        }
+
+        Block& block = hop.front();
+        if (failed(verifyHopArguments(getOperation(), block, step, nodeChunk, edgeChunk, imports))) {
+            return failure();
+        }
+
+        Yield yield = dyn_cast_or_null<Yield>(block.empty() ? nullptr : &block.back());
+        if (!yield || yield.getColumns().size() != 1) {
+            return emitOpError("hop region must end with an nl.yield of one mask chunk");
+        }
+    }
+
+    return success();
+}
+
 // A cross product yields one chunk per crossed column - the outer columns
 // followed by the inner - each keeping its input chunk's element type, since
 // the broadcast only changes the row count, not the element kind.
@@ -163,13 +534,32 @@ LogicalResult CrossProduct::inferReturnTypes(MLIRContext* context,
                                              std::optional<Location> location,
                                              CrossProduct::Adaptor adaptor,
                                              SmallVectorImpl<Type>& inferredReturnTypes) {
+    SmallVector<Type, 8> chunkTypes;
+
     for (const Type columnType : adaptor.getOuterColumns().getTypes()) {
-        inferredReturnTypes.push_back(columnType);
+        chunkTypes.push_back(columnType);
     }
 
     for (const Type columnType : adaptor.getInnerColumns().getTypes()) {
-        inferredReturnTypes.push_back(columnType);
+        chunkTypes.push_back(columnType);
     }
+
+    inferredReturnTypes.push_back(IteratorType::get(context, chunkTypes));
+
+    return success();
+}
+
+LogicalResult EachRow::inferReturnTypes(MLIRContext* context,
+                                        std::optional<Location> location,
+                                        EachRow::Adaptor adaptor,
+                                        SmallVectorImpl<Type>& inferredReturnTypes) {
+    SmallVector<Type, 8> chunkTypes;
+
+    for (const Type columnType : adaptor.getColumns().getTypes()) {
+        chunkTypes.push_back(columnType);
+    }
+
+    inferredReturnTypes.push_back(IteratorType::get(context, chunkTypes));
 
     return success();
 }
@@ -178,20 +568,41 @@ LogicalResult Constant::inferReturnTypes(MLIRContext* context,
                                          std::optional<Location> location,
                                          Constant::Adaptor adaptor,
                                          SmallVectorImpl<Type>& inferredReturnTypes) {
-    const TypedAttr value = cast<TypedAttr>(adaptor.getValue());
+    // An array of per-element attributes is a list literal; it carries no type of its own,
+    // so the element type is the homogeneity verdict over the elements.
+    if (const auto elements = dyn_cast<ArrayAttr>(adaptor.getValue())) {
+        const Type shared = ::db::sharedLiteralElementType(elements);
+        const Type listElement = shared ? shared : storage::AnyType::get(context);
+        const Type listType = storage::ListType::get(context, listElement);
 
-    Type elementType;
-    if (const auto elements = dyn_cast<DenseElementsAttr>(value)) {
-        const auto shapedType = cast<ShapedType>(elements.getType());
-        const bool isEmbedding = shapedType.getElementType().isF32()
-                                 && shapedType.hasRank()
-                                 && shapedType.getRank() == 1;
-        elementType = isEmbedding ? storage::EmbeddingType::get(context) : value.getType();
-    } else {
-        elementType = value.getType();
+        inferredReturnTypes.push_back(ChunkType::get(context, listType));
+        return success();
     }
 
-    inferredReturnTypes.push_back(ChunkType::get(context, elementType));
+    // The db-dialect sibling's rule: a dense f32 array is an embedding, a type the attribute
+    // itself does not carry.
+    if (isa<DenseF32ArrayAttr>(adaptor.getValue())) {
+        inferredReturnTypes.push_back(ChunkType::get(context, storage::EmbeddingType::get(context)));
+        return success();
+    }
+
+    if (llvm::isa<mlir::DictionaryAttr>(adaptor.getValue())) {
+        const mlir::Type mapType = storage::MapType::get(context);
+
+        inferredReturnTypes.emplace_back(ChunkType::get(context, mapType));
+        return success();
+    }
+
+    // Inference runs during parsing, ahead of the operand constraint, so an attribute that
+    // is neither typed nor an array is rejected here rather than cast blindly.
+    const auto value = dyn_cast<TypedAttr>(adaptor.getValue());
+    if (!value) {
+        return emitOptionalError(location,
+                                 "nl.constant carries a typed value, a dense f32 array or "
+                                 "an array of literals, not ", adaptor.getValue());
+    }
+
+    inferredReturnTypes.push_back(ChunkType::get(context, value.getType()));
     return success();
 }
 
@@ -217,6 +628,17 @@ LogicalResult SkipTruncate::inferReturnTypes(MLIRContext* context,
                                              SmallVectorImpl<Type>& inferredReturnTypes) {
     for (const Type columnType : adaptor.getColumns().getTypes()) {
         inferredReturnTypes.push_back(columnType);
+    }
+
+    return success();
+}
+
+LogicalResult CountSubqueryTally::verify() {
+    const bool hasTag = getTag() != nullptr;
+    const bool hasRows = getRows() != nullptr;
+
+    if (hasTag == hasRows) {
+        return emitOpError("counts either the rows of a tag or a row count, exactly one of the two");
     }
 
     return success();
@@ -252,6 +674,54 @@ LogicalResult SortCollect::verify() {
     return success();
 }
 
+// An nl.row_collect must append at least one column: the buffers' row count is read
+// from the first of them.
+LogicalResult RowCollect::verify() {
+    if (getColumns().empty()) {
+        return emitOpError("requires at least one column to collect");
+    }
+
+    return success();
+}
+
+// An nl.hash_join_collect must append at least one column: the build side's row
+// count is read from the first buffer, and one of the columns is the key the
+// buffer op names.
+LogicalResult HashJoinCollect::verify() {
+    if (getColumns().empty()) {
+        return emitOpError("requires at least one column to collect");
+    }
+
+    return success();
+}
+
+// An nl.hash_join_probe reads at least one probe column - one of them is the key -
+// and emits the probe columns unchanged followed by the build ones, so it has at
+// least as many results as columns and the first of them keep the probe types.
+LogicalResult HashJoinProbe::verify() {
+    const OperandRange columns = getColumns();
+    if (columns.empty()) {
+        return emitOpError("requires at least one column to probe with");
+    }
+
+    const auto iteratorType = cast<IteratorType>(getResult().getType());
+    const ArrayRef<Type> chunkTypes = iteratorType.getChunkTypes();
+    if (chunkTypes.size() < columns.size()) {
+        return emitOpError("expects a chunk per probe column and per build column, but has ")
+               << chunkTypes.size() << " chunks for " << columns.size() << " probe columns";
+    }
+
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        if (columns[columnIndex].getType() != chunkTypes[columnIndex]) {
+            return emitOpError("chunk ") << columnIndex
+                                         << " must have the same type as probe column "
+                                         << columnIndex;
+        }
+    }
+
+    return success();
+}
+
 // A distinct filter passes its columns through unchanged - only duplicate rows
 // are removed - so each result keeps its input column's chunk type, the same as
 // nl.limit_truncate.
@@ -271,6 +741,251 @@ LogicalResult DistinctFilter::inferReturnTypes(MLIRContext* context,
 LogicalResult DistinctFilter::verify() {
     if (getColumns().empty()) {
         return emitOpError("requires at least one column to filter");
+    }
+
+    return success();
+}
+
+// A count read off the graph's node counts is the same single unsigned tally
+// nl.count_result materializes, whatever it counted, so the chunk type never varies
+LogicalResult CountScanRows::inferReturnTypes(MLIRContext* context,
+                                              std::optional<Location> location,
+                                              CountScanRows::Adaptor adaptor,
+                                              SmallVectorImpl<Type>& inferredReturnTypes) {
+    inferredReturnTypes.push_back(ChunkType::get(context, IntegerType::get(context, 64, IntegerType::Unsigned)));
+    return success();
+}
+
+// A count with no scan listed has nothing to count; the empty product it would stand for
+// is an nl.constant instead. A property is read from one listed scan, as in db.count_scan_rows.
+LogicalResult CountScanRows::verify() {
+    if (getLabels().empty()) {
+        return emitOpError("requires at least one scan to count");
+    }
+
+    const std::optional<llvm::StringRef> property = getProperty();
+    if (property && property->empty()) {
+        return emitOpError("requires a non-empty property name");
+    }
+
+    if (!property && getPropertyScan()) {
+        return emitOpError("names the scan of a property it does not read");
+    }
+
+    if (getPropertyScan().value_or(0) >= getLabels().size()) {
+        return emitOpError("reads a property from a scan it does not list");
+    }
+
+    return success();
+}
+
+// An nl.make_list must read at least one element chunk: there would be no cell to build a
+// list out of, and nothing to size the step from. A list known without reading a row is an
+// nl.constant instead.
+LogicalResult MakeList::verify() {
+    if (getElements().empty()) {
+        return emitOpError("requires at least one element chunk");
+    }
+
+    const Type elementType = llvm::cast<ChunkType>(getResult().getType()).getElementType();
+    if (!llvm::isa<storage::ListType>(elementType)) {
+        return emitOpError("result must be a chunk of lists");
+    }
+
+    return success();
+}
+
+LogicalResult StaticMapKey::verify() {
+    if (!holdsAMapPerRow(getMap().getType())) {
+        return emitOpError("reads a chunk of maps or of tagged cells, optionally nullable");
+    }
+
+    if (getKey().empty()) {
+        return emitOpError("reads a key, which cannot be empty");
+    }
+
+    return success();
+}
+
+LogicalResult MapEntryValue::verify() {
+    const Type resultElement = llvm::cast<ChunkType>(getResult().getType()).getElementType();
+    if (!llvm::isa<storage::AnyType>(resultElement)) {
+        return emitOpError("answers a chunk of tagged cells");
+    }
+
+    return success();
+}
+
+LogicalResult DynamicMapKey::verify() {
+    if (!holdsAMapPerRow(getMap().getType())) {
+        return emitOpError("reads a chunk of maps or of tagged cells, optionally nullable");
+    }
+
+    const Type keyElement = llvm::cast<ChunkType>(getKey().getType()).getElementType();
+    const auto keyNullable = llvm::dyn_cast<storage::NullableType>(keyElement);
+    const Type key = keyNullable ? keyNullable.getValueType() : keyElement;
+
+    const bool readsAStringKey = llvm::isa<storage::StringType>(key);
+    const bool readsANullKey = llvm::isa<mlir::NoneType>(key);
+
+    if (!readsAStringKey && !readsANullKey) {
+        return emitOpError("reads its key out of a chunk of strings, optionally nullable");
+    }
+
+    return success();
+}
+
+LogicalResult MakeMap::verify() {
+    const size_t valueCount = getValues().size();
+    if (valueCount == 0) {
+        return emitOpError("requires at least one value chunk");
+    }
+
+    const ArrayAttr keys = getKeys();
+    if (keys.size() != valueCount) {
+        return emitOpError("requires one key per value chunk");
+    }
+
+    llvm::SmallDenseSet<StringRef, 8> seenKeys;
+    for (const Attribute key : keys) {
+        if (!seenKeys.insert(llvm::cast<StringAttr>(key).getValue()).second) {
+            return emitOpError("requires distinct keys");
+        }
+    }
+
+    return success();
+}
+
+// A bound is read as a nullable value chunk, so a row missing one gets no list, and what
+// the lists hold is integers whatever the bounds were.
+LogicalResult Range::verify() {
+    const Type elementType = llvm::cast<ChunkType>(getResult().getType()).getElementType();
+
+    const storage::NullableType nullableType = llvm::dyn_cast<storage::NullableType>(elementType);
+    if (!nullableType) {
+        return emitOpError("result must be a chunk of nullable lists");
+    }
+
+    const storage::ListType listType = llvm::dyn_cast<storage::ListType>(nullableType.getValueType());
+    if (!listType) {
+        return emitOpError("result must be a chunk of nullable lists");
+    }
+
+    if (!llvm::isa<mlir::IntegerType>(listType.getElementType())) {
+        return emitOpError("result must be a chunk of integer lists");
+    }
+
+    return success();
+}
+
+LogicalResult RowConstant::verify() {
+    llvm::SmallVector<Value> worklist {getRow()};
+    llvm::DenseSet<Value> visited;
+
+    while (!worklist.empty()) {
+        const Value value = worklist.pop_back_val();
+        if (!visited.insert(value).second) {
+            continue;
+        }
+
+        Operation* const definingOp = value.getDefiningOp();
+        if (!definingOp) {
+            return emitOpError("operand must be computed from constants, not from the rows of a step");
+        }
+
+        worklist.append(definingOp->operand_begin(), definingOp->operand_end());
+    }
+
+    return success();
+}
+
+LogicalResult Split::verify() {
+    const bool readsStrings = llvm::isa<storage::StringType, storage::AnyType>(
+                                  valueElementOf(getString().getType()))
+                           && llvm::isa<storage::StringType, storage::AnyType>(
+                                  valueElementOf(getDelimiter().getType()));
+    if (!readsStrings) {
+        return emitOpError("operands must be string chunks or chunks of tagged cells");
+    }
+
+    const storage::ListType listType = llvm::dyn_cast<storage::ListType>(valueElementOf(getResult().getType()));
+    if (!listType || !llvm::isa<storage::StringType>(listType.getElementType())) {
+        return emitOpError("result must be a chunk of string lists");
+    }
+
+    return success();
+}
+
+// The body binds the element, the row tag and one chunk per carried column, and ends
+// naming what each element contributes. The result holds one list per row of the source
+// chunk.
+LogicalResult ListComprehension::verify() {
+    if (failed(verifyElementBody(getOperation(), getBody().front(), getColumnsToFilter()))) {
+        return failure();
+    }
+
+    const Type elementType = llvm::cast<ChunkType>(getResult().getType()).getElementType();
+    const auto nullableType = llvm::dyn_cast<storage::NullableType>(elementType);
+
+    if (!nullableType || !llvm::isa<storage::ListType>(nullableType.getValueType())) {
+        return emitOpError("result must be a chunk of nullable lists");
+    }
+
+    return success();
+}
+
+// The body binds the element, the accumulator - of the result's type - and one chunk per
+// carried column, and ends naming the next accumulator.
+LogicalResult Reduce::verify() {
+    Block& bodyBlock = getBody().front();
+
+    auto yield = dyn_cast_or_null<ReduceYield>(bodyBlock.empty() ? nullptr : &bodyBlock.back());
+    if (!yield) {
+        return emitOpError("body region must end with an nl.reduce_yield");
+    }
+
+    const OperandRange carried = getColumnsToFilter();
+    const size_t expectedArguments = carried.size() + 2;
+
+    if (bodyBlock.getNumArguments() != expectedArguments) {
+        return emitOpError("body region takes the element and the accumulator plus one chunk per "
+                           "carried column, ")
+               << "expected " << expectedArguments << " but has " << bodyBlock.getNumArguments();
+    }
+
+    if (!llvm::isa<ChunkType>(bodyBlock.getArgument(0).getType())) {
+        return emitOpError("body argument 0 must be the chunk of elements");
+    }
+
+    if (bodyBlock.getArgument(1).getType() != getResult().getType()) {
+        return emitOpError("body argument 1 must be the accumulator, of the result's type");
+    }
+
+    for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
+        const Type argumentType = bodyBlock.getArgument(carriedIndex + 2).getType();
+
+        if (argumentType != carried[carriedIndex].getType()) {
+            return emitOpError("body argument ") << carriedIndex + 2
+                                                 << " must have the type of carried chunk "
+                                                 << carriedIndex;
+        }
+    }
+
+    return success();
+}
+
+// The same body, ending on the predicate's value for each element. The result holds one
+// truth value per row of the source chunk, null where the elements leave it unknown.
+LogicalResult ListPredicate::verify() {
+    if (failed(verifyElementBody(getOperation(), getBody().front(), getColumnsToFilter()))) {
+        return failure();
+    }
+
+    const Type elementType = llvm::cast<ChunkType>(getResult().getType()).getElementType();
+    const auto nullableType = llvm::dyn_cast<storage::NullableType>(elementType);
+
+    if (!nullableType || !nullableType.getValueType().isInteger(1)) {
+        return emitOpError("result must be a chunk of nullable booleans");
     }
 
     return success();
@@ -429,6 +1144,15 @@ LogicalResult For::verify() {
     return success();
 }
 
+void Output::build(OpBuilder& builder,
+                   OperationState& state,
+                   ValueRange columns,
+                   Value limit,
+                   Value skip,
+                   Value cardinality) {
+    Output::build(builder, state, columns, limit, skip, cardinality, ArrayAttr());
+}
+
 // A folded output reads the budgeted prefix (limit) or the surviving suffix
 // (skip) off a single handle - the truncate adjacent to it - so at most one may
 // be present. The interpreter reads them as an if(skip)/else if(limit) chain,
@@ -438,17 +1162,23 @@ LogicalResult Output::verify() {
         return emitOpError("carries both a limit and a skip handle; a folded output takes at most one");
     }
 
+    const ArrayAttr columnNames = getColumnNamesAttr();
+    if (columnNames && columnNames.size() != getColumns().size()) {
+        return emitOpError("names must give one name per output column, but has ")
+               << columnNames.size() << " names for " << getColumns().size() << " columns";
+    }
+
     return success();
 }
 
-// avg accumulates a running sum as f64, so its accumulator state must be an f64;
+// avg and stdev accumulate as f64, so their accumulator state must be an f64;
 // sum/min/max accumulate in the value's own type, so any value element type is
 // fine here (the update and result ops check the input/output against it).
 LogicalResult Aggregate::verify() {
-    if (getKind() == storage::AggregateKind::Avg) {
+    if (storage::reducesToADouble(getKind())) {
         const auto stateType = cast<AggregateStateType>(getState().getType());
         if (!isa<Float64Type>(stateType.getElementType())) {
-            return emitOpError("avg must produce an f64 accumulator state");
+            return emitOpError("avg and stdev must produce an f64 accumulator state");
         }
     }
 
@@ -461,22 +1191,48 @@ LogicalResult Aggregate::verify() {
 // rather than folding into a wrongly-typed or wrongly-initialized accumulator.
 LogicalResult AggregateUpdate::verify() {
     const storage::AggregateKind kind = getKind();
+    const bool foldsIntoDouble = storage::reducesToADouble(kind);
+    const Type accumulatorType = cast<AggregateStateType>(getState().getType()).getElementType();
 
-    // The input is a property value chunk; its value type is what the fold reads.
-    const Type inputValueType = aggregateValueType(getRows().getType());
-    if (!inputValueType) {
-        return emitOpError("input must be a nullable value chunk (a property column)");
+    // A type-erased column of tagged cells has no one value type: every cell is read
+    // through its own tag. sum, avg and stdev fold one into the f64 a reduction over
+    // mixed numeric tags lands on, and min/max into a tagged cell holding the winning one.
+    const auto rowsChunk = cast<ChunkType>(getRows().getType());
+    const Type rowsElement = rowsChunk.getElementType();
+    const auto rowsNullable = dyn_cast<storage::NullableType>(rowsElement);
+    const Type reducedElement = rowsNullable ? rowsNullable.getValueType() : rowsElement;
+    const bool taggedCells = isa<storage::AnyType>(reducedElement);
+    if (taggedCells) {
+        const bool isSum = kind == storage::AggregateKind::Sum;
+
+        if ((foldsIntoDouble || isSum) && !isa<Float64Type>(accumulatorType)) {
+            return emitOpError("a sum, avg or stdev over type-erased cells must fold into an f64 accumulator state");
+        } else if (!foldsIntoDouble && !isSum && !isa<storage::AnyType>(accumulatorType)) {
+            return emitOpError("a min or max over type-erased cells must fold into a tagged cell accumulator state");
+        }
     }
 
-    // avg folds any numeric input into an f64 accumulator; sum/min/max fold into an
-    // accumulator of the input's own value type.
-    const Type accumulatorType = cast<AggregateStateType>(getState().getType()).getElementType();
-    if (kind == storage::AggregateKind::Avg) {
-        if (!isa<Float64Type>(accumulatorType)) {
-            return emitOpError("avg must fold into an f64 accumulator state");
+    // Every other input is a property value chunk; its value type is what the fold
+    // reads, and sum/min/max fold into an accumulator of that type.
+    if (!taggedCells) {
+        const Type declaredValueType = aggregateValueType(getRows().getType());
+        if (!declaredValueType) {
+            return emitOpError("input must be a nullable value chunk (a property column)");
         }
-    } else if (inputValueType != accumulatorType) {
-        return emitOpError("sum/min/max must fold into an accumulator of the input's value type");
+
+        // The null literal names no value type of its own and is carried as a null
+        // integer, which is the column the fold reads and folds nothing out of
+        const bool untypedNull = isa<NoneType>(declaredValueType);
+        const Type inputValueType = untypedNull ? IntegerType::get(getContext(), 64) : declaredValueType;
+
+        if (!foldsIntoDouble && inputValueType != accumulatorType) {
+            return emitOpError("sum/min/max must fold into an accumulator of the input's value type");
+        }
+    }
+
+    // avg and stdev fold any numeric input into an f64 accumulator, tagged cells included.
+    if (foldsIntoDouble && !isa<Float64Type>(accumulatorType)) {
+        return emitOpError("avg and stdev must fold into an f64 accumulator state");
     }
 
     // The accumulator's reset depends on the producer's kind (a present zero for
@@ -502,13 +1258,13 @@ LogicalResult AggregateResult::verify() {
         return emitOpError("result must be a nullable value chunk");
     }
 
-    // avg emits an f64 result from an f64 accumulator; sum/min/max emit a result of
-    // the accumulator's own value type.
+    // avg and stdev emit an f64 result from an f64 accumulator; sum/min/max emit a
+    // result of the accumulator's own value type.
     const Type accumulatorType = cast<AggregateStateType>(getState().getType()).getElementType();
-    if (kind == storage::AggregateKind::Avg) {
+    if (storage::reducesToADouble(kind)) {
         const bool bothF64 = isa<Float64Type>(accumulatorType) && isa<Float64Type>(resultValueType);
         if (!bothF64) {
-            return emitOpError("avg must emit an f64 result from an f64 accumulator state");
+            return emitOpError("avg and stdev must emit an f64 result from an f64 accumulator state");
         }
     } else if (resultValueType != accumulatorType) {
         return emitOpError("sum/min/max must emit a result of the accumulator's value type");
@@ -537,13 +1293,56 @@ LogicalResult CreateNode::verify() {
 }
 
 LogicalResult CreateEdge::verify() {
-    if (getEdgeType().empty()) {
+    const StringAttr edgeType = dyn_cast<StringAttr>(getEdgeType());
+    if (edgeType && edgeType.getValue().empty()) {
         return emitOpError("requires a non-empty edge type");
     }
 
     if (getPropNames().size() != getPropValues().size()) {
         return emitOpError("prop_names and prop_values must have the same count, but has ")
                << getPropNames().size() << " names and " << getPropValues().size() << " values";
+    }
+
+    return success();
+}
+
+LogicalResult Merge::verify() {
+    const LogicalResult pattern = verifyMergePattern(getOperation(),
+                                                     getNodeLabels(),
+                                                     getNodePropNames(),
+                                                     getEdgeTypes(),
+                                                     getEdgePropNames(),
+                                                     getEdgeDirectionsAttr(),
+                                                     getPendingNodesAttr(),
+                                                     getBoundNodes().size(),
+                                                     getBoundPending().size(),
+                                                     getNodePropValues().size(),
+                                                     getEdgePropValues().size());
+    if (failed(pattern)) {
+        return pattern;
+    }
+
+    const size_t expectedResults = mergeResultCount(getNodeLabels(), getCarriedColumns().size());
+    if (getResults().size() != expectedResults) {
+        return emitOpError("must produce one chunk per chain entity, the created mask and one "
+                           "per carried chunk - ")
+               << expectedResults << " in all, but produces " << getResults().size();
+    }
+
+    return success();
+}
+
+LogicalResult SetNodeProperty::verify() {
+    if (getProperty().empty()) {
+        return emitOpError("requires a non-empty property name");
+    }
+
+    return success();
+}
+
+LogicalResult SetEdgeProperty::verify() {
+    if (getProperty().empty()) {
+        return emitOpError("requires a non-empty property name");
     }
 
     return success();
@@ -573,6 +1372,14 @@ LogicalResult GroupAggregateBuffer::verify() {
     return success();
 }
 
+// The names in `yields` are checked against the procedure's declared return values
+// during translation, which is where the registry is available; there is nothing to
+// check here. An empty list is legal and means the call binds no return value at all -
+// a procedure declaring none, driven for what it does rather than for rows.
+LogicalResult Procedure::verify() {
+    return success();
+}
+
 // A grouped update must collect at least one column - the grouping keys and
 // aggregate inputs together - since an empty collect could neither size the row
 // set nor build a group key.
@@ -584,13 +1391,47 @@ LogicalResult GroupAggregateUpdate::verify() {
     return success();
 }
 
-// A collect update must carry at least one column - the grouping keys (if any) and
-// the single value column - since with no column it could neither size the row set
-// nor build a group key. The one-value-column split against the buffer's keyCount is
-// reconciled during translation, where that count is known.
+// The columns split into the buffer's grouping keys, the collected values and one input
+// per reduction the buffer names, which is the split db.collect's verifier makes over its
+// own operands: the buffer holds the counts and the update holds the columns, so this is
+// where the nl side re-establishes it.
 LogicalResult CollectUpdate::verify() {
-    if (getColumns().empty()) {
+    const OperandRange columns = getColumns();
+    if (columns.empty()) {
         return emitOpError("requires at least one column to collect");
+    }
+
+    CollectBuffer buffer = getState().getDefiningOp<CollectBuffer>();
+    if (!buffer) {
+        return emitOpError("state must come from an nl.collect_buffer");
+    }
+
+    // Bound keyCount by the real column count first: summing keyCount + aggregateCount
+    // could wrap in unsigned 64-bit and let a pathological keyCount slip past into
+    // out-of-bounds translation.
+    const size_t columnCount = columns.size();
+    const uint64_t keyCount = buffer.getKeyCount();
+    const size_t aggregateCount = buffer.getKinds().value_or(llvm::ArrayRef<int64_t> {}).size();
+    if (keyCount >= columnCount || columnCount - keyCount <= aggregateCount) {
+        return emitOpError("expects ") << keyCount
+                                       << " grouping-key columns, at least one collected column and "
+                                       << aggregateCount
+                                       << " aggregate columns, but has "
+                                       << columnCount;
+    }
+
+    const size_t valueCount = columnCount - keyCount - aggregateCount;
+
+    // Every deduplicating value names one of the collected columns.
+    if (const std::optional<llvm::ArrayRef<int64_t>> distinctValues = buffer.getDistinctValues()) {
+        for (const int64_t valueIndex : *distinctValues) {
+            if (valueIndex < 0 || static_cast<size_t>(valueIndex) >= valueCount) {
+                return emitOpError("distinct value index ") << valueIndex
+                                                            << " is out of range for "
+                                                            << valueCount
+                                                            << " collected columns";
+            }
+        }
     }
 
     return success();

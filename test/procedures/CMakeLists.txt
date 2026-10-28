@@ -1,0 +1,13 @@
+add_turing_test(test_procedures_registration ProcedureRegistrationTest.cpp)
+
+add_turing_test(test_procedures_signature ProcedureSignatureTest.cpp)
+
+add_turing_test(test_procedures_nullable_return ProcedureNullableReturnTest.cpp)
+
+# The gnn sample and describeCommit chunking tests drive real registered procedures
+# against the shared SimpleGraph fixture.
+add_turing_test(test_procedures_gnn_neighbourhood_sample_chunk GnnNeighbourhoodSampleChunkTest.cpp)
+
+add_turing_test(test_procedures_describe_commit_chunk DescribeCommitChunkTest.cpp)
+
+add_turing_test(test_procedures_graphsage GraphSAGEProcedureTest.cpp)

@@ -4,15 +4,17 @@
 #include "ProcedureState.h"
 #include "Procedure.h"
 #include "ProcedureNamespace.h"
+#include "TypedProcedure.h"
 #include "ProcedureManager.h"
 #include "ProcedureTypeVector.h"
 #include "columns/ColumnVector.h"
+#include "buffers/StringBuffer.h"
 
 using namespace db;
 
 namespace {
 
-struct Data : public ProcedureData {
+struct Data : public TypedProcedureData<ProceduresProcedure> {
     size_t _nsIndex {0};
     size_t _procIndex {0};
 };
@@ -51,19 +53,14 @@ void buildSignature(std::string& result, const Procedure* proc) {
 void writeProcedures(Data* data,
                      ProcedureState* proc,
                      const ProcedureManager* manager,
-                     ColumnVector<std::string>* nameCol,
-                     ColumnVector<std::string>* signatureCol,
-                     size_t chunkSize) {
+                     ColumnVector<std::string_view>* nameCol,
+                     ColumnVector<std::string_view>* signatureCol,
+                     size_t chunkSize,
+                     StringBuffer* stringBuffer) {
     ProcedureManager::Namespaces namespaces;
     manager->getNamespaces(namespaces);
 
-    if (nameCol) {
-        nameCol->clear();
-    }
-
-    if (signatureCol) {
-        signatureCol->clear();
-    }
+    data->clearReturnColumns();
 
     size_t remaining = chunkSize;
     std::string signature;
@@ -85,7 +82,7 @@ void writeProcedures(Data* data,
 
             if (signatureCol) {
                 buildSignature(signature, procedure);
-                signatureCol->push_back(signature);
+                signatureCol->push_back(stringBuffer->insert(signature));
             }
 
             ++data->_procIndex;
@@ -105,22 +102,8 @@ void writeProcedures(Data* data,
 
 }
 
-ProcedureData* ProceduresProcedure::allocData() {
-    return new Data();
-}
-
-void ProceduresProcedure::deallocData(ProcedureData* data) {
-    delete data;
-}
-
 void ProceduresProcedure::registerProcedure(ProcedureNamespace* ns) {
-    Procedure* proc = new Procedure("procedures");
-    proc->setExecuteCallback(&execute);
-    proc->setAllocCallback(&allocData);
-    proc->setDeallocCallback(&deallocData);
-    proc->addReturnValue("name", ProcedureType::STRING);
-    proc->addReturnValue("signature", ProcedureType::STRING);
-    ns->addProcedure(proc);
+    ns->addProcedure(createTypedProcedure<Data>("procedures"));
 }
 
 void ProceduresProcedure::execute(ProcedureState* proc) {
@@ -128,11 +111,8 @@ void ProceduresProcedure::execute(ProcedureState* proc) {
     const ProcedureContext* ctxt = proc->getContext();
     const ProcedureManager* manager = ctxt->getProcedures();
 
-    Column* rawNameCol = data.getReturnColumn(0);
-    Column* rawSignatureCol = data.getReturnColumn(1);
-
-    auto* nameCol = static_cast<ColumnVector<std::string>*>(rawNameCol);
-    auto* signatureCol = static_cast<ColumnVector<std::string>*>(rawSignatureCol);
+    auto* nameCol = data.getReturnColumn<0>();
+    auto* signatureCol = data.getReturnColumn<1>();
 
     switch (proc->getStep()) {
         case ProcedureState::Step::PREPARE: {
@@ -153,7 +133,8 @@ void ProceduresProcedure::execute(ProcedureState* proc) {
                             manager,
                             nameCol,
                             signatureCol,
-                            ctxt->getChunkSize());
+                            ctxt->getChunkSize(),
+                            ctxt->getStringBuffer());
         }
         break;
     }

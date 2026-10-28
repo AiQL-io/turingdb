@@ -1,11 +1,14 @@
 #pragma once
 
 #include <atomic>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
 
 #include "ChangeManager.h"
+#include "DateTimeSpec.h"
+#include "DurationSpec.h"
 #include "EmbeddingsSpec.h"
 #include "GraphFileType.h"
 #include "GraphLoadStatus.h"
@@ -31,6 +34,7 @@ public:
     // Graph access
     Graph* getDefaultGraph() const { return _defaultGraph.load(); }
     Graph* getGraph(std::string_view graphName) const;
+    ChangeResult<Graph*> findGraph(std::string_view graphName) const;
     size_t getGraphCount() const { return _graphs.size(); }
 
     // Graph operations
@@ -38,6 +42,7 @@ public:
     LoadGraphResult<Graph*> loadGraph(std::string_view name);
     void setDefaultGraph(std::string_view name);
     void listGraphs(std::vector<std::string_view>& names) const;
+    void listAvailableGraphs(std::vector<std::string>& names) const;
 
     // Initialise the default graph, loading it from disk or creating it
     void loadOrCreateDefaultGraph();
@@ -46,7 +51,9 @@ public:
     Graph* importGraph(std::string_view graphName,
                        const fs::Path& filePath,
                        JobSystem* jobSystem,
-                       const EmbeddingsSpec& embeddingSpecs = {});
+                       const EmbeddingsSpec& embeddingSpecs = {},
+                       const DateTimeSpec& dateTimeSpecs = {},
+                       const DurationSpec& durationSpecs = {});
 
     GraphFileType getGraphFileType(const fs::Path& graphPath) const;
 
@@ -56,9 +63,10 @@ public:
     // Change management
     ChangeResult<Change*> newChange(std::string_view graphName, CommitHash baseHash);
     ChangeResult<Change*> getChange(const Graph* graph, ChangeID changeID);
-    ChangeResult<void> submitChange(ChangeAccessor& accessor, JobSystem& jobSystem);
+    ChangeResult<void> submitChange(ChangeAccessor& accessor, JobSystem& jobSystem, SubmitMode mode = SubmitMode::MERGE);
     ChangeResult<void> deleteChange(ChangeAccessor& accessor, ChangeID changeID);
     void listChanges(std::vector<const Change*>& changes, const Graph* graph) const;
+    bool hasChanges() const;
     DataPartMergeResult<void> mergeDataParts(Graph* graph, JobSystem& jobSystem);
 
 private:
@@ -73,7 +81,9 @@ private:
     Graph* loadJsonlDB(std::string_view graphName,
                        const fs::Path& dbPath,
                        JobSystem* jobSystem,
-                       const EmbeddingsSpec& embeddingSpecs);
+                       const EmbeddingsSpec& embeddingSpecs,
+                       const DateTimeSpec& dateTimeSpecs,
+                       const DurationSpec& durationSpecs);
 
     Graph* loadGmlDB(std::string_view graphName,
                      const fs::Path& dbPath,
@@ -85,6 +95,7 @@ private:
 
     Graph* loadParquetDB(std::string_view graphName,
                          const fs::Path& dbPath,
-                         JobSystem* jobSystem);
+                         JobSystem* jobSystem,
+                         const DurationSpec& durationSpecs);
 };
 }

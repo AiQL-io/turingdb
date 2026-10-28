@@ -5,6 +5,11 @@ set(storage_sources
         RowStore.cpp
         EntityList.cpp
 
+        buffers/BufferChunk.cpp
+        buffers/RawBuffer.cpp
+        buffers/SpanBuffer.cpp
+        buffers/StringBuffer.cpp
+
         datapart/DataPart.cpp
         datapart/NodeContainer.cpp
         datapart/EdgeContainer.cpp
@@ -12,16 +17,33 @@ set(storage_sources
         embedding/EmbeddingBucket.cpp
         embedding/EmbeddingContainer.cpp
 
+        list/EncodedList.cpp
         list/ListByteBuffer.cpp
         list/ListBuffer.cpp
+        list/ListContainer.cpp
+        list/ListElementOrder.cpp
+        list/ListHash.cpp
         list/ListElementViewBuffer.cpp
         list/ListWriteCursor.cpp
+        list/PathTrie.cpp
 
+        map/EncodedMap.cpp
+        map/MapByteBuffer.cpp
+        map/MapBuffer.cpp
+        map/MapEntryViewBuffer.cpp
+        map/MapWriteCursor.cpp
+        map/MapContainer.cpp
+        map/MapHash.cpp
+
+        metadata/DateTime.cpp
+        metadata/Duration.cpp
+        metadata/EdgeBranchingCache.cpp
         metadata/EdgeTypeMap.cpp
         metadata/PropertyTypeMap.cpp
         metadata/LabelMap.cpp
         metadata/LabelSetMap.cpp
 
+        views/EntityPropertyView.cpp
         views/GraphView.cpp
         views/NodeEdgeView.cpp
 
@@ -29,28 +51,47 @@ set(storage_sources
 
         iterators/GetInEdgesIterator.cpp
         iterators/GetInEdgesByTypeIterator.cpp
-        iterators/GetPropertiesIterator.cpp
+        iterators/GetInEdgesByLabelIterator.cpp
+        iterators/GetInEdgesByTypeAndLabelIterator.cpp
         iterators/GetPropertiesWithNullIterator.cpp
         iterators/GetNodeLabelSetIterator.cpp
+        iterators/GetEdgeTypesIterator.cpp
         iterators/GetOutEdgesIterator.cpp
         iterators/GetOutEdgesByTypeIterator.cpp
+        iterators/GetOutEdgesByLabelIterator.cpp
+        iterators/GetOutEdgesByTypeAndLabelIterator.cpp
         iterators/GetEdgesIterator.cpp
+        iterators/ScanEdgesByTypeIterator.cpp
         iterators/GetNodeViewsIterator.cpp
+        iterators/PartDirectory.cpp
         iterators/PartIterator.cpp
         iterators/ScanEdgesIterator.cpp
         iterators/ScanEdgePropertiesIterator.cpp
-        iterators/ScanInEdgesByLabelIterator.cpp
+        iterators/ScanInEdgesByTargetLabelIterator.cpp
         iterators/ScanNodePropertiesIterator.cpp
         iterators/ScanNodePropertiesByLabelIterator.cpp
         iterators/ScanNodesByLabelIterator.cpp
+        iterators/ScanNodesByPropertyValueIterator.cpp
         iterators/ScanNodesIterator.cpp
         iterators/ScanLabelsIterator.cpp
         iterators/ScanEdgeTypesIterator.cpp
         iterators/ScanPropertyTypesIterator.cpp
-        iterators/ScanOutEdgesByLabelIterator.cpp
+        iterators/ScanOutEdgesBySourceLabelIterator.cpp
+        iterators/ScanEdgesByEndpointLabelsChunkWriter.cpp
         iterators/MatchLabelSetIterator.cpp
+        iterators/NeighbourhoodSampleIterator.cpp
+        iterators/PathCycleTable.cpp
+        iterators/PathDistanceIndex.cpp
+        iterators/PathExplorator.cpp
+        iterators/PathHopFilter.cpp
+        iterators/PathLabelHopFilter.cpp
+        iterators/PathReachTable.cpp
+        iterators/PathTargetIndex.cpp
+        iterators/ReversedPathExplorator.cpp
 
         iterators/TombstoneFilter.cpp
+
+        samplers/GraphSAGESampler.cpp
 
         columns/Block.cpp
         columns/Column.cpp
@@ -91,6 +132,7 @@ set(storage_sources
         versioning/Commit.cpp
         versioning/CommitView.cpp
         versioning/CommitBuilder.cpp
+        versioning/PendingAdjacency.cpp
         versioning/ChangeRebaser.cpp
         versioning/ChangeConflictChecker.cpp
         versioning/MetadataRebaser.cpp
@@ -128,7 +170,11 @@ set(storage_sources
         dump/StringIndexerDumper.cpp
         dump/StringIndexerLoader.cpp
         dump/EmbeddingPropertyContainerDumper.cpp
+        dump/ListPropertyContainerDumper.cpp
+        dump/MapPropertyContainerDumper.cpp
         dump/EmbeddingPropertyContainerLoader.cpp
+        dump/ListPropertyContainerLoader.cpp
+        dump/MapPropertyContainerLoader.cpp
         dump/CommitJournalDumper.cpp
         dump/CommitJournalLoader.cpp
         dump/CommitMetaDataDumper.cpp
@@ -144,6 +190,7 @@ target_include_directories(turing_db_storage_s
 
 target_link_libraries(turing_db_storage_s
     PRIVATE turing_db_jobs_s
+            utf8proc::utf8proc
     PUBLIC  turing_db_base_s
             turing_db_io_fs_s
             turing_common_s

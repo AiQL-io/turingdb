@@ -11,16 +11,8 @@ public:
     static net::HTTP::Result<void> parseURI(net::HTTP::Info& info, std::string_view uri) {
         // Extract the path part of the URI
         // up to the ? character if any
-        const char* pathBegin = uri.data();
-        const char* pathPtr = pathBegin;
-        const char* const uriEnd = pathPtr + uri.size();
-        for (; pathPtr < uriEnd; pathPtr++) {
-            if (*pathPtr == '?') {
-                break;
-            }
-        }
-
-        info.setPath(std::string_view(pathBegin, pathPtr - pathBegin));
+        const size_t queryStart = uri.find('?');
+        info.setPath(uri.substr(0, queryStart));
 
         const auto res = getEndpointIndex(info.getPath());
         if (!res) {
@@ -34,15 +26,12 @@ public:
         }
 
         // We can stop here if we are already at the end of the URI
-        if (pathPtr >= uriEnd) {
+        if (queryStart == std::string_view::npos) {
             return {};
         }
 
         // URI variables
-        pathPtr++;
         auto& parameters = info.getParams();
-        std::string_view key;
-        std::string_view value;
 
         constexpr auto parseKeyValuePair = [](net::HTTP::Params& params,
                                               std::string_view k,
@@ -56,28 +45,24 @@ public:
             }
         };
 
-        const char* wordStart = pathPtr;
-        for (; pathPtr < uriEnd; pathPtr++) {
-            const char c = *pathPtr;
-            if (c == '=') {
-                key = std::string_view(wordStart, pathPtr - wordStart);
-                value = std::string_view();
-                wordStart = pathPtr + 1;
-            } else if (c == '&') {
-                value = std::string_view(wordStart, pathPtr - wordStart);
-                if (!key.empty() && !value.empty()) {
-                    parseKeyValuePair(parameters, key, value);
-                }
+        std::string_view query = uri.substr(queryStart + 1);
+        while (!query.empty()) {
+            const size_t separator = query.find('&');
+            const size_t pairEnd = separator == std::string_view::npos ? query.size() : separator;
+            const std::string_view pair = query.substr(0, pairEnd);
+            const size_t equalPosition = pair.find('=');
 
-                key = std::string_view();
-                value = std::string_view();
-                wordStart = pathPtr + 1;
+            if (equalPosition == std::string_view::npos) {
+                parseKeyValuePair(parameters, pair, std::string_view());
+            } else {
+                parseKeyValuePair(parameters, pair.substr(0, equalPosition), pair.substr(equalPosition + 1));
             }
-        }
 
-        if (wordStart < uriEnd && !key.empty()) {
-            value = std::string_view(wordStart, uriEnd - wordStart);
-            parseKeyValuePair(parameters, key, value);
+            if (separator == std::string_view::npos) {
+                break;
+            }
+
+            query.remove_prefix(pairEnd + 1);
         }
 
         return {};

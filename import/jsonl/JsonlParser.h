@@ -5,6 +5,8 @@
 
 #include "JsonlImportResult.h"
 
+#include "DateTimeSpec.h"
+#include "DurationSpec.h"
 #include "EmbeddingsSpec.h"
 
 namespace db {
@@ -23,7 +25,9 @@ public:
 
     [[nodiscard]] static JsonlImportResult<void> parse(ChangeAccessor& change,
                                                        std::istream& stream,
-                                                       const EmbeddingsSpec& embeddingSpecs = {});
+                                                       const EmbeddingsSpec& embeddingSpecs = {},
+                                                       const DateTimeSpec& dateTimeSpecs = {},
+                                                       const DurationSpec& durationSpecs = {});
 };
 
 }

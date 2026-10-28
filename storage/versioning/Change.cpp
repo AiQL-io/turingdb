@@ -139,8 +139,8 @@ CommitHash Change::baseHash() const {
     return _base->hash();
 }
 
-CommitResult<void> Change::submit(JobSystem& jobsystem) {
-    return _versionController->submitChange(this, jobsystem);
+CommitResult<void> Change::submit(JobSystem& jobsystem, SubmitMode mode) {
+    return _versionController->submitChange(this, jobsystem, mode);
 }
 
 GraphView Change::viewGraph(CommitHash commitHash) const {

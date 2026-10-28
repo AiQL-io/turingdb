@@ -18,7 +18,11 @@
 #include "TuringException.h"
 #include "comparators/GraphComparator.h"
 #include "datapart/EdgeRecord.h"
+#include "list/ListBufferTypeTag.h"
+#include "list/ListElementView.h"
+#include "list/ListView.h"
 #include "metadata/GraphMetadata.h"
+#include "metadata/DateTime.h"
 #include "metadata/PropertyType.h"
 #include "reader/GraphReader.h"
 #include "versioning/Transaction.h"
@@ -234,6 +238,117 @@ TEST_F(ParquetImporterTest, ImportsPropertiesWithRequiredIdColumns) {
     ASSERT_EQ(weights, (std::vector<double>{1.5, 2.5}));
 }
 
+// Parquet names what a TIMESTAMP column counts in beside the column, so the importer reads
+// the unit off the logical type and scales every one to the microseconds a DateTime holds.
+// All four scalar columns of the fixture carry the same instant written in a different unit.
+TEST_F(ParquetImporterTest, ImportsTimestampColumnsAsDateTimes) {
+    constexpr std::string_view graphName = "datetimes";
+    constexpr int64_t instant = 1710408600000000;
+
+    SystemAccessor system = _env->getSystemManager().accessUnique();
+    Graph* imported = importSplit(system,
+                                  graphName,
+                                  "datetime_property_nodes.parquet",
+                                  "datetime_property_edges.parquet");
+    ASSERT_NE(imported, nullptr);
+
+    const GraphReader reader = imported->openTransaction().readGraph();
+    const GraphMetadata& metadata = reader.getMetadata();
+
+    for (const std::string_view name : {"atMicros", "atMillis", "atNaive"}) {
+        const auto propType = metadata.propTypes().get(name);
+        ASSERT_TRUE(propType.has_value()) << name;
+        EXPECT_EQ(propType->_valueType, ValueType::DateTime) << name;
+
+        std::vector<int64_t> microseconds;
+        for (const DateTime at : reader.scanNodeProperties<types::DateTime>(propType->_id)) {
+            microseconds.push_back(at.getMicroseconds());
+        }
+        std::ranges::sort(microseconds);
+
+        EXPECT_EQ(microseconds, (std::vector<int64_t> {-1000000, instant})) << name;
+    }
+}
+
+// A nanosecond count is finer than a DateTime holds, so it lands on the microsecond below
+// it - which for an instant before the epoch is the one further from it, not nearer
+TEST_F(ParquetImporterTest, FloorsATimestampFinerThanAMicrosecond) {
+    constexpr std::string_view graphName = "datetimenanos";
+
+    SystemAccessor system = _env->getSystemManager().accessUnique();
+    Graph* imported = importSplit(system,
+                                  graphName,
+                                  "datetime_property_nodes.parquet",
+                                  "datetime_property_edges.parquet");
+    ASSERT_NE(imported, nullptr);
+
+    const GraphReader reader = imported->openTransaction().readGraph();
+    const auto propType = reader.getMetadata().propTypes().get("atNanos");
+    ASSERT_TRUE(propType.has_value());
+
+    std::vector<int64_t> microseconds;
+    for (const DateTime at : reader.scanNodeProperties<types::DateTime>(propType->_id)) {
+        microseconds.push_back(at.getMicroseconds());
+    }
+    std::ranges::sort(microseconds);
+
+    ASSERT_EQ(microseconds, (std::vector<int64_t> {-1000001, 1710408600000000}));
+}
+
+TEST_F(ParquetImporterTest, ImportsATimestampColumnOnEdges) {
+    constexpr std::string_view graphName = "datetimeedges";
+
+    SystemAccessor system = _env->getSystemManager().accessUnique();
+    Graph* imported = importSplit(system,
+                                  graphName,
+                                  "datetime_property_nodes.parquet",
+                                  "datetime_property_edges.parquet");
+    ASSERT_NE(imported, nullptr);
+
+    const GraphReader reader = imported->openTransaction().readGraph();
+    const auto propType = reader.getMetadata().propTypes().get("at");
+    ASSERT_TRUE(propType.has_value());
+    EXPECT_EQ(propType->_valueType, ValueType::DateTime);
+
+    std::vector<int64_t> microseconds;
+    for (const DateTime at : reader.scanEdgeProperties<types::DateTime>(propType->_id)) {
+        microseconds.push_back(at.getMicroseconds());
+    }
+
+    ASSERT_EQ(microseconds, (std::vector<int64_t> {1710408600000000}));
+}
+
+// A LIST<TIMESTAMP> column keeps the element type its values carry, so its elements are
+// read back as the instants they were written as rather than as the integers on disk
+TEST_F(ParquetImporterTest, ImportsAListOfTimestamps) {
+    constexpr std::string_view graphName = "datetimelists";
+
+    SystemAccessor system = _env->getSystemManager().accessUnique();
+    Graph* imported = importSplit(system,
+                                  graphName,
+                                  "datetime_property_nodes.parquet",
+                                  "datetime_property_edges.parquet");
+    ASSERT_NE(imported, nullptr);
+
+    const GraphReader reader = imported->openTransaction().readGraph();
+    const auto propType = reader.getMetadata().propTypes().get("atList");
+    ASSERT_TRUE(propType.has_value());
+    EXPECT_EQ(propType->_valueType, ValueType::List);
+
+    std::vector<std::vector<int64_t>> lists;
+    for (const ListView list : reader.scanNodeProperties<types::List>(propType->_id)) {
+        std::vector<int64_t>& microseconds = lists.emplace_back();
+        for (const ListElementView element : list) {
+            ASSERT_EQ(element.getTag(), ListBufferTypeTag::DateTime);
+            microseconds.push_back(element.getAs<types::DateTime::Primitive>().getMicroseconds());
+        }
+    }
+    std::ranges::sort(lists);
+
+    ASSERT_EQ(lists,
+              (std::vector<std::vector<int64_t>> {{}, {1710408600000000, -1000000}}));
+}
+
 // --- Bug-demonstration tests (branch code-review findings 1-5) ---
 //
 // Each test asserts the CORRECT behavior, so it fails against current main and turns
@@ -281,8 +396,105 @@ TEST_F(ParquetImporterTest, ImportsStringPropertySpanningManyPages) {
     ASSERT_EQ(names, expected);
 }
 
+// A repeated (LIST) property column: the values arrive flat with the repetition levels
+// that group them, and the property that lands is one list per row, named after the field
+// rather than after the leaf path Parquet nests it under.
+TEST_F(ParquetImporterTest, ImportsListProperty) {
+    constexpr std::string_view graphName = "listprop";
+
+    SystemAccessor system = _env->getSystemManager().accessUnique();
+    Graph* imported = importSplit(system,
+                                  graphName,
+                                  "list_property_nodes.parquet",
+                                  "minimal_edges.parquet");
+    ASSERT_NE(imported, nullptr);
+
+    const GraphReader reader = imported->openTransaction().readGraph();
+    const GraphMetadata& metadata = reader.getMetadata();
+
+    const auto tagsType = metadata.propTypes().get("tags");
+    ASSERT_TRUE(tagsType.has_value());
+    ASSERT_EQ(tagsType->_valueType, ValueType::List);
+
+    std::vector<std::vector<int64_t>> tags;
+    for (const ListView list : reader.scanNodeProperties<types::List>(tagsType->_id)) {
+        std::vector<int64_t>& elements = tags.emplace_back();
+        for (const ListElementView element : list) {
+            ASSERT_EQ(element.getTag(), ListBufferTypeTag::Int);
+            elements.push_back(element.getAs<int64_t>());
+        }
+    }
+    std::ranges::sort(tags);
+
+    const std::vector<std::vector<int64_t>> expected = {{1, 2}, {3}, {4, 5, 6}};
+    ASSERT_EQ(tags, expected);
+}
+
+// A LIST<LIST<INT64>> property column: two repetition levels, so the rows have to be
+// reassembled into nested lists rather than flattened into one. The fixture also carries
+// an empty inner list, a null inner list, a null element and an empty outer list, each of
+// which the definition levels distinguish from the others.
+TEST_F(ParquetImporterTest, ImportsNestedListProperty) {
+    constexpr std::string_view graphName = "nestedlistprop";
+
+    SystemAccessor system = _env->getSystemManager().accessUnique();
+    Graph* imported = importSplit(system,
+                                  graphName,
+                                  "nested_list_property_nodes.parquet",
+                                  "minimal_edges.parquet");
+    ASSERT_NE(imported, nullptr);
+
+    const GraphReader reader = imported->openTransaction().readGraph();
+    const GraphMetadata& metadata = reader.getMetadata();
+
+    const auto groupsType = metadata.propTypes().get("groups");
+    ASSERT_TRUE(groupsType.has_value());
+    ASSERT_EQ(groupsType->_valueType, ValueType::List);
+
+    const auto renderElement = [](const ListElementView element) -> std::string {
+        if (element.getTag() == ListBufferTypeTag::Null) {
+            return "null";
+        }
+
+        return std::to_string(element.getAs<int64_t>());
+    };
+
+    std::vector<std::string> groups;
+    for (const ListView list : reader.scanNodeProperties<types::List>(groupsType->_id)) {
+        std::string rendered = "[";
+        for (const ListElementView outer : list) {
+            if (rendered.size() > 1) {
+                rendered += ", ";
+            }
+
+            if (outer.getTag() == ListBufferTypeTag::Null) {
+                rendered += "null";
+                continue;
+            }
+
+            ASSERT_EQ(outer.getTag(), ListBufferTypeTag::ListView);
+
+            rendered += "[";
+            bool first = true;
+            for (const ListElementView inner : outer.getAs<ListView>()) {
+                if (!first) {
+                    rendered += ", ";
+                }
+                first = false;
+                rendered += renderElement(inner);
+            }
+            rendered += "]";
+        }
+
+        groups.push_back(rendered + "]");
+    }
+    std::ranges::sort(groups);
+
+    const std::vector<std::string> expected = {
+        "[[1, 2], [3]]", "[[], [4, null]]", "[]", "[null, [5]]"};
+    ASSERT_EQ(groups, expected);
+}
+
 int main(int argc, char** argv) {
-    return turing::test::turingTestMain(argc, argv, [] {
-        testing::GTEST_FLAG(repeat) = 5;
-    });
+    return turing::test::turingTestMain(argc, argv);
 }

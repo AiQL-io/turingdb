@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <sys/uio.h>
 #include <array>
+#include <span>
 #include <string_view>
 
 #include "AbstractTCPWriter.h"
@@ -15,8 +16,8 @@
 #include "QueryCallbacks.h"
 
 namespace db {
+class Column;
 class QueryStatus;
-class Dataframe;
 }
 
 namespace net::proto {
@@ -51,11 +52,13 @@ public:
     [[nodiscard]] bool wroteNonEmptyChunk() const override { return _wroteNonEmptyChunk; }
     [[nodiscard]] bool errorOccured() const override { return _errorOccured; }
 
-    void writeDataframeHeader(const db::Dataframe*);
-    void writeDataframe(const db::Dataframe*);
+    void writeColumnHeaders(std::span<const std::string_view> names,
+                            std::span<const db::Column* const> columns);
+    void writeColumns(std::span<const db::Column* const> columns, size_t offset, size_t rowCount);
     void writeError(const db::QueryStatus* status);
     void writeProtocolError(std::string_view message);
     void writeEndPacket(db::QueryCallbacks::ExecTimeMilliseconds milliseconds);
+    void writeAnalyzeError(int32_t) override;
 
 private:
     int _socket {-1};
@@ -71,7 +74,7 @@ private:
     // Proto payload (encoder writes into it). Reset after each successful flush.
     net::proto::TuringProtoOutBuf _buffer;
 
-    //Encoder to convert dataframes to encoded bytes
+    // Encoder to convert columns to encoded bytes
     net::proto::TuringProtoEncoder _encoder;
     // HTTP chunk trailer: "\r\n", pre-filled once in the constructor.
     std::array<char, net::http::CHUNK_TRAILER_SIZE> _trailerBuffer {'\r','\n'};

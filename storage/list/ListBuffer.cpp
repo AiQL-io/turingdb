@@ -1,6 +1,8 @@
 #include "ListBuffer.h"
 
+#include <ranges>
 #include <type_traits>
+#include <vector>
 
 #include "ListBufferTypeTag.h"
 #include "ListByteBuffer.h"
@@ -8,6 +10,15 @@
 #include "ListUtils.h"
 
 using namespace db;
+
+namespace {
+
+size_t elementValueSize(const ListElementView element) {
+    const ListTagDispatcher dispatch {element.getTag()};
+    return dispatch.execute([]<typename T>(auto&&) { return sizeof(T); }, element);
+}
+
+}
 
 template <size_t N>
 ListView ListBuffer<N>::insert(std::span<const ListItemVariant> elements) {
@@ -61,6 +72,85 @@ ListWriteCursor ListBuffer<N>::reserveList(size_t numElements, size_t valueBytes
         elementWritePtr,
         viewWritePtr,
     };
+}
+
+template <size_t N>
+ListView ListBuffer<N>::concatenate(ListView a, ListView b) {
+    const size_t numElements = a.size() + b.size();
+
+    size_t valueBytes = 0;
+    for (const ListElementView element : a) {
+        valueBytes += elementValueSize(element);
+    }
+    for (const ListElementView element : b) {
+        valueBytes += elementValueSize(element);
+    }
+
+    ListWriteCursor cursor = reserveList(numElements, valueBytes);
+    constexpr size_t tagSize = decltype(_elements)::tagSize();
+
+    for (const ListElementView element : a) {
+        const size_t numBytes = tagSize + elementValueSize(element);
+        cursor.writeRaw(element.getData(), numBytes);
+    }
+    for (const ListElementView element : b) {
+        const size_t numBytes = tagSize + elementValueSize(element);
+        cursor.writeRaw(element.getData(), numBytes);
+    }
+
+    return cursor.getView();
+}
+
+template <size_t N>
+ListView ListBuffer<N>::reverse(ListView list) {
+    size_t valueBytes = 0;
+    for (const ListElementView element : list) {
+        valueBytes += elementValueSize(element);
+    }
+
+    ListWriteCursor cursor = reserveList(list.size(), valueBytes);
+    constexpr size_t tagSize = decltype(_elements)::tagSize();
+
+    for (const ListElementView element : std::views::reverse(list.elements())) {
+        const size_t numBytes = tagSize + elementValueSize(element);
+        cursor.writeRaw(element.getData(), numBytes);
+    }
+
+    return cursor.getView();
+}
+
+template <size_t N>
+ListView ListBuffer<N>::copy(ListView list) {
+    std::vector<ListItemVariant> elements;
+    elements.reserve(list.size());
+
+    for (const ListElementView element : list) {
+        elements.push_back(ownedItem(element));
+    }
+
+    return insert(elements);
+}
+
+template <size_t N>
+ListElementView ListBuffer<N>::copy(ListElementView element) {
+    const ListItemVariant item = ownedItem(element);
+
+    return insert(std::span<const ListItemVariant> {&item, 1}).front();
+}
+
+template <size_t N>
+typename ListBuffer<N>::ListItemVariant ListBuffer<N>::ownedItem(ListElementView element) {
+    const auto asVariant = [this]<typename T>(const ListElementView view) -> ListItemVariant {
+        if constexpr (std::same_as<T, ListView>) {
+            return copy(view.getAs<ListView>());
+        } else {
+            return view.getAs<T>();
+        }
+    };
+
+    const ListTagDispatcher dispatcher {element.getTag()};
+
+    return dispatcher.execute(asVariant, element);
 }
 
 template <size_t N>

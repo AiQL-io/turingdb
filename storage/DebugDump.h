@@ -12,6 +12,9 @@
 #include "list/ListElementView.h"
 #include "list/ListView.h"
 
+#include "map/MapEntryView.h"
+#include "map/MapView.h"
+
 namespace db {
 
 class DebugDump {
@@ -52,6 +55,14 @@ public:
         dumpNull(out);
     }
 
+    inline static void dump(std::ostream& out, DateTime value) {
+        dumpImpl(out, static_cast<uint64_t>(value.getMicroseconds()));
+    }
+
+    inline static void dump(std::ostream& out, Duration value) {
+        dumpImpl(out, static_cast<uint64_t>(value.getMicroseconds()));
+    }
+
     static void dump(std::ostream& out, std::string_view str);
     static void dump(std::ostream& out, const std::string& str);
 
@@ -60,6 +71,9 @@ public:
 
     static void dump(std::ostream& out, ListView list);
     static void dump(std::ostream& out, ListElementView view, bool isInList = false);
+
+    static void dump(std::ostream& out, MapView map);
+    static void dump(std::ostream& out, MapEntryView view, bool isInMap = false);
 
 private:
     static void dumpImpl(std::ostream& out, uint64_t data);

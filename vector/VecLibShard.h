@@ -23,12 +23,15 @@ struct VecLibShard {
 
     std::unique_ptr<faiss::Index> _index;
 
+    bool _dirty {false};
+
     [[nodiscard]] size_t getUsedMem() const {
         return _index->ntotal * (sizeof(float) * _index->d + sizeof(faiss::idx_t));
     }
 
     VectorResult<void> save();
     VectorResult<void> load(const VecLibMetadata& meta);
+    void reset(const VecLibMetadata& meta);
 };
 
 }

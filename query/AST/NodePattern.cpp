@@ -37,9 +37,14 @@ NodePattern* NodePattern::fromExpr(CypherAST* ast, Expr* expr) {
             return pattern;
         }
     } else if (const EntityTypeExpr* nodeLabelExpr = dynamic_cast<EntityTypeExpr*>(expr)) {
+        if (nodeLabelExpr->getOperand()) {
+            return nullptr;
+        }
+
         NodePattern* pattern = NodePattern::create(ast);
         pattern->setSymbol(nodeLabelExpr->getSymbol());
-        pattern->setLabels(nodeLabelExpr->getTypes());
+        pattern->setLabelExpr(nodeLabelExpr->getLabelExpr());
+        return pattern;
     }
 
     return nullptr;

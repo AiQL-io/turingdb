@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "MATCH (n) CALL gnn.neighbourhoodSample(n, 0, 42) YIELD tgt AS m RETURN n, m",
+  "expect": {
+    "result": "n,m",
+    "resultJson": "{\"header\":{\"column_names\":[\"n\",\"m\"],\"column_types\":[\"UInt64\",\"UInt64\"]},\"data\":[[[],[]]]}"
+  },
+  "tags": [
+    "call",
+    "sample",
+    "yield",
+    "return"
+  ],
+  "write-required": false
+}

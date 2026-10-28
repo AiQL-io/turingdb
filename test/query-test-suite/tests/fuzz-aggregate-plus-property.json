@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "MATCH (n) RETURN COUNT(*) + n.age",
+  "expect": {
+    "result": "ANALYZE ERROR\n-------* Query error\n     1 | MATCH (n) RETURN COUNT(*) + n.age\n       |                             ^^^^^\n-------* An expression beside an aggregate may only read the grouping keys: return this one as a key of its own, or aggregate it.",
+    "resultJson": "{\"error\":\"ANALYZE_ERROR\",\"error_details\":\"-------* Query error\\n     1 | MATCH (n) RETURN COUNT(*) + n.age\\n       |                             ^^^^^\\n-------* An expression beside an aggregate may only read the grouping keys: return this one as a key of its own, or aggregate it.\"}"
+  },
+  "tags": [
+    "fuzz",
+    "crash",
+    "count",
+    "aggregate",
+    "expression"
+  ],
+  "write-required": false
+}

@@ -1,0 +1,278 @@
+#pragma once
+
+#include <optional>
+#include <span>
+#include <stdint.h>
+#include <stddef.h>
+#include <unordered_map>
+#include <vector>
+
+#include "PathDistanceIndex.h"
+#include "PathExplorationDir.h"
+#include "datapart/EdgeRecord.h"
+#include "views/GraphView.h"
+#include "ID.h"
+
+namespace db {
+
+class PartDirectory;
+class PathHopFilter;
+class Tombstones;
+
+// The nodes one batch of up to 64 targets reaches, in one of two layouts. Sparse: an
+// open-addressing table keyed by node holding the word of the targets that reached it and a
+// hop count per target, so a batch costs its ball. Dense: one cumulative word per node per
+// level, the targets within that many hops, so a batch costs the graph but each word is a
+// sequential write; it wins when the ball is a large share of a small graph at a shallow bound.
+class PathTargetBatch {
+public:
+    static constexpr size_t targetsPerBatch = 64;
+    static constexpr uint8_t unreached = 255;
+    static constexpr uint8_t farthestLevel = unreached - 1;
+
+    PathTargetBatch();
+    ~PathTargetBatch();
+
+    // Lays the batch out densely over that many nodes; the default is the sparse table
+    void setDense(size_t nodeCount);
+    bool isDense() const { return _dense; }
+
+    size_t size() const { return _count; }
+
+    bool canReachWithin(NodeID node, size_t bit, uint64_t hops) const {
+        if (_dense) {
+            const size_t last = _levels.size() - 1;
+            const std::vector<uint64_t>& reached = _levels[hops < last ? hops : last];
+            const size_t index = node.getValue();
+
+            return index < reached.size() && ((reached[index] >> bit) & 1) != 0;
+        }
+
+        const size_t slot = find(node);
+        if (slot == _keys.size()) {
+            return false;
+        }
+
+        const uint8_t distance = _distances[slot * targetsPerBatch + bit];
+
+        return distance != unreached && distance <= hops;
+    }
+
+    bool canReachAnyWithin(NodeID node, uint64_t hops) const {
+        if (_dense) {
+            const size_t last = _levels.size() - 1;
+            const std::vector<uint64_t>& reached = _levels[hops < last ? hops : last];
+            const size_t index = node.getValue();
+
+            return index < reached.size() && reached[index] != 0;
+        }
+
+        const size_t slot = find(node);
+        if (slot == _keys.size()) {
+            return false;
+        }
+
+        const uint8_t distance = _minDistances[slot];
+
+        return distance != unreached && distance <= hops;
+    }
+
+    // The targets that have reached the node so far
+    uint64_t getReached(NodeID node) const;
+
+    // Adds to the node the targets of the word it did not have yet, at that many hops, and
+    // returns them
+    uint64_t gain(NodeID node, uint64_t word, uint8_t distance);
+
+    bool isQueued(NodeID node) const;
+    void setQueued(NodeID node, bool queued);
+
+    // Opens the next level: the dense layout starts it as a copy of the one that closed
+    void beginLevel();
+
+private:
+    static constexpr uint64_t emptyKey = ~0ull;
+    static constexpr size_t initialCapacity = 128;
+
+    bool _dense {false};
+    size_t _count {0};
+
+    std::vector<std::vector<uint64_t>> _levels;
+    std::vector<uint8_t> _denseQueued;
+
+    std::vector<uint64_t> _keys;
+    std::vector<uint64_t> _reached;
+    std::vector<uint8_t> _distances;
+    std::vector<uint8_t> _minDistances;
+    std::vector<uint8_t> _queued;
+    uint64_t _mask {0};
+
+    static uint64_t hashOf(uint64_t key) { return (key * 0x9E3779B97F4A7C15ull) >> 20; }
+
+    size_t find(NodeID node) const {
+        const uint64_t key = node.getValue();
+        size_t slot = hashOf(key) & _mask;
+
+        while (_keys[slot] != emptyKey) {
+            if (_keys[slot] == key) {
+                return slot;
+            }
+
+            slot = (slot + 1) & _mask;
+        }
+
+        return _keys.size();
+    }
+
+    size_t findOrInsert(NodeID node);
+    void allocate(size_t capacity);
+    void grow();
+};
+
+// Where one target sits in a PathTargetIndex: its batch and its bit. An invalid handle stands
+// for a target the index does not cover and prunes nothing.
+struct PathTargetHandle {
+    const PathTargetBatch* _batch {nullptr};
+    size_t _bit {0};
+
+    bool isValid() const { return _batch != nullptr; }
+
+    bool canReachWithin(NodeID node, uint64_t hops) const {
+        return !_batch || _batch->canReachWithin(node, _bit, hops);
+    }
+};
+
+// For each of a chunk's distinct targets, the hops every node it reaches needs to get to it
+// along the exploration direction: one multi-source breadth-first search per 64 targets over
+// the reverse direction. In the set mode it is one search from every target, the hops to the
+// nearest, which answers only whether any target is in reach: a table of the nodes reached
+// or a distance byte per node, whichever is the smaller to probe. Like PathDistanceIndex it
+// ignores trail uniqueness and hop predicates, so pruning by it never drops a valid path.
+class PathTargetIndex {
+public:
+    static constexpr size_t targetsPerBatch = PathTargetBatch::targetsPerBatch;
+
+    PathTargetIndex();
+    ~PathTargetIndex();
+
+    void build(const GraphView& view,
+               std::span<const NodeID> targets,
+               PathExplorationDir direction,
+               std::span<const EdgeTypeID> edgeTypes,
+               uint64_t maxHops);
+
+    // The set mode: one search from every target at once
+    void buildSet(const GraphView& view,
+                  std::span<const NodeID> targets,
+                  PathExplorationDir direction,
+                  std::span<const EdgeTypeID> edgeTypes,
+                  uint64_t maxHops);
+
+    bool isBuilt() const { return _built; }
+    bool isDense() const;
+    size_t getBatchCount() const { return _batches.size(); }
+    size_t getReachedCount() const;
+
+    PathTargetHandle find(NodeID target) const;
+
+    // Whether any target of the index is within that many hops of the node, which is what a
+    // walk bound to a whole set of ends prunes by
+    bool canReachAnyWithin(NodeID node, uint64_t hops) const {
+        if (_set.isBuilt()) {
+            return _set.canReachEndWithin(node, hops);
+        }
+
+        for (const PathTargetBatch& batch : _batches) {
+            if (batch.canReachAnyWithin(node, hops)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    // Whether the enumeration the seeds imply is expected to cost more than the batches
+    static bool isWorthBuilding(const GraphView& view,
+                                PathExplorationDir direction,
+                                std::span<const EdgeTypeID> edgeTypes,
+                                const PathDistanceIndex::SeedExpansion& expansion,
+                                size_t seedCount,
+                                size_t targetCount,
+                                uint64_t maxHops,
+                                double hopPassRate = 1.0);
+
+    // The same for the set mode, priced as the one search it is
+    static bool isWorthBuildingSet(const GraphView& view,
+                                   PathExplorationDir direction,
+                                   std::span<const EdgeTypeID> edgeTypes,
+                                   const PathDistanceIndex::SeedExpansion& expansion,
+                                   size_t seedCount,
+                                   size_t targetCount,
+                                   uint64_t maxHops,
+                                   double hopPassRate = 1.0);
+
+private:
+    // What one batch of the build is expected to cost in the cheaper of the two layouts
+    struct BatchPlan {
+        bool _dense {false};
+        double _checks {0.0};
+        double _bytes {0.0};
+    };
+
+    // What the set is expected to cost in the smaller of its two layouts
+    struct SetPlan {
+        bool _sparse {false};
+        double _checks {0.0};
+        double _bytes {0.0};
+    };
+
+    std::vector<PathTargetBatch> _batches;
+    std::unordered_map<uint64_t, PathTargetHandle> _handles;
+    PathDistanceIndex _set;
+    bool _built {false};
+
+    static void planBatch(const PartDirectory& parts,
+                          PathExplorationDir direction,
+                          std::span<const EdgeTypeID> edgeTypes,
+                          size_t targetCount,
+                          uint64_t maxHops,
+                          BatchPlan& plan);
+
+    static void planSet(const PartDirectory& parts,
+                        PathExplorationDir direction,
+                        std::span<const EdgeTypeID> edgeTypes,
+                        size_t targetCount,
+                        uint64_t maxHops,
+                        SetPlan& plan);
+
+    void buildBatch(const PartDirectory& parts,
+                    std::span<const NodeID> targets,
+                    PathExplorationDir direction,
+                    std::span<const EdgeTypeID> edgeTypes,
+                    const Tombstones* tombstones,
+                    uint64_t maxHops,
+                    PathTargetBatch& batch);
+    void buildSetBatch(const PartDirectory& parts,
+                       std::span<const NodeID> targets,
+                       PathExplorationDir direction,
+                       std::span<const EdgeTypeID> edgeTypes,
+                       const Tombstones* tombstones,
+                       uint64_t maxHops,
+                       PathTargetBatch& batch);
+    void searchBatch(const PartDirectory& parts,
+                     std::vector<NodeID>& frontier,
+                     PathExplorationDir direction,
+                     std::span<const EdgeTypeID> edgeTypes,
+                     const Tombstones* tombstones,
+                     uint64_t maxHops,
+                     PathTargetBatch& batch);
+    void relax(std::span<const EdgeRecord> edges,
+               uint64_t word,
+               uint8_t distance,
+               std::span<const EdgeTypeID> edgeTypes,
+               const Tombstones* tombstones,
+               PathTargetBatch& batch,
+               std::vector<NodeID>& next);
+};
+
+}

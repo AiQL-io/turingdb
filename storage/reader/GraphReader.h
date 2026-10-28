@@ -1,9 +1,10 @@
 #pragma once
 
+#include <optional>
+
 #include "ID.h"
 #include "views/EdgeView.h"
 #include "views/GraphView.h"
-#include "iterators/GetPropertiesIterator.h"
 #include "iterators/GetPropertiesWithNullIterator.h"
 #include "iterators/GetInEdgesIterator.h"
 #include "iterators/GetEdgesIterator.h"
@@ -11,12 +12,13 @@
 #include "iterators/GetOutEdgesIterator.h"
 #include "iterators/ScanEdgesIterator.h"
 #include "iterators/ScanEdgePropertiesIterator.h"
-#include "iterators/ScanInEdgesByLabelIterator.h"
+#include "iterators/ScanInEdgesByTargetLabelIterator.h"
 #include "iterators/ScanNodePropertiesIterator.h"
 #include "iterators/ScanNodePropertiesByLabelIterator.h"
 #include "iterators/ScanNodesByLabelIterator.h"
 #include "iterators/ScanNodesIterator.h"
-#include "iterators/ScanOutEdgesByLabelIterator.h"
+#include "iterators/ScanOutEdgesBySourceLabelIterator.h"
+#include "iterators/GetEdgeTypesIterator.h"
 #include "iterators/GetNodeLabelSetIterator.h"
 #include "iterators/MatchLabelSetIterator.h"
 
@@ -73,6 +75,23 @@ public:
     [[nodiscard]] const EdgeRecord* getEdge(EdgeID edgeID) const;
     [[nodiscard]] LabelSetHandle getNodeLabelSet(NodeID nodeID) const;
     [[nodiscard]] size_t getNodeCountMatchingLabelset(const LabelSetHandle& labelset) const;
+
+    /**
+     * @brief Returns the number of edges the out-edge (in-edge) index holds under the label
+     * sets matching @p labelset, which is the number of edges a scan of that index walks.
+     * @detail Counts the edges a tombstone deleted, since the walk visits them too.
+     */
+    [[nodiscard]] size_t getOutEdgeCountMatchingLabelset(const LabelSetHandle& labelset) const;
+    [[nodiscard]] size_t getInEdgeCountMatchingLabelset(const LabelSetHandle& labelset) const;
+
+    /**
+     * @brief Returns the number of nodes matching @p labelset which hold property @p
+     * propertyTypeID, counting each node once and none that a tombstone deleted.
+     * @detail A node written twice holds the property in two data parts; only the newest
+     * entry stands for it.
+     */
+    [[nodiscard]] size_t getNodeCountWithProperty(const LabelSetHandle& labelset,
+                                                  PropertyTypeID propertyTypeID) const;
     [[nodiscard]] size_t getDatapartCount() const;
     [[nodiscard]] size_t getNodePropertyCount(PropertyTypeID ptID) const;
     [[nodiscard]] size_t getNodePropertyCount(size_t datapartIndex, PropertyTypeID ptID) const;
@@ -82,6 +101,7 @@ public:
     [[nodiscard]] EdgeView getEdgeView(EdgeID id) const;
     [[nodiscard]] EdgeTypeID getEdgeTypeID(EdgeID edgeID) const;
     [[nodiscard]] GetNodeLabelSetRange getNodeLabelSets(const ColumnNodeIDs* inputNodeIDs) const;
+    [[nodiscard]] GetEdgeTypesRange getEdgeTypes(const ColumnEdgeIDs* inputEdgeIDs) const;
     [[nodiscard]] GetNodeViewsRange getNodeViews(const ColumnNodeIDs* inputNodeIDs) const;
     [[nodiscard]] GetOutEdgesRange getOutEdges(const ColumnNodeIDs* inputNodeIDs) const;
     [[nodiscard]] GetInEdgesRange getInEdges(const ColumnNodeIDs* inputNodeIDs) const;
@@ -89,8 +109,8 @@ public:
     [[nodiscard]] ScanEdgesRange scanOutEdges() const;
     [[nodiscard]] ScanNodesRange scanNodes() const;
     [[nodiscard]] ScanNodesByLabelRange scanNodesByLabel(const LabelSetHandle& labelset) const;
-    [[nodiscard]] ScanOutEdgesByLabelRange scanOutEdgesByLabel(const LabelSetHandle& labelset) const;
-    [[nodiscard]] ScanInEdgesByLabelRange scanInEdgesByLabel(const LabelSetHandle& labelset) const;
+    [[nodiscard]] ScanOutEdgesBySourceLabelRange scanOutEdgesBySourceLabel(const LabelSetHandle& labelset) const;
+    [[nodiscard]] ScanInEdgesByTargetLabelRange scanInEdgesByTargetLabel(const LabelSetHandle& labelset) const;
     [[nodiscard]] MatchLabelSetIterator matchLabelSets(const LabelSetHandle& labelSet) const;
     [[nodiscard]] bool nodeHasProperty(PropertyTypeID ptID, NodeID nodeID) const;
     [[nodiscard]] bool graphHasNode(NodeID nodeID) const;
@@ -102,12 +122,12 @@ public:
     bool isEdgeProperty(PropertyTypeID ptID) const;
 
     template <SupportedType T>
-    [[nodiscard]] const T::Primitive* tryGetNodeProperty(PropertyTypeID ptID,
-                                                         NodeID nodeID) const;
+    [[nodiscard]] std::optional<const typename T::Primitive*> tryGetNodeProperty(PropertyTypeID ptID,
+                                                                                 NodeID nodeID) const;
 
     template <SupportedType T>
-    [[nodiscard]] const T::Primitive* tryGetEdgeProperty(PropertyTypeID ptID,
-                                                         EdgeID edgeID) const;
+    [[nodiscard]] std::optional<const typename T::Primitive*> tryGetEdgeProperty(PropertyTypeID ptID,
+                                                                                 EdgeID edgeID) const;
 
     template <SupportedType T>
     [[nodiscard]] ScanNodePropertiesRange<T> scanNodeProperties(PropertyTypeID ptID) const {
@@ -126,21 +146,9 @@ public:
     }
 
     template <SupportedType T>
-    [[nodiscard]] GetNodePropertiesRange<T> getNodeProperties(PropertyTypeID ptID,
-                                                              const ColumnNodeIDs* inputNodeIDs) const {
-        return GetNodePropertiesRange<T>(_view, ptID, inputNodeIDs);
-    }
-
-    template <SupportedType T>
     [[nodiscard]] GetNodePropertiesWithNullRange<T> getNodePropertiesWithNull(PropertyTypeID ptID,
                                                                               const ColumnNodeIDs* inputNodeIDs) const {
         return GetNodePropertiesWithNullRange<T>(_view, ptID, inputNodeIDs);
-    }
-
-    template <SupportedType T>
-    [[nodiscard]] GetEdgePropertiesRange<T> getEdgeProperties(PropertyTypeID ptID,
-                                                              const ColumnEdgeIDs* inputEdgeIDs) const {
-        return GetEdgePropertiesRange<T>(_view, ptID, inputEdgeIDs);
     }
 
     template <SupportedType T>

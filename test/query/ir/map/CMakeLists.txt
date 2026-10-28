@@ -1,0 +1,67 @@
+# The distinct-key rule nl.make_map shares with db.make_map.
+add_ir_tests(test_query_ir_nl_make_map_keys NLMakeMapKeysTest.cpp)
+
+add_turing_test(test_query_ir_cypher_map_literal_rows CypherMapLiteralRowsTest.cpp)
+target_include_directories(test_query_ir_cypher_map_literal_rows PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_of_maps ListOfMapsTest.cpp)
+target_include_directories(test_query_ir_list_of_maps PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_cypher_dynamic_map_literal CypherDynamicMapLiteralTest.cpp)
+target_include_directories(test_query_ir_cypher_dynamic_map_literal PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_literal_property_value MapLiteralPropertyValueTest.cpp)
+target_include_directories(test_query_ir_map_literal_property_value PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_property MapPropertyTest.cpp)
+target_include_directories(test_query_ir_map_property PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_of_map_properties ListOfMapPropertiesTest.cpp)
+target_include_directories(test_query_ir_list_of_map_properties PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_against_other_type MapAgainstOtherTypeTest.cpp)
+target_include_directories(test_query_ir_map_against_other_type PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_property_equality MapPropertyEqualityTest.cpp)
+target_include_directories(test_query_ir_map_property_equality PRIVATE ${IR_TEST_DIR})
+add_turing_test(test_query_ir_map_key_absent_property MapKeyAbsentPropertyTest.cpp)
+target_include_directories(test_query_ir_map_key_absent_property PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_value_unwind MapValueUnwindTest.cpp)
+target_include_directories(test_query_ir_map_value_unwind PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_value_membership MapValueMembershipTest.cpp)
+target_include_directories(test_query_ir_map_value_membership PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_value_reversed_comparison MapValueReversedComparisonTest.cpp)
+target_include_directories(test_query_ir_map_value_reversed_comparison PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_value_pattern_constraint MapValuePatternConstraintTest.cpp)
+target_include_directories(test_query_ir_map_value_pattern_constraint PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_value_list_null MapValueListNullTest.cpp)
+target_include_directories(test_query_ir_map_value_list_null PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_key_null MapKeyNullTest.cpp)
+target_include_directories(test_query_ir_map_key_null PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_key_comparison MapKeyComparisonTest.cpp)
+target_include_directories(test_query_ir_map_key_comparison PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_key_read MapKeyReadTest.cpp)
+target_include_directories(test_query_ir_map_key_read PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_dynamic_map_key DynamicMapKeyTest.cpp)
+target_include_directories(test_query_ir_dynamic_map_key PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_unwound_map_key UnwoundMapKeyTest.cpp)
+target_include_directories(test_query_ir_unwound_map_key PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_keyword_name KeywordNameTest.cpp)
+target_include_directories(test_query_ir_keyword_name PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_order_by MapOrderByTest.cpp)
+target_include_directories(test_query_ir_map_order_by PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_map_null_test MapNullTestTest.cpp)
+target_include_directories(test_query_ir_map_null_test PRIVATE ${IR_TEST_DIR})

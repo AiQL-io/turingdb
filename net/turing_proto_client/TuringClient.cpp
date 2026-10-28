@@ -10,15 +10,19 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
-#include <charconv>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <spdlog/fmt/fmt.h>
 
 #include "HTTPUtils.h"
 #include "TuringProtoDecoder.h"
 #include "TuringProtoHeaders.h"
 #include "TuringException.h"
+#include "TuringSink.h"
+#include "TuringSinkColumnContainer.h"
 #include "dataframe/Dataframe.h"
 #include "dataframe/DataframeManager.h"
 
@@ -175,32 +179,20 @@ void TuringClient::disconnect() {
     }
 }
 
-// Server-side ChangeID/CommitHash::fromString() parses with std::from_chars(..., 16),
-// so the wire encoding must be hex. std::to_string() would silently emit decimal,
-// which matches hex only for values 0-9 and then misroutes everything from 10 on.
-static std::string toHexString(uint64_t value) {
-    std::array<char, 17> buffer;
-    const auto res = std::to_chars(buffer.data(), buffer.data() + buffer.size(), value, 16);
-    return std::string(buffer.data(), res.ptr);
-}
+void TuringClient::sendRequest(const std::string& query, const db::ParameterMap* parameters) {
+    _requestBody.build(query, parameters);
+    const std::span<char> prefix = _requestBody.getPrefix();
+    const std::span<char> suffix = _requestBody.getSuffix();
 
-void TuringClient::sendRequest(const std::string& query) {
     std::string headers;
     headers.reserve(256);
-
-    const std::string commitParam = (_commitHash.get() == db::CommitHash::head().get())
-                                      ? std::string("head")
-                                      : toHexString(_commitHash.get());
-    const std::string changeParam = (_changeID.get() == db::ChangeID::head().get())
-                                      ? std::string("head")
-                                      : toHexString(_changeID.get());
 
     headers += "POST /query?graph=";
     headers += _graphName;
     headers += "&commit=";
-    headers += commitParam;
+    _commitHash.appendString(headers);
     headers += "&change=";
-    headers += changeParam;
+    _changeID.appendString(headers);
     headers += " HTTP/1.1\r\n";
 
     headers += "Host: ";
@@ -211,7 +203,7 @@ void TuringClient::sendRequest(const std::string& query) {
 
     headers += "Content-type: application/turing-proto\r\n";
     headers += "Content-Length: ";
-    headers += std::to_string(query.size());
+    headers += std::to_string(prefix.size() + query.size() + suffix.size());
     headers += "\r\n";
 
     if (!_authToken.empty()) {
@@ -226,9 +218,11 @@ void TuringClient::sendRequest(const std::string& query) {
     // iovec.iov_base is void* (non-const) because the struct is shared with
     // recvmsg, which writes through it. sendmsg only reads, so the const_cast
     // on query.data() is a POSIX-ABI wrinkle , not a real mutation.
-    std::array<iovec, 2> iovecs = {{
+    std::array<iovec, 4> iovecs = {{
         {headers.data(), headers.size()},
+        {prefix.data(), prefix.size()},
         {const_cast<char*>(query.data()), query.size()},
+        {suffix.data(), suffix.size()},
     }};
 
     size_t iovIndex = 0;
@@ -444,21 +438,30 @@ void TuringClient::recvCrlf() {
 }
 
 db::QueryStatus TuringClient::sendQuery(const std::string& query,
-                                        const db::QueryCallbacks::OnOutputData& callback) {
-    bioassert(query.length() <= MAX_WIRE_SIZE, "Query length exceeds maximum wire size");
-    bioassert(_graphName.length() <= MAX_WIRE_SIZE, "Graph name length exceeds maximum wire size");
+                                        const db::QueryCallbacks::OnOutputData& callback,
+                                        const db::ParameterMap* parameters) {
+    if (_graphName.length() > MAX_WIRE_SIZE) {
+        throw TuringException(fmt::format("The graph name is {} bytes, more than the {} bytes the binary protocol allows",
+                                          _graphName.length(),
+                                          MAX_WIRE_SIZE));
+    }
 
-    sendRequest(query);
+    sendRequest(query, parameters);
     recvHttpResponseHeaders();
 
     _embeddingBuffer.clear();
     _stringBuffer.clear();
     _listBuffer.clear();
+    _mapBuffer.clear();
+    _localMem->clear();
+
     db::DataframeManager dfMan;
     db::QueryStatus res;
-    std::vector<DecodedColumnSchema> colSchemas;
+    std::vector<DecodedColumnSchema> columnSchemas;
     db::Dataframe df;
-    TuringProtoDecoder decoder(_localMem, &dfMan, &_inBuf, &_embeddingBuffer, &_stringBuffer, &_listBuffer, colSchemas);
+    TuringSink sink(_localMem, &_embeddingBuffer, &_listBuffer, &_mapBuffer);
+    TuringSinkColumnContainer dataframeContainer(&df, &dfMan);
+    TuringProtoDecoder<TuringSink> decoder(&_inBuf, &sink, columnSchemas);
 
     bool callbackFired = false;
     bool sawTerminalPacket = false;
@@ -486,25 +489,27 @@ db::QueryStatus TuringClient::sendQuery(const std::string& query,
 
         switch (responseHeader._type) {
             case MessageTypes::CHUNK_HEADER:
-                decoder.decodeIncomingChunkHeader(&df);
+                decoder.decodeIncomingChunkHeader(&dataframeContainer);
             break;
 
             case MessageTypes::CHUNK:
-                decoder.decodeIncomingChunk(&df);
+                decoder.decodeIncomingChunk(&dataframeContainer);
             break;
 
             case MessageTypes::END_CHUNK:
+                decoder.decodeChunkFooter(&dataframeContainer);
                 callbackFired = true;
                 callback(&df);
                 df.clear();
-                for (auto& schema : colSchemas) {
-                    schema.getColState().reset();
+                for (auto& schema : columnSchemas) {
+                    schema.getColumnState().reset();
                 }
                 decoder.reset();
             break;
 
             case MessageTypes::END: {
                 if (!callbackFired) {
+                    df.setDeclaredRowCount(0);
                     callback(&df);
                 }
 

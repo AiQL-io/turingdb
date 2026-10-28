@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "decl/EvaluatedType.h"
+#include "decl/ListShape.h"
 
 #include "EnumToString.h"
 
@@ -17,16 +18,26 @@ public:
 
     enum class Kind : uint8_t {
         BINARY = 0,
+        LOGICAL,
         UNARY,
         STRING,
         ENTITY_TYPES,
         PROPERTY,
-        PATH,
+        PROPERTY_LOOKUP,
         SYMBOL,
         LITERAL,
         FUNCTION_INVOCATION,
         INDEX,
         LIST,
+        LIST_SLICE,
+        LIST_COMPREHENSION,
+        PATTERN_COMPREHENSION,
+        LIST_PREDICATE,
+        REDUCE,
+        CASE,
+        EXISTS,
+        COUNT_SUBQUERY,
+        COLLECT_SUBQUERY,
 
         _SIZE
     };
@@ -35,11 +46,16 @@ public:
         NONE = 0,
         AGGREGATE = 1U << 0U,
         DYNAMIC = 1U << 1U,
+        PARENTHESIZED = 1U << 2U,
     };
 
     Kind getKind() const { return _exprKind; }
 
     virtual EvaluatedType getType() const { return _type; }
+
+    // How deeply a List-typed expression nests and what its innermost elements are.
+    // What an UNWIND of this expression binds its variable to.
+    const ListShape& getListShape() const { return _listShape; }
 
     const VarDecl* getExprVarDecl() const { return _exprVarDecl; }
 
@@ -48,6 +64,8 @@ public:
     }
 
     void setType(EvaluatedType type) { _type = type; }
+
+    void setListShape(const ListShape& shape) { _listShape = shape; }
 
     void setExprVarDecl(const VarDecl* decl) { _exprVarDecl = decl; }
 
@@ -63,12 +81,20 @@ public:
         return ((uint8_t)_flags & (uint8_t)Flags::DYNAMIC) != 0;
     }
 
+    [[nodiscard]] bool isParenthesized() const {
+        return ((uint8_t)_flags & (uint8_t)Flags::PARENTHESIZED) != 0;
+    }
+
     void setAggregate() {
         _flags = (Flags)((uint8_t)_flags | (uint8_t)Flags::AGGREGATE);
     }
 
     void setDynamic() {
         _flags = (Flags)((uint8_t)_flags | (uint8_t)Flags::DYNAMIC);
+    }
+
+    void setParenthesized() {
+        _flags = (Flags)((uint8_t)_flags | (uint8_t)Flags::PARENTHESIZED);
     }
 
 protected:
@@ -88,22 +114,33 @@ private:
     const VarDecl* _exprVarDecl {nullptr};
     Kind _exprKind {Kind::BINARY};
     EvaluatedType _type {EvaluatedType::Invalid};
+    ListShape _listShape;
     Flags _flags {Flags::NONE};
     std::string_view _name;
 };
 
 using ExprKindDescription = EnumToString<Expr::Kind>::Create<
     EnumStringPair<Expr::Kind::BINARY, "BINARY">,
+    EnumStringPair<Expr::Kind::LOGICAL, "LOGICAL">,
     EnumStringPair<Expr::Kind::UNARY, "UNARY">,
     EnumStringPair<Expr::Kind::STRING, "STRING">,
     EnumStringPair<Expr::Kind::ENTITY_TYPES, "ENTITY_TYPES">,
     EnumStringPair<Expr::Kind::PROPERTY, "PROPERTY">,
-    EnumStringPair<Expr::Kind::PATH, "PATH">,
+    EnumStringPair<Expr::Kind::PROPERTY_LOOKUP, "PROPERTY_LOOKUP">,
     EnumStringPair<Expr::Kind::SYMBOL, "SYMBOL">,
     EnumStringPair<Expr::Kind::LITERAL, "LITERAL">,
     EnumStringPair<Expr::Kind::FUNCTION_INVOCATION, "FUNCTION_INVOCATION">,
     EnumStringPair<Expr::Kind::INDEX, "INDEX">,
-    EnumStringPair<Expr::Kind::LIST, "LIST">
+    EnumStringPair<Expr::Kind::LIST, "LIST">,
+    EnumStringPair<Expr::Kind::LIST_SLICE, "LIST_SLICE">,
+    EnumStringPair<Expr::Kind::LIST_COMPREHENSION, "LIST_COMPREHENSION">,
+    EnumStringPair<Expr::Kind::PATTERN_COMPREHENSION, "PATTERN_COMPREHENSION">,
+    EnumStringPair<Expr::Kind::LIST_PREDICATE, "LIST_PREDICATE">,
+    EnumStringPair<Expr::Kind::REDUCE, "REDUCE">,
+    EnumStringPair<Expr::Kind::CASE, "CASE">,
+    EnumStringPair<Expr::Kind::EXISTS, "EXISTS">,
+    EnumStringPair<Expr::Kind::COUNT_SUBQUERY, "COUNT_SUBQUERY">,
+    EnumStringPair<Expr::Kind::COLLECT_SUBQUERY, "COLLECT_SUBQUERY">
 >;
 
 }

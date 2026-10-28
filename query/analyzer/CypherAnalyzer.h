@@ -1,15 +1,26 @@
 #pragma once
 
+#include <span>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "stmt/CallSubqueryStmt.h"
 #include "views/GraphView.h"
 
 namespace db {
 
 class CypherAST;
+class Expr;
+class VarDecl;
 class ReadStmtAnalyzer;
 class WriteStmtAnalyzer;
 class ExprAnalyzer;
 class QueryCommand;
 class SinglePartQuery;
+class UnionQuery;
+class ConditionalQuery;
 class LoadGraphQuery;
 class CreateGraphQuery;
 class DeclContext;
@@ -28,6 +39,17 @@ class OrderBy;
 class Skip;
 class Limit;
 class ReturnStmt;
+class Stmt;
+class StmtContainer;
+class WithStmt;
+class NextSegmentStmt;
+class ExistsExpr;
+class CountSubqueryExpr;
+class CollectSubqueryExpr;
+class Pattern;
+class Projection;
+class Pattern;
+class PatternComprehensionExpr;
 class CreateNodePropertyIndexQuery;
 class CreateEdgePropertyIndexQuery;
 class DropIndexQuery;
@@ -48,7 +70,12 @@ public:
 
     // Query types
     void analyze(const SinglePartQuery* query);
+    void analyze(const UnionQuery* query);
     void analyze(const ReturnStmt* returnSt);
+    void analyze(WithStmt* withSt);
+    void analyze(CallSubqueryStmt* subquery);
+    void analyze(NextSegmentStmt* segment);
+    void analyze(const ConditionalQuery* query);
     void analyze(const LoadGraphQuery* loadGraph);
     void analyze(const CreateGraphQuery* createGraph);
     void analyze(LoadGMLQuery* loadGML);
@@ -63,12 +90,38 @@ public:
     void analyze(const CreateNodePropertyIndexQuery* query);
     void analyze(const CreateEdgePropertyIndexQuery* query);
 
+    // Analyzes the body of an EXISTS subquery under a scope of its own, seeded with the
+    // variables in flight so the body reads them and binds nothing outside itself
+    void analyzeExistsBody(ExistsExpr* exists);
+
+    // Analyzes the body of a COUNT subquery, scoped as an EXISTS body is
+    void analyzeCountSubqueryBody(CountSubqueryExpr* count);
+
+    // Analyzes the body of a COLLECT subquery, scoped as an EXISTS body is, whose every
+    // branch ends in a RETURN of one column
+    void analyzeCollectSubqueryBody(CollectSubqueryExpr* collect);
+
     // Sub-statements
-    void analyze(OrderBy* orderBySt);
+    void analyze(OrderBy* orderBySt, const Projection* projection);
     void analyze(Skip* skipSt);
     void analyze(Limit* limitSt);
 
 private:
+    using DeclSet = std::unordered_set<const VarDecl*>;
+
+    // How a branch of a subquery body reads the variables it imports
+    enum class BranchImports {
+        // Named by the scope clause: the WHEN predicate and every clause of the body read them
+        SCOPE_CLAUSE,
+
+        // Named by a leading WITH, which runs once the WHEN predicate has picked the branch
+        LEADING_WITH,
+
+        // The table a NEXT segment reads: the WHEN predicate reads it, and a WITH of the
+        // body descopes what it does not project, bar what a CALL around the segment imports
+        NEXT_SEGMENT,
+    };
+
     CypherAST* _ast {nullptr};
     GraphView _graphView;
     const GraphMetadata& _graphMetadata;
@@ -77,6 +130,130 @@ private:
     std::unique_ptr<ExprAnalyzer> _exprAnalyzer;
     std::unique_ptr<ReadStmtAnalyzer> _readAnalyzer;
     std::unique_ptr<WriteStmtAnalyzer> _writeAnalyzer;
+
+    // The names the scope clause of the subquery being analyzed imports, empty outside one
+    // and while a nested body is analyzed under its own. A body importing through a
+    // leading WITH holds none: those names are an ordinary projection, which an ordinary
+    // WITH descopes.
+    std::vector<std::string_view> _subqueryImports;
+
+    constexpr static int64_t MAX_VECTOR_INDEX_DIMENSION = 8192;
+
+    // The EXISTS and COUNT bodies analyzed so far: a SET analyzes its value expression twice
+    std::unordered_set<const SinglePartQuery*> _analyzedBodies;
+
+    // The declaration each import of a subquery body, and each variable a projection
+    // carries on, was made from
+    std::unordered_map<const VarDecl*, const VarDecl*> _declSources;
+
+    // The projection whose ORDER BY is being analyzed, and the variables its aggregate or
+    // DISTINCT consumed: the ORDER BY reads only its columns, a renamed variable included,
+    // so a subquery body there imports those and declares the consumed names itself
+    const Projection* _orderedProjection {nullptr};
+    DeclSet _consumedVariables;
+
+    // The shared body of a query and of a subquery's. @param returnRequired says whether a
+    // body ending on a reading clause needs a RETURN: an EXISTS body does not
+    void analyzeQueryBody(const SinglePartQuery* query, bool returnRequired);
+
+    void analyzeProjection(Projection* projection, const Stmt* clause);
+    void openWithScope(Projection* projection);
+
+    // Declares one variable per projected item in @param scope, under the name the item
+    // publishes, and records it on the projection for the code generator to bind
+    void publishProjection(Projection* projection, DeclContext* scope);
+
+    void setScope(DeclContext* scope);
+
+    // A body opening on a WITH of plain variables imports them, when no scope clause says
+    // what the body reads
+    void importThroughLeadingWith(CallSubqueryStmt::Branch& branch) const;
+
+    // `CALL (*)` imports every variable in scope
+    void importEveryVariable(CallSubqueryStmt* subquery) const;
+
+    // Analyzes one query of a CALL body under its own scope, seeded with what it imports
+    // @returns the scope the branch's RETURN reads
+    DeclContext* analyzeSubqueryBranch(CallSubqueryStmt::Branch& branch, BranchImports imports);
+
+    void analyzeBranchColumns(const CallSubqueryStmt* subquery) const;
+
+    void carrySegmentImports(const CallSubqueryStmt* body, std::span<DeclContext* const> returnScopes);
+    void importIntoBranch(CallSubqueryStmt::Branch& branch, DeclContext* outer, DeclContext* inner);
+
+    void throwOnPatternPredicateVariable(const Pattern* pattern, const DeclContext* outer) const;
+
+    // Analyzes one query of an EXISTS body, correlated with the variables in flight
+    void analyzeExistsBranch(const SinglePartQuery* body);
+
+    // Declares what a returning body publishes in the scope around the CALL, rejecting a
+    // name that scope already holds
+    void publishSubqueryReturn(const CallSubqueryStmt* subquery);
+
+    // Declares in @param scope the columns the branches of a body return, under the
+    // declarations the first branch makes
+    void publishBranchReturns(const CallSubqueryStmt* subquery, DeclContext* scope);
+    void publishUnionBranchReturn(Projection* branchProjection, const Projection* firstProjection);
+
+    // Adds to a barrier of a subquery body the imports it does not project, so what the
+    // scope clause named stays readable below it. Answers whether it added one.
+    bool carrySubqueryImports(Projection* projection, bool isAggregate, bool hasGroupingKeys) const;
+
+    // Rejects the item that publishes an imported name under another variable
+    void throwOnRedeclaredImport(const Projection* projection,
+                                 std::string_view import,
+                                 const VarDecl* decl) const;
+    void analyzeWithAliases(const Projection* projection) const;
+    void declareItemAlias(Expr* item, std::string_view alias);
+    void analyzeDistinct(const Projection* projection, bool isAggregate) const;
+    void analyzeAggregateOrderBy(const Projection* projection) const;
+    void analyzeAggregateItems(const Projection* projection) const;
+    void throwOnImplicitGroupingKey(const Expr* expr,
+                                    const Projection* projection,
+                                    DeclSet& elements) const;
+    bool isGroupWise(const Expr* expr, const Projection* projection) const;
+    bool isGroupWise(const Expr* expr, const Projection* projection, DeclSet& elements) const;
+    bool isGroupWise(std::span<const Expr* const> exprs,
+                     const Projection* projection,
+                     DeclSet& elements) const;
+    bool isGroupWise(const PatternComprehensionExpr* comprehension,
+                     const Projection* projection,
+                     DeclSet& elements) const;
+    bool joinsGroupWiseVariables(const Pattern* pattern,
+                                 const Projection* projection,
+                                 DeclSet& elements) const;
+
+    // Whether every variable of the scope around @param body that the body reads is a
+    // grouping key or an element
+    bool readsGroupWiseVariables(const SinglePartQuery* body,
+                                 const Projection* projection,
+                                 const DeclSet& elements) const;
+
+    // Fills @param read with every declaration the query reads, and the ones each was made from
+    void collectReadDecls(DeclSet& read) const;
+
+    // Every branch of a union must project the same columns, in the same order and
+    // under the same names: the union emits one result table, so a branch naming
+    // other columns has no column of that table to fill
+    void analyzeUnionColumns(const SinglePartQuery* first, const SinglePartQuery* branch) const;
+    const Projection* unionBranchProjection(const SinglePartQuery* branch) const;
+    static void collectProjectionNames(const Projection* projection,
+                                       std::vector<std::string_view>& names);
+
+    // The branches of a WHEN fill the same columns too, and a branch ending on a write
+    // fills none, so either every branch returns them or none does
+    void analyzeConditionalColumns(const SinglePartQuery* first, const SinglePartQuery* branch) const;
+
+    void throwOnDifferentColumns(std::string_view branches,
+                                 std::span<const std::string_view> firstNames,
+                                 std::span<const std::string_view> names,
+                                 const SinglePartQuery* branch) const;
+
+    void throwOnReadAfterUpdate(const StmtContainer* stmts) const;
+    void analyzeShortestPathReturn(const SinglePartQuery* query) const;
+    const VarDecl* findConsumedVariable(const Expr* expr,
+                                        const VarDecl* distDecl,
+                                        const VarDecl* pathDecl) const;
 
     [[noreturn]] void throwError(std::string_view msg, const void* obj = 0) const;
 };

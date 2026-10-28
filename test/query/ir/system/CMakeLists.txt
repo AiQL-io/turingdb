@@ -1,0 +1,28 @@
+add_turing_test(test_query_ir_system_command_equivalence SystemCommandEquivalenceTest.cpp)
+target_include_directories(test_query_ir_system_command_equivalence PRIVATE ${IR_TEST_DIR})
+
+add_ir_tests(test_query_ir_system_command_context SystemCommandContextTest.cpp)
+
+add_ir_tests(test_query_ir_system_ops_dialect SystemOpsDialectTest.cpp)
+target_compile_definitions(test_query_ir_system_ops_dialect
+    PRIVATE MLIR_SAMPLES_DIR="${CMAKE_SOURCE_DIR}/samples/mlir")
+
+add_ir_tests(test_query_ir_system_command_lowering SystemCommandLoweringTest.cpp)
+target_compile_definitions(test_query_ir_system_command_lowering
+    PRIVATE MLIR_SAMPLES_DIR="${CMAKE_SOURCE_DIR}/samples/mlir")
+
+add_turing_test(test_query_ir_system_command SystemCommandTest.cpp)
+target_include_directories(test_query_ir_system_command PRIVATE ${IR_TEST_DIR})
+
+# A graph load that fails after opening the change it imports into.
+add_turing_test(test_query_ir_failed_graph_load FailedGraphLoadTest.cpp)
+target_sources(test_query_ir_failed_graph_load PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_failed_graph_load PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_graph_not_found GraphNotFoundTest.cpp)
+target_sources(test_query_ir_graph_not_found PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_graph_not_found PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_available_graphs ListAvailableGraphsTest.cpp)
+target_sources(test_query_ir_list_available_graphs PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_list_available_graphs PRIVATE ${IR_TEST_DIR})

@@ -3,10 +3,38 @@
 #include <string_view>
 #include <stdint.h>
 #include <array>
+#include <string>
 
 #include "EnumToString.h"
 
 namespace net::HTTP {
+
+enum class Error {
+    UNKNOWN = 0,
+    HEADER_INCOMPLETE,
+    REQUEST_TOO_BIG,
+    NO_METHOD,
+    NO_URI,
+    INVALID_METHOD,
+    INVALID_CONTENT_LENGTH,
+    INVALID_URI,
+    UNKNOWN_ENDPOINT,
+    TOO_MANY_PARAMS,
+
+    _SIZE,
+};
+
+using ErrorName = EnumToString<Error>::Create<
+    EnumStringPair<Error::UNKNOWN, "UNKNOWN">,
+    EnumStringPair<Error::HEADER_INCOMPLETE, "HEADER_INCOMPLETE">,
+    EnumStringPair<Error::REQUEST_TOO_BIG, "REQUEST_TOO_BIG">,
+    EnumStringPair<Error::NO_METHOD, "NO_METHOD">,
+    EnumStringPair<Error::NO_URI, "NO_URI">,
+    EnumStringPair<Error::INVALID_METHOD, "INVALID_METHOD">,
+    EnumStringPair<Error::INVALID_CONTENT_LENGTH, "INVALID_CONTENT_LENGTH">,
+    EnumStringPair<Error::INVALID_URI, "INVALID_URI">,
+    EnumStringPair<Error::UNKNOWN_ENDPOINT, "UNKNOWN_ENDPOINT">,
+    EnumStringPair<Error::TOO_MANY_PARAMS, "TOO_MANY_PARAMS">>;
 
 enum class Status {
     OK = 0,
@@ -88,6 +116,8 @@ static constexpr size_t getCode(HTTP::Status status) {
 }
 
 HTTP::Status codeToStatus(size_t httpCode);
+
+void describeError(HTTP::Error error, std::string& details);
 
 }
 

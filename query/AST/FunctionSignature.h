@@ -4,6 +4,7 @@
 #include <string_view>
 
 #include "decl/EvaluatedType.h"
+#include "decl/ListShape.h"
 
 namespace db {
 
@@ -25,9 +26,44 @@ private:
     std::string_view _name;
 };
 
+// A constant argument is read once per call rather than once per row, so only an
+// expression that does not vary with the row may be passed to one.
+class FunctionArgumentType {
+public:
+    FunctionArgumentType(EvaluatedType type)
+        : _type(type)
+    {
+    }
+
+    EvaluatedType getType() const { return _type; }
+
+    std::string_view getName() const { return _name; }
+
+    bool isConstant() const { return _constant; }
+
+    bool takesAVariableLengthPath() const { return _takesAVariableLengthPath; }
+
+    bool rejectsNull() const { return _rejectsNull; }
+
+    void setName(std::string_view name) { _name = name; }
+
+    void setConstant(bool constant) { _constant = constant; }
+
+    void setTakesAVariableLengthPath(bool takesPath) { _takesAVariableLengthPath = takesPath; }
+
+    void setRejectsNull(bool rejects) { _rejectsNull = rejects; }
+
+private:
+    EvaluatedType _type {EvaluatedType::Invalid};
+    std::string_view _name;
+    bool _constant {false};
+    bool _takesAVariableLengthPath {false};
+    bool _rejectsNull {false};
+};
+
 class FunctionSignature {
 public:
-    using ArgumentTypes = std::vector<EvaluatedType>;
+    using ArgumentTypes = std::vector<FunctionArgumentType>;
     using ReturnTypes = std::vector<FunctionReturnType>;
 
     explicit FunctionSignature(std::string_view fullName);
@@ -43,10 +79,34 @@ public:
 
     bool isProcedure() const { return _isProcedure; }
 
+    // Whether the list this returns holds the values of its own argument, so a caller
+    // reading an element back knows the type it has - collect, and nothing else today.
+    bool collectsItsArgument() const { return _collectsItsArgument; }
+
+    // Whether this takes any number of values of one type and answers the type they
+    // share - coalesce, and nothing else today. Such a signature declares no argument of
+    // its own: the analyzer unifies the arguments against each other, as it does the
+    // branches of a CASE, and the type they share is what the call returns.
+    bool unifiesItsArguments() const { return _unifiesItsArguments; }
+
+    // Whether the list this returns nests as deeply over the same elements as its own
+    // argument, so an UNWIND of it binds what an UNWIND of the argument would - tail.
+    bool returnsItsArgumentShape() const { return _returnsItsArgumentShape; }
+
+    // Whether this returns one element of its list argument, typed as an UNWIND of that
+    // list types what it binds - head and last.
+    bool returnsAnElementOfItsArgument() const { return _returnsAnElementOfItsArgument; }
+
+    // The shape the list this returns has whatever it was called with - range, whose
+    // elements are integers however its bounds were written. A signature naming none
+    // leaves the shape to the rule its other flags name.
+    const ListShape& returnedListShape() const { return _returnedListShape; }
+
     size_t getMinArgCount() const { return _requiredArgCount; }
 
-    void setArguments(std::vector<EvaluatedType>&& args) {
+    void setArguments(ArgumentTypes&& args) {
         _argumentTypes = std::move(args);
+        _requiredArgCount = _argumentTypes.size();
     }
 
     void setRequiredArgCount(size_t count) { _requiredArgCount = count; }
@@ -59,13 +119,28 @@ public:
 
     void setIsProcedure(bool procedure) { _isProcedure = procedure; }
 
+    void setCollectsItsArgument(bool collects) { _collectsItsArgument = collects; }
+
+    void setUnifiesItsArguments(bool unifies) { _unifiesItsArguments = unifies; }
+
+    void setReturnsItsArgumentShape(bool returnsShape) { _returnsItsArgumentShape = returnsShape; }
+
+    void setReturnsAnElementOfItsArgument(bool returnsElement) { _returnsAnElementOfItsArgument = returnsElement; }
+
+    void setReturnedListShape(const ListShape& shape) { _returnedListShape = shape; }
+
 private:
     std::string_view _fullName;
-    std::vector<EvaluatedType> _argumentTypes;
+    ArgumentTypes _argumentTypes;
     std::vector<FunctionReturnType> _returnTypes;
+    ListShape _returnedListShape;
     size_t _requiredArgCount {0};
     bool _isAggregate {false};
     bool _isProcedure {false};
+    bool _collectsItsArgument {false};
+    bool _unifiesItsArguments {false};
+    bool _returnsItsArgumentShape {false};
+    bool _returnsAnElementOfItsArgument {false};
 };
 
 }

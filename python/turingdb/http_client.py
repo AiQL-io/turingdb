@@ -1,8 +1,61 @@
+import json as stdlib_json
+import re
 import time
 from typing import Literal, Optional
 
 from .exceptions import TuringDBException
 from .s3 import S3Client
+
+_DURATION_COMPONENT = re.compile(r"(-?)(\d+)(?:\.(\d+))?([HMS])")
+_MICROSECONDS_PER_UNIT = {"H": 3_600_000_000, "M": 60_000_000, "S": 1_000_000}
+
+
+# pandas' ISO-8601 parser rejects hours past two digits and a sign on each component,
+# both of which the server writes (PT100H, PT-25H-1M-1S), so durations are read here
+def _duration_microseconds(text: Optional[str]) -> Optional[int]:
+    if text is None:
+        return None
+
+    microseconds = 0
+    for sign, whole, fraction, unit in _DURATION_COMPONENT.findall(text):
+        value = int(whole) * _MICROSECONDS_PER_UNIT[unit]
+        if fraction:
+            value += int(fraction.ljust(6, "0")[:6])
+        microseconds += -value if sign else value
+
+    return microseconds
+
+
+# The server writes non-finite doubles as NaN, Infinity and -Infinity, which orjson
+# rejects as non-RFC 8259; the json module reads them as float nan / inf / -inf
+def _decode_body(text: str):
+    import orjson
+
+    try:
+        return orjson.loads(text)
+    except orjson.JSONDecodeError:
+        return stdlib_json.loads(text)
+
+
+def _raise_if_error(json) -> None:
+    if not isinstance(json, dict):
+        return
+
+    err = json.get("error")
+    if err is None:
+        return
+
+    details = json.get("error_details")
+    if details is not None:
+        err = f"{err}: {details}"
+    raise TuringDBException(err)
+
+
+def _column_values(column_type: str, values: list) -> list:
+    if column_type == "Duration":
+        return [_duration_microseconds(value) for value in values]
+
+    return values
 
 
 class HTTPClient:
@@ -71,7 +124,7 @@ class HTTPClient:
             self._client.timeout = prev
 
     def list_available_graphs(self) -> list[str]:
-        json = self._send_request("query", data="LIST AVAILABLE GRAPHS")
+        json = self._send_request("query", "LIST AVAILABLE GRAPHS")
         if not isinstance(json, dict):
             raise TuringDBException("Invalid response from the server")
         df = self._parse_chunks(json)
@@ -80,7 +133,7 @@ class HTTPClient:
         return df["graphName"].tolist()
 
     def list_loaded_graphs(self) -> list[str]:
-        json = self._send_request("query", data="LIST GRAPH")
+        json = self._send_request("query", "LIST GRAPH")
         if not isinstance(json, dict):
             raise TuringDBException("Invalid response from the server")
         df = self._parse_chunks(json)
@@ -93,7 +146,7 @@ class HTTPClient:
 
     def load_graph(self, graph_name: str, raise_if_loaded: bool = True):
         try:
-            return self._send_request("query", data=f"LOAD GRAPH {graph_name}")
+            return self._send_request("query", f"LOAD GRAPH {graph_name}")
         except TuringDBException as e:
             if not raise_if_loaded and "Graph already loaded" in str(e):
                 return None
@@ -102,16 +155,16 @@ class HTTPClient:
     def create_graph(self, graph_name: str):
         return self.query(f"create graph {graph_name}")
 
-    def query(self, query: str):
-        json = self._send_request("query", data=query, params=self._params)
+    def query(self, query: str, query_parameters: Optional[dict] = None):
+        json = self._send_request("query", query, query_parameters, params=self._params)
 
         if not isinstance(json, dict):
             raise TuringDBException("Invalid response from the server")
 
         return self._parse_chunks(json)
 
-    def query_raw(self, query: str) -> dict:
-        json = self._send_request("query", data=query, params=self._params)
+    def query_raw(self, query: str, query_parameters: Optional[dict] = None) -> dict:
+        json = self._send_request("query", query, query_parameters, params=self._params)
 
         if not isinstance(json, dict):
             raise TuringDBException("Invalid response from the server")
@@ -123,7 +176,7 @@ class HTTPClient:
 
     def set_change(self, change: int | str):
         if isinstance(change, int):
-            change = f"{change:x}"
+            change = str(change)
         self._params["change"] = change
 
     def checkout(self, change: int | Literal["main"] = "main", commit: str = "HEAD"):
@@ -182,33 +235,32 @@ class HTTPClient:
     def _send_request(
         self,
         path: str,
-        data: Optional[dict | str] = None,
+        query: str,
+        query_parameters: Optional[dict] = None,
         params: Optional[dict] = None,
     ):
-        import orjson
-
         self._query_exec_time = None
         self._total_exec_time = None
         self._t0 = time.time()
 
-        if data is None:
-            data = ""
+        body = {"query": query}
+        if query_parameters is not None:
+            body["parameters"] = query_parameters
 
         url = f"{self.host}/{path}"
-
-        if isinstance(data, dict):
-            response = self._client.post(
-                url, json=data, params=params, headers=self._headers
-            )
-        else:
-            response = self._client.post(
-                url, content=data, params=params, headers=self._headers
-            )
-        response.raise_for_status()
+        response = self._client.post(
+            url, json=body, params=params, headers=self._headers
+        )
+        if response.is_error:
+            try:
+                _raise_if_error(_decode_body(response.text))
+            except stdlib_json.JSONDecodeError:
+                pass
+            response.raise_for_status()
 
         try:
-            json = orjson.loads(response.text)
-        except orjson.JSONDecodeError as e:
+            json = _decode_body(response.text)
+        except stdlib_json.JSONDecodeError as e:
             start = max(0, e.pos - 40)
             end = min(len(e.doc), e.pos + 40)
             snippet = e.doc[start:end]
@@ -220,13 +272,7 @@ class HTTPClient:
                 f"  {pointer}"
             )
 
-        if isinstance(json, dict):
-            err = json.get("error")
-            if err is not None:
-                details = json.get("error_details")
-                if details is not None:
-                    err = f"{err}: {details}"
-                raise TuringDBException(err)
+        _raise_if_error(json)
 
         self._t1 = time.time()
         self._total_exec_time = (self._t1 - self._t0) * 1000
@@ -261,7 +307,7 @@ class HTTPClient:
         for chunk in json["data"]:
             df_chunk = pd.DataFrame(
                 {
-                    cname: pd.Series(col, dtype=DTYPE_MAP.get(ctype, "object"))
+                    cname: pd.Series(_column_values(ctype, col), dtype=DTYPE_MAP.get(ctype, "object"))
                     for (cname, ctype), col in zip(
                         zip(column_names, column_types), chunk
                     )

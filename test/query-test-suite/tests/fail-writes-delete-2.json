@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "MATCH (n:Person { name: \"Remy\" })-[e]->(m:Person)\nDELETE n, e",
+  "expect": {
+    "result": "EXEC ERROR\nCannot delete a node with relationships; use DETACH DELETE",
+    "resultJson": "{\"header\":{\"column_names\":[],\"column_types\":[]},\"data\":[],\"error\":\"EXEC_ERROR\",\"error_details\":\"Cannot delete a node with relationships; use DETACH DELETE\"}"
+  },
+  "tags": [
+    "fail",
+    "writes",
+    "delete"
+  ],
+  "write-required": true
+}

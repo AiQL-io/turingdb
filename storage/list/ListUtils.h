@@ -3,6 +3,11 @@
 #include "ListView.h"
 #include "ListBufferTypeTag.h"
 
+#include "map/MapView.h"
+
+#include "ID.h"
+
+#include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
 
 namespace db {
@@ -33,6 +38,24 @@ struct ListTagDispatcher {
             break;
             case ListBufferTypeTag::ListView:
                 return executor.template operator()<ListView>(view);
+            break;
+            case ListBufferTypeTag::Null:
+                return executor.template operator()<PropertyNull>(view);
+            break;
+            case ListBufferTypeTag::NodeID:
+                return executor.template operator()<NodeID>(view);
+            break;
+            case ListBufferTypeTag::EdgeID:
+                return executor.template operator()<EdgeID>(view);
+            break;
+            case ListBufferTypeTag::DateTime:
+                return executor.template operator()<types::DateTime::Primitive>(view);
+            break;
+            case ListBufferTypeTag::Duration:
+                return executor.template operator()<types::Duration::Primitive>(view);
+            break;
+            case ListBufferTypeTag::MapView:
+                return executor.template operator()<MapView>(view);
             break;
 
             case ListBufferTypeTag::INVALID:
@@ -79,6 +102,36 @@ struct TypeToListBufferTag<types::Embedding::Primitive> {
 template <>
 struct TypeToListBufferTag<ListView> {
     static constexpr ListBufferTypeTag Tag = ListBufferTypeTag::ListView;
+};
+
+template <>
+struct TypeToListBufferTag<PropertyNull> {
+    static constexpr ListBufferTypeTag Tag = ListBufferTypeTag::Null;
+};
+
+template <>
+struct TypeToListBufferTag<NodeID> {
+    static constexpr ListBufferTypeTag Tag = ListBufferTypeTag::NodeID;
+};
+
+template <>
+struct TypeToListBufferTag<EdgeID> {
+    static constexpr ListBufferTypeTag Tag = ListBufferTypeTag::EdgeID;
+};
+
+template <>
+struct TypeToListBufferTag<types::DateTime::Primitive> {
+    static constexpr ListBufferTypeTag Tag = ListBufferTypeTag::DateTime;
+};
+
+template <>
+struct TypeToListBufferTag<types::Duration::Primitive> {
+    static constexpr ListBufferTypeTag Tag = ListBufferTypeTag::Duration;
+};
+
+template <>
+struct TypeToListBufferTag<MapView> {
+    static constexpr ListBufferTypeTag Tag = ListBufferTypeTag::MapView;
 };
 
 }

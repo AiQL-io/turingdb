@@ -1,0 +1,146 @@
+add_call_v3_test(test_query_ir_concatenated_list_seed ConcatenatedListSeedTest.cpp)
+
+add_turing_test(test_query_ir_list_concat ListConcatTest.cpp)
+target_include_directories(test_query_ir_list_concat PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_index ListIndexTest.cpp)
+target_include_directories(test_query_ir_list_index PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_cypher_list_literal CypherListLiteralTest.cpp)
+target_include_directories(test_query_ir_cypher_list_literal PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_literal_element_type ListLiteralElementTypeTest.cpp)
+target_include_directories(test_query_ir_list_literal_element_type PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_literal_property_value ListLiteralPropertyValueTest.cpp)
+target_include_directories(test_query_ir_list_literal_property_value PRIVATE ${IR_TEST_DIR})
+
+# An element indexed out of a list bound by an UNWIND over a list of lists.
+add_turing_test(test_query_ir_nested_list_index_property NestedListIndexPropertyTest.cpp)
+
+add_turing_test(test_query_ir_list_property ListPropertyTest.cpp)
+target_include_directories(test_query_ir_list_property PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_property_equality ListPropertyEqualityTest.cpp)
+target_include_directories(test_query_ir_list_property_equality PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_functions ListFunctionsTest.cpp)
+target_include_directories(test_query_ir_list_functions PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_range_function RangeFunctionTest.cpp)
+target_include_directories(test_query_ir_range_function PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_property_order_collect ListPropertyOrderCollectTest.cpp)
+target_include_directories(test_query_ir_list_property_order_collect PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_property_in ListPropertyInTest.cpp)
+
+add_turing_test(test_query_ir_list_property_index_concat ListPropertyIndexConcatTest.cpp)
+
+add_turing_test(test_query_ir_list_property_comprehension ListPropertyComprehensionTest.cpp)
+
+add_turing_test(test_query_ir_list_equality ListEqualityTest.cpp)
+target_sources(test_query_ir_list_equality PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_list_equality PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_in ListInTest.cpp)
+target_sources(test_query_ir_list_in PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_list_in PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_return_heterogeneous_list ReturnHeterogeneousListTest.cpp)
+target_include_directories(test_query_ir_return_heterogeneous_list PRIVATE ${IR_TEST_DIR})
+
+# An indexed list element as the operand of an operator, run end to end against simpledb.
+add_turing_test(test_query_ir_list_element_operand ListElementOperandTest.cpp)
+target_sources(test_query_ir_list_element_operand PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_list_element_operand PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_scalar_concat ListScalarConcatTest.cpp)
+target_include_directories(test_query_ir_list_scalar_concat PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_slice ListSliceTest.cpp)
+target_include_directories(test_query_ir_list_slice PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_keyword ListKeywordTest.cpp)
+target_include_directories(test_query_ir_list_keyword PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_predicate ListPredicateTest.cpp)
+target_include_directories(test_query_ir_list_predicate PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_element_ops_over_a_constant_list ElementOpsOverAConstantListTest.cpp)
+target_sources(test_query_ir_element_ops_over_a_constant_list PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp ${IR_TEST_DIR}/CallV3Test.cpp)
+target_include_directories(test_query_ir_element_ops_over_a_constant_list PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_predicate_over_booleans ListPredicateOverBooleansTest.cpp)
+target_sources(test_query_ir_list_predicate_over_booleans PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp ${IR_TEST_DIR}/CallV3Test.cpp)
+target_include_directories(test_query_ir_list_predicate_over_booleans PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_predicate_over_a_list_property ListPredicateOverAListPropertyTest.cpp)
+target_sources(test_query_ir_list_predicate_over_a_list_property PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp ${IR_TEST_DIR}/CallV3Test.cpp)
+target_include_directories(test_query_ir_list_predicate_over_a_list_property PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_predicate_over_a_null_list ListPredicateOverANullListTest.cpp)
+target_sources(test_query_ir_list_predicate_over_a_null_list PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp ${IR_TEST_DIR}/CallV3Test.cpp)
+target_include_directories(test_query_ir_list_predicate_over_a_null_list PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_head_and_last HeadAndLastTest.cpp)
+target_sources(test_query_ir_head_and_last PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp ${IR_TEST_DIR}/CallV3Test.cpp)
+target_include_directories(test_query_ir_head_and_last PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_predicate_body_shapes ListPredicateBodyShapesTest.cpp)
+target_sources(test_query_ir_list_predicate_body_shapes PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp ${IR_TEST_DIR}/CallV3Test.cpp)
+target_include_directories(test_query_ir_list_predicate_body_shapes PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_constant_list_index ConstantListIndexTest.cpp)
+target_sources(test_query_ir_constant_list_index PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp ${IR_TEST_DIR}/CallV3Test.cpp)
+target_include_directories(test_query_ir_constant_list_index PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_comprehension ListComprehensionTest.cpp)
+target_include_directories(test_query_ir_list_comprehension PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_reduce ReduceTest.cpp)
+target_include_directories(test_query_ir_reduce PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_comprehension_edge_variable ListComprehensionEdgeVariableTest.cpp)
+target_include_directories(test_query_ir_list_comprehension_edge_variable PRIVATE ${IR_TEST_DIR})
+
+# The misaligned program is hand-written nl, so it runs against the SimpleGraph fixture
+# through the interpreter rather than through a query.
+add_ir_tests(test_query_ir_list_comprehension_row_alignment ListComprehensionRowAlignmentTest.cpp)
+
+add_turing_test(test_query_ir_list_comprehension_outer_variable ListComprehensionOuterVariableTest.cpp)
+target_sources(test_query_ir_list_comprehension_outer_variable PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_list_comprehension_outer_variable PRIVATE ${IR_TEST_DIR})
+
+# Arithmetic inside a list literal.
+add_call_v3_test(test_query_ir_list_literal_arithmetic ListLiteralArithmeticTest.cpp)
+
+# range() over the full Int64 span, whose integer count does not fit 64 bits.
+add_call_v3_test(test_query_ir_range_span_overflow RangeSpanOverflowTest.cpp)
+
+# Arithmetic on an element of a list that holds a property the graph does not have.
+add_call_v3_test(test_query_ir_missing_property_list_element MissingPropertyListElementTest.cpp)
+
+add_turing_test(test_query_ir_null_in_list_element NullInListElementTest.cpp)
+target_sources(test_query_ir_null_in_list_element PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_null_in_list_element PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_in_list ListInListTest.cpp)
+target_sources(test_query_ir_list_in_list PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_list_in_list PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_list_ordering ListOrderingTest.cpp)
+target_sources(test_query_ir_list_ordering PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp ${IR_TEST_DIR}/CallV3Test.cpp)
+target_include_directories(test_query_ir_list_ordering PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_node_in_integer_list NodeInIntegerListTest.cpp)
+
+add_turing_test(test_query_ir_list_reverse ListReverseTest.cpp)
+
+add_turing_test(test_query_ir_list_predicate_early_exit ListPredicateEarlyExitTest.cpp)
+target_sources(test_query_ir_list_predicate_early_exit PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp ${IR_TEST_DIR}/CallV3Test.cpp)
+target_include_directories(test_query_ir_list_predicate_early_exit PRIVATE ${IR_TEST_DIR})
+
+add_call_v3_test(test_query_ir_constant_list_element_truth ConstantListElementTruthTest.cpp)
+
+add_call_v3_test(test_query_ir_logical_operator_over_unreached_cell LogicalOperatorOverUnreachedCellTest.cpp)

@@ -35,6 +35,8 @@ public:
         CREATE_EDGE_PROPERTY_INDEX_QUERY,
         DROP_INDEX_QUERY,
         MERGE_DATAPARTS_QUERY,
+        UNION_QUERY,
+        CONDITIONAL_QUERY,
     };
 
     virtual Kind getKind() const = 0;

@@ -1,29 +1,348 @@
 #include "ExprAnalyzer.h"
 
 #include <algorithm>
+#include <optional>
 
+#include "CypherAnalyzer.h"
 #include "DiagnosticsManager.h"
 #include "AnalyzeException.h"
+#include "ReadStmtAnalyzer.h"
 #include "CypherAST.h"
 #include "FunctionDecls.h"
 #include "FunctionResolver.h"
 #include "FunctionInvocation.h"
 #include "EdgePattern.h"
 #include "NodePattern.h"
+#include "Pattern.h"
+#include "PatternElement.h"
 #include "QualifiedName.h"
 #include "Symbol.h"
 #include "Literal.h"
+#include "Projection.h"
+#include "SinglePartQuery.h"
+#include "UnionQuery.h"
+#include "stmt/LoadCSVStmt.h"
+#include "stmt/ReturnStmt.h"
 #include "decl/DeclContext.h"
 #include "decl/EvaluatedType.h"
 #include "decl/VarDecl.h"
 
 #include "embedding/EmbeddingBucket.h"
+#include "metadata/DateTime.h"
+#include "metadata/Duration.h"
 #include "StringBucket.h"
 
 #include "expr/All.h"
+#include "expr/ExprChildren.h"
 #include "expr/Expr.h"
 
+#include "BioAssert.h"
+
 using namespace db;
+
+namespace {
+
+// What <, <=, > and >= answer over two types: null against a null or across order classes,
+// a boolean within one, and Invalid for a type no ordering takes
+EvaluatedType orderingResultType(EvaluatedType a, EvaluatedType b) {
+    if (a == EvaluatedType::Null || b == EvaluatedType::Null) {
+        return EvaluatedType::Null;
+    } else if (!namesAnOrderingOperand(a) || !namesAnOrderingOperand(b)) {
+        return EvaluatedType::Invalid;
+    } else if (ordersAsDisjointTypes(a, b)) {
+        return EvaluatedType::Null;
+    }
+
+    return EvaluatedType::Bool;
+}
+
+// What = and <> answer over two types: null against a null, a boolean between two operands
+// an equality takes, and Invalid for any other pair. Two doubles are not tested for
+// equality, which rounding makes unreliable, and a label, an edge type or a property type
+// is the id of one, equal only to an id of its kind.
+EvaluatedType equalityResultType(EvaluatedType a, EvaluatedType b) {
+    const bool equatesTwoDoubles = a == EvaluatedType::Double && b == EvaluatedType::Double;
+    const bool equatesMetadataIDs = a == b
+                                 && (a == EvaluatedType::Label
+                                     || a == EvaluatedType::EdgeType
+                                     || a == EvaluatedType::PropertyType);
+    const bool takesA = a == EvaluatedType::Null || namesAnEqualityOperand(a);
+    const bool takesB = b == EvaluatedType::Null || namesAnEqualityOperand(b);
+
+    if (equatesMetadataIDs) {
+        return EvaluatedType::Bool;
+    } else if (!takesA || !takesB || equatesTwoDoubles) {
+        return EvaluatedType::Invalid;
+    } else if (a == EvaluatedType::Null || b == EvaluatedType::Null) {
+        return EvaluatedType::Null;
+    }
+
+    return EvaluatedType::Bool;
+}
+
+std::string_view componentOwnerName(bool namesADateTimePart, bool namesADurationPart) {
+    if (namesADateTimePart) {
+        return "datetime";
+    } else if (namesADurationPart) {
+        return "duration";
+    }
+
+    return "datetime or a duration";
+}
+
+// What a write or an index is turned away with when its target is read out of a property
+// rather than being one. Both name what can be targeted, since neither shape can be.
+constexpr std::string_view datetimeComponentNotAProperty =
+    "A datetime component is computed from a property, not stored as one. "
+    "Only a property can be set, removed or indexed.";
+
+constexpr std::string_view mapKeyNotAProperty =
+    "A map key is a value inside a property, not a property of its own. "
+    "Only a property can be set, removed or indexed.";
+
+// The type a CASE takes when one branch gives @param carried and another gives
+// @param branch: a null branch constrains nothing, an integer beside a double widens,
+// and a one-character string literal reads as the string it is. Invalid when the two
+// share no column type, which is what the caller reports.
+EvaluatedType unifiedBranchType(EvaluatedType carried, EvaluatedType branch) {
+    if (carried == branch) {
+        return carried;
+    }
+
+    if (carried == EvaluatedType::Null) {
+        return branch;
+    } else if (branch == EvaluatedType::Null) {
+        return carried;
+    }
+
+    const TypePairBitset pair(carried, branch);
+
+    if (pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::Double)) {
+        return EvaluatedType::Double;
+    } else if (pair == TypePairBitset(EvaluatedType::Char, EvaluatedType::String)) {
+        return EvaluatedType::String;
+    }
+
+    return EvaluatedType::Invalid;
+}
+
+// The type a reduce's accumulator takes once it has held @param accumulator and then
+// @param value: what a CASE unifies, and a tagged cell when the two share no column type
+EvaluatedType accumulatedType(EvaluatedType accumulator, EvaluatedType value) {
+    if (accumulator == EvaluatedType::Any) {
+        return accumulator;
+    }
+
+    const EvaluatedType unified = unifiedBranchType(accumulator, value);
+    if (unified == EvaluatedType::Invalid) {
+        return EvaluatedType::Any;
+    }
+
+    return unified;
+}
+
+ListShape accumulatedShape(const ListShape& accumulator, const ListShape& value) {
+    const bool sameShape = accumulator.getLeafType() == value.getLeafType()
+                        && accumulator.getDepth() == value.getDepth();
+
+    if (sameShape || !value.isList()) {
+        return accumulator;
+    } else if (!accumulator.isList()) {
+        return value;
+    }
+
+    return ListShape(EvaluatedType::Invalid, 1);
+}
+
+// The shape a branch of a CASE or an argument of a coalesce gives the list they answer. A
+// list whose shape no type names holds tagged cells, while a null holds no list at all.
+ListShape selectedListShape(const Expr* value) {
+    const ListShape& shape = value->getListShape();
+    const bool namesNoShape = value->getType() == EvaluatedType::List && !shape.isList();
+
+    return namesNoShape ? ListShape(EvaluatedType::Invalid, 1) : shape;
+}
+
+// A number or a boolean joins a string as the text Cypher writes it with: 1 + ' apples' is
+// '1 apples' and true + 'x' is 'truex'.
+bool concatenatesAsText(TypePairBitset pair) {
+    return pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::String)
+        || pair == TypePairBitset(EvaluatedType::Double, EvaluatedType::String)
+        || pair == TypePairBitset(EvaluatedType::Bool, EvaluatedType::String);
+}
+
+// Whether an arithmetic operator's operands are a type-erased cell and a number, or two
+// cells. A cell is numeric only once read, and its tag names a type per row rather than
+// one for the column, so the answer is the double a reduction over cells lands on too.
+bool computesOverAny(TypePairBitset pair) {
+    return pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Any)
+        || pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Integer)
+        || pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Double);
+}
+
+bool computesTimeOverAny(TypePairBitset pair) {
+    return pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::DateTime)
+        || pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Duration);
+}
+
+// The types a list is homogeneous in: the scalars a value column holds, the entities a
+// pattern binds - [n, m] is a list of nodes, as collect(n) gathers one - and the lists a
+// nesting is made of.
+bool namesAListElementType(EvaluatedType type) {
+    return convertibleToValueType(type)
+        || type == EvaluatedType::NodePattern
+        || type == EvaluatedType::EdgePattern
+        || type == EvaluatedType::List;
+}
+
+// The shape of the list these elements make: depth 1 over the one type they share, or
+// one level deeper than the lists they are. Elements that share no type - an empty list,
+// a mix of types, lists of differing shape - leave the leaf Invalid, which is what makes
+// the list hand out tagged scalars. A null names no type of its own, so it agrees with
+// every element: [1, null, 3] is a list of integers with a null in it, and [null, null]
+// is a list of nulls rather than a list that mixes types.
+ListShape sharedListShape(std::span<Expr* const> elements) {
+    const Expr* first = nullptr;
+    for (Expr* const element : elements) {
+        if (element->getType() != EvaluatedType::Null) {
+            first = element;
+            break;
+        }
+    }
+
+    if (!first) {
+        if (elements.empty()) {
+            return {EvaluatedType::Invalid, 1};
+        }
+
+        return {EvaluatedType::Null, 1};
+    }
+
+    const EvaluatedType shared = first->getType();
+
+    const auto agreesWithShared = [shared](const Expr* element) {
+        const EvaluatedType type = element->getType();
+        return type == EvaluatedType::Null || type == shared;
+    };
+
+    if (!std::ranges::all_of(elements, agreesWithShared)) {
+        return ListShape(EvaluatedType::Invalid, 1);
+    }
+
+    const ListShape& firstShape = first->getListShape();
+
+    if (shared == EvaluatedType::List) {
+        const auto agreesWithFirstShape = [&firstShape](const Expr* element) {
+            if (element->getType() == EvaluatedType::Null) {
+                return true;
+            }
+
+            const ListShape& shape = element->getListShape();
+            return shape.getDepth() == firstShape.getDepth() && shape.getLeafType() == firstShape.getLeafType();
+        };
+
+        if (!std::ranges::all_of(elements, agreesWithFirstShape)) {
+            return ListShape(EvaluatedType::Invalid, 1);
+        }
+    }
+
+    if (!namesAListElementType(shared)) {
+        return ListShape(EvaluatedType::Invalid, 1);
+    }
+
+    return ListShape::collecting(shared, firstShape);
+}
+
+// The shape of the list a COLLECT gathers its one column into, which every branch of a
+// UNION contributes to: the one each branch would gather where they all agree, and a list
+// of tagged scalars where they do not
+ListShape collectedListShape(const UnionQuery::Branches& branches) {
+    std::optional<ListShape> shared;
+
+    for (const UnionQuery::Branch& branch : branches) {
+        const Projection* projection = branch._query->getReturnStmt()->getProjection();
+
+        const ListShape collected = std::visit([](auto&& item) {
+            return ListShape::collecting(item->getType(), item->getListShape());
+        }, projection->items().front());
+
+        if (!shared) {
+            shared = collected;
+            continue;
+        }
+
+        const bool agrees = collected.getDepth() == shared->getDepth()
+                         && collected.getLeafType() == shared->getLeafType();
+        if (!agrees) {
+            return ListShape(EvaluatedType::Invalid, 1);
+        }
+    }
+
+    return *shared;
+}
+
+// The types a scalar operand of '+' joins a list as: whatever an element of a list can be,
+// a tagged cell and a null included - appending a null leaves a list with a null in it.
+bool joinsAList(EvaluatedType type) {
+    return namesAListElementType(type)
+        || type == EvaluatedType::Char
+        || type == EvaluatedType::Null
+        || type == EvaluatedType::Any;
+}
+
+// The shape of the list appending a scalar makes: the list's own where the scalar is the
+// type its elements carry, and a list of tagged scalars where it is not, as a mixed list
+// literal is. A null carries no type, so it leaves the shape as it found it.
+ListShape appendedListShape(const ListShape& list, EvaluatedType scalar) {
+    const bool joinsTheLeaf = list.getDepth() == 1
+                              && (scalar == EvaluatedType::Null || list.getLeafType() == scalar);
+
+    if (!joinsTheLeaf) {
+        return ListShape(EvaluatedType::Invalid, 1);
+    }
+
+    return list;
+}
+
+// The shape of the list a concatenation makes: the one both sides carry, or a list of
+// tagged scalars when they carry different ones, as a mixed list literal is.
+ListShape concatenatedListShape(const ListShape& left, const ListShape& right) {
+    const bool sameDepth = left.getDepth() == right.getDepth();
+    const bool sameLeafType = left.getLeafType() == right.getLeafType();
+
+    if (!sameDepth || !sameLeafType) {
+        return ListShape(EvaluatedType::Invalid, 1);
+    }
+
+    return left;
+}
+
+bool isEntity(EvaluatedType type) {
+    return type == EvaluatedType::NodePattern || type == EvaluatedType::EdgePattern;
+}
+
+bool holdsAsAny(EvaluatedType type) {
+    return type == EvaluatedType::Any
+        || type == EvaluatedType::Char
+        || isEntity(type)
+        || convertibleToValueType(type);
+}
+
+// The type one column holding values of @param carried and of @param value takes: the type
+// the two unify to, Any when they share none but each rides a tagged cell, Invalid otherwise
+EvaluatedType selectedType(EvaluatedType carried, EvaluatedType value) {
+    const EvaluatedType unified = unifiedBranchType(carried, value);
+
+    if (unified != EvaluatedType::Invalid) {
+        return unified;
+    } else if (holdsAsAny(carried) && holdsAsAny(value)) {
+        return EvaluatedType::Any;
+    }
+
+    return EvaluatedType::Invalid;
+}
+
+}
 
 ExprAnalyzer::ExprAnalyzer(CypherAST* ast, const GraphView& graphView)
     : _ast(ast),
@@ -36,6 +355,10 @@ ExprAnalyzer::~ExprAnalyzer() {
 }
 
 void ExprAnalyzer::analyzeRootExpr(Expr* expr) {
+    // Each root is walked on its own: a SET analyzes its value expression a second time,
+    // once the property it assigns has been declared, and that walk has to run again
+    _analyzedExprs.clear();
+
     analyzeExpr(expr);
 
     if (!expr->getExprVarDecl()) {
@@ -44,9 +367,19 @@ void ExprAnalyzer::analyzeRootExpr(Expr* expr) {
 }
 
 void ExprAnalyzer::analyzeExpr(Expr* expr) {
+    // A comparison chain hands its middle operand to both of its sides, so one walk
+    // reaches that expression twice. Analyzing it again declares a second unnamed
+    // variable for a value that already has one, and orphans the first
+    if (!_analyzedExprs.insert(expr).second) {
+        return;
+    }
+
     switch (expr->getKind()) {
         case Expr::Kind::BINARY:
             analyzeBinaryExpr(static_cast<BinaryExpr*>(expr));
+        break;
+        case Expr::Kind::LOGICAL:
+            analyzeLogicalExpr(static_cast<LogicalExpr*>(expr));
         break;
         case Expr::Kind::UNARY:
             analyzeUnaryExpr(static_cast<UnaryExpr*>(expr));
@@ -60,8 +393,8 @@ void ExprAnalyzer::analyzeExpr(Expr* expr) {
         case Expr::Kind::PROPERTY:
             analyzePropertyExpr(static_cast<PropertyExpr*>(expr));
         break;
-        case Expr::Kind::PATH:
-            analyzePathExpr(static_cast<PathExpr*>(expr));
+        case Expr::Kind::PROPERTY_LOOKUP:
+            analyzePropertyLookupExpr(static_cast<PropertyLookupExpr*>(expr));
         break;
         case Expr::Kind::SYMBOL:
             analyzeSymbolExpr(static_cast<SymbolExpr*>(expr));
@@ -70,8 +403,7 @@ void ExprAnalyzer::analyzeExpr(Expr* expr) {
             analyzeLiteralExpr(static_cast<LiteralExpr*>(expr));
         break;
         case Expr::Kind::FUNCTION_INVOCATION:
-            analyzeFuncInvocExpr(static_cast<FunctionInvocationExpr*>(expr),
-                                _ast->getFunctionDecls());
+            analyzeFuncInvocExpr(static_cast<FunctionInvocationExpr*>(expr), &FunctionDecls::getBuiltins());
         break;
         case Expr::Kind::INDEX:
             analyzeIndexExpr(static_cast<IndexExpr*>(expr));
@@ -79,12 +411,72 @@ void ExprAnalyzer::analyzeExpr(Expr* expr) {
         case Expr::Kind::LIST:
             analyzeListExpr(static_cast<ListExpr*>(expr));
         break;
+        case Expr::Kind::LIST_SLICE:
+            analyzeListSliceExpr(static_cast<ListSliceExpr*>(expr));
+        break;
+        case Expr::Kind::LIST_COMPREHENSION:
+            analyzeListComprehensionExpr(static_cast<ListComprehensionExpr*>(expr));
+        break;
+        case Expr::Kind::PATTERN_COMPREHENSION:
+            analyzePatternComprehensionExpr(static_cast<PatternComprehensionExpr*>(expr));
+        break;
+        case Expr::Kind::LIST_PREDICATE:
+            analyzeListPredicateExpr(static_cast<ListPredicateExpr*>(expr));
+        break;
+        case Expr::Kind::REDUCE:
+            analyzeReduceExpr(static_cast<ReduceExpr*>(expr));
+        break;
+        case Expr::Kind::CASE:
+            analyzeCaseExpr(static_cast<CaseExpr*>(expr));
+        break;
+        case Expr::Kind::EXISTS:
+            analyzeExistsExpr(static_cast<ExistsExpr*>(expr));
+        break;
+        case Expr::Kind::COUNT_SUBQUERY:
+            analyzeCountSubqueryExpr(static_cast<CountSubqueryExpr*>(expr));
+        break;
+        case Expr::Kind::COLLECT_SUBQUERY:
+            analyzeCollectSubqueryExpr(static_cast<CollectSubqueryExpr*>(expr));
+        break;
 
         case Expr::Kind::_SIZE:
             throwError("Unknown expression type in ExprAnalyzer.");
         break;
 
     }
+}
+
+void ExprAnalyzer::analyzeExistsExpr(ExistsExpr* expr) {
+    bioassert(_queryAnalyzer, "EXISTS analyzed without a query analyzer.");
+
+    _queryAnalyzer->analyzeExistsBody(expr);
+
+    expr->setType(EvaluatedType::Bool);
+
+    // The body reads the graph over the rows in flight, so the answer is a value per row
+    // even where the body names nothing of the scope around it
+    expr->setDynamic();
+}
+
+void ExprAnalyzer::analyzeCountSubqueryExpr(CountSubqueryExpr* expr) {
+    bioassert(_queryAnalyzer, "COUNT analyzed without a query analyzer.");
+
+    _queryAnalyzer->analyzeCountSubqueryBody(expr);
+
+    expr->setType(EvaluatedType::Integer);
+    expr->setDynamic();
+}
+
+void ExprAnalyzer::analyzeCollectSubqueryExpr(CollectSubqueryExpr* expr) {
+    bioassert(_queryAnalyzer, "COLLECT analyzed without a query analyzer.");
+
+    _queryAnalyzer->analyzeCollectSubqueryBody(expr);
+
+    expr->setType(EvaluatedType::List);
+    expr->setListShape(collectedListShape(expr->getBranches()));
+    expr->setDynamic();
+
+    expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, EvaluatedType::List));
 }
 
 void ExprAnalyzer::analyzeBinaryExpr(BinaryExpr* expr) {
@@ -102,109 +494,43 @@ void ExprAnalyzer::analyzeBinaryExpr(BinaryExpr* expr) {
     const TypePairBitset pair(a, b);
 
     switch (expr->getOperator()) {
-        case BinaryOperator::Or:
-        case BinaryOperator::Xor:
-        case BinaryOperator::And: {
-            type = EvaluatedType::Bool;
-
-            if (pair == TypePairBitset(EvaluatedType::Bool, EvaluatedType::Bool)) {
-                break;
-            }
-
-            const std::string error = fmt::format(
-                "Operands must be booleans, not '{}' and '{}'",
-                EvaluatedTypeName::value(a),
-                EvaluatedTypeName::value(b));
-
-            throwError(error, expr);
-        } break;
-
         case BinaryOperator::NotEqual:
         case BinaryOperator::Equal: {
+            type = analyzeEquality(a, b, expr);
+        } break;
+
+        case BinaryOperator::IsNull:
+        case BinaryOperator::IsNotNull: {
             type = EvaluatedType::Bool;
 
-            if (pair == TypePairBitset(EvaluatedType::Double, EvaluatedType::Double)) {
-                const std::string error = fmt::format(
-                    "Equality of types '{}' and '{}' is not encouraged due to "
-                    "potential rounding innacuracy. Please constrain with '<' "
-                    "and '>' instead.",
-                    EvaluatedTypeName::value(a), EvaluatedTypeName::value(b));
-                throwError(error, expr);
-            }
-
-            if (pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::Integer)
-                || pair == TypePairBitset(EvaluatedType::String, EvaluatedType::String)
-                || pair == TypePairBitset(EvaluatedType::String, EvaluatedType::Char)
-                || pair == TypePairBitset(EvaluatedType::Char, EvaluatedType::Char)
-                || pair == TypePairBitset(EvaluatedType::Bool, EvaluatedType::Bool)
-                || pair == TypePairBitset(EvaluatedType::Embedding, EvaluatedType::Embedding)
-                || pair == TypePairBitset(EvaluatedType::Label, EvaluatedType::Label)
-                || pair == TypePairBitset(EvaluatedType::EdgeType, EvaluatedType::EdgeType)
-                || pair == TypePairBitset(EvaluatedType::PropertyType, EvaluatedType::PropertyType)) {
+            if (b == EvaluatedType::Null) {
                 break;
             }
 
-            // For IS NULL or IS NOT NULL
-            if (pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::Null)
-                || pair == TypePairBitset(EvaluatedType::String, EvaluatedType::Null)
-                || pair == TypePairBitset(EvaluatedType::String, EvaluatedType::Null)
-                || pair == TypePairBitset(EvaluatedType::Char, EvaluatedType::Null)
-                || pair == TypePairBitset(EvaluatedType::Bool, EvaluatedType::Null)
-                || pair == TypePairBitset(EvaluatedType::Embedding, EvaluatedType::Null)
-            ) {
-                break;
-            }
-
-            // Allows NodeID <-> NodeID and NodeID <-> Integer comparisons
-            if (pair == TypePairBitset(EvaluatedType::NodePattern,
-                                       EvaluatedType::NodePattern)
-                || pair == TypePairBitset(EvaluatedType::Integer,
-                                          EvaluatedType::NodePattern)) {
-                break;
-            }
-
-            // Allows EdgeID <-> EdgeID and EdgeID <-> Integer comparisons
-            if (pair == TypePairBitset(EvaluatedType::EdgePattern,
-                                       EvaluatedType::EdgePattern)
-                || pair == TypePairBitset(EvaluatedType::Integer,
-                                          EvaluatedType::EdgePattern)) {
-                break;
-            }
-
-            const std::string error = fmt::format(
-                "Operands are not valid or compatible types: '{}' and '{}'",
-                EvaluatedTypeName::value(a),
-                EvaluatedTypeName::value(b));
-
-            throwError(error, expr);
+            throwError(fmt::format("IS tests whether its operand is null, so its right side "
+                                   "must be NULL, not '{}'",
+                                   EvaluatedTypeName::value(b)),
+                       expr);
         } break;
+
         case BinaryOperator::LessThan:
         case BinaryOperator::GreaterThan:
         case BinaryOperator::LessThanOrEqual:
         case BinaryOperator::GreaterThanOrEqual: {
-            type = EvaluatedType::Bool;
-
-            if (pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::Integer)
-                || pair == TypePairBitset(EvaluatedType::Double, EvaluatedType::Double)
-                || pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::Double)) {
-                // Valid pair
+            type = orderingResultType(a, b);
+            if (type != EvaluatedType::Invalid) {
                 break;
             }
 
             const std::string error = fmt::format(
-                "Operands are not valid or compatible numeric types: '{}' and '{}'",
+                "Operands are not valid or compatible types for an ordering: '{}' and '{}'",
                 EvaluatedTypeName::value(a),
                 EvaluatedTypeName::value(b));
 
             throwError(error, expr);
         } break;
 
-        case BinaryOperator::Add:
-        case BinaryOperator::Sub:
-        case BinaryOperator::Mult:
-        case BinaryOperator::Div:
-        case BinaryOperator::Mod:
-        case BinaryOperator::Pow: {
+        case BinaryOperator::Add: {
             if (pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::Integer)) {
                 type = EvaluatedType::Integer;
                 break;
@@ -216,8 +542,213 @@ void ExprAnalyzer::analyzeBinaryExpr(BinaryExpr* expr) {
                 break;
             }
 
+            if (pair == TypePairBitset(EvaluatedType::String, EvaluatedType::String)) {
+                type = EvaluatedType::String;
+                break;
+            }
+
+            if (pair == TypePairBitset(EvaluatedType::List, EvaluatedType::List)) {
+                type = EvaluatedType::List;
+                expr->setListShape(concatenatedListShape(lhs->getListShape(), rhs->getListShape()));
+                break;
+            }
+
+            // A scalar joins a list as the one-element list it stands for, from either
+            // side: [1, 2] + 3 and 1 + [2, 3] are both [1, 2, 3]
+            const bool leftIsAList = a == EvaluatedType::List;
+            const bool oneSideIsAList = leftIsAList || b == EvaluatedType::List;
+            const EvaluatedType scalar = leftIsAList ? b : a;
+
+            if (oneSideIsAList && joinsAList(scalar)) {
+                const ListShape& listShape = leftIsAList ? lhs->getListShape() : rhs->getListShape();
+
+                type = EvaluatedType::List;
+                expr->setListShape(appendedListShape(listShape, scalar));
+                break;
+            }
+
+            if (concatenatesAsText(pair)) {
+                type = EvaluatedType::String;
+                break;
+            }
+
+            // A cell meets a string or a boolean row by row: holding text or a number it
+            // joins it as text, holding a list it takes it as an element
+            const bool addsATextToAny = pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::String)
+                                     || pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Char);
+            const bool addsABooleanToAny = pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Bool);
+            if (addsATextToAny || addsABooleanToAny) {
+                type = EvaluatedType::Any;
+                break;
+            }
+
+            if (pair == TypePairBitset(EvaluatedType::DateTime, EvaluatedType::Duration)) {
+                type = EvaluatedType::DateTime;
+                break;
+            } else if (pair == TypePairBitset(EvaluatedType::Duration, EvaluatedType::Duration)) {
+                type = EvaluatedType::Duration;
+                break;
+            } else if (computesTimeOverAny(pair)) {
+                type = EvaluatedType::Any;
+                break;
+            }
+
+            // Arithmetic over an unknown value is unknown, whatever the other side holds.
+            // A list appends the null instead, typed or held by a cell: [1, 2] + null
+            if (pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Null)) {
+                type = EvaluatedType::Any;
+                break;
+            } else if (a == EvaluatedType::Null || b == EvaluatedType::Null) {
+                type = EvaluatedType::Null;
+                break;
+            }
+
+            if (computesOverAny(pair)) {
+                type = EvaluatedType::Any;
+                break;
+            }
+
             const std::string error = fmt::format(
-                "Operands are not valid and compatible numeric types: '{} ' and '{}'",
+                "Operands are not valid and compatible types for '+': '{}' and '{}'",
+                EvaluatedTypeName::value(a),
+                EvaluatedTypeName::value(b));
+
+            throwError(error, expr);
+        } break;
+
+        case BinaryOperator::Concat: {
+            if (pair == TypePairBitset(EvaluatedType::String, EvaluatedType::String)) {
+                type = EvaluatedType::String;
+                break;
+            }
+
+            if (pair == TypePairBitset(EvaluatedType::List, EvaluatedType::List)) {
+                type = EvaluatedType::List;
+                expr->setListShape(concatenatedListShape(lhs->getListShape(), rhs->getListShape()));
+                break;
+            }
+
+            // A type-erased cell joins a string where its row holds a string, a list where
+            // it holds a list, and is a type error where it holds anything else
+            if (pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::String)) {
+                type = EvaluatedType::String;
+                break;
+            } else if (pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::List)) {
+                type = EvaluatedType::List;
+                expr->setListShape(ListShape(EvaluatedType::Invalid, 1));
+                break;
+            } else if (pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Any)) {
+                type = EvaluatedType::Any;
+                break;
+            }
+
+            // '||' joins two strings or two lists, so an unknown value is no side of one
+            // rather than an element to append: [1, 2] || null is null where [1, 2] + null
+            // is [1, 2, null]
+            if (a == EvaluatedType::Null || b == EvaluatedType::Null) {
+                type = EvaluatedType::Null;
+                break;
+            }
+
+            const std::string error = fmt::format(
+                "Operands are not valid and compatible types for '||': '{}' and '{}'",
+                EvaluatedTypeName::value(a),
+                EvaluatedTypeName::value(b));
+
+            throwError(error, expr);
+        } break;
+
+        case BinaryOperator::Sub:
+        case BinaryOperator::Mult:
+        case BinaryOperator::Div:
+        case BinaryOperator::Mod: {
+            const BinaryOperator binaryOperator = expr->getOperator();
+            const bool isSubtraction = binaryOperator == BinaryOperator::Sub;
+            const bool isMultiplication = binaryOperator == BinaryOperator::Mult;
+            const bool isDivision = binaryOperator == BinaryOperator::Div;
+
+            if (isSubtraction) {
+                const bool subtractsInstants = a == EvaluatedType::DateTime && b == EvaluatedType::DateTime;
+                const bool subtractsADuration = a == EvaluatedType::DateTime && b == EvaluatedType::Duration;
+                const bool subtractsDurations = a == EvaluatedType::Duration && b == EvaluatedType::Duration;
+
+                if (subtractsInstants || subtractsDurations) {
+                    type = EvaluatedType::Duration;
+                    break;
+                } else if (subtractsADuration) {
+                    type = EvaluatedType::DateTime;
+                    break;
+                } else if (computesTimeOverAny(pair)) {
+                    type = EvaluatedType::Any;
+                    break;
+                }
+            } else if (isMultiplication || isDivision) {
+                const bool scalesByANumber = pair == TypePairBitset(EvaluatedType::Duration, EvaluatedType::Integer)
+                                          || pair == TypePairBitset(EvaluatedType::Duration, EvaluatedType::Double);
+                const bool scalesAnAny = pair == TypePairBitset(EvaluatedType::Any, EvaluatedType::Duration);
+                const bool scalesTheDuration = isMultiplication || a == EvaluatedType::Duration;
+
+                if (scalesByANumber && scalesTheDuration) {
+                    type = EvaluatedType::Duration;
+                    break;
+                } else if (scalesAnAny) {
+                    type = EvaluatedType::Any;
+                    break;
+                }
+            }
+
+            if (pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::Integer)) {
+                type = EvaluatedType::Integer;
+                break;
+            }
+
+            if (pair == TypePairBitset(EvaluatedType::Double, EvaluatedType::Double)
+                || pair == TypePairBitset(EvaluatedType::Double, EvaluatedType::Integer)) {
+                type = EvaluatedType::Double;
+                break;
+            }
+
+            if (computesOverAny(pair)) {
+                type = EvaluatedType::Any;
+                break;
+            }
+
+            if (a == EvaluatedType::Null || b == EvaluatedType::Null) {
+                type = EvaluatedType::Null;
+                break;
+            }
+
+            const std::string error = fmt::format(
+                "Operands are not valid and compatible numeric types: '{}' and '{}'",
+                EvaluatedTypeName::value(a),
+                EvaluatedTypeName::value(b));
+
+            throwError(error, expr);
+        } break;
+
+        case BinaryOperator::Pow: {
+            const bool bothInteger = pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::Integer);
+            const bool bothDouble = pair == TypePairBitset(EvaluatedType::Double, EvaluatedType::Double);
+            const bool mixedNumeric = pair == TypePairBitset(EvaluatedType::Double, EvaluatedType::Integer);
+
+            // As per OpenCypher spec
+            if (bothInteger || bothDouble || mixedNumeric) {
+                type = EvaluatedType::Double;
+                break;
+            }
+
+            if (computesOverAny(pair)) {
+                type = EvaluatedType::Double;
+                break;
+            }
+
+            if (a == EvaluatedType::Null || b == EvaluatedType::Null) {
+                type = EvaluatedType::Null;
+                break;
+            }
+
+            const std::string error = fmt::format(
+                "Operands are not valid and compatible numeric types: '{}' and '{}'",
                 EvaluatedTypeName::value(a),
                 EvaluatedTypeName::value(b));
 
@@ -225,17 +756,16 @@ void ExprAnalyzer::analyzeBinaryExpr(BinaryExpr* expr) {
         } break;
 
         case BinaryOperator::In: {
-            type = EvaluatedType::Bool;
+            // A type-erased cell holds whatever its row put there, so the test reads the
+            // list out of its tag and answers null for a row holding something else
+            const bool searchesACell = b == EvaluatedType::Any;
+            const bool searchesNull = b == EvaluatedType::Null;
 
-            if (b != EvaluatedType::List && b != EvaluatedType::Map) {
+            type = searchesNull ? EvaluatedType::Null : EvaluatedType::Bool;
+
+            if (b != EvaluatedType::List && b != EvaluatedType::Map && !searchesACell && !searchesNull) {
                 const std::string error = fmt::format("IN operand must be a list or map, not '{}'",
                                                       EvaluatedTypeName::value(b));
-                throwError(error, expr);
-            }
-
-            if (a == EvaluatedType::List || a == EvaluatedType::Map) {
-                const std::string error = fmt::format("Left operand must be a scalar, not '{}'",
-                                                      EvaluatedTypeName::value(a));
                 throwError(error, expr);
             }
         } break;
@@ -263,6 +793,42 @@ void ExprAnalyzer::analyzeBinaryExpr(BinaryExpr* expr) {
     expr->setExprVarDecl(decl);
 }
 
+void ExprAnalyzer::analyzeLogicalExpr(LogicalExpr* expr) {
+    const std::string_view op = LogicalOperatorDescription::value(expr->getOperator());
+
+    // A side that holds a value can answer AND, OR and XOR for a null one: false AND null is
+    // false. With every side null there is no value to answer against
+    bool everyOperandIsNull = true;
+
+    for (Expr* operand : expr->getOperands()) {
+        analyzeExpr(operand);
+
+        const EvaluatedType operandType = operand->getType();
+        if (!namesATruthValue(operandType)) {
+            const std::string error = fmt::format("{} operand must be a boolean, not '{}'",
+                                                  op,
+                                                  EvaluatedTypeName::value(operandType));
+            throwError(error, operand);
+        }
+
+        everyOperandIsNull = everyOperandIsNull && operandType == EvaluatedType::Null;
+
+        if (operand->isDynamic()) {
+            expr->setDynamic();
+        }
+
+        if (operand->isAggregate()) {
+            expr->setAggregate();
+        }
+    }
+
+    const EvaluatedType type = everyOperandIsNull ? EvaluatedType::Null : EvaluatedType::Bool;
+    expr->setType(type);
+
+    const VarDecl* decl = _ctxt->createUnnamedVariable(_ast, type);
+    expr->setExprVarDecl(decl);
+}
+
 void ExprAnalyzer::analyzeUnaryExpr(UnaryExpr* expr) {
     Expr* operand = expr->getSubExpr();
     analyzeExpr(operand);
@@ -271,13 +837,14 @@ void ExprAnalyzer::analyzeUnaryExpr(UnaryExpr* expr) {
 
     switch (expr->getOperator()) {
         case UnaryOperator::Not: {
-            if (operand->getType() != EvaluatedType::Bool) {
+            const EvaluatedType operandType = operand->getType();
+            if (!namesATruthValue(operandType)) {
                 const std::string error = fmt::format("NOT operand must be a boolean, not '{}'",
-                                                      EvaluatedTypeName::value(operand->getType()));
+                                                      EvaluatedTypeName::value(operandType));
                 throwError(error, expr);
             }
 
-            type = EvaluatedType::Bool;
+            type = operandType == EvaluatedType::Null ? EvaluatedType::Null : EvaluatedType::Bool;
         } break;
 
         case UnaryOperator::Minus:
@@ -287,8 +854,14 @@ void ExprAnalyzer::analyzeUnaryExpr(UnaryExpr* expr) {
                 type = EvaluatedType::Integer;
             } else if (operandType == EvaluatedType::Double) {
                 type = EvaluatedType::Double;
+            } else if (operandType == EvaluatedType::Duration) {
+                type = EvaluatedType::Duration;
+            } else if (operandType == EvaluatedType::Null) {
+                type = EvaluatedType::Null;
+            } else if (operandType == EvaluatedType::Any) {
+                type = EvaluatedType::Any;
             } else {
-                const std::string error = fmt::format("Operand must be an integer or double, not '{}'",
+                const std::string error = fmt::format("Operand must be an integer, a double or a duration, not '{}'",
                                                       EvaluatedTypeName::value(operandType));
                 throwError(error, expr);
             }
@@ -312,14 +885,41 @@ void ExprAnalyzer::analyzeUnaryExpr(UnaryExpr* expr) {
     }
 }
 
+VarDecl* ExprAnalyzer::resolveVariable(std::string_view name) {
+    if (VarDecl* local = _ctxt->getDecl(name)) {
+        return local;
+    }
+
+    VarDecl* outer = _ctxt->lookup(name);
+    if (outer && _importSink && std::ranges::find(*_importSink, outer) == _importSink->end()) {
+        _importSink->push_back(outer);
+    }
+
+    return outer;
+}
+
+ValueType ExprAnalyzer::resolvePropertyType(std::string_view name) const {
+    const std::optional<PropertyType> graphType = _graphMetadata.propTypes().get(name);
+    const auto toBeCreated = _toBeCreatedTypes.find(name);
+
+    if (graphType) {
+        return graphType->_valueType;
+    } else if (toBeCreated != _toBeCreatedTypes.end()) {
+        return toBeCreated->second;
+    }
+
+    return ValueType::Invalid;
+}
+
 void ExprAnalyzer::analyzeSymbolExpr(SymbolExpr* expr) {
-    VarDecl* varDecl = _ctxt->getDecl(expr->getSymbol()->getName());
+    VarDecl* varDecl = resolveVariable(expr->getSymbol()->getName());
     if (!varDecl) {
         throwError(fmt::format("Variable '{}' not found", expr->getSymbol()->getName()), expr);
     }
 
     expr->setDecl(varDecl);
     expr->setType(varDecl->getType());
+    expr->setListShape(varDecl->getListShape());
     expr->setExprVarDecl(varDecl);
 
     // For now, variable expressions cannot be evaluated at compile time
@@ -356,20 +956,14 @@ void ExprAnalyzer::analyzeLiteralExpr(LiteralExpr* expr) {
         } break;
         case Literal::Kind::LIST: {
             expr->setType(EvaluatedType::List);
-            auto* list = static_cast<ListLiteral*>(expr->getLiteral());
-            for (Expr* item : list->items()) {
-                const Expr::Kind itemKind = item->getKind();
-                const bool itemLiteral = itemKind == Expr::Kind::LITERAL;
-
-                if (!itemLiteral) {
-                    throwError("Non-literal list elements are not yet supported", item);
-                }
-
-                analyzeExpr(item);
-            }
+            ListLiteral* list = static_cast<ListLiteral*>(expr->getLiteral());
+            analyzeListElements(expr, list->items());
         } break;
         case Literal::Kind::MAP: {
             expr->setType(EvaluatedType::Map);
+
+            const MapLiteral* map = static_cast<const MapLiteral*>(literal);
+            analyzeMapEntries(expr, map);
         } break;
         case Literal::Kind::EMBEDDING: {
             const auto* embLit = static_cast<const EmbeddingLiteral*>(literal);
@@ -383,6 +977,9 @@ void ExprAnalyzer::analyzeLiteralExpr(LiteralExpr* expr) {
         case Literal::Kind::WILDCARD: {
             expr->setType(EvaluatedType::Wildcard);
         } break;
+        case Literal::Kind::NORMAL_FORM: {
+            expr->setType(EvaluatedType::NormalForm);
+        } break;
     }
 
     expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, expr->getType()));
@@ -391,78 +988,270 @@ void ExprAnalyzer::analyzeLiteralExpr(LiteralExpr* expr) {
 ValueType ExprAnalyzer::analyzePropertyExpr(PropertyExpr* expr, bool allowCreate, ValueType defaultType) {
     const QualifiedName* qualifiedName = expr->getFullName();
 
-    if (qualifiedName->size() != 2) {
+    // Two names read a property of an entity or a field of a row; three read a component
+    // off a property holding an instant or a duration, the one chain a value extends
+    const bool readsAComponentOfAProperty = qualifiedName->size() == 3;
+
+    if (qualifiedName->size() != 2 && !readsAComponentOfAProperty) {
         throwError("Invalid property expression.", expr);
     }
 
     const Symbol* varName = qualifiedName->front();
-    const Symbol* propName = qualifiedName->back();
+    const Symbol* propName = qualifiedName->get(1);
 
-    VarDecl* varDecl = _ctxt->getDecl(varName->getName());
+    // An anonymous pattern's declaration carries no name the context can resolve, so the
+    // predicate its inline property map becomes arrives with that declaration already set
+    VarDecl* varDecl = expr->getEntityVarDecl();
+    if (!varDecl) {
+        varDecl = resolveVariable(varName->getName());
+    }
+
     if (!varDecl) {
         throwError(fmt::format("Variable '{}' not found", varName->getName()), expr);
     }
 
-    if (varDecl->getType() == EvaluatedType::StringTable) {
+    const EvaluatedType varType = varDecl->getType();
+
+    // A third name is a calendar field of an instant or a key of a map, and only the
+    // property's own type tells the two apart, so the verdict waits until it is resolved
+    DateTimePart part {DateTimePart::Year};
+    DurationPart durationPart {DurationPart::Years};
+    bool namesADateTimePart = false;
+    bool namesADurationPart = false;
+    std::string_view componentName;
+    std::string_view componentOwner;
+
+    if (readsAComponentOfAProperty) {
+        const Symbol* componentSymbol = qualifiedName->back();
+        componentName = componentSymbol->getName();
+        namesADateTimePart = DateTime::partNamed(componentName, part);
+        namesADurationPart = Duration::partNamed(componentName, durationPart);
+        componentOwner = componentOwnerName(namesADateTimePart, namesADurationPart);
+
+        // A write naming a property the graph does not carry would introduce it, and
+        // neither a component nor a key names one: turned away here, before the name is
+        // read as a new one. Which of the two it is only the property's type says, and an
+        // unknown property names no map, so it is the component this turns away.
+        if (allowCreate) {
+            const bool readsAMapVariable = varType == EvaluatedType::Map;
+            const bool storesAMap = resolvePropertyType(propName->getName()) == ValueType::Map;
+
+            const bool namesAMapKey = readsAMapVariable || storesAMap;
+
+            if (namesAMapKey) {
+                throwError(mapKeyNotAProperty, expr);
+            } else if (!namesADateTimePart && !namesADurationPart) {
+                throwError(fmt::format("'{}' is not a component of a {}", componentName, componentOwner), expr);
+            } else if (namesADateTimePart) {
+                throwError(datetimeComponentNotAProperty, expr);
+            }
+
+            throwError(fmt::format("A {} component cannot name a property.", componentOwner), expr);
+        }
+    }
+
+    // d.year or d.hours, where d was bound to an instant or a duration rather than to an entity
+    const bool bindsAValueWithComponents = varType == EvaluatedType::DateTime
+                                        || varType == EvaluatedType::Duration;
+
+    if (bindsAValueWithComponents && !readsAComponentOfAProperty) {
+        const std::string_view name = propName->getName();
+
+        if (varType == EvaluatedType::DateTime) {
+            if (!DateTime::partNamed(name, part)) {
+                throwError(fmt::format("'{}' is not a component of a datetime", name), expr);
+            }
+
+            expr->setDateTimePart(part);
+        } else {
+            if (!Duration::partNamed(name, durationPart)) {
+                throwError(fmt::format("'{}' is not a component of a duration", name), expr);
+            }
+
+            expr->setDurationPart(durationPart);
+        }
+
+        expr->setEntityVarDecl(varDecl);
+        expr->setType(EvaluatedType::Integer);
+        expr->setDynamic();
+
+        expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, EvaluatedType::Integer));
+
+        return ValueType::Int64;
+    }
+
+    if (varType == EvaluatedType::StringTable) {
+        if (readsAComponentOfAProperty) {
+            throwError(fmt::format("Field '{}' of '{}' is 'String', only a {} has components",
+                                   propName->getName(),
+                                   varName->getName(),
+                                   componentOwner),
+                       expr);
+        }
+
         // CSV header access: row.columnName
         expr->setEntityVarDecl(varDecl);
         expr->setPropertyName(propName->getName());
         expr->setStringTableHeaderAccess(true);
         expr->setType(EvaluatedType::String);
         expr->setDynamic();
-        auto* exprDecl = _ctxt->createUnnamedVariable(_ast, EvaluatedType::String);
-        expr->setExprVarDecl(exprDecl);
+
+        LoadCSVStmt* const loadCSV = findCSVSource(varDecl);
+        if (loadCSV) {
+            // Without a header line the file names no field, so there is nothing for a
+            // header access to resolve against - only a position reaches a field
+            if (!loadCSV->hasHeaders()) {
+                throwError(fmt::format("'{}' was loaded without WITH HEADERS, so it has no field "
+                                       "named '{}': read it by position, as {}[<index>]",
+                                       varName->getName(), propName->getName(), varName->getName()),
+                           expr);
+            }
+
+            const size_t slot = loadCSV->declareField(propName->getName());
+            expr->setCSVFieldDecl(declareCSVField(*loadCSV, slot));
+        }
+
+        expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, EvaluatedType::String));
+
         return ValueType::String;
     }
 
-    if (varDecl->getType() != EvaluatedType::NodePattern
-        && varDecl->getType() != EvaluatedType::EdgePattern) {
-        const std::string error = fmt::format(
-            "Variable '{}' is '{}' it must be a node or edge",
-            varName->getName(), EvaluatedTypeName::value(varDecl->getType()));
+    // A variable bound only ever to null, as the element of a null list is, has no entity
+    // to read: its property is null, as the property of a null entity is
+    const bool readsANullVariable = varType == EvaluatedType::Null && !allowCreate;
+    if (readsANullVariable) {
+        expr->setEntityVarDecl(varDecl);
+        expr->setPropertyName(propName->getName());
+        expr->setType(EvaluatedType::Null);
+        expr->setDynamic();
 
-        throwError(error, expr);
+        expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, EvaluatedType::Null));
+
+        return ValueType::Invalid;
     }
 
-    const auto propTypeFound = _graphMetadata.propTypes().get(propName->getName());
+    const bool readsAKeyOfTheVariable = varType == EvaluatedType::Map
+                                     || varType == EvaluatedType::Any;
 
-    ValueType vt = ValueType::Invalid;
-
-    if (!propTypeFound) {
-        // Property does not exist yet
-
-        const std::string_view name = propName->getName();
-        auto it = _toBeCreatedTypes.find(name);
-
-        if (it == _toBeCreatedTypes.end()) {
-            if (!allowCreate) {
-                // Property does not exist and is not meant to be created in this query
-                const std::string error = fmt::format("Property type '{}' not found", propName->getName());
-                throwError(error, expr);
-            } else {
-                // Property does not exist but is created
-                addToBeCreatedType(propName->getName(), defaultType, expr);
-                it = _toBeCreatedTypes.find(name);
-            }
+    // m.key, where m was bound to a map rather than to an entity, or to a tagged cell whose
+    // row may hold one
+    if (readsAKeyOfTheVariable) {
+        if (allowCreate) {
+            throwError(mapKeyNotAProperty, expr);
         }
 
-        // Property is meant to be created in this query
-        vt = it->second;
-        expr->setPropertyName(name);
-    } else {
-        // Property already exists
-        vt = propTypeFound.value()._valueType;
-        expr->setPropertyName(propName->getName());
+        if (readsAComponentOfAProperty) {
+            throwError(fmt::format("'{}.{}' reads a key of a map held by another map, "
+                                   "which is not supported",
+                                   varName->getName(), propName->getName()),
+                       expr);
+        }
+
+        expr->setEntityVarDecl(varDecl);
+        expr->setMapKey(propName->getName());
+        expr->setType(EvaluatedType::Any);
+        expr->setDynamic();
+
+        expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, EvaluatedType::Any));
+
+        return ValueType::Invalid;
     }
 
-    const auto maybeEvalType = toEvaluatedType(vt);
-    if (!maybeEvalType.has_value()) {
-        const std::string_view name = propName->getName();
-        const std::string error = fmt::format("Property type '{}' is invalid", name);
+    if (varType != EvaluatedType::NodePattern && varType != EvaluatedType::EdgePattern) {
+        const std::string error = fmt::format(
+            "Variable '{}' is '{}' it must be a node or edge",
+            varName->getName(), EvaluatedTypeName::value(varType));
+
         throwError(error, expr);
     }
 
-    EvaluatedType type = *maybeEvalType;
+    if (varDecl->isQuantifiedPath()) {
+        throwError(fmt::format("Variable '{}' binds the list of a variable-length path, "
+                               "not a single entity: it has no property '{}'",
+                               varName->getName(), propName->getName()),
+                   expr);
+    }
+
+    const std::string_view name = propName->getName();
+    ValueType vt = resolvePropertyType(name);
+
+    if (vt == ValueType::Invalid && allowCreate) {
+        addToBeCreatedType(name, defaultType, expr);
+        vt = defaultType;
+    }
+
+    // A name no property in the graph carries has no value on any row and no type: the
+    // read is null.
+    const bool readsAsNull = vt == ValueType::Invalid && !allowCreate;
+
+    if (!readsAsNull) {
+        expr->setValueType(vt);
+    }
+
+    expr->setPropertyName(name);
+
+    EvaluatedType type = EvaluatedType::Null;
+
+    if (!readsAsNull) {
+        const auto maybeEvalType = toEvaluatedType(vt);
+        if (!maybeEvalType.has_value()) {
+            const std::string error = fmt::format("Property type '{}' is invalid", name);
+            throwError(error, expr);
+        }
+
+        type = *maybeEvalType;
+    }
+
+    if (readsAComponentOfAProperty) {
+        const bool readsAnInstant = type == EvaluatedType::DateTime;
+        const bool readsADuration = type == EvaluatedType::Duration;
+        const bool readsAMap = type == EvaluatedType::Map;
+
+        if (readsAnInstant) {
+            if (!namesADateTimePart) {
+                throwError(fmt::format("'{}' is not a component of a datetime", componentName), expr);
+            }
+
+            expr->setDateTimePart(part);
+
+            type = EvaluatedType::Integer;
+            vt = ValueType::Int64;
+        } else if (readsADuration) {
+            if (!namesADurationPart) {
+                throwError(fmt::format("'{}' is not a component of a duration", componentName), expr);
+            }
+
+            expr->setDurationPart(durationPart);
+
+            type = EvaluatedType::Integer;
+            vt = ValueType::Int64;
+        } else if (readsAMap) {
+            expr->setMapKey(componentName);
+
+            type = EvaluatedType::Any;
+            vt = ValueType::Invalid;
+        } else if (readsAsNull) {
+            // The property is not one the graph carries, so the third name resolves against
+            // null. A component of null is null; a name that is no component names nothing
+            // this read could ever answer.
+            if (!namesADateTimePart && !namesADurationPart) {
+                throwError(fmt::format("'{}' does not exist for type '{}'",
+                                       componentName,
+                                       EvaluatedTypeName::value(type)),
+                           expr);
+            } else if (namesADateTimePart) {
+                expr->setDateTimePart(part);
+            } else {
+                expr->setDurationPart(durationPart);
+            }
+        } else {
+            throwError(fmt::format("Property '{}' is '{}', only a {} or a map has components",
+                                   propName->getName(),
+                                   EvaluatedTypeName::value(type),
+                                   componentOwner),
+                       expr);
+        }
+    }
 
     expr->setEntityVarDecl(varDecl);
     expr->setType(type);
@@ -473,6 +1262,84 @@ ValueType ExprAnalyzer::analyzePropertyExpr(PropertyExpr* expr, bool allowCreate
     return vt;
 }
 
+// A datetime or duration component and a map key are all read out of a property rather than
+// being one, so none of them can be the property a write or an index targets.
+void ExprAnalyzer::throwIfReadsPartOfAProperty(const PropertyExpr* expr) {
+    if (expr->readsADateTimeComponent()) {
+        throwError(datetimeComponentNotAProperty, expr);
+    } else if (expr->readsADurationComponent()) {
+        throwError("A duration component cannot name a property.", expr);
+    } else if (expr->readsAMapKey()) {
+        throwError(mapKeyNotAProperty, expr);
+    }
+}
+
+void ExprAnalyzer::analyzePropertyLookupExpr(PropertyLookupExpr* expr) {
+    Expr* base = expr->getBase();
+    analyzeExpr(base);
+
+    const EvaluatedType baseType = base->getType();
+    const std::string_view propName = expr->getPropName();
+
+    const bool readsAnEntity = baseType == EvaluatedType::NodePattern
+                            || baseType == EvaluatedType::EdgePattern;
+
+    // A map, and a tagged cell the row may have put a map in: both answer a key read
+    const bool readsAMapKey = baseType == EvaluatedType::Map
+                           || baseType == EvaluatedType::Any;
+
+    EvaluatedType type = EvaluatedType::Null;
+
+    if (baseType == EvaluatedType::DateTime) {
+        DateTimePart part {DateTimePart::Year};
+        if (!DateTime::partNamed(propName, part)) {
+            throwError(fmt::format("'{}' is not a component of a datetime", propName), expr);
+        }
+
+        expr->setDateTimePart(part);
+        type = EvaluatedType::Integer;
+    } else if (baseType == EvaluatedType::Duration) {
+        DurationPart part {DurationPart::Years};
+        if (!Duration::partNamed(propName, part)) {
+            throwError(fmt::format("'{}' is not a component of a duration", propName), expr);
+        }
+
+        expr->setDurationPart(part);
+        type = EvaluatedType::Integer;
+    } else if (readsAnEntity) {
+        const ValueType valueType = resolvePropertyType(propName);
+
+        if (valueType != ValueType::Invalid) {
+            const auto maybeEvalType = toEvaluatedType(valueType);
+            if (!maybeEvalType.has_value()) {
+                throwError(fmt::format("Property type '{}' is invalid", propName), expr);
+            }
+
+            expr->setValueType(valueType);
+            type = *maybeEvalType;
+        }
+    } else if (readsAMapKey) {
+        expr->setReadsAMapKey();
+        type = EvaluatedType::Any;
+    } else if (baseType != EvaluatedType::Null) {
+        throwError(fmt::format("A value of type '{}' has no property '{}'",
+                               EvaluatedTypeName::value(baseType), propName),
+                   expr);
+    }
+
+    expr->setType(type);
+
+    if (base->isDynamic()) {
+        expr->setDynamic();
+    }
+
+    if (base->isAggregate()) {
+        expr->setAggregate();
+    }
+
+    expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, type));
+}
+
 void ExprAnalyzer::analyzeIndexExpr(IndexExpr* expr) {
     Expr* base = expr->getBase();
     Expr* indexExpr = expr->getIndexExpr();
@@ -480,14 +1347,114 @@ void ExprAnalyzer::analyzeIndexExpr(IndexExpr* expr) {
     analyzeExpr(base);
     analyzeExpr(indexExpr);
 
-    if (base->getType() != EvaluatedType::StringTable) {
-        throwError(fmt::format("Index operator [] can only be applied to StringTable, not '{}'",
-                               EvaluatedTypeName::value(base->getType())), expr);
+    if (base->isDynamic() || indexExpr->isDynamic()) {
+        expr->setDynamic();
     }
 
-    if (indexExpr->getType() != EvaluatedType::Integer) {
+    if (base->isAggregate() || indexExpr->isAggregate()) {
+        expr->setAggregate();
+    }
+
+    const EvaluatedType baseType = base->getType();
+    const VarDecl* baseDecl = base->getExprVarDecl();
+
+    const bool indexesAPath = baseDecl && baseDecl->isQuantifiedPath();
+    const bool indexesAList = baseType == EvaluatedType::List;
+    const bool indexesAMap = baseType == EvaluatedType::Map;
+    const bool indexesACSVRow = baseType == EvaluatedType::StringTable;
+
+    const bool indexesATaggedCell = baseType == EvaluatedType::Any;
+
+    const bool indexesANullValue = baseType == EvaluatedType::Null;
+
+    if (!indexesAPath && !indexesAList && !indexesAMap && !indexesATaggedCell && !indexesACSVRow
+        && !indexesANullValue) {
+        throwError(fmt::format("Index operator [] can only be applied to a list, a map or a CSV row, not '{}'",
+                               EvaluatedTypeName::value(baseType)), expr);
+    }
+
+    if (indexesACSVRow) {
+        analyzeCSVRowIndex(expr);
+        return;
+    }
+
+    const EvaluatedType indexType = indexExpr->getType();
+
+    const bool indexesByKey = indexType == EvaluatedType::String;
+    const bool indexesByPosition = indexType == EvaluatedType::Integer;
+    const bool indexesByNull = indexType == EvaluatedType::Null;
+
+    // What an index can be at all, which no base changes. Which of the two a base takes is
+    // its own question, below.
+    if (!indexesByKey && !indexesByPosition && !indexesByNull) {
+        throwError(fmt::format("An index is an integer position or a string key, not '{}'",
+                               EvaluatedTypeName::value(indexType)), expr);
+    }
+
+    // Set a null index, and a read of a null value, to evaluate to a null type
+    if (indexesANullValue || indexesByNull) {
+        expr->setType(EvaluatedType::Null);
+        expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, EvaluatedType::Null));
+
+        return;
+    }
+
+    // A tagged cell takes either kind, since only its row says which it holds
+    const bool readsByPositionOnly = indexesAPath || indexesAList;
+
+    if (indexesAMap && !indexesByKey) {
+        throwError(fmt::format("A map is indexed by a string key, not by '{}'",
+                               EvaluatedTypeName::value(indexType)), expr);
+    } else if (readsByPositionOnly && !indexesByPosition) {
+        throwError(fmt::format("A list index expression must be an integer, not '{}'",
+                               EvaluatedTypeName::value(indexType)), expr);
+    }
+
+    if (indexesByKey) {
+        // A map literal names its own keys, so reading one back is a separate feature. It is
+        // turned away first, since the dotted form it would be sent to does not parse either.
+        if (base->getKind() == Expr::Kind::LITERAL) {
+            throwError("Reading a key of a map literal is not supported yet.", expr);
+        }
+
+        // The bracket form reads a key computed per row. A key written in the query is not
+        // one, whatever it is read off, so it is sent to the dotted form.
+        if (indexExpr->getKind() == Expr::Kind::LITERAL) {
+            throwError("A map key known in the query is written m.key, not m['key']", expr);
+        }
+
+        expr->setReadsAMapKey();
+        expr->setType(EvaluatedType::Any);
+
+        expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, EvaluatedType::Any));
+
+        return;
+    }
+
+    // The case where we are reading from a list or path
+    const EvaluatedType elementType = indexesAPath ? baseType : base->getListShape().unwoundType();
+    const bool readsAValue = convertibleToValueType(elementType);
+    const bool readsAnEntity = elementType == EvaluatedType::NodePattern
+                            || elementType == EvaluatedType::EdgePattern;
+    const bool readsTheElementType = readsAValue || readsAnEntity;
+    const EvaluatedType indexedType = readsTheElementType ? elementType : EvaluatedType::Any;
+
+    expr->setType(indexedType);
+
+    expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, indexedType));
+}
+
+void ExprAnalyzer::analyzeCSVRowIndex(IndexExpr* expr) {
+    const Expr* base = expr->getBase();
+    const Expr* indexExpr = expr->getIndexExpr();
+
+    const EvaluatedType indexType = indexExpr->getType();
+
+    // A row has no null position to read, so a null index names no field here, unlike the
+    // one a list or a map answers
+    if (indexType != EvaluatedType::Integer) {
         throwError(fmt::format("Index expression must be an integer, not '{}'",
-                               EvaluatedTypeName::value(indexExpr->getType())), expr);
+                               EvaluatedTypeName::value(indexType)), expr);
     }
 
     // Detect literal index for compile-time optimization
@@ -505,8 +1472,59 @@ void ExprAnalyzer::analyzeIndexExpr(IndexExpr* expr) {
 
     expr->setType(EvaluatedType::String);
     expr->setDynamic();
-    auto* varDecl = _ctxt->createUnnamedVariable(_ast, EvaluatedType::String);
-    expr->setExprVarDecl(varDecl);
+
+    // A computed index names no field of the load: which column it reads is only known
+    // once the row is in hand, so it keeps an access of its own and the engine that
+    // cannot build one reports the gap
+    LoadCSVStmt* const loadCSV = findCSVSource(base->getExprVarDecl());
+    if (loadCSV && expr->hasLiteralIndex()) {
+        const size_t slot = loadCSV->declareField(expr->getLiteralIndex());
+        expr->setCSVFieldDecl(declareCSVField(*loadCSV, slot));
+    }
+
+    expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, EvaluatedType::String));
+}
+
+void ExprAnalyzer::registerCSVSource(const VarDecl* alias, LoadCSVStmt* loadCSV) {
+    _csvSources[alias] = loadCSV;
+}
+
+void ExprAnalyzer::importCSVSource(const VarDecl* imported, const VarDecl* source) {
+    LoadCSVStmt* const loadCSV = findCSVSource(source);
+    if (loadCSV) {
+        registerCSVSource(imported, loadCSV);
+    }
+}
+
+LoadCSVStmt* ExprAnalyzer::findCSVSource(const VarDecl* alias) const {
+    const auto foundIt = _csvSources.find(alias);
+    if (foundIt == end(_csvSources)) {
+        return nullptr;
+    }
+
+    return foundIt->second;
+}
+
+VarDecl* ExprAnalyzer::declareCSVField(LoadCSVStmt& loadCSV, size_t slot) {
+    VarDecl* decl = loadCSV.getField(slot)._decl;
+    if (decl) {
+        return decl;
+    }
+
+    const LoadCSVStmt::Field& field = loadCSV.getField(slot);
+    const std::string_view alias = loadCSV.getAliasDecl()->getName();
+
+    // Named after the access rather than v0, v1, ...: codegen tells columns apart by name,
+    // and a subquery body numbers its unnamed variables from v0 again
+    std::string* name = _ast->createString();
+    *name = field._byHeader ? fmt::format("{}.{}", alias, field._header)
+                            : fmt::format("{}[{}]", alias, field._index);
+
+    decl = VarDecl::create(_ast, _ctxt, *name, EvaluatedType::String);
+    decl->setIsUnnamed(true);
+    loadCSV.setFieldDecl(slot, decl);
+
+    return decl;
 }
 
 void ExprAnalyzer::analyzeStringExpr(StringExpr* expr) {
@@ -516,11 +1534,21 @@ void ExprAnalyzer::analyzeStringExpr(StringExpr* expr) {
     analyzeExpr(lhs);
     analyzeExpr(rhs);
 
-    if (lhs->getType() != EvaluatedType::String || rhs->getType() != EvaluatedType::String) {
+    const EvaluatedType lhsType = lhs->getType();
+    const EvaluatedType rhsType = rhs->getType();
+
+    // A type-erased cell carries its own type, so the characters it holds are read row by
+    // row, exactly as an equality against one is.
+    const bool lhsReadsAsString = lhsType == EvaluatedType::String
+                               || lhsType == EvaluatedType::Any;
+    const bool rhsReadsAsString = rhsType == EvaluatedType::String
+                               || rhsType == EvaluatedType::Any;
+
+    if (!lhsReadsAsString || !rhsReadsAsString) {
         const std::string error = fmt::format(
             "String expressions operands must be strings, not '{}' and '{}'",
-            EvaluatedTypeName::value(lhs->getType()),
-            EvaluatedTypeName::value(rhs->getType()));
+            EvaluatedTypeName::value(lhsType),
+            EvaluatedTypeName::value(rhsType));
 
         throwError(error, expr);
     }
@@ -541,20 +1569,37 @@ void ExprAnalyzer::analyzeStringExpr(StringExpr* expr) {
 }
 
 void ExprAnalyzer::analyzeEntityTypeExpr(EntityTypeExpr* expr) {
+    if (Expr* operand = expr->getOperand()) {
+        analyzeTypeTestOfAnExpr(expr, operand);
+        return;
+    }
+
     expr->setType(EvaluatedType::Bool);
 
-    VarDecl* decl = _ctxt->getDecl(expr->getSymbol()->getName());
+    VarDecl* decl = resolveVariable(expr->getSymbol()->getName());
 
     if (!decl) {
         throwError(fmt::format("Variable '{}' not found", expr->getSymbol()->getName()), expr);
     }
 
-    if (decl->getType() != EvaluatedType::NodePattern
-        && decl->getType() != EvaluatedType::EdgePattern) {
+    const EvaluatedType entityType = decl->getType();
+    const bool isEntity = entityType == EvaluatedType::NodePattern || entityType == EvaluatedType::EdgePattern;
+    if (!isEntity && entityType != EvaluatedType::Null) {
         const std::string error = fmt::format("Variable '{}' is '{}'. Must be NodePattern or EdgePattern",
-                                              decl->getName(), EvaluatedTypeName::value(decl->getType()));
+                                              decl->getName(), EvaluatedTypeName::value(entityType));
 
         throwError(error, expr);
+    }
+
+    if (decl->isQuantifiedPath()) {
+        throwError(fmt::format("Variable '{}' binds the list of a variable-length path, "
+                               "not a single entity: it has no label or type",
+                               decl->getName()),
+                   expr);
+    }
+
+    if (entityType == EvaluatedType::Null) {
+        expr->setType(EvaluatedType::Null);
     }
 
     expr->setEntityDecl(decl);
@@ -562,11 +1607,33 @@ void ExprAnalyzer::analyzeEntityTypeExpr(EntityTypeExpr* expr) {
     expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, expr->getType()));
 }
 
-void ExprAnalyzer::analyzePathExpr(PathExpr* expr) {
-    throwError("Path expressions not supported", expr);
+void ExprAnalyzer::analyzeTypeTestOfAnExpr(EntityTypeExpr* expr, Expr* operand) {
+    analyzeExpr(operand);
+
+    const EvaluatedType operandType = operand->getType();
+    const bool testsAnEntity = operandType == EvaluatedType::NodePattern
+                            || operandType == EvaluatedType::EdgePattern;
+
+    if (!testsAnEntity && operandType != EvaluatedType::Null) {
+        throwError(fmt::format("A label or type test needs a node or an edge, not '{}'",
+                               EvaluatedTypeName::value(operandType)),
+                   expr);
+    }
+
+    expr->setType(testsAnEntity ? EvaluatedType::Bool : EvaluatedType::Null);
+
+    if (operand->isDynamic()) {
+        expr->setDynamic();
+    }
+
+    if (operand->isAggregate()) {
+        expr->setAggregate();
+    }
+
+    expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, expr->getType()));
 }
 
-void ExprAnalyzer::analyzeFuncInvocExpr(FunctionInvocationExpr* expr, FunctionResolver* resolver) {
+void ExprAnalyzer::analyzeFuncInvocExpr(FunctionInvocationExpr* expr, const FunctionResolver* resolver) {
     const FunctionInvocation* invoc = expr->getFunctionInvocation();
     const std::vector<Symbol*>& names = invoc->getName()->names();
 
@@ -611,26 +1678,91 @@ void ExprAnalyzer::analyzeFuncInvocExpr(FunctionInvocationExpr* expr, FunctionRe
         expr->setAggregate();
     }
 
+    // Nested aggregates not allowed by OpenCypher: reject here
+    bool functionIsAggregate = false;
+    for (const FunctionSignature* candidate : signatures) {
+        if (candidate->isAggregate()) {
+            functionIsAggregate = true;
+            break;
+        }
+    }
+
+    if (functionIsAggregate && isAggregate) {
+        throwError("Aggregate functions cannot be nested inside other aggregate functions", expr);
+    }
+
+    const FunctionArgumentType* constantReadingARow = nullptr;
+    const Expr* rowReadingArg = nullptr;
+
     // For each overload, check if the argument types match
-    for (FunctionSignature* signature : signatures) {
+    for (const FunctionSignature* signature : signatures) {
         const auto& expectedArgs = signature->argumentTypes();
+
+        // A signature unifying its arguments declares none of them, so its arity is a
+        // minimum alone and there is no expected type to match each against: they are
+        // checked against each other once the overload is settled on.
+        const bool unifiesArguments = signature->unifiesItsArguments();
 
         const size_t minArgs = signature->getMinArgCount();
         const size_t maxArgs = expectedArgs.size();
 
-        if (providedArgs.size() < minArgs || providedArgs.size() > maxArgs) {
+        const bool tooFewArgs = providedArgs.size() < minArgs;
+        const bool tooManyArgs = !unifiesArguments && providedArgs.size() > maxArgs;
+
+        if (tooFewArgs || tooManyArgs) {
             // Number of arguments does not match
             continue;
         }
 
-        const bool matchingArgs = std::equal(
-            expectedArgs.begin(), expectedArgs.begin() + providedArgs.size(),
-            providedArgs.begin(), [](const EvaluatedType& expected, const Expr* arg) {
-                return arg->getType() == expected;
-            });
+        // A scalar function answers null over a null argument, so a null stands in for
+        // whichever type the signature declares. An aggregate declares its own null overload
+        const bool answersNullOverNull = !unifiesArguments && !signature->isAggregate();
 
-        if (!matchingArgs) {
-            // Argument types do not match
+        if (!unifiesArguments) {
+            const bool matchingArgs = std::equal(
+                expectedArgs.begin(), expectedArgs.begin() + providedArgs.size(),
+                providedArgs.begin(), [answersNullOverNull](const FunctionArgumentType& expected, const Expr* arg) {
+                    const EvaluatedType argType = arg->getType();
+                    const VarDecl* decl = arg->getExprVarDecl();
+
+                    const bool bindsAPath = decl && decl->isQuantifiedPath();
+                    const bool typeMatches = argType == expected.getType() || (answersNullOverNull && argType == EvaluatedType::Null);
+
+                    return typeMatches && (!bindsAPath || expected.takesAVariableLengthPath());
+                });
+
+            if (!matchingArgs) {
+                // Argument types do not match
+                continue;
+            }
+        }
+
+        // A constant argument is read once per call, so an expression varying with the row
+        // would have to be read again for every one. Turned away here rather than by the
+        // procedure at runtime, once a row has already reached it - but only once every
+        // overload has been tried, since another may take that argument per row.
+
+        // A signature can declare fewer arguments than were provided - one unifying them
+        // declares none - and more, when the ones behind the required count are optional
+        const size_t declaredArgs = std::min(providedArgs.size(), expectedArgs.size());
+
+        bool readsARowIntoAConstant = false;
+        for (size_t argIndex = 0; argIndex < declaredArgs; argIndex++) {
+            const FunctionArgumentType& expected = expectedArgs[argIndex];
+            const Expr* arg = providedArgs[argIndex];
+
+            if (expected.isConstant() && arg->isDynamic()) {
+                if (!constantReadingARow) {
+                    constantReadingARow = &expected;
+                    rowReadingArg = arg;
+                }
+
+                readsARowIntoAConstant = true;
+                break;
+            }
+        }
+
+        if (readsARowIntoAConstant) {
             continue;
         }
 
@@ -650,15 +1782,74 @@ void ExprAnalyzer::analyzeFuncInvocExpr(FunctionInvocationExpr* expr, FunctionRe
             arg->setExprVarDecl(decl);
         }
 
+        bool readsANull = false;
+        for (size_t argIndex = 0; argIndex < providedArgs.size(); argIndex++) {
+            const bool isNull = providedArgs[argIndex]->getType() == EvaluatedType::Null;
+            const bool rejectsNull = argIndex < expectedArgs.size() && expectedArgs[argIndex].rejectsNull();
+
+            if (isNull && !rejectsNull) {
+                readsANull = true;
+                break;
+            }
+        }
+
         // Found a valid signature
-        if (signature->returnTypes().size() == 1) {
+        if (answersNullOverNull && readsANull) {
+            expr->setType(EvaluatedType::Null);
+        } else if (unifiesArguments) {
+            expr->setType(unifiedArgumentType(name, providedArgs));
+        } else if (signature->returnTypes().size() == 1) {
             expr->setType(signature->returnTypes().front().getType());
         } else {
             expr->setType(EvaluatedType::Tuple);
         }
 
+        // A collect's list holds the values of its argument, so it is one level deeper
+        // than what it gathers - what an UNWIND of the list binds its variable to.
+        if (signature->collectsItsArgument() && !providedArgs.empty()) {
+            const Expr* collected = providedArgs.front();
+            expr->setListShape(ListShape::collecting(collected->getType(), collected->getListShape()));
+        }
+
+        // A tail nests as deeply over the same elements as the list it drops one from, so
+        // it hands on that list's shape - what an UNWIND of it reads to know its elements.
+        if (signature->returnsItsArgumentShape() && !providedArgs.empty()) {
+            expr->setListShape(providedArgs.front()->getListShape());
+        }
+
+        if (signature->returnsAnElementOfItsArgument() && !providedArgs.empty()) {
+            const ListShape& listShape = providedArgs.front()->getListShape();
+
+            if (listShape.isList()) {
+                expr->setType(listShape.unwoundType());
+                expr->setListShape(listShape.unwound());
+            }
+        }
+
+        const ListShape& returnedShape = signature->returnedListShape();
+        if (returnedShape.isList() && expr->getType() == EvaluatedType::List) {
+            expr->setListShape(returnedShape);
+        }
+
+        if (unifiesArguments && expr->getType() == EvaluatedType::List) {
+            ListShape unifiedShape;
+            for (const Expr* arg : providedArgs) {
+                unifiedShape = accumulatedShape(unifiedShape, selectedListShape(arg));
+            }
+
+            expr->setListShape(unifiedShape);
+        }
+
         if (signature->isAggregate()) {
+            if (isAggregate) {
+                throwError(fmt::format("Aggregate functions may not be nested: the argument of "
+                                       "'{}' is itself an aggregate", name), expr);
+            }
+
             expr->setAggregate();
+        } else if (invoc->isDistinct()) {
+            throwError(fmt::format("DISTINCT may only be used in an aggregate function: "
+                                   "'{}' is not an aggregate", name), expr);
         }
 
         expr->setSignature(signature);
@@ -670,8 +1861,37 @@ void ExprAnalyzer::analyzeFuncInvocExpr(FunctionInvocationExpr* expr, FunctionRe
         return;
     }
 
+    if (constantReadingARow) {
+        throwError(fmt::format("Argument '{}' of '{}' must be constant, so it cannot read a row",
+                               constantReadingARow->getName(),
+                               name),
+                   rowReadingArg);
+    }
+
     // Checked all overloaded signatures, none match: error
     throwError(fmt::format("Invalid arguments for function '{}'", name), expr);
+}
+
+EvaluatedType ExprAnalyzer::unifiedArgumentType(std::string_view name,
+                                                std::span<Expr* const> args) const {
+    EvaluatedType unified = EvaluatedType::Null;
+
+    for (const Expr* arg : args) {
+        const EvaluatedType argType = arg->getType();
+        const EvaluatedType folded = selectedType(unified, argType);
+
+        if (folded == EvaluatedType::Invalid) {
+            throwError(fmt::format("'{}' cannot mix '{}' and '{}' arguments",
+                                   name,
+                                   EvaluatedTypeName::value(unified),
+                                   EvaluatedTypeName::value(argType)),
+                       arg);
+        }
+
+        unified = folded;
+    }
+
+    return unified;
 }
 
 void ExprAnalyzer::addToBeCreatedType(std::string_view name, ValueType type, const void* obj) {
@@ -715,8 +1935,15 @@ bool ExprAnalyzer::propTypeCompatible(ValueType vt, EvaluatedType exprType) {
         case EvaluatedType::Embedding:
             return vt == ValueType::Embedding;
         case EvaluatedType::List:
+            return vt == ValueType::List;
+        case EvaluatedType::DateTime:
+            return vt == ValueType::DateTime;
+        case EvaluatedType::Duration:
+            return vt == ValueType::Duration;
         case EvaluatedType::Map:
+            return vt == ValueType::Map;
         case EvaluatedType::Wildcard:
+        case EvaluatedType::NormalForm:
         case EvaluatedType::Invalid:
         case EvaluatedType::Tuple:
         case EvaluatedType::GraphPath:
@@ -726,7 +1953,7 @@ bool ExprAnalyzer::propTypeCompatible(ValueType vt, EvaluatedType exprType) {
         case EvaluatedType::PropertyType:
         case EvaluatedType::EdgeType:
         case EvaluatedType::_SIZE:
-        case EvaluatedType::ListItem:
+        case EvaluatedType::Any:
             return false;
         break;
     }
@@ -772,16 +1999,564 @@ void ExprAnalyzer::registerEdgePatternDeclaration(const EdgePattern* edge) {
     _ctxt->getOrCreateNamedVariable(_ast, EvaluatedType::EdgePattern, edgeName);
 }
 
-void ExprAnalyzer::analyzeListExpr(ListExpr* expr) {
-    for (Expr* item : *expr) {
-        const Expr::Kind itemKind = item->getKind();
-        const bool itemLiteral = itemKind == Expr::Kind::LITERAL;
-
-        if (!itemLiteral) {
-            throwError("Non-literal list elements are not yet supported", item);
+void ExprAnalyzer::analyzeCaseExpr(CaseExpr* expr) {
+    const auto contaminate = [expr](const Expr* part) {
+        if (part->isDynamic()) {
+            expr->setDynamic();
         }
 
-        analyzeExpr(item);
+        if (part->isAggregate()) {
+            expr->setAggregate();
+        }
+    };
+
+    // The subject of the simple form, compared for equality against every WHEN value.
+    // Null in the generic form, whose WHEN expressions are predicates of their own.
+    Expr* const subject = expr->getSubject();
+    if (subject) {
+        analyzeExpr(subject);
+        requireCaseSubject(subject);
+        contaminate(subject);
+    }
+
+    EvaluatedType resultType = EvaluatedType::Null;
+    ListShape resultShape;
+
+    for (const CaseExpr::Branch& branch : expr->getBranches()) {
+        for (const CaseExpr::Test& test : branch._tests) {
+            analyzeCaseTest(branch, subject, test);
+
+            if (test._value) {
+                contaminate(test._value);
+            }
+        }
+
+        analyzeExpr(branch._then);
+
+        resultType = unifyCaseBranch(resultType, branch._then);
+        resultShape = accumulatedShape(resultShape, selectedListShape(branch._then));
+
+        contaminate(branch._then);
+    }
+
+    Expr* const elseExpr = expr->getElseExpr();
+    if (elseExpr) {
+        analyzeExpr(elseExpr);
+        resultType = unifyCaseBranch(resultType, elseExpr);
+        resultShape = accumulatedShape(resultShape, selectedListShape(elseExpr));
+        contaminate(elseExpr);
+    }
+
+    expr->setType(resultType);
+
+    if (resultType == EvaluatedType::List) {
+        expr->setListShape(resultShape);
+    }
+}
+
+void ExprAnalyzer::analyzeCaseTest(const CaseExpr::Branch& branch,
+                                   const Expr* subject,
+                                   const CaseExpr::Test& test) {
+    const bool testsNull = test._kind == CaseExpr::TestKind::IsNull
+                           || test._kind == CaseExpr::TestKind::IsNotNull;
+
+    if (!subject) {
+        if (test._kind != CaseExpr::TestKind::Value) {
+            throwError("A WHEN that compares needs a CASE subject to compare against",
+                       testsNull ? branch._then : test._value);
+        }
+
+        if (branch._tests.size() > 1) {
+            throwError("A CASE with no subject takes one predicate per WHEN, not a list of values",
+                       test._value);
+        }
+
+        analyzeExpr(test._value);
+
+        const EvaluatedType whenType = test._value->getType();
+        if (!namesATruthValue(whenType)) {
+            throwError(fmt::format("The WHEN condition of a CASE must be a boolean, not '{}'",
+                                   EvaluatedTypeName::value(whenType)),
+                       test._value);
+        }
+
+        return;
+    }
+
+    if (testsNull) {
+        return;
+    }
+
+    analyzeExpr(test._value);
+
+    const EvaluatedType subjectType = subject->getType();
+    const EvaluatedType valueType = test._value->getType();
+    const BinaryOperator op = test._operator;
+
+    const bool testsOrdering = test._kind == CaseExpr::TestKind::Comparison
+                               && (op == BinaryOperator::LessThan
+                                   || op == BinaryOperator::GreaterThan
+                                   || op == BinaryOperator::LessThanOrEqual
+                                   || op == BinaryOperator::GreaterThanOrEqual);
+
+    if (testsOrdering) {
+        if (orderingResultType(subjectType, valueType) == EvaluatedType::Invalid) {
+            throwError(fmt::format("A CASE cannot order '{}' against '{}'",
+                                   EvaluatedTypeName::value(subjectType),
+                                   EvaluatedTypeName::value(valueType)),
+                       test._value);
+        }
+    } else {
+        analyzeEquality(subjectType, valueType, test._value);
+    }
+}
+
+EvaluatedType ExprAnalyzer::unifyCaseBranch(EvaluatedType carried, const Expr* branch) {
+    const EvaluatedType branchType = branch->getType();
+    const EvaluatedType unified = selectedType(carried, branchType);
+
+    if (unified == EvaluatedType::Invalid) {
+        throwError(fmt::format("A CASE cannot mix '{}' and '{}' branches",
+                               EvaluatedTypeName::value(carried),
+                               EvaluatedTypeName::value(branchType)),
+                   branch);
+    }
+
+    return unified;
+}
+
+void ExprAnalyzer::requireCaseSubject(const Expr* subject) const {
+    const EvaluatedType type = subject->getType();
+
+    const bool isScalar = type == EvaluatedType::Null
+                          || namesATaggedCell(type)
+                          || convertibleToValueType(type);
+
+    if (isScalar || isEntity(type)) {
+        return;
+    }
+
+    throwError(fmt::format("The subject of a CASE must be a scalar, a node or an edge, not '{}'",
+                           EvaluatedTypeName::value(type)),
+               subject);
+}
+
+EvaluatedType ExprAnalyzer::analyzeEquality(EvaluatedType a, EvaluatedType b, const Expr* expr) const {
+    const EvaluatedType type = equalityResultType(a, b);
+
+    const bool equatesTwoDoubles = a == EvaluatedType::Double && b == EvaluatedType::Double;
+
+    if (type != EvaluatedType::Invalid) {
+        return type;
+    } else if (equatesTwoDoubles) {
+        throwError(fmt::format("Equality of types '{}' and '{}' is not encouraged due to "
+                               "potential rounding innaccuracy. Please constrain with '<' "
+                               "and '>' instead.",
+                               EvaluatedTypeName::value(a),
+                               EvaluatedTypeName::value(b)),
+                   expr);
+    }
+
+    throwError(fmt::format("Operands are not valid or compatible types: '{}' and '{}'",
+                           EvaluatedTypeName::value(a),
+                           EvaluatedTypeName::value(b)),
+               expr);
+}
+
+void ExprAnalyzer::analyzeListSliceExpr(ListSliceExpr* expr) {
+    Expr* const base = expr->getBase();
+    analyzeExpr(base);
+
+    const EvaluatedType baseType = base->getType();
+
+    // A tagged cell names no type until a row is in hand, and a null slices into a null
+    const bool slicesAList = baseType == EvaluatedType::List
+                          || baseType == EvaluatedType::Any
+                          || baseType == EvaluatedType::Null;
+
+    if (!slicesAList) {
+        throwError(fmt::format("A slice reads a list, not '{}'", EvaluatedTypeName::value(baseType)),
+                   expr);
+    }
+
+    bool dynamic = base->isDynamic();
+    bool aggregate = base->isAggregate();
+
+    for (Expr* const bound : {expr->getFrom(), expr->getTo()}) {
+        if (!bound) {
+            continue;
+        }
+
+        analyzeExpr(bound);
+
+        const EvaluatedType boundType = bound->getType();
+        const bool countsPositions = boundType == EvaluatedType::Integer
+                                  || boundType == EvaluatedType::Any
+                                  || boundType == EvaluatedType::Null;
+
+        if (!countsPositions) {
+            throwError(fmt::format("A slice counts its bounds in integers, not '{}'",
+                                   EvaluatedTypeName::value(boundType)),
+                       expr);
+        }
+
+        dynamic = dynamic || bound->isDynamic();
+        aggregate = aggregate || bound->isAggregate();
+    }
+
+    // Slicing an unknown value is unknown, as adding to one is: null[1..2] is null. The
+    // elements are otherwise the ones the base holds, so the slice keeps its shape
+    const EvaluatedType slicedType = baseType == EvaluatedType::Null ? EvaluatedType::Null
+                                                                    : EvaluatedType::List;
+
+    expr->setType(slicedType);
+    expr->setListShape(base->getListShape());
+
+    if (dynamic) {
+        expr->setDynamic();
+    }
+
+    if (aggregate) {
+        expr->setAggregate();
+    }
+
+    expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, slicedType));
+}
+
+void ExprAnalyzer::analyzeListExpr(ListExpr* expr) {
+    analyzeListElements(expr, expr->getElements());
+}
+
+void ExprAnalyzer::analyzeListComprehensionExpr(ListComprehensionExpr* expr) {
+    Expr* const source = expr->getSource();
+    analyzeExpr(source);
+
+    const EvaluatedType sourceType = source->getType();
+    const VarDecl* const sourceDecl = source->getExprVarDecl();
+    const bool iteratesAPath = sourceDecl && sourceDecl->isQuantifiedPath();
+
+    // A tagged cell names no type until a row is in hand, and a null iterates into a null
+    // rather than into a type error - as an UNWIND of one emits no row
+    const bool iteratesAList = iteratesAPath
+                            || sourceType == EvaluatedType::List
+                            || sourceType == EvaluatedType::Any
+                            || sourceType == EvaluatedType::Null;
+
+    if (!iteratesAList) {
+        throwError(fmt::format("A list comprehension iterates a list, not '{}'",
+                               EvaluatedTypeName::value(sourceType)),
+                   expr);
+    }
+
+    const std::string_view itemName = expr->getSymbol()->getName();
+
+    // The comprehension names a new variable, as an UNWIND does, so a name already in
+    // scope would put two of them under one name
+    if (_ctxt->hasDecl(itemName)) {
+        throwError(fmt::format("Variable '{}' is already declared", itemName), expr);
+    }
+
+    const ListShape sourceShape = iteratesAPath ? ListShape(sourceType, 1) : source->getListShape();
+
+    // A null list holds no element, so the variable never reads as anything but null
+    const EvaluatedType itemType = sourceType == EvaluatedType::Null ? EvaluatedType::Null
+                                                                     : sourceShape.unwoundType();
+
+    VarDecl* const itemDecl = _ctxt->getOrCreateNamedVariable(_ast, itemType, itemName);
+    itemDecl->setIsUnwound(true);
+    itemDecl->setListShape(sourceShape.unwound());
+
+    expr->setDecl(itemDecl);
+
+    Expr* const predicate = expr->getPredicate();
+    if (predicate) {
+        analyzeExpr(predicate);
+    }
+
+    Expr* const projection = expr->getProjection();
+    if (projection) {
+        analyzeExpr(projection);
+    }
+
+    _ctxt->dropVariable(itemName);
+
+    if (predicate) {
+        const EvaluatedType predicateType = predicate->getType();
+
+        // A null WHERE holds for no element, as a null WHERE cuts every row. An element of a
+        // list naming no type for its elements is read as a truth value row by row
+        if (!namesATruthValue(predicateType)) {
+            throwError("The WHERE of a list comprehension must be a boolean", predicate);
+        }
+    }
+
+    const bool aggregatesTheBody = (predicate && predicate->isAggregate())
+                                || (projection && projection->isAggregate());
+
+    if (aggregatesTheBody) {
+        throwError(fmt::format("Aggregate functions may not be used over the elements of a "
+                               "list comprehension: '{}' names one element, not a group",
+                               itemName),
+                   expr);
+    }
+
+    expr->setType(EvaluatedType::List);
+
+    // Filtering leaves the shape the source has; a projection replaces the elements, so
+    // the list gathers whatever it computes - what an UNWIND of the comprehension binds
+    if (projection) {
+        expr->setListShape(ListShape::collecting(projection->getType(), projection->getListShape()));
+    } else {
+        expr->setListShape(sourceShape);
+    }
+
+    // The elements are read row by row, so the list is never the compile-time value an
+    // argument declared constant takes
+    expr->setDynamic();
+
+    // An aggregated source aggregates the comprehension: the projection reduces the rows
+    // to one, and the list is built over that one
+    if (source->isAggregate()) {
+        expr->setAggregate();
+    }
+
+    expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, EvaluatedType::List));
+}
+
+void ExprAnalyzer::analyzeListPredicateExpr(ListPredicateExpr* expr) {
+    ListComprehensionExpr* const comprehension = expr->getComprehension();
+    analyzeExpr(comprehension);
+
+    if (!comprehension->getPredicate()) {
+        throwError("A list predicate needs a WHERE over its elements: all(x IN xs WHERE p(x))", expr);
+    }
+
+    expr->setType(EvaluatedType::Bool);
+    expr->setDynamic();
+
+    if (comprehension->isAggregate()) {
+        expr->setAggregate();
+    }
+
+    expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, EvaluatedType::Bool));
+}
+
+void ExprAnalyzer::analyzeReduceExpr(ReduceExpr* expr) {
+    Expr* const initialValue = expr->getInitialValue();
+    Expr* const source = expr->getSource();
+    analyzeExpr(initialValue);
+    analyzeExpr(source);
+
+    const EvaluatedType sourceType = source->getType();
+
+    const bool iteratesAList = sourceType == EvaluatedType::List
+                            || sourceType == EvaluatedType::Any
+                            || sourceType == EvaluatedType::Null;
+
+    if (!iteratesAList) {
+        throwError(fmt::format("A reduce iterates a list, not '{}'", EvaluatedTypeName::value(sourceType)),
+                   expr);
+    }
+
+    const std::string_view accumulatorName = expr->getAccumulatorSymbol()->getName();
+    const std::string_view itemName = expr->getItemSymbol()->getName();
+
+    for (const std::string_view name : {accumulatorName, itemName}) {
+        if (_ctxt->hasDecl(name)) {
+            throwError(fmt::format("Variable '{}' is already declared", name), expr);
+        }
+    }
+
+    if (accumulatorName == itemName) {
+        throwError(fmt::format("Variable '{}' is already declared", itemName), expr);
+    }
+
+    const ListShape& sourceShape = source->getListShape();
+    const EvaluatedType itemType = sourceType == EvaluatedType::Null ? EvaluatedType::Null
+                                                                     : sourceShape.unwoundType();
+
+    VarDecl* const itemDecl = _ctxt->getOrCreateNamedVariable(_ast, itemType, itemName);
+    itemDecl->setIsUnwound(true);
+    itemDecl->setListShape(sourceShape.unwound());
+
+    VarDecl* const accumulatorDecl = _ctxt->getOrCreateNamedVariable(_ast, initialValue->getType(), accumulatorName);
+    accumulatorDecl->setListShape(initialValue->getListShape());
+
+    expr->setItemDecl(itemDecl);
+    expr->setAccumulatorDecl(accumulatorDecl);
+
+    // The accumulator holds the initial value and then whatever the expression computed
+    // from it, so its type is what both share. Reading it as the initial value's alone
+    // would fold `acc + x` to null under `reduce(acc = null, ...)`
+    Expr* const expression = expr->getExpression();
+
+    while (true) {
+        analyzeExpr(expression);
+
+        const EvaluatedType accumulatorType = accumulatorDecl->getType();
+        const ListShape& accumulatorShape = accumulatorDecl->getListShape();
+
+        const EvaluatedType widenedType = accumulatedType(accumulatorType, expression->getType());
+        const ListShape widenedShape = accumulatedShape(accumulatorShape, expression->getListShape());
+
+        const bool settled = widenedType == accumulatorType
+                          && widenedShape.getLeafType() == accumulatorShape.getLeafType()
+                          && widenedShape.getDepth() == accumulatorShape.getDepth();
+
+        if (settled) {
+            break;
+        }
+
+        accumulatorDecl->setType(widenedType);
+        accumulatorDecl->setListShape(widenedShape);
+        forgetAnalysis(expression);
+    }
+
+    _ctxt->dropVariable(itemName);
+    _ctxt->dropVariable(accumulatorName);
+
+    if (expression->isAggregate()) {
+        throwError(fmt::format("Aggregate functions may not be used over the elements of a "
+                               "reduce: '{}' names one element, not a group",
+                               itemName),
+                   expr);
+    }
+
+    const EvaluatedType reducedType = accumulatorDecl->getType();
+
+    expr->setType(reducedType);
+    expr->setListShape(accumulatorDecl->getListShape());
+    expr->setDynamic();
+
+    if (initialValue->isAggregate() || source->isAggregate()) {
+        expr->setAggregate();
+    }
+
+    expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, reducedType));
+}
+
+void ExprAnalyzer::forgetAnalysis(const Expr* expr) {
+    std::vector<const Expr*> pending {expr};
+    std::vector<const Expr*> children;
+
+    while (!pending.empty()) {
+        const Expr* const current = pending.back();
+        pending.pop_back();
+
+        _analyzedExprs.erase(current);
+
+        children.clear();
+        if (ExprChildren::collect(current, children)) {
+            pending.insert(pending.end(), children.begin(), children.end());
+        }
+    }
+}
+
+void ExprAnalyzer::analyzePatternComprehensionExpr(PatternComprehensionExpr* expr) {
+    const Pattern* pattern = expr->getPattern();
+
+    // A name the pattern binds that the scope does not hold yet is the comprehension's
+    // own: the WHERE and the projection read it, and nothing outside them does
+    std::vector<std::string_view> ownVariables;
+    std::vector<const EntityPattern*> ownEntities;
+    std::vector<std::string_view> enclosingVariables;
+
+    for (const PatternElement* element : pattern->elements()) {
+        for (const EntityPattern* entity : element->getEntities()) {
+            const Symbol* symbol = entity->getSymbol();
+
+            if (!symbol || _ctxt->hasDecl(symbol->getName())) {
+                continue;
+            }
+
+            // A name the scope reads through to the one around it is that variable: the
+            // pattern binds to it rather than to a new one
+            if (VarDecl* enclosing = resolveVariable(symbol->getName())) {
+                _ctxt->declareAlias(symbol->getName(), enclosing);
+                enclosingVariables.push_back(symbol->getName());
+                continue;
+            }
+
+            ownVariables.push_back(symbol->getName());
+            ownEntities.push_back(entity);
+
+            // A SET analyzes the expression it assigns twice, and the reads in the body
+            // hold the declarations the first pass bound: binding the names back to them
+            // leaves the second pass reading the variables the pattern already has, not
+            // fresh ones the traversal knows nothing about.
+            if (VarDecl* bound = entity->getDecl()) {
+                _ctxt->declareAlias(symbol->getName(), bound);
+            }
+        }
+    }
+
+    _readAnalyzer->analyze(pattern);
+
+    PatternComprehensionExpr::OwnDecls ownDecls;
+    for (const EntityPattern* entity : ownEntities) {
+        ownDecls.push_back(entity->getDecl());
+    }
+
+    expr->setOwnDecls(ownDecls);
+
+    Expr* const projection = expr->getProjection();
+    analyzeExpr(projection);
+
+    for (const std::string_view name : ownVariables) {
+        _ctxt->dropVariable(name);
+    }
+
+    for (const std::string_view name : enclosingVariables) {
+        _ctxt->dropVariable(name);
+    }
+
+    if (projection->isAggregate()) {
+        throwError("Aggregate functions may not be used over the matches of a pattern "
+                   "comprehension: the pattern names one match, not a group",
+                   expr);
+    }
+
+    expr->setType(EvaluatedType::List);
+    expr->setListShape(ListShape::collecting(projection->getType(), projection->getListShape()));
+
+    // The pattern is matched row by row, so the list is never the compile-time value an
+    // argument declared constant takes
+    expr->setDynamic();
+
+    expr->setExprVarDecl(_ctxt->createUnnamedVariable(_ast, EvaluatedType::List));
+}
+
+void ExprAnalyzer::analyzeListElements(Expr* expr, std::span<Expr* const> elements) {
+    for (Expr* element : elements) {
+        analyzeExpr(element);
+
+        // An element is an expression of its own, so its flags are the list's: the n of
+        // [n, m] reads a row, and so does the {age: n.age} of ORDER BY [{age: n.age}]
+        if (element->isDynamic()) {
+            expr->setDynamic();
+        }
+
+        if (element->isAggregate()) {
+            expr->setAggregate();
+        }
+    }
+
+    expr->setListShape(sharedListShape(elements));
+}
+
+void ExprAnalyzer::analyzeMapEntries(Expr* expr, const MapLiteral* map) {
+    // The keys of a map are symbols written in the query, so only its values can make it
+    // vary or aggregate
+    for (const auto& [key, value] : *map) {
+        analyzeExpr(value);
+
+        if (value->isDynamic()) {
+            expr->setDynamic();
+        }
+
+        if (value->isAggregate()) {
+            expr->setAggregate();
+        }
     }
 }
 

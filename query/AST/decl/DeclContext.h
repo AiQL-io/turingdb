@@ -29,11 +29,43 @@ public:
 
     VarDecl* getDecl(std::string_view name) const;
 
+    // The declaration a name reads as, searched out through the enclosing scopes that this
+    // one reads. A scope declares into itself, so this is what an expression resolves with
+    // and getDecl what a declaration checks against: the hop of a quantified pattern binds
+    // its own entities while its predicate still reads the variables around it
+    VarDecl* lookup(std::string_view name) const;
+
+    // Whether a name this scope does not declare reads as the enclosing scope's. A WITH
+    // opens a scope that does only for its WHERE: what its projection dropped is gone
+    // behind the barrier
+    void setReadsEnclosingScope(bool reads) { _readsEnclosing = reads; }
+    bool readsEnclosingScope() const { return _readsEnclosing; }
+
     VarDecl* getOrCreateNamedVariable(CypherAST* ast, EvaluatedType type, std::string_view name);
+
+    // The name a node of a pattern binds. An integer already in scope is the node IDs an
+    // UNWIND bound, and a pattern naming it seeds itself from those nodes, so the variable
+    // becomes the pattern node it is used as rather than conflicting with it
+    VarDecl* getOrCreateNodePatternVariable(CypherAST* ast, std::string_view name);
+
+    // The name a projected item publishes its column under. What follows the projection
+    // reads that column, so the name binds to the item even when the query already used
+    // it for a variable of another type
+    VarDecl* declareProjectedVariable(CypherAST* ast, EvaluatedType type, std::string_view name);
+
     VarDecl* createUnnamedVariable(CypherAST* ast, EvaluatedType type);
+
+    // Undeclares a name, leaving the scope as it was before it was declared. A list
+    // comprehension binds its variable here so the expressions inside it read the names
+    // around it, and drops it once its body is analyzed: the name is no variable of the
+    // query, so nothing after the comprehension - a wildcard projection included - sees it
+    void dropVariable(std::string_view name);
+
+    void declareAlias(std::string_view name, VarDecl* decl);
 
 private:
     DeclContext* _parent {nullptr};
+    bool _readsEnclosing {false};
     DeclMap _declMap;
     Decls _decls;
 

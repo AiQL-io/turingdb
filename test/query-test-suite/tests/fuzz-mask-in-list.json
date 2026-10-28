@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "RETURN COUNT(*) = 1 IN [1, 2, 3]",
+  "expect": {
+    "result": "\"COUNT(*) = 1 IN [1, 2, 3]\"\nfalse",
+    "resultJson": "{\"header\":{\"column_names\":[\"COUNT(*) = 1 IN [1, 2, 3]\"],\"column_types\":[\"Bool\"]},\"data\":[[[false]]]}"
+  },
+  "tags": [
+    "fuzz",
+    "crash",
+    "list",
+    "expression"
+  ],
+  "write-required": false
+}

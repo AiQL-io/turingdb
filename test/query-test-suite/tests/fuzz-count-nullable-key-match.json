@@ -1,0 +1,15 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "MATCH (n) RETURN COUNT(n), toFloat(\"10\")",
+  "expect": {
+    "result": "COUNT(n),\"toFloat(\"\"10\"\")\"\n18,10",
+    "resultJson": "{\"header\":{\"column_names\":[\"COUNT(n)\",\"toFloat(\\\"10\\\")\"],\"column_types\":[\"UInt64\",\"Double\"]},\"data\":[[[18],[10.0]]]}"
+  },
+  "tags": [
+    "fuzz",
+    "count",
+    "aggregate"
+  ],
+  "write-required": false
+}

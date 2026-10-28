@@ -123,12 +123,11 @@ EndToEndResult runEndToEnd(const std::string& outDir,
 
 class TuringProtoEndToEndTest : public TuringTest {};
 
-// chunkRows=1 forces the query pipeline to emit one Dataframe per row. Each
-// server-side writeDataframe() produces its own CHUNK_HEADER + CHUNK +
-// END_CHUNK group on the wire and the client fires onOutputData once per
-// END_CHUNK. With 12 seeded rows we therefore expect exactly 12 client
-// callbacks. Verifies the streaming path delivers many small dataframes in
-// order without losing or merging rows.
+// chunkRows=1 forces the engine to emit one chunk per row. Each server-side
+// writeColumns() produces its own CHUNK + END_CHUNK group on the wire and the
+// client fires onOutputData once per END_CHUNK. With 12 seeded rows we
+// therefore expect exactly 12 client callbacks. Verifies the streaming path
+// delivers many small chunks in order without losing or merging rows.
 TEST_F(TuringProtoEndToEndTest, ManySmallQueryChunks) {
     constexpr size_t ROW_COUNT = 12;
 
@@ -170,6 +169,42 @@ TEST_F(TuringProtoEndToEndTest, ManySmallQueryChunks) {
     std::sort(expected.begin(), expected.end());
 
     EXPECT_EQ(received, expected);
+}
+
+// An optional-constant column across many chunk groups: toInteger of a string literal
+// evaluates to ColumnConst<std::optional<Int64>>, re-encoded per group by chunkRows=1.
+// Guards the END_CHUNK per-column state reset; the constant sits last in the projection
+// so a decode desync fails as a wrong value rather than a garbage string allocation.
+TEST_F(TuringProtoEndToEndTest, OptionalConstantAcrossManyChunkGroups) {
+    constexpr size_t ROW_COUNT = 12;
+
+    auto seeder = [&](db::Graph* graph, db::JobSystem* jobSystem) {
+        db::GraphWriter writer(graph, jobSystem);
+        for (size_t i = 0; i < ROW_COUNT; ++i) {
+            const auto node = writer.addNode({"TestLabel"});
+            const std::string name = "node_" + std::to_string(i);
+            writer.addNodeProperty<db::types::String>(node, "name", std::string_view(name));
+        }
+        ASSERT_TRUE(writer.commit());
+        ASSERT_TRUE(writer.submit());
+    };
+
+    const auto result = runEndToEnd(_outDir,
+                                    /*queryChunkRows=*/1,
+                                    /*bufferCapacity=*/net::proto::DEFAULT_BUFFER_CAPACITY,
+                                    seeder,
+                                    "MATCH (n:TestLabel) RETURN n.name AS name, toInteger(\"7\") AS seven");
+
+    EXPECT_EQ(result.dataframesReceived, ROW_COUNT);
+    ASSERT_EQ(result.rows.size(), ROW_COUNT);
+    ASSERT_EQ(result.columnNames.size(), 2u);
+    EXPECT_EQ(result.columnNames[0], "name");
+    EXPECT_EQ(result.columnNames[1], "seven");
+
+    for (const auto& row : result.rows) {
+        ASSERT_EQ(row.size(), 2u);
+        EXPECT_EQ(row[1], "7");
+    }
 }
 
 // One row whose value is far larger than the proto buffer. The server's
@@ -352,4 +387,85 @@ TEST_F(TuringProtoEndToEndTest, BigMaskSplitAcrossPackets) {
         expected[i] = static_cast<int64_t>(i);
     }
     EXPECT_EQ(nonNullValues, expected);
+}
+
+// A folded SKIP or LIMIT emits a window of each chunk, not the whole chunk, so only the
+// rows the query kept may reach the wire. Chunks of 4 over 12 rows: the skip drops the
+// first 2 rows of the first chunk and the limit cuts the second chunk short.
+TEST_F(TuringProtoEndToEndTest, SkipLimitWindow) {
+    constexpr size_t ROW_COUNT = 12;
+    constexpr size_t SKIP_COUNT = 2;
+    constexpr size_t LIMIT_COUNT = 5;
+
+    auto seeder = [&](db::Graph* graph, db::JobSystem* jobSystem) {
+        db::GraphWriter writer(graph, jobSystem);
+        for (size_t i = 0; i < ROW_COUNT; ++i) {
+            const auto node = writer.addNode({"TestLabel"});
+            const std::string name = "node_" + std::to_string(i);
+            writer.addNodeProperty<db::types::String>(node, "name", std::string_view(name));
+        }
+        ASSERT_TRUE(writer.commit());
+        ASSERT_TRUE(writer.submit());
+    };
+
+    const auto result = runEndToEnd(_outDir,
+                                    /*queryChunkRows=*/4,
+                                    /*bufferCapacity=*/net::proto::DEFAULT_BUFFER_CAPACITY,
+                                    seeder,
+                                    "MATCH (n:TestLabel) RETURN n.name AS name SKIP 2 LIMIT 5");
+
+    ASSERT_EQ(result.rows.size(), LIMIT_COUNT);
+    ASSERT_EQ(result.columnNames.size(), 1u);
+    EXPECT_EQ(result.columnNames[0], "name");
+
+    std::vector<std::string> received;
+    received.reserve(result.rows.size());
+    for (const auto& row : result.rows) {
+        ASSERT_EQ(row.size(), 1u);
+        received.push_back(row[0]);
+    }
+
+    // The nodes are scanned in the order they were seeded, so naming the rows the window
+    // must land on is what tells a dropped SKIP from an honoured one - a count alone
+    // passes either way.
+    std::vector<std::string> expected;
+    expected.reserve(LIMIT_COUNT);
+    for (size_t i = SKIP_COUNT; i < SKIP_COUNT + LIMIT_COUNT; ++i) {
+        expected.push_back("node_" + std::to_string(i));
+    }
+
+    EXPECT_EQ(received, expected);
+}
+
+TEST_F(TuringProtoEndToEndTest, UnmatchedOptionalMatchEntitiesAreNull) {
+    db::NodeID company;
+    db::EdgeID worksAt;
+
+    auto seeder = [&](db::Graph* graph, db::JobSystem* jobSystem) {
+        db::GraphWriter writer(graph, jobSystem);
+        const auto employed = writer.addNode({"Person"});
+        writer.addNodeProperty<db::types::String>(employed, "name", std::string_view("employed"));
+
+        const auto unemployed = writer.addNode({"Person"});
+        writer.addNodeProperty<db::types::String>(unemployed, "name", std::string_view("unemployed"));
+
+        company = writer.addNode({"Company"});
+        worksAt = writer.addEdge("WORKS_AT", employed, company)._edgeID;
+        ASSERT_TRUE(writer.commit());
+        ASSERT_TRUE(writer.submit());
+    };
+
+    const auto result = runEndToEnd(_outDir,
+                                    /*queryChunkRows=*/net::proto::DEFAULT_BUFFER_CAPACITY,
+                                    /*bufferCapacity=*/net::proto::DEFAULT_BUFFER_CAPACITY,
+                                    seeder,
+                                    "MATCH (a:Person) OPTIONAL MATCH (a)-[e:WORKS_AT]->(c:Company) "
+                                    "RETURN a.name AS name, c, e ORDER BY name");
+
+    const std::vector<std::vector<std::string>> expected = {
+        {"employed", std::to_string(company.getValue()), std::to_string(worksAt.getValue())},
+        {"unemployed", "null", "null"},
+    };
+
+    EXPECT_EQ(result.rows, expected);
 }

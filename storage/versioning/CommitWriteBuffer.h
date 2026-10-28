@@ -37,12 +37,16 @@ public:
     struct EdgeUpdate;
 
     using SupportedTypeVariant = std::variant<
-                     types::Int64::Primitive,
-                     types::UInt64::Primitive,
-                     types::Double::Primitive,
-                     std::string, /// Needs to be owning to outlive the query
-                     types::Bool::Primitive,
-                     types::Embedding::OwningPrimitive
+        std::optional<types::Int64::Primitive>,
+        std::optional<types::UInt64::Primitive>,
+        std::optional<types::Double::Primitive>,
+        std::optional<types::String::OwningPrimitive>, /// Needs to be owning to outlive the query
+        std::optional<types::Bool::Primitive>,
+        std::optional<types::Embedding::OwningPrimitive>,
+        std::optional<types::List::OwningPrimitive>,
+        std::optional<types::DateTime::Primitive>,
+        std::optional<types::Duration::Primitive>,
+        std::optional<types::Map::OwningPrimitive>
      >;
      using UntypedProperties = std::vector<UntypedProperty>;
      using PendingNodeOffset = size_t;
@@ -53,6 +57,8 @@ public:
      using PendingEdges = std::vector<PendingEdge>;
      using DeletedNodes = std::unordered_set<NodeID>;
      using DeletedEdges = std::unordered_set<EdgeID>;
+     /// Offsets into @ref _pendingNodes / @ref _pendingEdges of writes this commit drops
+     using DeletedPendingEntities = std::unordered_set<size_t>;
      using UpdatedNodes = std::vector<NodeUpdate>;
      using UpdatedEdges = std::vector<EdgeUpdate>;
      using PendingIndexes = std::vector<WeakArc<Index>>;
@@ -104,7 +110,7 @@ public:
       * as registering all newly created nodes/edges in the associated @ref WriteSet of
       * @ref _journal
       */
-     void buildPending(DataPartBuilder& builder);
+     void buildPending(DataPartBuilder& builder, Tombstones& tombstones);
 
      void applyUpdates(DataPartBuilder& builder);
 
@@ -161,6 +167,31 @@ public:
      */
     void addDeletedNode(const NodeID& newDeletedNode);
 
+    /**
+     * @brief Marks a node this commit creates as deleted again. Its slot is kept, so the
+     * offsets a pending edge names stay valid; the node is built into the datapart and
+     * tombstoned rather than written.
+     */
+    void addDeletedPendingNode(PendingNodeOffset offset);
+
+    void addDeletedPendingEdge(size_t offset);
+
+    const DeletedPendingEntities& deletedPendingNodes() const { return _deletedPendingNodes; }
+    const DeletedPendingEntities& deletedPendingEdges() const { return _deletedPendingEdges; }
+
+    /**
+     * @brief Marks every pending edge incident to a node this commit deletes - one it
+     * created or one already committed - as deleted too, the pending counterpart of
+     * @ref addHangingEdges.
+     */
+    void addHangingPendingEdges();
+
+    /**
+     * @brief Whether any pending edge this commit has not deleted is incident to
+     * @param node, which a DELETE without DETACH must refuse.
+     */
+    bool hasPendingEdgesOn(const ExistingOrPendingNode& node) const;
+
     void addNodeUpdate(NodeID id, UntypedProperty& updatedProperty);
     void addEdgeUpdate(EdgeID id, UntypedProperty& updatedProperty);
 
@@ -181,6 +212,9 @@ public:
 
     PendingNode& getPendingNode(size_t idx) { return _pendingNodes.at(idx); }
     PendingEdge& getPendingEdge(size_t idx) { return _pendingEdges.at(idx); }
+
+    const PendingNode& getPendingNode(size_t idx) const { return _pendingNodes.at(idx); }
+    const PendingEdge& getPendingEdge(size_t idx) const { return _pendingEdges.at(idx); }
 
     const PendingIndexes& pendingIndexes() const { return _pendingIndexes; }
     const DroppedIndexes& droppedIndexes() const { return _droppedIndexes; }
@@ -209,6 +243,10 @@ private:
     // Edges to be deleted when this commit commits
     DeletedEdges _deletedEdges;
 
+    // Creations of this commit that it deletes again before committing
+    DeletedPendingEntities _deletedPendingNodes;
+    DeletedPendingEntities _deletedPendingEdges;
+
     UpdatedNodes _updatedNodes;
     UpdatedEdges _updatedEdges;
 
@@ -219,13 +257,15 @@ private:
     PendingEdges& pendingEdges() { return _pendingEdges; }
 
     // Collection of methods to write the buffer to the provided datapart builder
-    void buildPendingNodes(DataPartBuilder& builder);
-    void buildPendingEdges(DataPartBuilder& builder);
+    void buildPendingNodes(DataPartBuilder& builder, Tombstones& tombstones);
+    void buildPendingEdges(DataPartBuilder& builder, Tombstones& tombstones);
 
-    void buildPendingNode(DataPartBuilder& builder, const PendingNode& node);
-    void addPendingNodeProperties(DataPartBuilder& builder, const PendingNode& node);
+    NodeID buildPendingNode(DataPartBuilder& builder, PendingNode& node, bool deleted);
+    void addPendingNodeProperties(DataPartBuilder& builder, PendingNode& node);
 
-    void buildPendingEdge(DataPartBuilder& builder, const PendingEdge& edge);
+    EdgeID buildPendingEdge(DataPartBuilder& builder, PendingEdge& edge, bool deleted);
+
+    bool touchesDeletedNode(const PendingEdge& edge) const;
 
     void applyNodeUpdates(DataPartBuilder& builder);
     void applyEdgeUpdates(DataPartBuilder& builder);
@@ -233,12 +273,12 @@ private:
     /// Updates a property of an edge which is already committed
     void applyExistingEdgeUpdate(DataPartBuilder& builder,
                                  const EdgeRecord& record,
-                                 const CommitWriteBuffer::UntypedProperty& prop);
+                                 CommitWriteBuffer::UntypedProperty& prop);
 
     /// Updates a property of an edge which is not yet committed
     void applyPendingEdgeUpdate(DataPartBuilder& builder,
                                 EdgeID edgeID,
-                                const CommitWriteBuffer::UntypedProperty& prop);
+                                CommitWriteBuffer::UntypedProperty& prop);
 };
 
 class CommitWriteBufferRebaser {

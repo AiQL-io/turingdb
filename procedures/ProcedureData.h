@@ -5,6 +5,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "columns/ColumnIndices.h"
+
 namespace db {
 
 class Column;
@@ -39,9 +41,21 @@ public:
         _returnColumns[i] = col;
     }
 
+    void clearReturnColumns();
+
 private:
     std::vector<const Column*> _inputColumns;
     std::vector<Column*> _returnColumns;
+};
+
+class IndexedProcedureData : public ProcedureData {
+public:
+    void setIndices(ColumnIndices* indices) { _indices = indices; }
+
+    ColumnIndices* indices() { return _indices; }
+
+private:
+    ColumnIndices* _indices {nullptr};
 };
 
 template <typename T>

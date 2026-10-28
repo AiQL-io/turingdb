@@ -1,26 +1,26 @@
 #include "TuringProtoServerProcessor.h"
 
-#include "DBHTTPParams.h"
 #include "DBThreadContext.h"
+#include "DBTransactionInfo.h"
 #include "DBURIParser.h"
 #include "Endpoints.h"
 #include "HTTPParser.h"
 #include "NetException.h"
 #include "ProtocolException.h"
-#include "QueryCallbacks.h"
+#include "QueryState.h"
 #include "QueryStatus.h"
 #include "TCPConnection.h"
 #include "TuringDB.h"
+#include "TuringProtoQueryRequest.h"
 #include "TuringProtoWriter.h"
 #include "AuthGate.h"
-#include "dataframe/Dataframe.h"
 
 using namespace db;
 
-TuringProtoServerProcessor::TuringProtoServerProcessor(TuringDB& db,
-                                                       net::TCPConnection& connection)
+TuringProtoServerProcessor::TuringProtoServerProcessor(TuringDB& db, net::TCPConnection& connection)
     : _db(db),
-    _connection(connection)
+    _connection(connection),
+    _protoNLSink(&connection.getWriter<net::proto::TuringProtoWriter>())
 {
 }
 
@@ -73,88 +73,35 @@ void TuringProtoServerProcessor::process(net::AbstractThreadContext* threadConte
 
 // Process the query in the request
 void TuringProtoServerProcessor::handleQuery() {
+    auto& parser = _connection.getParser<net::HTTPParser<DBURIParser>>();
     auto& writer = _connection.getWriter<net::proto::TuringProtoWriter>();
     auto& mem = _threadContext->getLocalMemory();
-    const TransactionInfo info = getTransactionInfo();
+    CompilerContext& compilerContext = _threadContext->getCompilerContext();
+    const QueryConfig& queryConfig = _db.getDefaultQueryConfig();
+    const net::HTTP::Info& httpInfo = parser.getHttpInfo();
 
-    QueryCallbacks callbacks;
+    DBTransactionInfo transactionInfo;
+    QueryStatus status;
+    DBTransactionInfo::read(httpInfo, transactionInfo, status);
 
-    callbacks.setOnOutputHeader([&](const Dataframe* df) {
-        bioassert(df != nullptr, "Cannot output header of a null dataframe");
-        writer.writeDataframeHeader(df);
-    });
+    TuringProtoQueryRequest request;
+    if (status.isOk()) {
+        TuringProtoQueryRequest::read(httpInfo, request, status);
+    }
 
-    callbacks.setOnOutputData([&](const Dataframe* df) {
-        bioassert(df != nullptr, "Cannot output data of a null dataframe");
-        writer.writeDataframe(df);
-    });
+    if (status.isOk()) {
+        const QueryState state(transactionInfo.graphName, &mem, &compilerContext, &queryConfig, &_protoNLSink, transactionInfo.commit, transactionInfo.change, &request.getParameters());
+        status = _db.query(request.getQuery(), state);
+    }
 
-    callbacks.setOnEnd([&](QueryCallbacks::ExecTimeMilliseconds milliseconds) {
-        if (writer.errorOccured()) {
-            return;
-        }
-        writer.writeEndPacket(milliseconds);
-    });
-
-    callbacks.setOnError([&](const QueryStatus& status) {
+    if (!status.isOk()) {
         writer.reset();
-        if (writer.errorOccured()) {
-            return;
-        }
         writer.writeError(&status);
-    });
-
-    const QueryState state(info.graphName, &mem, &_db.getDefaultQueryConfig(), &callbacks, info.commit, info.change);
-    _db.query(info.query, state);
-}
-
-// Extract the transaction info from the URI params; the query string comes from the HTTP body.
-TuringProtoServerProcessor::TransactionInfo TuringProtoServerProcessor::getTransactionInfo() const {
-    auto& parser = _connection.getParser<net::HTTPParser<DBURIParser>>();
-    const auto& httpInfo = parser.getHttpInfo();
-
-    std::string_view graphNameView = httpInfo.getParams()[static_cast<size_t>(DBHTTPParams::graph)];
-    std::string_view commitHashString = httpInfo.getParams()[static_cast<size_t>(DBHTTPParams::commit)];
-    std::string_view changeHashString = httpInfo.getParams()[static_cast<size_t>(DBHTTPParams::change)];
-
-    if (graphNameView.empty()) {
-        graphNameView = "default";
     }
 
-    if (commitHashString.empty()) {
-        commitHashString = "head";
+    if (writer.errorOccured()) {
+        return;
     }
 
-    if (changeHashString.empty()) {
-        changeHashString = "head";
-    }
-
-    const auto commitHashResult = CommitHash::fromString(commitHashString);
-
-    if (!commitHashResult) {
-        return {
-            .graphName = graphNameView,
-            .commit = CommitHash::head(),
-            .change = ChangeID::head(),
-            .query = httpInfo.getPayload(),
-        };
-    }
-
-    const auto changeHashResult = ChangeID::fromString(changeHashString);
-
-    if (!changeHashResult) {
-        return {
-            .graphName = graphNameView,
-            .commit = commitHashResult.value(),
-            .change = ChangeID::head(),
-            .query = httpInfo.getPayload(),
-        };
-    }
-
-    return {
-        .graphName = graphNameView,
-        .commit = commitHashResult.value(),
-        .change = changeHashResult.value(),
-        .query = httpInfo.getPayload(),
-    };
+    writer.writeEndPacket(status.getTotalTime().count());
 }

@@ -64,7 +64,6 @@ enum class ColumnInternalKind : uint32_t {
     ENTITY_LIST,
     LIST_VIEW,
     VALUE_TYPE,
-    NULL_VALUE,
     LIST_ELEMENT_VIEW,
     NODE_ID,
     EDGE_ID,
@@ -75,6 +74,10 @@ enum class ColumnInternalKind : uint32_t {
     COMMIT_HASH,
     CHANGE_ID,
     PROPERTY_NULL,
+    MAP_VIEW,
+    MAP_ENTRY_VIEW,
+    DATE_TIME,
+    DURATION,
 };
 
 enum class ColumnKind : uint8_t {

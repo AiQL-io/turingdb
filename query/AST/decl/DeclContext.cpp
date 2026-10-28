@@ -36,11 +36,25 @@ VarDecl* DeclContext::getDecl(std::string_view name) const {
     return it->second;
 }
 
+VarDecl* DeclContext::lookup(std::string_view name) const {
+    const DeclContext* scope = this;
+    while (scope) {
+        if (VarDecl* decl = scope->getDecl(name)) {
+            return decl;
+        }
+
+        scope = scope->_readsEnclosing ? scope->_parent : nullptr;
+    }
+
+    return nullptr;
+}
+
 VarDecl* DeclContext::getOrCreateNamedVariable(CypherAST* ast, EvaluatedType type, std::string_view name) {
     VarDecl* decl = getDecl(name);
     if (!decl) {
         decl = VarDecl::create(ast, this, name, type);
         decl->setIsUnnamed(false);
+        _declMap[decl->getName()] = decl;
     }
 
     if (decl->getType() != type) {
@@ -55,17 +69,65 @@ VarDecl* DeclContext::getOrCreateNamedVariable(CypherAST* ast, EvaluatedType typ
     return decl;
 }
 
+VarDecl* DeclContext::getOrCreateNodePatternVariable(CypherAST* ast, std::string_view name) {
+    VarDecl* declared = getDecl(name);
+
+    const bool holdsUnwoundIntegers = declared
+                                      && declared->getType() == EvaluatedType::Integer
+                                      && declared->isUnwound();
+
+    if (holdsUnwoundIntegers) {
+        declared->setType(EvaluatedType::NodePattern);
+
+        return declared;
+    }
+
+    return getOrCreateNamedVariable(ast, EvaluatedType::NodePattern, name);
+}
+
+// The item computes a column of its own, so an alias spelling a name already in scope
+// declares a second variable that shadows the first rather than naming it again
+VarDecl* DeclContext::declareProjectedVariable(CypherAST* ast, EvaluatedType type, std::string_view name) {
+    VarDecl* decl = VarDecl::create(ast, this, name, type);
+    decl->setIsUnnamed(false);
+    _declMap[decl->getName()] = decl;
+
+    return decl;
+}
+
+void DeclContext::dropVariable(std::string_view name) {
+    const auto findIt = _declMap.find(name);
+    if (findIt == _declMap.end()) {
+        return;
+    }
+
+    std::erase(_decls, findIt->second);
+    _declMap.erase(findIt);
+}
+
 VarDecl* DeclContext::createUnnamedVariable(CypherAST* ast, EvaluatedType type) {
     std::string* name = ast->createString();
-    name->assign("v" + std::to_string(_unnamedVarCounter++));
+
+    // The generated names share one spelling with what a query may call its own
+    // variables, and `v0` is a legal Cypher identifier: skipping the ones already
+    // declared here keeps a generated name from taking over a name the query wrote
+    do {
+        name->assign("v" + std::to_string(_unnamedVarCounter++));
+    } while (hasDecl(*name));
+
     VarDecl* decl = VarDecl::create(ast, this, *name, type);
     decl->setIsUnnamed(true);
 
     return decl;
 }
 
+void DeclContext::declareAlias(std::string_view name, VarDecl* decl) {
+    // The alias names no new variable, which is why it is bound to an existing declaration
+    // and not appended to `_decls`: a wildcard must not return the variable twice
+    _declMap[name] = decl;
+}
+
 void DeclContext::addDecl(VarDecl* decl) {
-    _declMap[decl->getName()] = decl;
     _decls.push_back(decl);
 }
 

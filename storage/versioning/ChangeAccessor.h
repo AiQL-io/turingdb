@@ -6,6 +6,7 @@
 #include "versioning/CommitHash.h"
 #include "versioning/ChangeID.h"
 #include "versioning/CommitResult.h"
+#include "versioning/SubmitMode.h"
 
 namespace db {
 
@@ -33,7 +34,7 @@ public:
     [[nodiscard]] auto end() const;
 
     [[nodiscard]] CommitResult<void> commit(JobSystem& jobsystem);
-    [[nodiscard]] CommitResult<void> submit(JobSystem& jobsystem);
+    [[nodiscard]] CommitResult<void> submit(JobSystem& jobsystem, SubmitMode mode = SubmitMode::MERGE);
 
     [[nodiscard]] ChangeID getID() const;
     [[nodiscard]] GraphView viewGraph(CommitHash commitHash = CommitHash::head()) const;

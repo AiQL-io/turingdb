@@ -10,11 +10,11 @@
 #include "Literal.h"
 #include "EdgePattern.h"
 #include "ExprAnalyzer.h"
+#include "LabelExpr.h"
 #include "NodePattern.h"
 #include "Pattern.h"
 #include "PatternElement.h"
 #include "Symbol.h"
-#include "SymbolChain.h"
 #include "decl/DeclContext.h"
 #include "decl/EvaluatedType.h"
 #include "decl/PatternData.h"
@@ -26,7 +26,9 @@
 #include "stmt/SetItem.h"
 #include "stmt/Stmt.h"
 #include "stmt/CreateStmt.h"
+#include "stmt/MergeStmt.h"
 #include "stmt/SetStmt.h"
+#include "stmt/RemoveStmt.h"
 
 using namespace db;
 
@@ -46,8 +48,16 @@ void WriteStmtAnalyzer::analyze(const Stmt* stmt) {
             analyze(static_cast<const CreateStmt*>(stmt));
             break;
 
+        case Stmt::Kind::MERGE:
+            analyze(static_cast<const MergeStmt*>(stmt));
+            break;
+
         case Stmt::Kind::SET:
             analyze(static_cast<const SetStmt*>(stmt));
+            break;
+
+        case Stmt::Kind::REMOVE:
+            analyze(static_cast<const RemoveStmt*>(stmt));
             break;
 
         case Stmt::Kind::DELETE:
@@ -63,18 +73,43 @@ void WriteStmtAnalyzer::analyze(const Stmt* stmt) {
 }
 
 void WriteStmtAnalyzer::analyze(const CreateStmt* createStmt) {
-    _hasCreate = true;
-    if (createStmt->getPattern()) {
-        analyze(createStmt->getPattern());
+    if (const Pattern* pattern = createStmt->getPattern()) {
+        throwOnEntityWhere(pattern, "CREATE");
+        throwOnUndirectedEdge(pattern);
+        analyze(pattern);
+    }
+}
+
+void WriteStmtAnalyzer::analyze(const MergeStmt* mergeStmt) {
+    const Pattern* pattern = mergeStmt->getPattern();
+
+    throwOnEntityWhere(pattern, "MERGE");
+    analyze(pattern);
+    throwOnNullProperty(pattern);
+
+    for (const SetStmt* actions : {mergeStmt->getOnCreate(), mergeStmt->getOnMatch()}) {
+        if (!actions) {
+            continue;
+        }
+
+        for (SetItem* item : actions->getItems()) {
+            analyze(item);
+        }
     }
 }
 
 void WriteStmtAnalyzer::analyze(const SetStmt* setStmt) {
-    if (_hasCreate) {
-        throwError("CREATE ... SET is not yet supported. Please use brace initialisation.", setStmt);
-    }
     for (SetItem* item : setStmt->getItems()) {
         analyze(item);
+    }
+}
+
+void WriteStmtAnalyzer::analyze(const RemoveStmt* removeStmt) {
+    constexpr bool ALLOW_CREATES = false;
+
+    for (PropertyExpr* property : removeStmt->getProperties()) {
+        _exprAnalyzer->analyzePropertyExpr(property, ALLOW_CREATES, ValueType::Invalid);
+        _exprAnalyzer->throwIfReadsPartOfAProperty(property);
     }
 }
 
@@ -90,12 +125,52 @@ void WriteStmtAnalyzer::analyze(const DeleteStmt* deleteStmt) {
 }
 
 void WriteStmtAnalyzer::analyze(const Pattern* pattern) {
-    for (const PatternElement* element : pattern->elements()) {
+    for (PatternElement* element : pattern->elements()) {
         analyze(element);
     }
 }
 
-void WriteStmtAnalyzer::analyze(const PatternElement* element) {
+void WriteStmtAnalyzer::throwOnEntityWhere(const Pattern* pattern, std::string_view clause) const {
+    for (const PatternElement* element : pattern->elements()) {
+        for (const EntityPattern* entity : element->getEntities()) {
+            if (entity->getWhere()) {
+                throwError(fmt::format("WHERE is not allowed in a {} pattern", clause), entity);
+            }
+        }
+    }
+}
+
+void WriteStmtAnalyzer::throwOnNullProperty(const Pattern* pattern) const {
+    for (const PatternElement* element : pattern->elements()) {
+        for (const EntityPattern* entity : element->getEntities()) {
+            const MapLiteral* properties = entity->getProperties();
+            if (!properties) {
+                continue;
+            }
+
+            for (const auto& [propertyName, expr] : *properties) {
+                if (expr->getType() == EvaluatedType::Null) {
+                    throwError(fmt::format("MERGE cannot match on property '{}', which is null",
+                                           propertyName->getName()),
+                               expr);
+                }
+            }
+        }
+    }
+}
+
+void WriteStmtAnalyzer::throwOnUndirectedEdge(const Pattern* pattern) const {
+    for (const PatternElement* element : pattern->elements()) {
+        for (const EntityPattern* entity : element->getEntities()) {
+            const EdgePattern* edge = dynamic_cast<const EdgePattern*>(entity);
+            if (edge && edge->getDirection() == EdgePattern::Direction::Undirected) {
+                throwError("Only directed relationships are supported in CREATE", entity);
+            }
+        }
+    }
+}
+
+void WriteStmtAnalyzer::analyze(PatternElement* element) {
     const auto& entities = element->getEntities();
 
     for (EntityPattern* entity : entities) {
@@ -107,9 +182,32 @@ void WriteStmtAnalyzer::analyze(const PatternElement* element) {
             throwError(fmt::format("Unsupported pattern entity type"), entity);
         }
     }
+
+    analyzeNamedPath(element);
+}
+
+void WriteStmtAnalyzer::analyzeNamedPath(PatternElement* element) {
+    Symbol* symbol = element->getPathSymbol();
+    if (!symbol) {
+        return;
+    }
+
+    const std::string_view name = symbol->getName();
+
+    if (_ctxt->getDecl(name)) {
+        throwError(fmt::format("Variable '{}' is already bound: a named path takes a name of its own", name),
+                   element);
+    }
+
+    VarDecl* decl = _ctxt->getOrCreateNamedVariable(_ast, EvaluatedType::GraphPath, name);
+    element->setPathDecl(decl);
 }
 
 void WriteStmtAnalyzer::analyze(NodePattern* nodePattern) {
+    if (nodePattern->getWhere()) {
+        throwError("WHERE cannot be used in a write pattern", nodePattern);
+    }
+
     VarDecl* decl = nullptr;
 
     if (Symbol* symbol = nodePattern->getSymbol()) {
@@ -122,10 +220,8 @@ void WriteStmtAnalyzer::analyze(NodePattern* nodePattern) {
                            nodePattern);
             }
 
-            const auto& labels = nodePattern->labels();
-
             // Already existing vars cannot have constraints
-            if (nodePattern->getData() != nullptr || labels != nullptr) {
+            if (nodePattern->getData() != nullptr || nodePattern->getLabelExpr() != nullptr) {
                 throwError("Variable already defined", nodePattern);
             }
 
@@ -144,14 +240,16 @@ void WriteStmtAnalyzer::analyze(NodePattern* nodePattern) {
     nodePattern->setDecl(decl);
     nodePattern->setData(data);
 
-    const auto& labels = nodePattern->labels();
-    if (labels == nullptr) {
+    const LabelExpr* labelExpr = nodePattern->getLabelExpr();
+    if (labelExpr == nullptr) {
         throwError("Node pattern must have at least one label", nodePattern);
     }
 
-    for (const Symbol* label : *labels) {
-        data->addLabelConstraint(label->getName());
+    if (labelExpr->getKind() != LabelExpr::Kind::LABELS) {
+        throwError("Labels in a write pattern can only be joined by ':' or '&'", nodePattern);
     }
+
+    data->addLabelConstraints(labelExpr->getLabels());
 
     const MapLiteral* properties = nodePattern->getProperties();
     if (properties) {
@@ -164,21 +262,26 @@ void WriteStmtAnalyzer::analyze(NodePattern* nodePattern) {
                 throwError("Invalid use of aggregate expression in this context", nodePattern);
             }
 
+            const EvaluatedType exprType = expr->getType();
+            if (exprType == EvaluatedType::Null) {
+                continue;
+            }
+
             const std::optional<PropertyType> propType = propTypeMap.get(propName->getName());
             if (propType) {
                 // Property type already exists
-                if (!ExprAnalyzer::propTypeCompatible(propType->_valueType, expr->getType())) {
+                if (!ExprAnalyzer::propTypeCompatible(propType->_valueType, exprType)) {
                     throwError(fmt::format("Cannot evaluate node property: types '{}' and '{}' are incompatible",
                                            ValueTypeName::value(propType->_valueType),
-                                           EvaluatedTypeName::value(expr->getType())),
+                                           EvaluatedTypeName::value(exprType)),
                                nodePattern);
                 }
                 data->addExprConstraint(propName->getName(), propType->_valueType, expr);
             } else {
                 // Property type needs to be created
-                const ValueType valueType = evaluatedToValueType(expr->getType());
+                const ValueType valueType = evaluatedToValueType(exprType);
                 if (valueType == ValueType::Invalid) {
-                    throwError(fmt::format("Cannot evaluate node property: unsupported type '{}'", EvaluatedTypeName::value(expr->getType())),
+                    throwError(fmt::format("Cannot evaluate node property: unsupported type '{}'", EvaluatedTypeName::value(exprType)),
                                expr);
                 }
                 data->addExprConstraint(propName->getName(), valueType, expr);
@@ -189,6 +292,10 @@ void WriteStmtAnalyzer::analyze(NodePattern* nodePattern) {
 }
 
 void WriteStmtAnalyzer::analyze(EdgePattern* edgePattern) {
+    if (edgePattern->getWhere()) {
+        throwError("WHERE cannot be used in a write pattern", edgePattern);
+    }
+
     VarDecl* decl = nullptr;
 
     if (Symbol* symbol = edgePattern->getSymbol()) {
@@ -207,17 +314,20 @@ void WriteStmtAnalyzer::analyze(EdgePattern* edgePattern) {
     edgePattern->setDecl(decl);
     edgePattern->setData(data);
 
-    if (edgePattern->types() == nullptr) {
+    if (edgePattern->getQuantifiedPath()) {
+        throwError("Variable length relationships cannot be used in a write pattern", edgePattern);
+    }
+
+    const LabelExpr* typeExpr = edgePattern->getLabelExpr();
+    if (typeExpr == nullptr) {
         throwError("Edge pattern must have at least one edge type", edgePattern);
     }
 
-    const auto& types = edgePattern->types();
-
-    if (types->size() > 1) {
-        throwError("An edge cannot have more than one edge type", edgePattern);
+    if (!typeExpr->namesOneLabel()) {
+        throwError("An edge in a write pattern takes exactly one edge type, with no '|', '&', ':' or '!'", edgePattern);
     }
 
-    data->addEdgeTypeConstraint(types->front()->getName());
+    data->addEdgeTypeConstraints(typeExpr->getLabels());
 
     const MapLiteral* properties = edgePattern->getProperties();
     if (properties) {
@@ -230,24 +340,30 @@ void WriteStmtAnalyzer::analyze(EdgePattern* edgePattern) {
                 throwError("Invalid use of aggregate expression in this context", edgePattern);
             }
 
+            const EvaluatedType exprType = expr->getType();
+            if (exprType == EvaluatedType::Null) {
+                continue;
+            }
+
             const std::optional<PropertyType> propType = propTypeMap.get(propName->getName());
             if (propType) {
                 // Property type already exists
-                if (!ExprAnalyzer::propTypeCompatible(propType->_valueType, expr->getType())) {
-                    throwError(fmt::format("Cannot evaluate node property: types '{}' and '{}' are incompatible",
+                if (!ExprAnalyzer::propTypeCompatible(propType->_valueType, exprType)) {
+                    throwError(fmt::format("Cannot evaluate edge property: types '{}' and '{}' are incompatible",
                                            ValueTypeName::value(propType->_valueType),
-                                           EvaluatedTypeName::value(expr->getType())),
+                                           EvaluatedTypeName::value(exprType)),
                                edgePattern);
                 }
                 data->addExprConstraint(propName->getName(), propType->_valueType, expr);
             } else {
                 // Property type needs to be created
-                const ValueType valueType = evaluatedToValueType(expr->getType());
+                const ValueType valueType = evaluatedToValueType(exprType);
                 if (valueType == ValueType::Invalid) {
-                    throwError(fmt::format("Cannot evaluate edge property: unsupported type '{}'", EvaluatedTypeName::value(expr->getType())),
+                    throwError(fmt::format("Cannot evaluate edge property: unsupported type '{}'", EvaluatedTypeName::value(exprType)),
                                expr);
                 }
                 data->addExprConstraint(propName->getName(), valueType, expr);
+                _exprAnalyzer->addToBeCreatedType(propName->getName(), valueType, expr);
             }
         }
     }
@@ -265,12 +381,37 @@ void WriteStmtAnalyzer::analyze(SetItem* item) {
             _exprAnalyzer->analyzeExpr(rhs);
             const EvaluatedType rhsType = rhs->getType();
 
-            constexpr bool ALLOW_CREATES = true;
+            // writing null cannot create a new property
+            const bool writesNull = rhsType == EvaluatedType::Null;
+            const bool allowCreates = !writesNull;
+
             const ValueType valType = evaluatedToValueType(rhsType);
             const ValueType lhsEvaluatedVt =
-                _exprAnalyzer->analyzePropertyExpr(lhs, ALLOW_CREATES, valType);
+                _exprAnalyzer->analyzePropertyExpr(lhs, allowCreates, valType);
+
+            _exprAnalyzer->throwIfReadsPartOfAProperty(lhs);
 
             _exprAnalyzer->analyzeRootExpr(v._propValueExpr);
+
+            if (rhs->isAggregate()) {
+                throwError("Invalid use of aggregate expression in this context", item);
+            }
+
+            // An element of a mixed list carries its type per row, so the write checks it
+            // against the property's type
+            const bool writesAListElement = rhsType == EvaluatedType::Any;
+            const bool propertyHasAType = lhsEvaluatedVt != ValueType::Invalid;
+            const bool checksTheTypePerRow = writesAListElement && propertyHasAType;
+
+            if (writesNull || checksTheTypePerRow) {
+                return;
+            }
+
+            if (writesAListElement) {
+                const std::string err = fmt::format(
+                    "Cannot create property '{}' from a list.", lhs->getPropName());
+                throwError(err, item);
+            }
 
             if (!ExprAnalyzer::propTypeCompatible(lhsEvaluatedVt, rhsType)) {
                 throwError(fmt::format("Cannot evaluate property: types '{}' and '{}' are incompatible",
@@ -312,14 +453,21 @@ db::ValueType WriteStmtAnalyzer::evaluatedToValueType(EvaluatedType type) {
             return ValueType::Int64;
         case EvaluatedType::Embedding:
             return ValueType::Embedding;
+        case EvaluatedType::List:
+            return ValueType::List;
+        case EvaluatedType::DateTime:
+            return ValueType::DateTime;
+        case EvaluatedType::Duration:
+            return ValueType::Duration;
+        case EvaluatedType::Map:
+            return ValueType::Map;
         case EvaluatedType::Null:
         case EvaluatedType::NodePattern:
         case EvaluatedType::EdgePattern:
         case EvaluatedType::StringTable:
-        case EvaluatedType::List:
-        case EvaluatedType::Map:
         case EvaluatedType::Invalid:
         case EvaluatedType::Wildcard:
+        case EvaluatedType::NormalForm:
         case EvaluatedType::GraphPath:
         case EvaluatedType::Tuple:
         case EvaluatedType::ValueType:
@@ -328,7 +476,7 @@ db::ValueType WriteStmtAnalyzer::evaluatedToValueType(EvaluatedType type) {
         case EvaluatedType::PropertyType:
         case EvaluatedType::EdgeType:
         case EvaluatedType::_SIZE:
-        case EvaluatedType::ListItem:
+        case EvaluatedType::Any:
             return ValueType::Invalid;
         break;
     }

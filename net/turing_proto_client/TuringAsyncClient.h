@@ -12,11 +12,14 @@
 #include "TuringProtoDecoder.h"
 #include "TuringProtoInBuf.h"
 #include "TuringProtoHeaders.h"
+#include "TuringProtoRequestBody.h"
 #include "QueryCallbacks.h"
 #include "QueryStatus.h"
+#include "TuringSink.h"
 #include "dataframe/Dataframe.h"
 #include "dataframe/DataframeManager.h"
 #include "list/ListBuffer.h"
+#include "map/MapBuffer.h"
 #include "versioning/ChangeID.h"
 #include "versioning/CommitHash.h"
 
@@ -24,6 +27,7 @@ namespace db {
 
 class LocalMemory;
 class DataframeManager;
+class ParameterMap;
 
 }
 
@@ -63,7 +67,8 @@ public:
     void send();
     void recv();
     db::QueryStatus sendQuery(const std::string& query,
-                              const db::QueryCallbacks::OnOutputData& callback);
+                              const db::QueryCallbacks::OnOutputData& callback,
+                              const db::ParameterMap* parameters = nullptr);
 
     void setRemoteAddress(const std::string& remoteAddress) { _remoteAddress = remoteAddress; }
     void setRemotePort(const std::string& remotePort) { _remotePort = remotePort; }
@@ -100,10 +105,12 @@ private:
     db::CommitHash _commitHash {db::CommitHash::head()};
     db::ChangeID _changeID {db::ChangeID::head()};
     int _socket {-1};
+    bool _connecting {false};
     db::LocalMemory* _localMem {nullptr};
 
     // Send Buffer Members
     std::string _sendBuffer;
+    net::proto::TuringProtoRequestBody _requestBody;
     size_t _sendOffset {0};
     // Flag to indicate whether we are in the sending phase of the client
     bool _sending {false};
@@ -134,16 +141,19 @@ private:
     net::proto::ChunkedBuffer<float> _embeddingBuffer;
     net::proto::ChunkedBuffer<char> _stringBuffer;
     db::ListBuffer<> _listBuffer;
+    db::MapBuffer<> _mapBuffer;
+    net::proto::TuringSink _sink;
 
     // Decoded-response state, persisted across recv() resumptions for the in-flight query
     // and rebuilt fresh per query in reset(). _df/_dfMan are owned so a new query starts
     // with an empty dataframe; recreating _dfMan also frees the columns it owned from the
     // previous query (it deletes them in its destructor), instead of accumulating one set
     // of columns per query for the client's lifetime.
-    std::vector<DecodedColumnSchema> _colSchemas;
+    std::vector<DecodedColumnSchema> _columnSchemas;
     std::unique_ptr<db::DataframeManager> _dfMan;
     std::unique_ptr<db::Dataframe> _df;
-    std::unique_ptr<TuringProtoDecoder> _decoder;
+    std::unique_ptr<TuringSinkColumnContainer> _dataframeContainer;
+    TuringProtoDecoder<TuringSink> _decoder;
 
     // Per-query output callback and accumulated result.
     db::QueryCallbacks::OnOutputData _callback;
@@ -151,7 +161,12 @@ private:
     bool _callbackFired {false};
     bool _sawTerminalPacket {false};
 
-    void buildRequest(const std::string& query);
+    // Completes a connect() that returned EINPROGRESS: WouldBlock until the socket is
+    // writable, then throws if the handshake failed.
+    AsyncIOProgress finishConnect();
+    [[noreturn]] void throwConnectError(int error) const;
+
+    void buildRequest(const std::string& query, const db::ParameterMap* parameters);
 
     // Copies up to (need - filled) buffered bytes from _httpScratch into dst, advancing
     // _scratchHead and filled. Any remaining bytes are read from the socket by the caller.

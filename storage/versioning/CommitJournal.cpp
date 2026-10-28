@@ -34,6 +34,17 @@ void CommitJournal::addWrittenEdgeProperty(PropertyTypeID prop) {
     _edgePropertyWriteSet.insert(prop);
 }
 
+void CommitJournal::absorb(const CommitJournal& other) {
+    _nodeWriteSet.insert(other._nodeWriteSet);
+    _edgeWriteSet.insert(other._edgeWriteSet);
+    _nodePropertyWriteSet.insert(other._nodePropertyWriteSet);
+    _edgePropertyWriteSet.insert(other._edgePropertyWriteSet);
+
+    finalise();
+    _nodePropertyWriteSet.finalise();
+    _edgePropertyWriteSet.finalise();
+}
+
 void CommitJournal::finalise() {
     _nodeWriteSet.finalise();
     _edgeWriteSet.finalise();

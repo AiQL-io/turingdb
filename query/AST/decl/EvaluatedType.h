@@ -1,6 +1,8 @@
 #pragma once
 
 #include <stdint.h>
+
+#include <optional>
 #include <utility>
 
 #include "EnumToString.h"
@@ -24,7 +26,7 @@ enum class EvaluatedType : uint8_t {
     Char,
     Bool,
     List,
-    ListItem,
+    Any,
     Map,
     Wildcard,
     Tuple,
@@ -35,6 +37,9 @@ enum class EvaluatedType : uint8_t {
     LabelSet,
     PropertyType,
     EdgeType,
+    DateTime,
+    Duration,
+    NormalForm,
 
     _SIZE,
 };
@@ -73,7 +78,7 @@ using EvaluatedTypeName = EnumToString<EvaluatedType>::Create<
     EnumStringPair<EvaluatedType::Char, "Char">,
     EnumStringPair<EvaluatedType::Bool, "Bool">,
     EnumStringPair<EvaluatedType::List, "List">,
-    EnumStringPair<EvaluatedType::ListItem, "ListItem">,
+    EnumStringPair<EvaluatedType::Any, "Any">,
     EnumStringPair<EvaluatedType::Map, "Map">,
     EnumStringPair<EvaluatedType::Wildcard, "Wildcard">,
     EnumStringPair<EvaluatedType::Tuple, "Tuple">,
@@ -83,11 +88,14 @@ using EvaluatedTypeName = EnumToString<EvaluatedType>::Create<
     EnumStringPair<EvaluatedType::Label, "Label">,
     EnumStringPair<EvaluatedType::LabelSet, "LabelSet">,
     EnumStringPair<EvaluatedType::PropertyType, "PropertyType">,
-    EnumStringPair<EvaluatedType::EdgeType, "EdgeType">>;
+    EnumStringPair<EvaluatedType::EdgeType, "EdgeType">,
+    EnumStringPair<EvaluatedType::DateTime, "DateTime">,
+    EnumStringPair<EvaluatedType::Duration, "Duration">,
+    EnumStringPair<EvaluatedType::NormalForm, "NormalForm">>;
 
 // Evaluated Type to ValueType conversion
 static constexpr size_t VALUE_TYPE_COUNT = std::to_underlying(ValueType::_SIZE);
-static_assert(VALUE_TYPE_COUNT == 7, "ValueType added: please update below map.");
+static_assert(VALUE_TYPE_COUNT == 11, "ValueType added: please update below map.");
 
 static constexpr std::pair<ValueType, EvaluatedType> EVConversions[VALUE_TYPE_COUNT + 1] = {
     {ValueType::Int64,     EvaluatedType::Integer  },
@@ -96,6 +104,10 @@ static constexpr std::pair<ValueType, EvaluatedType> EVConversions[VALUE_TYPE_CO
     {ValueType::String,    EvaluatedType::String   },
     {ValueType::Embedding, EvaluatedType::Embedding},
     {ValueType::Bool,      EvaluatedType::Bool     },
+    {ValueType::List,      EvaluatedType::List     },
+    {ValueType::DateTime,  EvaluatedType::DateTime },
+    {ValueType::Duration,  EvaluatedType::Duration },
+    {ValueType::Map,       EvaluatedType::Map      },
 
     {ValueType::Invalid,   EvaluatedType::Invalid  },
     {ValueType::_SIZE,     EvaluatedType::Invalid  }
@@ -126,6 +138,122 @@ inline bool convertibleToEvaluatedType(ValueType v) {
 
 inline bool convertibleToValueType(EvaluatedType e) {
     return toValueType(e).has_value();
+}
+
+// The types naming a value an equality can be answered over without reading a row: the
+// scalars, the list and the map, but not a tagged cell, whose type is the row's rather
+// than the column's
+inline bool namesAComparableValue(EvaluatedType e) {
+    return e == EvaluatedType::Integer
+        || e == EvaluatedType::Double
+        || e == EvaluatedType::String
+        || e == EvaluatedType::Char
+        || e == EvaluatedType::Bool
+        || e == EvaluatedType::Embedding
+        || e == EvaluatedType::List
+        || e == EvaluatedType::DateTime
+        || e == EvaluatedType::Duration
+        || e == EvaluatedType::Map;
+}
+
+inline bool namesATaggedCell(EvaluatedType e) {
+    return e == EvaluatedType::Any;
+}
+
+// The types a WHERE, a WHEN, NOT, AND, OR and XOR read as a truth value. A value of type
+// any holds the row's own type, which is checked as each row is read.
+inline bool namesATruthValue(EvaluatedType e) {
+    return e == EvaluatedType::Bool || e == EvaluatedType::Null || e == EvaluatedType::Any;
+}
+
+// The types = and <> take: every value and every entity
+inline bool namesAnEqualityOperand(EvaluatedType e) {
+    return namesAComparableValue(e)
+        || namesATaggedCell(e)
+        || e == EvaluatedType::NodePattern
+        || e == EvaluatedType::EdgePattern;
+}
+
+// Whether both types are numbers, which = and <> compare by value: 32 equals 32.0
+inline bool comparesAsNumbers(EvaluatedType a, EvaluatedType b) {
+    const bool aIsANumber = a == EvaluatedType::Integer || a == EvaluatedType::Double;
+    const bool bIsANumber = b == EvaluatedType::Integer || b == EvaluatedType::Double;
+
+    return aIsANumber && bIsANumber;
+}
+
+// Whether two types can never hold equal values, which makes an equality between them
+// false on every row. A numeric pair is not disjoint - 32 equals 32.0 in Cypher - nor is a
+// string against a char, which compare as the characters they carry, nor an entity against
+// the integer its id is. A tagged cell holds the row's type, so it is disjoint from none.
+inline bool comparesAsDisjointTypes(EvaluatedType a, EvaluatedType b) {
+    const bool comparesACell = namesATaggedCell(a) || namesATaggedCell(b);
+
+    if (!namesAnEqualityOperand(a) || !namesAnEqualityOperand(b) || a == b || comparesACell) {
+        return false;
+    }
+
+    const TypePairBitset pair(a, b);
+    const bool bothNumeric = comparesAsNumbers(a, b);
+    const bool bothTextual = pair == TypePairBitset(EvaluatedType::String, EvaluatedType::Char);
+    const bool comparesAnID = pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::NodePattern)
+                           || pair == TypePairBitset(EvaluatedType::Integer, EvaluatedType::EdgePattern);
+
+    return !bothNumeric && !bothTextual && !comparesAnID;
+}
+
+// The types <, <=, > and >= take: every value, entities and paths included, though only
+// numbers, strings, booleans, datetimes, durations and lists have an order
+inline bool namesAnOrderingOperand(EvaluatedType e) {
+    return namesAnEqualityOperand(e) || e == EvaluatedType::GraphPath;
+}
+
+// The class a type is ordered in, or nullopt for a type with no order: a map, an
+// embedding, an entity or a path
+inline std::optional<EvaluatedType> orderClassOf(EvaluatedType e) {
+    switch (e) {
+        case EvaluatedType::Integer:
+        case EvaluatedType::Double:
+            return EvaluatedType::Integer;
+        break;
+        case EvaluatedType::String:
+        case EvaluatedType::Char:
+            return EvaluatedType::String;
+        break;
+        case EvaluatedType::Bool:
+        case EvaluatedType::DateTime:
+        case EvaluatedType::Duration:
+        case EvaluatedType::List:
+            return e;
+        break;
+        default:
+            return std::nullopt;
+        break;
+    }
+}
+
+// Whether <, <=, > and >= between two types are null on every row: Cypher orders two
+// values of one class only. A tagged cell holds the row's type, so it can order against
+// another cell or any type that has an order.
+inline bool ordersAsDisjointTypes(EvaluatedType a, EvaluatedType b) {
+    if (!namesAnOrderingOperand(a) || !namesAnOrderingOperand(b)) {
+        return false;
+    }
+
+    const bool aIsACell = namesATaggedCell(a);
+    const bool bIsACell = namesATaggedCell(b);
+    const std::optional<EvaluatedType> aClass = orderClassOf(a);
+    const std::optional<EvaluatedType> bClass = orderClassOf(b);
+
+    if (aIsACell && bIsACell) {
+        return false;
+    } else if (aIsACell) {
+        return !bClass;
+    } else if (bIsACell) {
+        return !aClass;
+    }
+
+    return !aClass || aClass != bClass;
 }
 
 }

@@ -7,9 +7,7 @@
 
 #include "ListBufferTypeTag.h"
 
-#include "metadata/PropertyType.h"
-
-#include "FatalException.h"
+#include "metadata/PropertyNull.h"
 
 namespace db {
 
@@ -35,6 +33,9 @@ public:
         return ListBufferTypeTag {tagValue};
     }
 
+    /// Returns a pointer to the raw element bytes: the tag, followed by the value bytes.
+    const std::byte* getData() const { return _tag; }
+
     /**
      * @brief Attempts to read the viewed element as a @param T.
      * @warn Does not verify that the viewed element is in fact a @param T.
@@ -43,9 +44,18 @@ public:
     template <typename T>
     T getAs() const;
 
+    /// Returns a view of a null element, for a producer holding no @ref ListByteBuffer.
+    static ListElementView nullElement() { return ListElementView {_nullElementBytes}; }
+
 private:
     /// Pointer to the tag of this element in a ListByteBuffer
     const std::byte* _tag {nullptr};
+
+    // What a ListByteBuffer holds for a null element: the tag, then the bytes of the
+    // value, which getAs reads whatever the size of the type it reads them into.
+    static constexpr std::byte _nullElementBytes[1 + sizeof(PropertyNull)] {
+        static_cast<std::byte>(ListBufferTypeTag::Null),
+    };
 };
 
 template <typename T>
@@ -68,5 +78,10 @@ T ListElementView::getAs() const {
 
     return out;
 }
+
+// A cell carries its null in its tag. Declared beside the type, so that every translation
+// unit comparing one against PropertyNull reads the tag rather than PropertyNull.h's
+// fallback, which answers false.
+bool operator==(ListElementView element, PropertyNull);
 
 }

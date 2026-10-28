@@ -1,5 +1,6 @@
 #include "GraphManager.h"
 
+#include <algorithm>
 #include <string>
 #include <utility>
 
@@ -49,6 +50,24 @@ Graph* GraphManager::getGraph(std::string_view graphName) const {
     }
 
     return slot->getObject();
+}
+
+ChangeResult<Graph*> GraphManager::findGraph(std::string_view graphName) const {
+    Graph* graph = getGraph(graphName);
+    if (graph) {
+        return graph;
+    }
+
+    const fs::Path& graphsDir = _config->getGraphsDir();
+    const fs::Path graphPath = graphsDir / graphName;
+    const bool isOnDisk = _config->isSyncedOnDisk()
+                       && graphPath.isSubDirectory(graphsDir)
+                       && graphPath.exists();
+    if (isOnDisk) {
+        return ChangeError::graphResult(ChangeErrorType::GRAPH_NOT_LOADED, graphName);
+    }
+
+    return ChangeError::graphResult(ChangeErrorType::GRAPH_NOT_FOUND, graphName);
 }
 
 Graph* GraphManager::createGraph(std::string_view name) {
@@ -109,8 +128,38 @@ void GraphManager::listGraphs(std::vector<std::string_view>& names) const {
     _graphs.listNames(names);
 }
 
+void GraphManager::listAvailableGraphs(std::vector<std::string>& names) const {
+    const auto list = _config->getGraphsDir().listDir();
+    if (!list) {
+        throw TuringException("Can not list graphs in turing directory");
+    }
+
+    for (const auto& path : list.value()) {
+        names.emplace_back(path.filename());
+    }
+
+    _graphLoadStatus.listLoadingGraphs(names);
+
+    std::vector<std::string_view> loadedNames;
+    _graphs.listNames(loadedNames);
+    names.insert(names.end(), loadedNames.begin(), loadedNames.end());
+
+    std::ranges::sort(names);
+    const auto [duplicatesBegin, duplicatesEnd] = std::ranges::unique(names);
+    names.erase(duplicatesBegin, duplicatesEnd);
+}
+
 void GraphManager::loadOrCreateDefaultGraph() {
     const LoadGraphResult<Graph*> loadRes = loadGraph("default");
+
+    if (!loadRes) {
+        const LoadGraphError& loadError = loadRes.error();
+        const std::optional<DumpError> dumpError = loadError.getDumpError();
+        const bool graphIsMissing = dumpError && dumpError->getType() == DumpErrorType::GRAPH_DOES_NOT_EXIST;
+        if (!graphIsMissing) {
+            spdlog::error(loadError.fmtMessage());
+        }
+    }
 
     Graph* graph = loadRes.has_value() ? loadRes.value() : createGraph("default");
 
@@ -124,7 +173,9 @@ void GraphManager::loadOrCreateDefaultGraph() {
 Graph* GraphManager::importGraph(std::string_view graphName,
                                  const fs::Path& filePath,
                                  JobSystem* jobSystem,
-                                const EmbeddingsSpec& embeddingSpecs) {
+                                 const EmbeddingsSpec& embeddingSpecs,
+                                 const DateTimeSpec& dateTimeSpecs,
+                                 const DurationSpec& durationSpecs) {
     const fs::Path graphPath = _config->getGraphsDir() / filePath;
 
     // Step 1. Check if graph was already loaded || is already loading
@@ -153,18 +204,18 @@ Graph* GraphManager::importGraph(std::string_view graphName,
             return loadGmlDB(graphName, absolute, jobSystem);
         break;
         case GraphFileType::JSONL:
-            return loadJsonlDB(graphName, absolute, jobSystem, embeddingSpecs);
+            return loadJsonlDB(graphName, absolute, jobSystem, embeddingSpecs, dateTimeSpecs, durationSpecs);
         break;
         case GraphFileType::BINARY:
             return loadBinaryDB(graphName, absolute, jobSystem);
         break;
         case GraphFileType::PARQUET:
-            return loadParquetDB(graphName, absolute, jobSystem);
+            return loadParquetDB(graphName, absolute, jobSystem, durationSpecs);
         break;
         case GraphFileType::UNKNOWN:
             // If we can not determine the file type, assume it is a JSONL graph
             // FIXME To be changed
-            return loadJsonlDB(graphName, absolute, jobSystem, embeddingSpecs);
+            return loadJsonlDB(graphName, absolute, jobSystem, embeddingSpecs, dateTimeSpecs, durationSpecs);
         break;
         case GraphFileType::_SIZE:
             throw TuringException("Unsupported graph type");
@@ -229,9 +280,9 @@ Graph* GraphManager::loadBinaryDB(std::string_view graphName,
         return nullptr;
     }
 
-    _graphLoadStatus.removeLoadingGraph(graphName);
-
     reservation.publish(std::move(graph));
+
+    _graphLoadStatus.removeLoadingGraph(graphName);
 
     return graphPtr;
 }
@@ -239,7 +290,9 @@ Graph* GraphManager::loadBinaryDB(std::string_view graphName,
 Graph* GraphManager::loadJsonlDB(std::string_view graphName,
                                  const fs::Path& dbPath,
                                  JobSystem* jobSystem,
-                                 const EmbeddingsSpec& embeddingSpecs) {
+                                 const EmbeddingsSpec& embeddingSpecs,
+                                 const DateTimeSpec& dateTimeSpecs,
+                                 const DurationSpec& durationSpecs) {
     const fs::Path graphPath = _config->getGraphsDir() / graphName;
     if (graphPath == dbPath) {
         return nullptr;
@@ -267,17 +320,18 @@ Graph* GraphManager::loadJsonlDB(std::string_view graphName,
     Change* change = _changes.createChange(graph.get(), CommitHash::head());
     ChangeAccessor changeAccessor = change->access();
 
-    const auto importRes = JsonlParser::parse(changeAccessor, file, embeddingSpecs);
+    const auto importRes = JsonlParser::parse(changeAccessor, file, embeddingSpecs, dateTimeSpecs, durationSpecs);
 
     if (!importRes) {
+        _changes.deleteChange(changeAccessor, change->id());
         _graphLoadStatus.removeLoadingGraph(graphName);
-        spdlog::error(importRes.error().fmtMessage());
-        return nullptr;
+        throw TuringException(importRes.error().fmtMessage());
     }
 
     const auto submitRes = _changes.submitChange(changeAccessor, *jobSystem);
 
     if (!submitRes) {
+        _changes.deleteChange(changeAccessor, change->id());
         _graphLoadStatus.removeLoadingGraph(graphName);
         spdlog::error(submitRes.error().fmtMessage());
         return nullptr;
@@ -293,9 +347,9 @@ Graph* GraphManager::loadJsonlDB(std::string_view graphName,
         }
     }
 
-    _graphLoadStatus.removeLoadingGraph(graphName);
-
     reservation.publish(std::move(graph));
+
+    _graphLoadStatus.removeLoadingGraph(graphName);
 
     return graphPtr;
 }
@@ -337,16 +391,17 @@ Graph* GraphManager::loadGmlDB(std::string_view graphName,
         }
     }
 
-    _graphLoadStatus.removeLoadingGraph(graphName);
-
     reservation.publish(std::move(graph));
+
+    _graphLoadStatus.removeLoadingGraph(graphName);
 
     return graphPtr;
 }
 
 Graph* GraphManager::loadParquetDB(std::string_view graphName,
                                    const fs::Path& dbPath,
-                                   JobSystem* jobSystem) {
+                                   JobSystem* jobSystem,
+                                   const DurationSpec& durationSpecs) {
     const fs::Path graphPath = _config->getGraphsDir() / graphName;
     if (graphPath == dbPath) {
         return nullptr;
@@ -381,10 +436,11 @@ Graph* GraphManager::loadParquetDB(std::string_view graphName,
     // Unfortunately I think we need to have this try-catch due to the dependency on the
     // Parquet lib which throws. Removing would require a rewrite of the reader.
     // TODO: Attempt to remove this try-catch and make the importer/reader exception free
-    ParquetImporter importer(nodeFile, edgeFile, commitBuilder);
+    ParquetImporter importer(nodeFile, edgeFile, commitBuilder, durationSpecs);
     try {
         importer.import();
     } catch (...) {
+        _changes.deleteChange(changeAccessor, change->id());
         _graphLoadStatus.removeLoadingGraph(graphName);
         throw;
     }
@@ -392,6 +448,7 @@ Graph* GraphManager::loadParquetDB(std::string_view graphName,
     const auto submitRes = _changes.submitChange(changeAccessor, *jobSystem);
 
     if (!submitRes) {
+        _changes.deleteChange(changeAccessor, change->id());
         _graphLoadStatus.removeLoadingGraph(graphName);
         spdlog::error(submitRes.error().fmtMessage());
         return nullptr;
@@ -407,28 +464,28 @@ Graph* GraphManager::loadParquetDB(std::string_view graphName,
         }
     }
 
-    _graphLoadStatus.removeLoadingGraph(graphName);
-
     reservation.publish(std::move(graph));
+
+    _graphLoadStatus.removeLoadingGraph(graphName);
 
     return graphPtr;
 }
 
 ChangeResult<Change*> GraphManager::newChange(std::string_view graphName, CommitHash baseHash) {
-    Graph* graph = getGraph(graphName);
+    const ChangeResult<Graph*> graph = findGraph(graphName);
     if (!graph) {
-        return ChangeError::result(ChangeErrorType::GRAPH_NOT_FOUND);
+        return BadResult<ChangeError>(graph.error());
     }
 
-    return _changes.createChange(graph, baseHash);
+    return _changes.createChange(graph.value(), baseHash);
 }
 
 ChangeResult<Change*> GraphManager::getChange(const Graph* graph, ChangeID changeID) {
     return _changes.getChange(graph, changeID);
 }
 
-ChangeResult<void> GraphManager::submitChange(ChangeAccessor& accessor, JobSystem& jobSystem) {
-    return _changes.submitChange(accessor, jobSystem);
+ChangeResult<void> GraphManager::submitChange(ChangeAccessor& accessor, JobSystem& jobSystem, SubmitMode mode) {
+    return _changes.submitChange(accessor, jobSystem, mode);
 }
 
 ChangeResult<void> GraphManager::deleteChange(ChangeAccessor& accessor, ChangeID changeID) {
@@ -437,6 +494,10 @@ ChangeResult<void> GraphManager::deleteChange(ChangeAccessor& accessor, ChangeID
 
 void GraphManager::listChanges(std::vector<const Change*>& changes, const Graph* graph) const {
     _changes.listChanges(changes, graph);
+}
+
+bool GraphManager::hasChanges() const {
+    return _changes.hasChanges();
 }
 
 DataPartMergeResult<void> GraphManager::mergeDataParts(Graph* graph, JobSystem& jobSystem) {

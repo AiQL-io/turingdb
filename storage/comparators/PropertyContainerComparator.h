@@ -2,8 +2,12 @@
 
 #include <string.h>
 
+#include <unordered_set>
+
 #include <range/v3/view/zip.hpp>
 
+#include "list/ListElementOrder.h"
+#include "map/MapHash.h"
 #include "properties/PropertyContainer.h"
 
 namespace db {
@@ -38,6 +42,29 @@ public:
     }
 };
 
+// A dump round trip must give back each value under the tag it was written with, so maps
+// compare structurally here rather than by Cypher's =, under which 1 and 1.0 are equal
+template <>
+class TypedPropertyContainerComparator<types::Map> {
+public:
+    [[nodiscard]] static bool same(const TypedPropertyContainer<types::Map>& a,
+                                   const TypedPropertyContainer<types::Map>& b) {
+        namespace rv = ranges::views;
+
+        if (a.size() != b.size()) {
+            return false;
+        }
+
+        for (const auto& [idA, idB, mapA, mapB] : rv::zip(a.ids(), b.ids(), a.all(), b.all())) {
+            if (idA != idB || !sameMap(mapA, mapB)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+};
+
 class PropertyContainerComparator {
 public:
     [[nodiscard]] static bool same(const PropertyContainer* a,
@@ -45,6 +72,10 @@ public:
         const auto valueType = a->getValueType();
 
         if (valueType != b->getValueType()) {
+            return false;
+        }
+
+        if (!sameNulls(a, b)) {
             return false;
         }
 
@@ -126,6 +157,40 @@ public:
                 break;
             }
 
+            case ValueType::List: {
+                if (!TypedPropertyContainerComparator<types::List>::same(
+                        a->cast<types::List>(),
+                        b->cast<types::List>())) {
+                    return false;
+                }
+                break;
+            }
+
+            case ValueType::DateTime: {
+                if (!TypedPropertyContainerComparator<types::DateTime>::same(
+                        a->cast<types::DateTime>(),
+                        b->cast<types::DateTime>())) {
+                    return false;
+                }
+                break;
+            }
+
+            case ValueType::Duration: {
+                if (!TypedPropertyContainerComparator<types::Duration>::same(
+                        a->cast<types::Duration>(),
+                        b->cast<types::Duration>())) {
+                    return false;
+                }
+                break;
+            }
+
+            case ValueType::Map: {
+                if (!TypedPropertyContainerComparator<types::Map>::same(a->cast<types::Map>(), b->cast<types::Map>())) {
+                    return false;
+                }
+                break;
+            }
+
             case ValueType::Invalid:
             case ValueType::_SIZE: {
                 break;
@@ -133,6 +198,24 @@ public:
         }
 
         return true;
+    }
+
+private:
+    // sort() never orders _nullIds, so two containers holding the same nulls can list
+    // them in different orders
+    [[nodiscard]] static bool sameNulls(const PropertyContainer* a,
+                                        const PropertyContainer* b) {
+        const auto& nullsA = a->nullIds();
+        const auto& nullsB = b->nullIds();
+
+        if (nullsA.size() != nullsB.size()) {
+            return false;
+        }
+
+        const std::unordered_set<EntityID> setA(nullsA.begin(), nullsA.end());
+        const std::unordered_set<EntityID> setB(nullsB.begin(), nullsB.end());
+
+        return setA == setB;
     }
 };
 

@@ -15,6 +15,9 @@ set(LLVM_TARGET_DEFINITIONS DBTypes.td)
 mlir_tablegen(DBTypes.h.inc      -gen-typedef-decls     -dialect db --typedefs-dialect db EXTRA_INCLUDES ${MLIR_INCLUDE_DIRS} ${STORAGE_DIALECT_SOURCE_DIR})
 mlir_tablegen(DBTypes.cpp.inc    -gen-typedef-defs      -dialect db --typedefs-dialect db EXTRA_INCLUDES ${MLIR_INCLUDE_DIRS} ${STORAGE_DIALECT_SOURCE_DIR})
 
+set (LLVM_TARGET_DEFINITIONS DBPasses.td)
+mlir_tablegen(DBPasses.h.inc     -gen-pass-decls    -name DB -dialect db  EXTRA_INCLUDES ${MLIR_INCLUDE_DIRS})
+
 # Creates CMAKE target with all included .inc files, the lib depends on this
 add_public_tablegen_target(DBDialectIncGen)
 
@@ -27,9 +30,11 @@ set_source_files_properties(
 
 # Compiles .cpp files; needs the codegen first, hence the DEPENDS clause
 add_mlir_library(turing_db_ir_dbdialect_s
+  DBColumnElement.cpp
   DBDialect.cpp
   DBOps.cpp
   DBTypes.cpp
+  DBPasses.cpp
 
   DEPENDS
   DBDialectIncGen
@@ -37,9 +42,16 @@ add_mlir_library(turing_db_ir_dbdialect_s
   LINK_LIBS PUBLIC
   MLIRIR
   MLIRSupport
+  MLIRPass
+  MLIRTransformUtils
   MLIRFuncDialect
   MLIRBuiltinToLLVMIRTranslation
   turing_db_ir_storagedialect_s
+  turing_db_ir_common_s
+
+  # The join cost model estimates each side from the graph's node counts, which is what
+  # the v2 planner reads it from too
+  turing_db_query_common_s
 )
 
 # Ensure we have MLIR and LLVM includes, as well as the headers in current dir
@@ -47,6 +59,7 @@ target_include_directories(turing_db_ir_dbdialect_s PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
   ${CMAKE_CURRENT_BINARY_DIR}
   ${STORAGE_DIALECT_BINARY_DIR}
+  ${IR_COMMON_SOURCE_DIR}
   ${MLIR_INCLUDE_DIRS}
   ${LLVM_INCLUDE_DIRS}
 )

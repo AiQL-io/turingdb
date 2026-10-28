@@ -2,6 +2,10 @@
 
 #include "TuringDB.h"
 #include "JsonEncoder.h"
+#include "DBServerNlSink.h"
+#include "DBQueryRequest.h"
+#include "DBTransactionInfo.h"
+#include "QueryState.h"
 
 #include "DBThreadContext.h"
 #include "HTTPParser.h"
@@ -14,8 +18,7 @@
 
 using namespace db;
 
-DBServerProcessor::DBServerProcessor(TuringDB& db,
-                                     net::TCPConnection& connection)
+DBServerProcessor::DBServerProcessor(TuringDB& db, net::TCPConnection& connection)
     : _writer(&connection.getWriter<net::HTTPWriter>()),
     _db(db),
     _connection(connection)
@@ -61,65 +64,8 @@ const net::HTTP::Info& DBServerProcessor::getHttpInfo() const {
 
 void DBServerProcessor::query() {
     const net::HTTP::Info& httpInfo = getHttpInfo();
-    const TransactionInfo transactionInfo = getTransactionInfo();
-
-    queryImpl(httpInfo.getPayload(),
-              transactionInfo.graphName,
-              transactionInfo.commit,
-              transactionInfo.change);
-}
-
-DBServerProcessor::TransactionInfo DBServerProcessor::getTransactionInfo() const {
-    auto& parser = _connection.getParser<net::HTTPParser<DBURIParser>>();
-    const auto& httpInfo = parser.getHttpInfo();
-    std::string_view graphNameView = httpInfo.getParams()[(size_t)DBHTTPParams::graph];
-    std::string_view commitHashStr = httpInfo.getParams()[(size_t)DBHTTPParams::commit];
-    std::string_view changeHashStr = httpInfo.getParams()[(size_t)DBHTTPParams::change];
-
-    if (graphNameView.empty()) {
-        graphNameView = "default";
-    }
-
-    if (commitHashStr.empty()) {
-        commitHashStr = "head";
-    }
-
-    if (changeHashStr.empty()) {
-        changeHashStr = "head";
-    }
-
-    const auto commitHashRes = CommitHash::fromString(commitHashStr);
-
-    if (!commitHashRes) {
-        return {
-            .graphName = std::string {graphNameView},
-            .commit = CommitHash::head(),
-            .change = ChangeID::head(),
-        };
-    }
-
-    const auto changeHashRes = ChangeID::fromString(changeHashStr);
-
-    if (!changeHashRes) {
-        return {
-            .graphName = std::string {graphNameView},
-            .commit = commitHashRes.value(),
-            .change = ChangeID::head(),
-        };
-    }
-
-    return {
-        .graphName = std::string {graphNameView},
-        .commit = commitHashRes.value(),
-        .change = changeHashRes.value(),
-    };
-}
-
-void DBServerProcessor::queryImpl(std::string_view query,
-                                  std::string_view graphName,
-                                  CommitHash commit,
-                                  ChangeID change) {
     LocalMemory& mem = _threadContext->getLocalMemory();
+    CompilerContext& compilerContext = _threadContext->getCompilerContext();
 
     const auto header = _writer.startHeader(net::HTTP::Status::OK,
                                             !_connection.isCloseRequired());
@@ -127,32 +73,30 @@ void DBServerProcessor::queryImpl(std::string_view query,
     net::NetWriter* writer = _writer.getWriter();
     bioassert(writer, "Invalid writer");
 
-    QueryCallbacks queryCallbacks;
     JsonEncoder<net::NetWriter> encoder(*writer);
 
-    queryCallbacks.setOnBegin([&] {
-        encoder.start();
-    });
+    encoder.start();
 
-    queryCallbacks.setOnOutputData([&] (const Dataframe* df) {
-        bioassert(df != nullptr, "Cannot output data of a null dataframe");
-        encoder.writeDataframe(*df);
-    });
+    DBServerNlSink sink(&encoder);
 
-    queryCallbacks.setOnOutputHeader([&] (const Dataframe* df) {
-        bioassert(df != nullptr, "Cannot output header of a null dataframe");
-        encoder.writeDataframeHeader(*df);
-    });
+    DBTransactionInfo transactionInfo;
+    QueryStatus status;
+    DBTransactionInfo::read(httpInfo, transactionInfo, status);
 
-    queryCallbacks.setOnError([&] (const QueryStatus& status) {
+    DBQueryRequest request;
+    if (status.isOk()) {
+        DBQueryRequest::read(httpInfo, request, status);
+    }
+
+    if (status.isOk()) {
+        const QueryState state(transactionInfo.graphName, &mem, &compilerContext, &_db.getDefaultQueryConfig(), &sink, transactionInfo.commit, transactionInfo.change, &request.getParameters());
+        status = _db.query(request.getQuery(), state);
+    }
+
+    if (!status.isOk()) {
         encoder.encodeError(status.getStatus(), status.getError());
-    });
+    }
 
-    queryCallbacks.setOnEnd([&] (QueryCallbacks::ExecTimeMilliseconds milliseconds) {
-        encoder.encodeTime(milliseconds);
-        encoder.finish();
-    });
-
-    const QueryState state(graphName, &mem, &_db.getDefaultQueryConfig(), &queryCallbacks, commit, change);
-    _db.query(query, state);
+    encoder.encodeTime(status.getTotalTime().count());
+    encoder.finish();
 }

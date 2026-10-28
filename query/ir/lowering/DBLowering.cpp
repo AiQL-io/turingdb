@@ -1,24 +1,42 @@
 #include "DBLowering.h"
 
 #include <algorithm>
+#include <array>
+#include <memory>
 #include <mlir/IR/Location.h>
 #include <optional>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+
+#include <spdlog/fmt/fmt.h>
 
 #include "mlir/IR/Block.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/Types.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "NLOps.h"
 
+#include "DBColumnElement.h"
+#include "IRConstantColumn.h"
+#include "IRRowAlignment.h"
+#include "MergePatternShape.h"
+#include "PathHopArguments.h"
+#include "Procedure.h"
+#include "ProcedureManager.h"
+#include "ProcedureTypeVector.h"
+
 #include "views/GraphView.h"
 #include "metadata/GraphMetadata.h"
-#include "metadata/LabelSet.h"
-#include "metadata/LabelSetHandle.h"
-#include "metadata/LabelSetMap.h"
-#include "metadata/LabelMap.h"
 #include "metadata/PropertyType.h"
 
+#include "IRValueTypes.h"
+
 #include "IRException.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Support/Casting.h"
 
 using namespace db;
@@ -28,49 +46,355 @@ namespace storage = mlir::storage;
 
 namespace {
 
-// Map a stored property value type to the MLIR element type baked into the
-// nullable value chunk. The element only has to round-trip back to this value
-// type during translation, so each kind takes a distinct builtin.
-mlir::Type valueTypeToElementType(mlir::OpBuilder& builder, ValueType valueType) {
-    switch (valueType) {
-        case ValueType::Int64:
-            return builder.getIntegerType(64);
+// The name a result column's value type goes out under. A rejection is read by whoever
+// wrote the query, so it names the type the value has rather than the chunk spelling it
+// is carried in.
+void describeColumnType(mlir::Type chunkType, std::string& out) {
+    out.clear();
+
+    mlir::Type element = mlir::cast<nl::ChunkType>(chunkType).getElementType();
+    if (const auto nullable = mlir::dyn_cast<storage::NullableType>(element)) {
+        element = nullable.getValueType();
+    }
+
+    if (mlir::isa<storage::StringType>(element)) {
+        out = "String";
+    } else if (mlir::isa<storage::BoolType>(element)) {
+        out = "Bool";
+    } else if (mlir::isa<mlir::NoneType>(element)) {
+        out = "Null";
+    } else if (mlir::isa<mlir::Float64Type>(element)) {
+        out = "Double";
+    } else if (mlir::isa<storage::NodeIDType>(element)) {
+        out = "Node";
+    } else if (mlir::isa<storage::EdgeIDType>(element)) {
+        out = "Edge";
+    } else if (mlir::isa<storage::ListType>(element)) {
+        out = "List";
+    } else if (mlir::isa<storage::EmbeddingType>(element)) {
+        out = "Embedding";
+    } else if (mlir::isa<storage::PathType>(element)) {
+        out = "Path";
+    } else if (const auto integer = mlir::dyn_cast<mlir::IntegerType>(element)) {
+        if (integer.getWidth() == 1) {
+            out = "Bool";
+        } else if (integer.isUnsigned()) {
+            out = "UInt64";
+        } else {
+            out = "Int64";
+        }
+    } else {
+        llvm::raw_string_ostream stream(out);
+        stream << element;
+    }
+}
+
+using NLUnaryFunctionEmitter = mlir::Value (*)(mlir::OpBuilder& builder,
+                                               mlir::Location loc,
+                                               nl::ChunkType resultType,
+                                               mlir::Value input,
+                                               mlir::Operation* source);
+
+template <typename NLOp>
+mlir::Value emitNLUnaryFunction(mlir::OpBuilder& builder,
+                                mlir::Location loc,
+                                nl::ChunkType resultType,
+                                mlir::Value input,
+                                mlir::Operation* source) {
+    return builder.create<NLOp>(loc, resultType, input).getResult();
+}
+
+template <typename DBOp, typename NLOp>
+mlir::Value emitNLNormalFormFunction(mlir::OpBuilder& builder,
+                                     mlir::Location loc,
+                                     nl::ChunkType resultType,
+                                     mlir::Value input,
+                                     mlir::Operation* source) {
+    DBOp normalFormOp = mlir::cast<DBOp>(source);
+
+    return builder.create<NLOp>(loc, resultType, input, normalFormOp.getForm()).getResult();
+}
+
+bool holdsTaggedCells(mlir::Type chunkType);
+
+// A number or a duration is its own unary plus, which the analyzer already checked. Only a
+// cell, whose type is the row's, is checked when the program runs.
+mlir::Value emitUnaryPlus(mlir::OpBuilder& builder,
+                          mlir::Location loc,
+                          nl::ChunkType resultType,
+                          mlir::Value input,
+                          mlir::Operation* source) {
+    if (!holdsTaggedCells(input.getType())) {
+        return input;
+    }
+
+    return builder.create<nl::UnaryPlus>(loc, resultType, input).getResult();
+}
+
+// The nl sibling of each db system command. They are copied across one for one -
+// same attributes under the same names, each db column result becoming the chunk
+// the command fills - so the whole family lowers through one table instead of a
+// branch apiece.
+const llvm::StringMap<llvm::StringRef> systemCommandSiblings = {
+    {mlir::db::LoadGraph::getOperationName(),           nl::LoadGraph::getOperationName()},
+    {mlir::db::CreateGraph::getOperationName(),         nl::CreateGraph::getOperationName()},
+    {mlir::db::ImportGraph::getOperationName(),         nl::ImportGraph::getOperationName()},
+    {mlir::db::ListGraphs::getOperationName(),          nl::ListGraphs::getOperationName()},
+    {mlir::db::ListAvailableGraphs::getOperationName(), nl::ListAvailableGraphs::getOperationName()},
+    {mlir::db::ChangeCommand::getOperationName(),       nl::ChangeCommand::getOperationName()},
+    {mlir::db::CommitChange::getOperationName(),        nl::CommitChange::getOperationName()},
+    {mlir::db::LoadCommit::getOperationName(),          nl::LoadCommit::getOperationName()},
+    {mlir::db::MergeDataParts::getOperationName(),      nl::MergeDataParts::getOperationName()},
+    {mlir::db::S3Connect::getOperationName(),           nl::S3Connect::getOperationName()},
+    {mlir::db::S3Transfer::getOperationName(),          nl::S3Transfer::getOperationName()},
+    {mlir::db::ShowProcedures::getOperationName(),      nl::ShowProcedures::getOperationName()},
+    {mlir::db::InstallExtension::getOperationName(),    nl::InstallExtension::getOperationName()},
+    {mlir::db::ShowExtensions::getOperationName(),      nl::ShowExtensions::getOperationName()},
+    {mlir::db::CreateVectorIndex::getOperationName(),   nl::CreateVectorIndex::getOperationName()},
+    {mlir::db::DeleteVectorIndex::getOperationName(),   nl::DeleteVectorIndex::getOperationName()},
+    {mlir::db::ShowVectorIndexes::getOperationName(),   nl::ShowVectorIndexes::getOperationName()},
+    {mlir::db::LoadVector::getOperationName(),          nl::LoadVector::getOperationName()},
+    {mlir::db::LoadEmbedding::getOperationName(),       nl::LoadEmbedding::getOperationName()},
+    {mlir::db::CreatePropertyIndex::getOperationName(), nl::CreatePropertyIndex::getOperationName()},
+    {mlir::db::DropIndex::getOperationName(),           nl::DropIndex::getOperationName()},
+    {mlir::db::Explain::getOperationName(),             nl::Explain::getOperationName()},
+};
+
+enum class ResultNullability {
+    FollowsInput,
+    AlwaysNullable,
+    NeverNullable,
+};
+
+struct UnaryFunctionLowering {
+    NLUnaryFunctionEmitter emit {nullptr};
+    ResultNullability nullability {ResultNullability::FollowsInput};
+};
+
+const std::unordered_map<std::string_view, UnaryFunctionLowering> unaryFunctionLowerings = {
+    // Both read an entity column, which carries its null in the ID an OPTIONAL MATCH left
+    // invalid rather than in an optional, so their result is nullable whatever the input
+    // chunk's own type says
+    {"db.labels",     {&emitNLUnaryFunction<nl::Labels>, ResultNullability::AlwaysNullable}},
+    {"db.edge_type",  {&emitNLUnaryFunction<nl::EdgeType>, ResultNullability::AlwaysNullable}},
+    {"db.keys",       {&emitNLUnaryFunction<nl::Keys>, ResultNullability::AlwaysNullable}},
+    {"db.properties", {&emitNLUnaryFunction<nl::PropertyMap>, ResultNullability::AlwaysNullable}},
+
+    // An end of an edge is a node, and a node column spells its null as an invalid ID, so
+    // the result stays a plain node chunk where labels() and type() need a nullable one
+    {"db.start_node", {&emitNLUnaryFunction<nl::StartNode>, ResultNullability::NeverNullable}},
+    {"db.end_node",   {&emitNLUnaryFunction<nl::EndNode>, ResultNullability::NeverNullable}},
+
+    {"db.to_integer", {&emitNLUnaryFunction<nl::ToInteger>, ResultNullability::AlwaysNullable}},
+    {"db.to_float",   {&emitNLUnaryFunction<nl::ToFloat>, ResultNullability::AlwaysNullable}},
+    {"db.to_boolean", {&emitNLUnaryFunction<nl::ToBoolean>, ResultNullability::AlwaysNullable}},
+    {"db.to_datetime", {&emitNLUnaryFunction<nl::ToDateTime>, ResultNullability::AlwaysNullable}},
+    {"db.to_duration", {&emitNLUnaryFunction<nl::ToDuration>, ResultNullability::AlwaysNullable}},
+
+    // A calendar field of an instant is always readable, so the field is null exactly
+    // where the instant it was read off is
+    {"db.datetime_year",        {&emitNLUnaryFunction<nl::DateTimeYear>, ResultNullability::FollowsInput}},
+    {"db.datetime_month",       {&emitNLUnaryFunction<nl::DateTimeMonth>, ResultNullability::FollowsInput}},
+    {"db.datetime_day",         {&emitNLUnaryFunction<nl::DateTimeDay>, ResultNullability::FollowsInput}},
+    {"db.datetime_hour",        {&emitNLUnaryFunction<nl::DateTimeHour>, ResultNullability::FollowsInput}},
+    {"db.datetime_minute",      {&emitNLUnaryFunction<nl::DateTimeMinute>, ResultNullability::FollowsInput}},
+    {"db.datetime_second",      {&emitNLUnaryFunction<nl::DateTimeSecond>, ResultNullability::FollowsInput}},
+    {"db.datetime_millisecond", {&emitNLUnaryFunction<nl::DateTimeMillisecond>, ResultNullability::FollowsInput}},
+    {"db.datetime_microsecond", {&emitNLUnaryFunction<nl::DateTimeMicrosecond>, ResultNullability::FollowsInput}},
+
+    {"db.duration_years",                  {&emitNLUnaryFunction<nl::DurationYears>, ResultNullability::FollowsInput}},
+    {"db.duration_quarters",               {&emitNLUnaryFunction<nl::DurationQuarters>, ResultNullability::FollowsInput}},
+    {"db.duration_months",                 {&emitNLUnaryFunction<nl::DurationMonths>, ResultNullability::FollowsInput}},
+    {"db.duration_weeks",                  {&emitNLUnaryFunction<nl::DurationWeeks>, ResultNullability::FollowsInput}},
+    {"db.duration_days",                   {&emitNLUnaryFunction<nl::DurationDays>, ResultNullability::FollowsInput}},
+    {"db.duration_hours",                  {&emitNLUnaryFunction<nl::DurationHours>, ResultNullability::FollowsInput}},
+    {"db.duration_minutes",                {&emitNLUnaryFunction<nl::DurationMinutes>, ResultNullability::FollowsInput}},
+    {"db.duration_seconds",                {&emitNLUnaryFunction<nl::DurationSeconds>, ResultNullability::FollowsInput}},
+    {"db.duration_milliseconds",           {&emitNLUnaryFunction<nl::DurationMilliseconds>, ResultNullability::FollowsInput}},
+    {"db.duration_microseconds",           {&emitNLUnaryFunction<nl::DurationMicroseconds>, ResultNullability::FollowsInput}},
+    {"db.duration_quarters_of_year",       {&emitNLUnaryFunction<nl::DurationQuartersOfYear>, ResultNullability::FollowsInput}},
+    {"db.duration_months_of_year",         {&emitNLUnaryFunction<nl::DurationMonthsOfYear>, ResultNullability::FollowsInput}},
+    {"db.duration_months_of_quarter",      {&emitNLUnaryFunction<nl::DurationMonthsOfQuarter>, ResultNullability::FollowsInput}},
+    {"db.duration_days_of_week",           {&emitNLUnaryFunction<nl::DurationDaysOfWeek>, ResultNullability::FollowsInput}},
+    {"db.duration_minutes_of_hour",        {&emitNLUnaryFunction<nl::DurationMinutesOfHour>, ResultNullability::FollowsInput}},
+    {"db.duration_seconds_of_minute",      {&emitNLUnaryFunction<nl::DurationSecondsOfMinute>, ResultNullability::FollowsInput}},
+    {"db.duration_milliseconds_of_second", {&emitNLUnaryFunction<nl::DurationMillisecondsOfSecond>, ResultNullability::FollowsInput}},
+    {"db.duration_microseconds_of_second", {&emitNLUnaryFunction<nl::DurationMicrosecondsOfSecond>, ResultNullability::FollowsInput}},
+    {"db.to_string",  {&emitNLUnaryFunction<nl::ToString>, ResultNullability::FollowsInput}},
+    {"db.to_integer_or_null", {&emitNLUnaryFunction<nl::ToIntegerOrNull>, ResultNullability::AlwaysNullable}},
+    {"db.to_float_or_null",   {&emitNLUnaryFunction<nl::ToFloatOrNull>, ResultNullability::AlwaysNullable}},
+    {"db.to_boolean_or_null", {&emitNLUnaryFunction<nl::ToBooleanOrNull>, ResultNullability::AlwaysNullable}},
+    {"db.to_string_or_null",  {&emitNLUnaryFunction<nl::ToStringOrNull>, ResultNullability::FollowsInput}},
+    {"db.element_id", {&emitNLUnaryFunction<nl::ElementID>, ResultNullability::AlwaysNullable}},
+    {"db.size",       {&emitNLUnaryFunction<nl::Size>, ResultNullability::FollowsInput}},
+    {"db.char_length", {&emitNLUnaryFunction<nl::CharLength>, ResultNullability::FollowsInput}},
+    {"db.head",       {&emitNLUnaryFunction<nl::Head>, ResultNullability::NeverNullable}},
+    {"db.last",       {&emitNLUnaryFunction<nl::Last>, ResultNullability::NeverNullable}},
+    {"db.tail",       {&emitNLUnaryFunction<nl::Tail>, ResultNullability::FollowsInput}},
+
+    {"db.abs",      {&emitNLUnaryFunction<nl::Abs>, ResultNullability::FollowsInput}},
+    {"db.negate",   {&emitNLUnaryFunction<nl::Negate>, ResultNullability::FollowsInput}},
+    {"db.unary_plus", {&emitUnaryPlus, ResultNullability::FollowsInput}},
+    {"db.sign",     {&emitNLUnaryFunction<nl::Sign>, ResultNullability::FollowsInput}},
+    {"db.ceil",     {&emitNLUnaryFunction<nl::Ceil>, ResultNullability::FollowsInput}},
+    {"db.floor",    {&emitNLUnaryFunction<nl::Floor>, ResultNullability::FollowsInput}},
+    {"db.round",    {&emitNLUnaryFunction<nl::Round>, ResultNullability::FollowsInput}},
+    {"db.sqrt",     {&emitNLUnaryFunction<nl::Sqrt>, ResultNullability::FollowsInput}},
+    {"db.exp",      {&emitNLUnaryFunction<nl::Exp>, ResultNullability::FollowsInput}},
+    {"db.log",      {&emitNLUnaryFunction<nl::Log>, ResultNullability::FollowsInput}},
+    {"db.log10",    {&emitNLUnaryFunction<nl::Log10>, ResultNullability::FollowsInput}},
+    {"db.sin",      {&emitNLUnaryFunction<nl::Sin>, ResultNullability::FollowsInput}},
+    {"db.cos",      {&emitNLUnaryFunction<nl::Cos>, ResultNullability::FollowsInput}},
+    {"db.tan",      {&emitNLUnaryFunction<nl::Tan>, ResultNullability::FollowsInput}},
+    {"db.cot",      {&emitNLUnaryFunction<nl::Cot>, ResultNullability::FollowsInput}},
+    {"db.asin",     {&emitNLUnaryFunction<nl::Asin>, ResultNullability::FollowsInput}},
+    {"db.acos",     {&emitNLUnaryFunction<nl::Acos>, ResultNullability::FollowsInput}},
+    {"db.atan",     {&emitNLUnaryFunction<nl::Atan>, ResultNullability::FollowsInput}},
+    {"db.degrees",  {&emitNLUnaryFunction<nl::Degrees>, ResultNullability::FollowsInput}},
+    {"db.radians",  {&emitNLUnaryFunction<nl::Radians>, ResultNullability::FollowsInput}},
+    {"db.haversin", {&emitNLUnaryFunction<nl::Haversin>, ResultNullability::FollowsInput}},
+
+    {"db.to_upper", {&emitNLUnaryFunction<nl::ToUpper>, ResultNullability::FollowsInput}},
+    {"db.to_lower", {&emitNLUnaryFunction<nl::ToLower>, ResultNullability::FollowsInput}},
+    {"db.trim",     {&emitNLUnaryFunction<nl::Trim>, ResultNullability::FollowsInput}},
+    {"db.ltrim",    {&emitNLUnaryFunction<nl::LTrim>, ResultNullability::FollowsInput}},
+    {"db.rtrim",    {&emitNLUnaryFunction<nl::RTrim>, ResultNullability::FollowsInput}},
+    {"db.reverse",  {&emitNLUnaryFunction<nl::Reverse>, ResultNullability::FollowsInput}},
+    {"db.normalize", {&emitNLNormalFormFunction<mlir::db::Normalize, nl::Normalize>, ResultNullability::FollowsInput}},
+    {"db.is_normalized", {&emitNLNormalFormFunction<mlir::db::IsNormalized, nl::IsNormalized>, ResultNullability::FollowsInput}}
+};
+
+const UnaryFunctionLowering* lookupUnaryFunctionLowering(mlir::Operation& operation) {
+    const llvm::StringRef name = operation.getName().getStringRef();
+    const auto it = unaryFunctionLowerings.find(std::string_view(name.data(), name.size()));
+    return it == unaryFunctionLowerings.end() ? nullptr : &it->second;
+}
+
+using NLBinaryFunctionEmitter = mlir::Value (*)(mlir::OpBuilder& builder,
+                                                mlir::Location loc,
+                                                nl::ChunkType resultType,
+                                                mlir::Value lhs,
+                                                mlir::Value rhs);
+
+template <typename NLOp>
+mlir::Value emitNLBinaryFunction(mlir::OpBuilder& builder,
+                                 mlir::Location loc,
+                                 nl::ChunkType resultType,
+                                 mlir::Value lhs,
+                                 mlir::Value rhs) {
+    return builder.create<NLOp>(loc, resultType, lhs, rhs).getResult();
+}
+
+using BinaryFunctionElement = mlir::Type (*)(mlir::OpBuilder& builder, mlir::Type lhsElement);
+
+mlir::Type floatFunctionElement(mlir::OpBuilder& builder, mlir::Type lhsElement) {
+    return builder.getF64Type();
+}
+
+struct BinaryFunctionLowering {
+    NLBinaryFunctionEmitter emit {nullptr};
+    BinaryFunctionElement element {nullptr};
+};
+
+const std::unordered_map<std::string_view, BinaryFunctionLowering> binaryFunctionLowerings = {
+    {"db.cosine_similarity",  {&emitNLBinaryFunction<nl::CosineSimilarity>,  &floatFunctionElement}},
+    {"db.euclidean_distance", {&emitNLBinaryFunction<nl::EuclideanDistance>, &floatFunctionElement}},
+};
+
+const BinaryFunctionLowering* lookupBinaryFunctionLowering(mlir::Operation& operation) {
+    const llvm::StringRef name = operation.getName().getStringRef();
+    const auto it = binaryFunctionLowerings.find(std::string_view(name.data(), name.size()));
+    return it == binaryFunctionLowerings.end() ? nullptr : &it->second;
+}
+
+mlir::Type procedureElementType(mlir::OpBuilder& builder, ProcedureType procedureType) {
+    mlir::MLIRContext* const context = builder.getContext();
+
+    switch (procedureType) {
+        case ProcedureType::NODE:
+            return storage::NodeIDType::get(context);
         break;
 
-        case ValueType::UInt64:
+        case ProcedureType::EDGE:
+            return storage::EdgeIDType::get(context);
+        break;
+
+        case ProcedureType::LABEL_ID:
+            return storage::LabelIDType::get(context);
+        break;
+
+        case ProcedureType::EDGE_TYPE_ID:
+            return storage::EdgeTypeIDType::get(context);
+        break;
+
+        case ProcedureType::PROPERTY_TYPE_ID:
+            return storage::PropertyTypeIDType::get(context);
+        break;
+
+        case ProcedureType::VALUE_TYPE:
+            return storage::ValueTypeType::get(context);
+        break;
+
+        case ProcedureType::UINT_64:
             return builder.getIntegerType(64, /*isSigned=*/false);
         break;
 
-        case ValueType::Double:
+        case ProcedureType::INT64:
+            return builder.getIntegerType(64);
+        break;
+
+        case ProcedureType::DOUBLE:
             return builder.getF64Type();
         break;
 
-        case ValueType::Bool:
+        case ProcedureType::BOOL:
             return builder.getI1Type();
         break;
 
-        case ValueType::String:
-            return storage::StringType::get(builder.getContext());
+        case ProcedureType::STRING_VIEW:
+            return storage::StringType::get(context);
         break;
 
-        case ValueType::Embedding:
-            return storage::EmbeddingType::get(builder.getContext());
+        case ProcedureType::LIST:
+            return storage::ListType::get(context, mlir::NoneType::get(context));
         break;
 
-        case ValueType::Invalid:
-        case ValueType::_SIZE:
-            throw IRException("Invalid property value type");
+        case ProcedureType::MAP:
+            throw IRException("Unsupported procedure return type: MAP");
+        break;
+
+        case ProcedureType::INVALID:
+        case ProcedureType::_SIZE:
+            throw IRException("Invalid procedure value type");
         break;
     }
 
-    throw IRException("Unhandled property value type");
+    throw IRException("Unhandled procedure value type");
+}
+
+// A return value the procedure declared nullable is read as a nullable chunk over that
+// element type - storage's ColumnOptVector - so a row the procedure has no value for is
+// null rather than a value standing in for one.
+nl::ChunkType procedureChunkType(mlir::OpBuilder& builder, const NamedProcedureType& returnValue) {
+    mlir::MLIRContext* const context = builder.getContext();
+    const mlir::Type elementType = procedureElementType(builder, returnValue._type);
+
+    if (returnValue._nullable) {
+        return nl::ChunkType::get(context, storage::NullableType::get(context, elementType));
+    }
+
+    return nl::ChunkType::get(context, elementType);
 }
 
 // The accumulator (and result) element type of an aggregate over a column whose
-// nullable value chunk wraps inputElement. avg always reduces to an f64; sum,
+// nullable value chunk wraps inputElement - or over a type-erased column, whose
+// inputElement is the tagged cell itself. avg and stdev always reduce to an f64; sum,
 // min and max keep the input's own type. Throws for a value type the reduction
-// cannot handle: sum/avg need a numeric column, min/max an orderable one (so a
-// string sum, a bool sum or an embedding min is rejected, matching Cypher).
+// cannot handle: sum/avg/stdev need a numeric column, min/max an orderable one (so a
+// string sum, a bool sum or an embedding min is rejected, matching Cypher). A tagged
+// cell is numeric only once read, so sum, avg and stdev accept one - all landing on the
+// f64 mixed numeric tags reduce to - where min/max would have to hand the winning cell
+// back under its own type, which no single result type names.
 mlir::Type aggregateResultElementType(mlir::OpBuilder& builder,
                                       storage::AggregateKind kind,
                                       mlir::Type inputElement) {
@@ -80,19 +404,44 @@ mlir::Type aggregateResultElementType(mlir::OpBuilder& builder,
     const bool isInteger = integerType && !isBool;
     const bool isNumeric = isFloat || isInteger;
     const bool isString = mlir::isa<storage::StringType>(inputElement);
+    const bool isDateTime = mlir::isa<storage::DateTimeType>(inputElement);
+    const bool isDuration = mlir::isa<storage::DurationType>(inputElement);
+    const bool isTaggedCell = mlir::isa<storage::AnyType>(inputElement);
+
+    // An untyped null holds no value to reduce - a name no property in the graph carries,
+    // or the null literal - so every reduction over it sees nothing: min, max and avg
+    // answer null, sum answers 0 and stdev 0.0. It names no value type either, so the
+    // answer rides the integer column an untyped null is laid out over anywhere else,
+    // except avg's and stdev's, which are floats whatever they reduced.
+    if (mlir::isa<mlir::NoneType>(inputElement)) {
+        if (storage::reducesToADouble(kind)) {
+            return builder.getF64Type();
+        }
+
+        return builder.getIntegerType(64);
+    }
 
     switch (kind) {
         case storage::AggregateKind::Sum: {
-            if (!isNumeric) {
+            if (!isNumeric && !isTaggedCell) {
                 throw IRException("db.sum requires a numeric column");
             }
-            return inputElement;
+            return isTaggedCell ? builder.getF64Type() : inputElement;
         }
         break;
 
         case storage::AggregateKind::Avg: {
-            if (!isNumeric) {
+            if (!isNumeric && !isTaggedCell) {
                 throw IRException("db.avg requires a numeric column");
+            }
+            return builder.getF64Type();
+        }
+        break;
+
+        case storage::AggregateKind::StDev:
+        case storage::AggregateKind::StDevP: {
+            if (!isNumeric && !isTaggedCell) {
+                throw IRException("db.stdev/db.stdevp requires a numeric column");
             }
             return builder.getF64Type();
         }
@@ -100,9 +449,14 @@ mlir::Type aggregateResultElementType(mlir::OpBuilder& builder,
 
         case storage::AggregateKind::Min:
         case storage::AggregateKind::Max: {
-            // min/max order the values, so anything with a natural order is fine -
-            // numbers, strings and bools - but an embedding has none.
-            if (!isNumeric && !isString && !isBool) {
+            // min/max order the values, so anything Cypher orders is fine - numbers,
+            // strings, bools, instants, lists, maps, and cells of different types - but
+            // an embedding has no order.
+            const bool isList = mlir::isa<storage::ListType>(inputElement);
+            const bool isMap = mlir::isa<storage::MapType>(inputElement);
+            const bool isOrderable = isNumeric || isString || isBool || isDateTime || isDuration
+                                  || isList || isMap || isTaggedCell;
+            if (!isOrderable) {
                 throw IRException("db.min/db.max requires an orderable column");
             }
             return inputElement;
@@ -131,6 +485,13 @@ NumericOperand numericOperand(mlir::Type chunkType) {
         element = nullableType.getValueType();
     }
 
+    // A type-erased cell is numeric only once read. '^' answers a double whatever it
+    // reads, so a cell reaching here computes in f64 and answers null on a row holding no
+    // number; every other operator keeps the cell and never asks.
+    if (mlir::isa<storage::AnyType>(element)) {
+        return {.numeric = mlir::Float64Type::get(chunkType.getContext()), .nullable = true};
+    }
+
     const bool isFloat = mlir::isa<mlir::Float64Type>(element);
     const auto integerType = mlir::dyn_cast<mlir::IntegerType>(element);
     const bool isInt64 = integerType && integerType.getWidth() == 64;
@@ -139,6 +500,37 @@ NumericOperand numericOperand(mlir::Type chunkType) {
     }
 
     return {.numeric = element, .nullable = nullable};
+}
+
+// The value element a chunk carries, with its nullability stripped and a mask read as the
+// i1 it holds: what two chunks are compared on to see whether they carry the same values.
+mlir::Type chunkValueElement(mlir::OpBuilder& builder, mlir::Type chunkType) {
+    mlir::Type element = mlir::cast<nl::ChunkType>(chunkType).getElementType();
+    if (const auto nullable = mlir::dyn_cast<storage::NullableType>(element)) {
+        element = nullable.getValueType();
+    }
+
+    if (mlir::isa<storage::BoolType>(element)) {
+        return builder.getI1Type();
+    }
+
+    return element;
+}
+
+bool isIntegerChunk(mlir::OpBuilder& builder, mlir::Type chunkType) {
+    const auto integerType = mlir::dyn_cast<mlir::IntegerType>(chunkValueElement(builder, chunkType));
+    return integerType && integerType.getWidth() == 64;
+}
+
+// Whether an element type is one arithmetic promotes: the two Cypher number columns.
+bool isNumericElement(mlir::Type element) {
+    if (mlir::isa<mlir::Float64Type>(element)) {
+        return true;
+    }
+
+    const auto integerType = mlir::dyn_cast<mlir::IntegerType>(element);
+
+    return integerType && integerType.getWidth() == 64;
 }
 
 bool isNullableChunk(mlir::Type chunkType) {
@@ -150,29 +542,200 @@ bool isNullableChunk(mlir::Type chunkType) {
     return mlir::isa<storage::NullableType>(chunk.getElementType());
 }
 
+// A node or edge ID chunk: the one plain chunk whose rows can be null, an OPTIONAL MATCH
+// leaving an invalid ID where the pattern missed.
+bool isEntityChunk(mlir::Type chunkType) {
+    const nl::ChunkType chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    if (!chunk) {
+        return false;
+    }
+
+    return mlir::isa<storage::NodeIDType, storage::EdgeIDType>(chunk.getElementType());
+}
+
+// A list column, read through the nullable a stored list wears: a property fetch produces
+// its values nullable, since a node carrying no list reads as absent there.
+bool isListChunk(mlir::Type chunkType) {
+    const nl::ChunkType chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    if (!chunk) {
+        return false;
+    }
+
+    const mlir::Type element = chunk.getElementType();
+    const auto nullable = mlir::dyn_cast<storage::NullableType>(element);
+    const mlir::Type listed = nullable ? nullable.getValueType() : element;
+
+    return mlir::isa<storage::ListType>(listed);
+}
+
+bool isIndexableChunk(mlir::Type chunkType) {
+    const nl::ChunkType chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    if (!chunk) {
+        return false;
+    }
+
+    const mlir::Type element = chunk.getElementType();
+    const auto nullable = mlir::dyn_cast<storage::NullableType>(element);
+    const mlir::Type indexed = nullable ? nullable.getValueType() : element;
+
+    return mlir::isa<storage::ListType, storage::AnyType, storage::MapElementType>(indexed);
+}
+
+// The chunk shapes a key read accepts: a column of maps, and a tagged cell the row may
+// have put a map in - which is what a read of a nested container hands back
+bool holdsAMapPerRow(mlir::Type chunkType) {
+    const nl::ChunkType chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    if (!chunk) {
+        return false;
+    }
+
+    const mlir::Type element = chunk.getElementType();
+    const auto nullable = mlir::dyn_cast<storage::NullableType>(element);
+    const mlir::Type read = nullable ? nullable.getValueType() : element;
+
+    return mlir::isa<storage::MapType, storage::AnyType, storage::MapElementType>(read);
+}
+
+// The element type an indexed list hands out, read through the nullable an optional list
+// wears. None when the indexed operand is a type-erased cell rather than a list.
+mlir::Type indexedListElementType(mlir::Type chunkType) {
+    const nl::ChunkType chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    if (!chunk) {
+        return {};
+    }
+
+    const mlir::Type element = chunk.getElementType();
+    const auto nullable = mlir::dyn_cast<storage::NullableType>(element);
+    const mlir::Type indexed = nullable ? nullable.getValueType() : element;
+
+    const auto listType = mlir::dyn_cast<storage::ListType>(indexed);
+    return listType ? listType.getElementType() : mlir::Type {};
+}
+
+// The element types a list gathers entities under, which an index reads back out as the
+// entity column they came from.
+bool namesAnEntityType(mlir::Type element) {
+    if (!element) {
+        return false;
+    }
+
+    return mlir::isa<storage::NodeIDType, storage::EdgeIDType>(element);
+}
+
+// The element types an index reads out as a value column rather than as a tagged cell:
+// the scalars a value column holds, and the lists a list of lists is made of.
+bool namesAnIndexedValueType(mlir::Type element) {
+    if (!element) {
+        return false;
+    }
+
+    if (const auto integerType = mlir::dyn_cast<mlir::IntegerType>(element)) {
+        return integerType.getWidth() == 1 || integerType.getWidth() == 64;
+    }
+
+    return mlir::isa<mlir::Float64Type, storage::StringType, storage::EmbeddingType, storage::ListType>(element);
+}
+
+// Internal type of listChunk
+mlir::Type listInternalType(mlir::Type chunkType) {
+    const nl::ChunkType chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    if (!chunk) {
+        return {};
+    }
+
+    const mlir::Type element = chunk.getElementType();
+    const auto nullable = mlir::dyn_cast<storage::NullableType>(element);
+    const mlir::Type listed = nullable ? nullable.getValueType() : element;
+
+    const auto listType = mlir::dyn_cast<storage::ListType>(listed);
+    return listType ? listType.getElementType() : mlir::Type {};
+}
+
+// The null literal's chunk: nullable with no value type of its own.
+bool isUntypedNullChunk(mlir::Type chunkType) {
+    const nl::ChunkType chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    if (!chunk) {
+        return false;
+    }
+
+    const auto nullableType = mlir::dyn_cast<storage::NullableType>(chunk.getElementType());
+    return nullableType && mlir::isa<mlir::NoneType>(nullableType.getValueType());
+}
+
+bool isTaggedCellChunk(mlir::Type chunkType) {
+    const nl::ChunkType chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    return chunk && mlir::isa<storage::AnyType, storage::MapElementType>(chunk.getElementType());
+}
+
+// A tagged cell holds its null in its tag and an ID column in the invalid ID, so a null test
+// reads either as it stands, and always answers
+bool carriesItsOwnNull(mlir::Type chunkType) {
+    return isTaggedCellChunk(chunkType) || isEntityChunk(chunkType);
+}
+
+bool mayHoldANull(mlir::Type chunkType) {
+    return isNullableChunk(chunkType) || isTaggedCellChunk(chunkType);
+}
+
+// A list element's null rides the column's optional, so a plain !storage.any column holds
+// none. A map value's null rides the entry's own tag, so even a plain column can answer
+// one - which is what makes comparing it three-valued whatever the column's shape.
+bool isMapElementChunk(mlir::Type chunkType) {
+    const nl::ChunkType chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    return chunk && mlir::isa<storage::MapElementType>(chunk.getElementType());
+}
+
+// The same cell behind the nullable an index wraps it in: reading an element out of a list
+// answers no cell where the row has no such element, and a cell carrying its own tag where
+// it has one
+bool holdsTaggedCells(mlir::Type chunkType) {
+    const nl::ChunkType chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    if (!chunk) {
+        return false;
+    }
+
+    const mlir::Type element = chunk.getElementType();
+    const auto nullable = mlir::dyn_cast<storage::NullableType>(element);
+
+    return mlir::isa<storage::AnyType>(nullable ? nullable.getValueType() : element);
+}
+
 mlir::Type promoteNumeric(mlir::OpBuilder& builder, mlir::Type lhs, mlir::Type rhs) {
     const bool anyFloat = mlir::isa<mlir::Float64Type>(lhs) || mlir::isa<mlir::Float64Type>(rhs);
     if (anyFloat) {
         return builder.getF64Type();
     }
 
-    const auto lhsInteger = mlir::cast<mlir::IntegerType>(lhs);
-    const auto rhsInteger = mlir::cast<mlir::IntegerType>(rhs);
-    const bool anyUnsigned = lhsInteger.isUnsigned() || rhsInteger.isUnsigned();
-    if (anyUnsigned) {
-        return builder.getIntegerType(64, /*isSigned=*/false);
-    }
-
+    // Cypher has one integer type and it is signed. A tally is carried unsigned - it can
+    // never be negative - but arithmetic over it can be, so a count entering an expression
+    // is promoted like any other integer instead of wrapping around zero
     return builder.getIntegerType(64);
 }
 
+// The element of one column holding both @param lhs and @param rhs, or a null type when
+// no column type holds the two
+mlir::Type unifiedValueElement(mlir::OpBuilder& builder, mlir::Type lhs, mlir::Type rhs) {
+    if (lhs == rhs) {
+        return lhs;
+    } else if (isNumericElement(lhs) && isNumericElement(rhs)) {
+        return promoteNumeric(builder, lhs, rhs);
+    } else if (mlir::isa<storage::ListType>(lhs) && mlir::isa<storage::ListType>(rhs)) {
+        mlir::MLIRContext* const context = builder.getContext();
+        return storage::ListType::get(context, storage::AnyType::get(context));
+    }
+
+    return mlir::Type {};
+}
+
 // The value-reduction AggregateKind matching a grouped aggregate's kind, so the
-// grouped result-type resolution reuses aggregateResultElementType. count tallies
-// rows rather than reducing values, so it has no value-reduction kind and never
-// reaches here (the caller resolves its result type - a ui64 - directly).
+// grouped result-type resolution reuses aggregateResultElementType. count and
+// count_distinct tally rows rather than reducing values, so they have no
+// value-reduction kind and never reach here (the caller resolves their result type -
+// a ui64 - directly).
 storage::AggregateKind groupKindToAggregateKind(storage::GroupAggregateKind kind) {
     switch (kind) {
         case storage::GroupAggregateKind::Sum:
+        case storage::GroupAggregateKind::SumDistinct:
             return storage::AggregateKind::Sum;
         break;
 
@@ -185,11 +748,57 @@ storage::AggregateKind groupKindToAggregateKind(storage::GroupAggregateKind kind
         break;
 
         case storage::GroupAggregateKind::Avg:
+        case storage::GroupAggregateKind::AvgDistinct:
             return storage::AggregateKind::Avg;
         break;
 
+        case storage::GroupAggregateKind::StDev:
+        case storage::GroupAggregateKind::StDevDistinct:
+            return storage::AggregateKind::StDev;
+        break;
+
+        case storage::GroupAggregateKind::StDevP:
+        case storage::GroupAggregateKind::StDevPDistinct:
+            return storage::AggregateKind::StDevP;
+        break;
+
         case storage::GroupAggregateKind::Count:
+        case storage::GroupAggregateKind::CountDistinct:
+        case storage::GroupAggregateKind::CountRows:
             throw IRException("count has no value-reduction kind");
+        break;
+
+        case storage::GroupAggregateKind::First:
+            throw IRException("first has no value-reduction kind");
+        break;
+    }
+
+    throw IRException("Unhandled group aggregate kind");
+}
+
+// Whether a grouped aggregate reduces the values of its input column rather than tallying
+// its rows: the reductions read a nullable value chunk, while the counts read the chunk
+// they are anchored on as it comes - an ID chunk for count(*).
+bool reducesValues(storage::GroupAggregateKind kind) {
+    switch (kind) {
+        case storage::GroupAggregateKind::Sum:
+        case storage::GroupAggregateKind::SumDistinct:
+        case storage::GroupAggregateKind::Min:
+        case storage::GroupAggregateKind::Max:
+        case storage::GroupAggregateKind::Avg:
+        case storage::GroupAggregateKind::AvgDistinct:
+        case storage::GroupAggregateKind::StDev:
+        case storage::GroupAggregateKind::StDevP:
+        case storage::GroupAggregateKind::StDevDistinct:
+        case storage::GroupAggregateKind::StDevPDistinct:
+        case storage::GroupAggregateKind::First:
+            return true;
+        break;
+
+        case storage::GroupAggregateKind::Count:
+        case storage::GroupAggregateKind::CountDistinct:
+        case storage::GroupAggregateKind::CountRows:
+            return false;
         break;
     }
 
@@ -199,10 +808,10 @@ storage::AggregateKind groupKindToAggregateKind(storage::GroupAggregateKind kind
 // The nl chunk type of one grouped aggregate's result column, resolved from its
 // kind and input chunk. A switch (not an if/else) over every GroupAggregateKind so
 // a new kind is a compile error here rather than silently taking the value-reduction
-// path: count is a single non-null unsigned i64 per group; sum/min/max/avg reduce
-// the input's values, so they require a nullable value column (an ID column is
-// rejected) and follow aggregateResultElementType - sum/min/max keep the value type,
-// avg widens to f64.
+// path: count and count_distinct are a single non-null unsigned i64 per group;
+// sum/min/max/avg reduce the input's values, so they require a nullable value column
+// (an ID column is rejected) and follow aggregateResultElementType - sum/min/max keep
+// the value type, avg widens to f64.
 nl::ChunkType groupAggregateResultChunkType(mlir::OpBuilder& builder,
                                             storage::GroupAggregateKind kind,
                                             mlir::Value inputChunk,
@@ -211,22 +820,34 @@ nl::ChunkType groupAggregateResultChunkType(mlir::OpBuilder& builder,
 
     switch (kind) {
         case storage::GroupAggregateKind::Count:
+        case storage::GroupAggregateKind::CountDistinct:
+        case storage::GroupAggregateKind::CountRows:
             return countChunkType;
         break;
 
         case storage::GroupAggregateKind::Sum:
+        case storage::GroupAggregateKind::SumDistinct:
         case storage::GroupAggregateKind::Min:
         case storage::GroupAggregateKind::Max:
-        case storage::GroupAggregateKind::Avg: {
+        case storage::GroupAggregateKind::Avg:
+        case storage::GroupAggregateKind::AvgDistinct:
+        case storage::GroupAggregateKind::StDev:
+        case storage::GroupAggregateKind::StDevP:
+        case storage::GroupAggregateKind::StDevDistinct:
+        case storage::GroupAggregateKind::StDevPDistinct:
+        case storage::GroupAggregateKind::First: {
             const nl::ChunkType inputChunkType = mlir::cast<nl::ChunkType>(inputChunk.getType());
-            const auto inputNullable = mlir::dyn_cast<storage::NullableType>(inputChunkType.getElementType());
-            if (!inputNullable) {
-                throw IRException("db.group_aggregate sum/min/max/avg requires a property value column");
+            const mlir::Type inputElement = inputChunkType.getElementType();
+            const auto inputNullable = mlir::dyn_cast<storage::NullableType>(inputElement);
+            const bool taggedCells = mlir::isa<storage::AnyType>(inputElement);
+            if (!inputNullable && !taggedCells) {
+                throw IRException("db.group_aggregate sum/min/max/avg/stdev/first requires a property value column");
             }
 
-            const mlir::Type resultElement = aggregateResultElementType(builder,
-                                                                        groupKindToAggregateKind(kind),
-                                                                        inputNullable.getValueType());
+            const mlir::Type inputValue = taggedCells ? inputElement : inputNullable.getValueType();
+            const bool keepsTheValue = kind == storage::GroupAggregateKind::First;
+            const mlir::Type resultElement = keepsTheValue ? inputValue
+                                                           : aggregateResultElementType(builder, groupKindToAggregateKind(kind), inputValue);
             const storage::NullableType resultNullable = storage::NullableType::get(context, resultElement);
 
             return nl::ChunkType::get(context, resultNullable);
@@ -265,11 +886,163 @@ nl::Output soleOutputConsumer(mlir::ResultRange results) {
     return sharedByAllResults ? output : nl::Output();
 }
 
+bool opensSourceLoop(mlir::Operation* operation) {
+    return mlir::isa<mlir::db::ScanNodes,
+                     mlir::db::ConstScanNodes,
+                     mlir::db::UnwindConst,
+                     mlir::db::LoadCSV,
+                     mlir::db::VectorSearch,
+                     mlir::db::Unwind,
+                     mlir::db::UnwindRange,
+                     mlir::db::UnwindComputed,
+                     mlir::db::ScanNodesByLabel,
+                     mlir::db::ScanNodesByPropertyValue,
+                     mlir::db::ScanEdges,
+                     mlir::db::ScanEdgesByType,
+                     mlir::db::ScanOutEdgesByLabelSrc,
+                     mlir::db::ScanInEdgesByLabelTgt,
+                     mlir::db::ScanOutEdgesByLabelTgt,
+                     mlir::db::ScanInEdgesByLabelSrc,
+                     mlir::db::ScanOutEdgesByLabelSrcTgt,
+                     mlir::db::ScanInEdgesByLabelSrcTgt,
+                     mlir::db::GetOutEdges,
+                     mlir::db::GetInEdges,
+                     mlir::db::GetEdges,
+                     mlir::db::GetOutEdgesByType,
+                     mlir::db::GetInEdgesByType,
+                     mlir::db::GetOutEdgesByLabel,
+                     mlir::db::GetInEdgesByLabel,
+                     mlir::db::GetOutEdgesByTypeAndLabel,
+                     mlir::db::GetInEdgesByTypeAndLabel,
+                     mlir::db::ExplorePaths,
+                     mlir::db::CallProcedure,
+                     mlir::db::ScanMaterialized>(operation);
 }
 
-DBLowering::DBLowering(mlir::MLIRContext* context, const GraphView* view)
+// An EXISTS, a COUNT or a COLLECT: a subquery standing in an expression, one value per
+// row in flight
+bool isSubqueryExpression(mlir::Operation* operation) {
+    return mlir::isa<mlir::db::ExistsSubquery, mlir::db::CountSubquery, mlir::db::CollectSubquery>(operation);
+}
+
+// A body whose own dataflow cannot keep the input rows paired with what it makes of them
+// runs one input row at a time, whatever it ends on
+bool runsPerRow(mlir::Operation* operation) {
+    if (mlir::db::CallSubquery call = mlir::dyn_cast<mlir::db::CallSubquery>(operation)) {
+        return !call.getCarriesScope();
+    } else if (mlir::db::ExistsSubquery exists = mlir::dyn_cast<mlir::db::ExistsSubquery>(operation)) {
+        return !exists.getCarriesScope();
+    } else if (mlir::db::CountSubquery count = mlir::dyn_cast<mlir::db::CountSubquery>(operation)) {
+        return !count.getCarriesScope();
+    } else if (mlir::db::CollectSubquery collect = mlir::dyn_cast<mlir::db::CollectSubquery>(operation)) {
+        return !collect.getCarriesScope();
+    }
+
+    return false;
+}
+
+// The columns an op holding a body hands it through its block arguments, empty for an op
+// holding none
+mlir::OperandRange subqueryInputColumns(mlir::Operation* operation) {
+    if (mlir::db::CallSubquery call = mlir::dyn_cast<mlir::db::CallSubquery>(operation)) {
+        return call.getInputColumns();
+    } else if (mlir::db::ExistsSubquery exists = mlir::dyn_cast<mlir::db::ExistsSubquery>(operation)) {
+        return exists.getInputColumns();
+    } else if (mlir::db::CountSubquery count = mlir::dyn_cast<mlir::db::CountSubquery>(operation)) {
+        return count.getInputColumns();
+    } else if (mlir::db::CollectSubquery collect = mlir::dyn_cast<mlir::db::CollectSubquery>(operation)) {
+        return collect.getInputColumns();
+    }
+
+    return mlir::OperandRange(operation->operand_end(), operation->operand_end());
+}
+
+// The innermost body run one row at a time that holds the op, or null when none does
+mlir::Operation* nearestPerRowSubquery(mlir::Operation* operation) {
+    for (mlir::Operation* parent = operation->getParentOp(); parent; parent = parent->getParentOp()) {
+        if (runsPerRow(parent)) {
+            return parent;
+        }
+    }
+
+    return nullptr;
+}
+
+// The db ops whose rows a projection is emitted over: a source, the nest a cross product
+// or a hash join builds, and the emit loop a pipeline breaker opens over what it
+// accumulated
+bool opensRowLoop(mlir::Operation* operation) {
+    const bool returningSubquery = mlir::isa<mlir::db::CallSubquery>(operation)
+                                   && operation->getNumResults() > 0;
+
+    // A subquery expression answering for the rows in flight opens no loop of its own; one
+    // run a row at a time opens the loop over those rows, which the ops after it are
+    // emitted into.
+    const bool perRowExpression = isSubqueryExpression(operation) && runsPerRow(operation);
+
+    return opensSourceLoop(operation)
+        || returningSubquery
+        || perRowExpression
+        || mlir::isa<mlir::db::CrossProduct,
+                     mlir::db::HashJoin,
+                     mlir::db::Sort,
+                     mlir::db::GroupAggregate,
+                     mlir::db::OptionalMatch>(operation);
+}
+
+// A reduction emits its one row at function scope, so what follows it walks no rows of the
+// relation it read - and that relation had to be read in full to reduce it
+bool reducesToOneRow(mlir::Operation* operation) {
+    return mlir::isa<mlir::db::Count,
+                     mlir::db::Sum,
+                     mlir::db::Min,
+                     mlir::db::Max,
+                     mlir::db::Avg,
+                     mlir::db::StDev,
+                     mlir::db::StDevP>(operation);
+}
+
+// Passes some of its rows on and keeps the rest back, so the rows reaching a cut below it
+// are fewer than the rows a producer above it made. A unit body writes and yields nothing,
+// so the rows come out of it as they went in.
+bool dropsRows(mlir::Operation* operation) {
+    mlir::db::CallSubquery call = mlir::dyn_cast<mlir::db::CallSubquery>(operation);
+    if (call) {
+        return !call.getUnit();
+    } else if (mlir::isa<mlir::db::Conditional>(operation)) {
+        return operation->getNumResults() > 0;
+    }
+
+    return mlir::isa<mlir::db::FilterOp,
+                     mlir::db::FetchNodes,
+                     mlir::db::HashJoin,
+                     mlir::db::Skip,
+                     mlir::db::Limit,
+                     mlir::db::RemoveDuplicates>(operation);
+}
+
+// Hands every row it reads on as at least one row, and writes nothing. An optional match
+// qualifies: a row its pattern misses comes out padded.
+bool keepsEveryRow(mlir::Operation* operation) {
+    if (mlir::isa<mlir::db::OptionalMatch>(operation)) {
+        return true;
+    }
+
+    return mlir::isMemoryEffectFree(operation)
+        && !opensRowLoop(operation)
+        && !dropsRows(operation)
+        && !reducesToOneRow(operation);
+}
+
+
+}
+
+DBLowering::DBLowering(mlir::MLIRContext* context,
+                       const GraphView* view,
+                       const ProcedureManager* procedures)
     : _builder(context),
-    _view(view)
+    _view(view),
+    _procedures(procedures)
 {
 }
 
@@ -297,19 +1070,21 @@ mlir::func::FuncOp DBLowering::lower(mlir::func::FuncOp dbFunction, mlir::Module
     _entryBlock = nlFunction.addEntryBlock();
 
     // Create the ReturnOp of the target function right away
-    _builder.setInsertionPointToStart(_entryBlock);
+    setInsertionToEntryBlockStart();
     _builder.create<mlir::func::ReturnOp>(loc);
 
     // Lower each operation of the db function. Top-level scans root their loop
     // in the entry block; a cross product retargets the root per factor.
     _valueMap.clear();
     _propertyTypes.clear();
-    _edgeTypes.clear();
+    _edgeTypeSets.clear();
+    _constantColumns.clear();
     _rootBlock = _entryBlock;
     _innermostLoopBody = nullptr;
     _innermostCardinality = mlir::Value();
     _limitHandles.clear();
     _loopLimitHandle.clear();
+    _optionalMatchLimits.clear();
     _sortTopK.clear();
     _fusedLimits.clear();
 
@@ -318,39 +1093,7 @@ mlir::func::FuncOp DBLowering::lower(mlir::func::FuncOp dbFunction, mlir::Module
     // the bound. Detect before the limit pre-scan so the fused ones are skipped.
     detectTopKFusion(dbFunction);
 
-    // Pre-scan for db.limits before any loop is built: nl.for's limit operand is
-    // fixed at build time, so each handle must exist first to be threaded in, and
-    // which loops a handle attaches to must be known up front. A limit fused into
-    // a sort's top-K carries no streaming handle, so it is left out here.
-    llvm::SmallVector<mlir::db::Limit, 2> limits;
-    dbFunction.walk([&](mlir::db::Limit limit) {
-        if (!_fusedLimits.count(limit.getOperation())) {
-            limits.push_back(limit);
-        }
-    });
-
-    // Hoist one nl.limit handle per db.limit to the top of the entry block, where
-    // each dominates the loops, the update and the truncate that read it. The
-    // reset scope is function scope (uncorrelated); a correlated limit would hoist
-    // into its enclosing loop body instead - future work.
-    if (!limits.empty()) {
-        _builder.setInsertionPointToStart(_entryBlock);
-        for (mlir::db::Limit limit : limits) {
-            nl::Limit limitOp = _builder.create<nl::Limit>(loc, limit.getCount());
-            _limitHandles[limit.getOperation()] = limitOp.getState();
-        }
-    }
-
-    // Assign each limit's handle to the loops that produce its columns and their
-    // enclosing nest, so only those loops early-exit (consumer loops downstream of
-    // the truncate fan out freely). The first limit, in program order, to claim a
-    // shared producer wins, so a loop never needs to carry two handles.
-    for (mlir::db::Limit limit : limits) {
-        const mlir::Value handle = _limitHandles[limit.getOperation()];
-        for (const mlir::Value column : limit.getColumns()) {
-            assignProducerLoops(column, handle);
-        }
-    }
+    hoistLimitHandles(dbFunction.getBody(), _entryBlock, nullptr);
 
     for (mlir::Operation& operation : dbBody.front()) {
         lowerOperation(operation);
@@ -367,6 +1110,8 @@ mlir::func::FuncOp DBLowering::lower(mlir::func::FuncOp dbFunction, mlir::Module
     // offset) instead of copying it to the front - the copy-free post-skip tail.
     foldSkipTruncatesIntoOutputs(nlFunction);
 
+    foldBroadcastsIntoOutputs(nlFunction);
+
     // Run MLIR verifier on the nlFunction
     if (mlir::failed(mlir::verify(nlFunction))) {
         throw IRException("DBLowering produced an invalid nl function");
@@ -375,29 +1120,336 @@ mlir::func::FuncOp DBLowering::lower(mlir::func::FuncOp dbFunction, mlir::Module
     return nlFunction;
 }
 
+void DBLowering::hoistLimitHandles(mlir::Region& region, mlir::Block* hoistBlock, mlir::Operation* holder) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+
+    // Pre-scan for db.limits before any loop is built: nl.for's limit operand is
+    // fixed at build time, so each handle must exist first to be threaded in, and
+    // which loops a handle attaches to must be known up front. A limit fused into
+    // a sort's top-K carries no streaming handle, so it is left out here - and so is
+    // one inside a body run one row at a time, which that body hoists into its own
+    // step, so the budget resets per input row.
+    llvm::SmallVector<mlir::db::Limit, 2> limits;
+    region.walk([&](mlir::db::Limit limit) {
+        const bool fused = _fusedLimits.count(limit.getOperation());
+        const bool heldHere = nearestPerRowSubquery(limit.getOperation()) == holder;
+
+        if (!fused && heldHere) {
+            limits.push_back(limit);
+        }
+    });
+
+    // Hoist one nl.limit handle per db.limit to the top of the hoist block, where
+    // each dominates the loops, the update and the truncate that read it.
+    if (!limits.empty()) {
+        _builder.setInsertionPointToStart(hoistBlock);
+        for (mlir::db::Limit limit : limits) {
+            nl::Limit limitOp = _builder.create<nl::Limit>(loc, limit.getCount());
+            _limitHandles[limit.getOperation()] = limitOp.getState();
+        }
+    }
+
+    // Assign each limit's handle to the loops that produce its columns and their
+    // enclosing nest, so only those loops early-exit (consumer loops downstream of
+    // the truncate fan out freely). The first limit, in program order, to claim a
+    // shared producer wins, so a loop never needs to carry two handles.
+    for (mlir::db::Limit limit : limits) {
+        const mlir::Value handle = _limitHandles[limit.getOperation()];
+        _producerWalkVisits.clear();
+
+        bool producedByALoop = false;
+        for (const mlir::Value column : limit.getColumns()) {
+            producedByALoop |= assignProducerLoops(column, handle, /*rowsDroppedBeforeTheCut=*/false, holder);
+        }
+
+        // A cut over constants alone walks back to no loop at all - the constants are
+        // bound above the nest - so the handle goes to the relation driving the
+        // projection instead. Without it the nest runs to its end and the budget only
+        // stops the output, producing every row to throw all but k away.
+        if (!producedByALoop) {
+            assignCardinalityDriverLoop(limit, handle, holder);
+        }
+
+        assignOptionalMatchLimits(limit, handle);
+    }
+}
+
 void DBLowering::lowerOperation(mlir::Operation& operation) {
+    // A value read out of a map is read as a tagged cell by every op but the ones whose
+    // kernels read a map entry where it stands, and the ones carrying it. IN looks its
+    // left side up in place, while its right side is a list or a cell holding one.
+    const bool readsEntriesInPlace = mlir::isa<mlir::db::StaticMapKey,
+                                               mlir::db::DynamicMapKey,
+                                               mlir::db::ListIndex,
+                                               mlir::db::EqOp,
+                                               mlir::db::NeqOp,
+                                               mlir::db::GtOp,
+                                               mlir::db::LtOp,
+                                               mlir::db::GteOp,
+                                               mlir::db::LteOp,
+                                               mlir::db::Keys,
+                                               mlir::db::PropertyMap,
+                                               mlir::db::Labels,
+                                               mlir::db::EdgeType,
+                                               mlir::db::Output,
+                                               mlir::db::Yield>(operation);
+
+    const bool looksUpAnEntry = mlir::isa<mlir::db::InOp>(operation);
+
+    llvm::SmallVector<std::pair<mlir::Value, mlir::Value>, 2> entryChunks;
+    if (!readsEntriesInPlace) {
+        for (mlir::OpOperand& use : operation.getOpOperands()) {
+            if (looksUpAnEntry && use.getOperandNumber() == 0) {
+                continue;
+            }
+
+            const mlir::Value operand = use.get();
+            const auto slotIt = _valueMap.find(operand);
+            if (slotIt == _valueMap.end()) {
+                continue;
+            }
+
+            const mlir::Value chunk = slotIt->second;
+            const mlir::Value cells = mapEntriesAsCells(chunk);
+            if (cells != chunk) {
+                entryChunks.emplace_back(operand, chunk);
+                _valueMap[operand] = cells;
+            }
+        }
+    }
+
+    if (computesOnceOverConstants(operation)) {
+        lowerOnceOverConstants(operation);
+    } else if (raisesOverConstants(operation)) {
+        lowerOverReachingRows(operation);
+    } else {
+        lowerOperationByKind(operation);
+    }
+
+    for (const auto& [operand, entries] : llvm::reverse(entryChunks)) {
+        _valueMap[operand] = entries;
+    }
+}
+
+mlir::Value DBLowering::mapEntriesAsCells(mlir::Value chunk) {
+    if (!isMapElementChunk(chunk.getType())) {
+        return chunk;
+    }
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const nl::ChunkType cellsType = nl::ChunkType::get(context, storage::AnyType::get(context));
+
+    mlir::OpBuilder::InsertionGuard guard(_builder);
+    setInsertionForUnaryOp(chunk);
+
+    return _builder.create<nl::MapEntryValue>(_builder.getUnknownLoc(), cellsType, chunk).getResult();
+}
+
+mlir::Value DBLowering::yieldedChunk(mlir::Value column) {
+    return mapEntriesAsCells(mapValue(column));
+}
+
+bool DBLowering::computesOnceOverConstants(mlir::Operation& operation) {
+    const bool constantThroughOperands = operation.hasTrait<mlir::OpTrait::ConstantThroughOperands>();
+
+    return constantThroughOperands && yieldsConstantColumn(operation.getResult(0), _constantColumns);
+}
+
+bool DBLowering::raisesOverConstants(mlir::Operation& operation) {
+    const bool constantThroughOperands = operation.hasTrait<mlir::OpTrait::ConstantThroughOperands>();
+    const bool readsConstantsAlone = constantThroughOperands && llvm::all_of(operation.getOperands(), [this](mlir::Value operand) {
+        return yieldsConstantColumn(mapValue(operand), _constantColumns);
+    });
+
+    return readsConstantsAlone && !runsWithoutRaising(&operation);
+}
+
+void DBLowering::lowerOverReachingRows(mlir::Operation& operation) {
+    llvm::SmallVector<std::pair<mlir::Value, mlir::Value>, 2> constantChunks;
+    for (const mlir::Value operand : operation.getOperands()) {
+        const mlir::Value chunk = mapValue(operand);
+        constantChunks.emplace_back(operand, chunk);
+        _valueMap[operand] = rowAlignedChunk(chunk, _innermostCardinality);
+    }
+
+    lowerOperationByKind(operation);
+
+    for (const auto& [operand, chunk] : llvm::reverse(constantChunks)) {
+        _valueMap[operand] = chunk;
+    }
+}
+
+void DBLowering::lowerOnceOverConstants(mlir::Operation& operation) {
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+    _innermostCardinality = {};
+
+    lowerOperationByKind(operation);
+
+    _innermostCardinality = previousInnermostCardinality;
+
+    for (const mlir::Value result : operation.getResults()) {
+        const mlir::Value row = mapValue(result);
+        if (yieldsConstantColumn(row, _constantColumns)) {
+            continue;
+        }
+
+        _builder.setInsertionPointAfterValue(row);
+
+        nl::RowConstant constant = _builder.create<nl::RowConstant>(_builder.getUnknownLoc(), row);
+        _valueMap[result] = constant.getResult();
+
+        moveAheadOfLoops(constant.getOperation());
+    }
+}
+
+void DBLowering::moveAheadOfLoops(mlir::Operation* computation) {
+    mlir::Block* const block = computation->getBlock();
+
+    const auto loopIt = llvm::find_if(*block, [](mlir::Operation& op) { return mlir::isa<nl::For>(op); });
+    const bool followsALoop = loopIt != block->end() && loopIt->isBeforeInBlock(computation);
+    if (!followsALoop) {
+        return;
+    }
+
+    mlir::Operation* const firstLoop = &*loopIt;
+
+    llvm::SmallVector<mlir::Operation*> cone;
+    llvm::DenseSet<mlir::Operation*> visited;
+    llvm::SmallVector<mlir::Operation*> worklist {computation};
+
+    while (!worklist.empty()) {
+        mlir::Operation* const op = worklist.pop_back_val();
+        if (!visited.insert(op).second) {
+            continue;
+        }
+
+        cone.push_back(op);
+
+        op->walk([&](mlir::Operation* nested) {
+            for (const mlir::Value operand : nested->getOperands()) {
+                mlir::Operation* const definingOp = operand.getDefiningOp();
+                const bool definedPastTheLoop = definingOp
+                                             && definingOp->getBlock() == block
+                                             && firstLoop->isBeforeInBlock(definingOp);
+                if (definedPastTheLoop) {
+                    worklist.push_back(definingOp);
+                }
+            }
+        });
+    }
+
+    llvm::sort(cone, [](mlir::Operation* lhs, mlir::Operation* rhs) { return lhs->isBeforeInBlock(rhs); });
+
+    for (mlir::Operation* const op : cone) {
+        op->moveBefore(firstLoop);
+    }
+}
+
+void DBLowering::lowerOperationByKind(mlir::Operation& operation) {
     if (mlir::db::ScanNodes scanNodes = mlir::dyn_cast<mlir::db::ScanNodes>(operation)) {
         lowerScanNodes(scanNodes);
     } else if (mlir::db::ScanNodesByLabel scanNodesByLabel = mlir::dyn_cast<mlir::db::ScanNodesByLabel>(operation)) {
         lowerScanNodesByLabel(scanNodesByLabel);
     } else if (mlir::db::ConstScanNodes constScanNodes = mlir::dyn_cast<mlir::db::ConstScanNodes>(operation)) {
         lowerConstScanNodes(constScanNodes);
+    } else if (mlir::db::ScanNodesByPropertyValue scanNodesByPropertyValue = mlir::dyn_cast<mlir::db::ScanNodesByPropertyValue>(operation)) {
+        lowerScanNodesByPropertyValue(scanNodesByPropertyValue);
+    } else if (mlir::db::UnwindConst unwindConst = mlir::dyn_cast<mlir::db::UnwindConst>(operation)) {
+        lowerUnwindConst(unwindConst);
+    } else if (mlir::db::LoadCSV loadCSV = mlir::dyn_cast<mlir::db::LoadCSV>(operation)) {
+        lowerLoadCSV(loadCSV);
+    } else if (mlir::db::VectorSearch vectorSearch = mlir::dyn_cast<mlir::db::VectorSearch>(operation)) {
+        lowerVectorSearch(vectorSearch);
+    } else if (mlir::db::Unwind unwind = mlir::dyn_cast<mlir::db::Unwind>(operation)) {
+        lowerUnwind(unwind);
+    } else if (mlir::db::UnwindRange unwindRange = mlir::dyn_cast<mlir::db::UnwindRange>(operation)) {
+        lowerUnwindRange(unwindRange);
+    } else if (mlir::db::UnwindComputed unwindComputed = mlir::dyn_cast<mlir::db::UnwindComputed>(operation)) {
+        lowerUnwindComputed(unwindComputed);
+    } else if (mlir::db::MakeList makeList = mlir::dyn_cast<mlir::db::MakeList>(operation)) {
+        lowerMakeList(makeList);
+    } else if (mlir::db::MakeMap makeMap = mlir::dyn_cast<mlir::db::MakeMap>(operation)) {
+        lowerMakeMap(makeMap);
+    } else if (mlir::db::StaticMapKey mapKey = mlir::dyn_cast<mlir::db::StaticMapKey>(operation)) {
+        lowerStaticMapKey(mapKey);
+    } else if (mlir::db::DynamicMapKey dynamicMapKey = mlir::dyn_cast<mlir::db::DynamicMapKey>(operation)) {
+        lowerDynamicMapKey(dynamicMapKey);
+    } else if (mlir::db::Range range = mlir::dyn_cast<mlir::db::Range>(operation)) {
+        lowerRange(range);
+    } else if (mlir::db::Substring substring = mlir::dyn_cast<mlir::db::Substring>(operation)) {
+        lowerSubstring(substring);
+    } else if (mlir::db::Split split = mlir::dyn_cast<mlir::db::Split>(operation)) {
+        lowerSplit(split);
+    } else if (mlir::db::Left left = mlir::dyn_cast<mlir::db::Left>(operation)) {
+        lowerStringEnd<nl::Left>(left);
+    } else if (mlir::db::Right right = mlir::dyn_cast<mlir::db::Right>(operation)) {
+        lowerStringEnd<nl::Right>(right);
+    } else if (mlir::db::Replace replace = mlir::dyn_cast<mlir::db::Replace>(operation)) {
+        lowerReplace(replace);
+    } else if (mlir::db::ListSlice listSlice = mlir::dyn_cast<mlir::db::ListSlice>(operation)) {
+        lowerListSlice(listSlice);
+    } else if (mlir::isa<mlir::db::PercentileCont, mlir::db::PercentileDisc>(operation)) {
+        lowerPercentile(&operation);
+    } else if (mlir::db::ListComprehension listComprehension = mlir::dyn_cast<mlir::db::ListComprehension>(operation)) {
+        lowerListComprehension(listComprehension);
+    } else if (mlir::db::ListPredicate listPredicate = mlir::dyn_cast<mlir::db::ListPredicate>(operation)) {
+        lowerListPredicate(listPredicate);
+    } else if (mlir::db::Reduce reduce = mlir::dyn_cast<mlir::db::Reduce>(operation)) {
+        lowerReduce(reduce);
+    } else if (mlir::db::PatternComprehension patternComprehension = mlir::dyn_cast<mlir::db::PatternComprehension>(operation)) {
+        lowerPatternComprehension(patternComprehension);
     } else if (mlir::db::ScanEdges scanEdges = mlir::dyn_cast<mlir::db::ScanEdges>(operation)) {
         lowerScanEdges(scanEdges);
+    } else if (mlir::db::ScanEdgesByType scanEdgesByType = mlir::dyn_cast<mlir::db::ScanEdgesByType>(operation)) {
+        lowerScanEdgesByType(scanEdgesByType);
+    } else if (mlir::db::ScanOutEdgesByLabelSrc scanOutEdgesByLabelSrc = mlir::dyn_cast<mlir::db::ScanOutEdgesByLabelSrc>(operation)) {
+        lowerScanOutEdgesByLabelSrc(scanOutEdgesByLabelSrc);
+    } else if (mlir::db::ScanInEdgesByLabelTgt scanInEdgesByLabelTgt = mlir::dyn_cast<mlir::db::ScanInEdgesByLabelTgt>(operation)) {
+        lowerScanInEdgesByLabelTgt(scanInEdgesByLabelTgt);
+    } else if (mlir::db::ScanOutEdgesByLabelTgt scanOutEdgesByLabelTgt = mlir::dyn_cast<mlir::db::ScanOutEdgesByLabelTgt>(operation)) {
+        lowerScanOutEdgesByLabelTgt(scanOutEdgesByLabelTgt);
+    } else if (mlir::db::ScanInEdgesByLabelSrc scanInEdgesByLabelSrc = mlir::dyn_cast<mlir::db::ScanInEdgesByLabelSrc>(operation)) {
+        lowerScanInEdgesByLabelSrc(scanInEdgesByLabelSrc);
+    } else if (mlir::db::ScanOutEdgesByLabelSrcTgt scanOutEdgesByLabelSrcTgt = mlir::dyn_cast<mlir::db::ScanOutEdgesByLabelSrcTgt>(operation)) {
+        lowerScanOutEdgesByLabelSrcTgt(scanOutEdgesByLabelSrcTgt);
+    } else if (mlir::db::ScanInEdgesByLabelSrcTgt scanInEdgesByLabelSrcTgt = mlir::dyn_cast<mlir::db::ScanInEdgesByLabelSrcTgt>(operation)) {
+        lowerScanInEdgesByLabelSrcTgt(scanInEdgesByLabelSrcTgt);
     } else if (mlir::db::GetOutEdges getOutEdges = mlir::dyn_cast<mlir::db::GetOutEdges>(operation)) {
         lowerGetOutEdges(getOutEdges);
     } else if (mlir::db::GetInEdges getInEdges = mlir::dyn_cast<mlir::db::GetInEdges>(operation)) {
         lowerGetInEdges(getInEdges);
+    } else if (mlir::db::GetEdges getEdges = mlir::dyn_cast<mlir::db::GetEdges>(operation)) {
+        lowerGetEdges(getEdges);
     } else if (mlir::db::GetOutEdgesByType getOutEdgesByType = mlir::dyn_cast<mlir::db::GetOutEdgesByType>(operation)) {
         lowerGetOutEdgesByType(getOutEdgesByType);
     } else if (mlir::db::GetInEdgesByType getInEdgesByType = mlir::dyn_cast<mlir::db::GetInEdgesByType>(operation)) {
         lowerGetInEdgesByType(getInEdgesByType);
+    } else if (mlir::db::GetOutEdgesByLabel getOutEdgesByLabel = mlir::dyn_cast<mlir::db::GetOutEdgesByLabel>(operation)) {
+        lowerGetOutEdgesByLabel(getOutEdgesByLabel);
+    } else if (mlir::db::GetInEdgesByLabel getInEdgesByLabel = mlir::dyn_cast<mlir::db::GetInEdgesByLabel>(operation)) {
+        lowerGetInEdgesByLabel(getInEdgesByLabel);
+    } else if (mlir::db::GetOutEdgesByTypeAndLabel getOutEdgesByTypeAndLabel = mlir::dyn_cast<mlir::db::GetOutEdgesByTypeAndLabel>(operation)) {
+        lowerGetOutEdgesByTypeAndLabel(getOutEdgesByTypeAndLabel);
+    } else if (mlir::db::GetInEdgesByTypeAndLabel getInEdgesByTypeAndLabel = mlir::dyn_cast<mlir::db::GetInEdgesByTypeAndLabel>(operation)) {
+        lowerGetInEdgesByTypeAndLabel(getInEdgesByTypeAndLabel);
+    } else if (mlir::db::ExplorePaths explorePaths = mlir::dyn_cast<mlir::db::ExplorePaths>(operation)) {
+        lowerExplorePaths(explorePaths);
+    } else if (mlir::db::ExpandPath expandPath = mlir::dyn_cast<mlir::db::ExpandPath>(operation)) {
+        lowerExpandPath(expandPath);
+    } else if (mlir::db::PathLength pathLength = mlir::dyn_cast<mlir::db::PathLength>(operation)) {
+        lowerPathLength(pathLength);
+    } else if (mlir::db::PathElements pathElements = mlir::dyn_cast<mlir::db::PathElements>(operation)) {
+        lowerPathElements(pathElements);
+    } else if (mlir::db::MakePath makePath = mlir::dyn_cast<mlir::db::MakePath>(operation)) {
+        lowerMakePath(makePath);
     } else if (mlir::db::GetNodeProperties getNodeProperties = mlir::dyn_cast<mlir::db::GetNodeProperties>(operation)) {
         lowerGetNodeProperties(getNodeProperties);
     } else if (mlir::db::GetEdgeProperties getEdgeProperties = mlir::dyn_cast<mlir::db::GetEdgeProperties>(operation)) {
         lowerGetEdgeProperties(getEdgeProperties);
     } else if (mlir::db::GetNodeLabelSet getNodeLabelSet = mlir::dyn_cast<mlir::db::GetNodeLabelSet>(operation)) {
         lowerGetNodeLabelSet(getNodeLabelSet);
+    } else if (mlir::db::GetEdgeTypes getEdgeTypes = mlir::dyn_cast<mlir::db::GetEdgeTypes>(operation)) {
+        lowerGetEdgeTypes(getEdgeTypes);
     } else if (mlir::db::CheckLabelConstraint checkLabelConstraint = mlir::dyn_cast<mlir::db::CheckLabelConstraint>(operation)) {
         lowerCheckLabelConstraint(checkLabelConstraint);
     } else if (mlir::db::CheckEdgeTypeConstraint checkEdgeTypeConstraint = mlir::dyn_cast<mlir::db::CheckEdgeTypeConstraint>(operation)) {
@@ -406,8 +1458,40 @@ void DBLowering::lowerOperation(mlir::Operation& operation) {
         lowerCreateNode(createNode);
     } else if (mlir::db::CreateEdge createEdge = mlir::dyn_cast<mlir::db::CreateEdge>(operation)) {
         lowerCreateEdge(createEdge);
+    } else if (mlir::db::Merge merge = mlir::dyn_cast<mlir::db::Merge>(operation)) {
+        lowerMerge(merge);
+    } else if (mlir::db::SetNodeProperty setNodeProperty = mlir::dyn_cast<mlir::db::SetNodeProperty>(operation)) {
+        lowerSetNodeProperty(setNodeProperty);
+    } else if (mlir::db::SetEdgeProperty setEdgeProperty = mlir::dyn_cast<mlir::db::SetEdgeProperty>(operation)) {
+        lowerSetEdgeProperty(setEdgeProperty);
+    } else if (mlir::db::DeleteNode deleteNode = mlir::dyn_cast<mlir::db::DeleteNode>(operation)) {
+        lowerDeleteNode(deleteNode);
+    } else if (mlir::db::DeleteEdge deleteEdge = mlir::dyn_cast<mlir::db::DeleteEdge>(operation)) {
+        lowerDeleteEdge(deleteEdge);
     } else if (mlir::db::CrossProduct crossProduct = mlir::dyn_cast<mlir::db::CrossProduct>(operation)) {
         lowerCrossProduct(crossProduct);
+    } else if (mlir::db::HashJoin hashJoin = mlir::dyn_cast<mlir::db::HashJoin>(operation)) {
+        lowerHashJoin(hashJoin);
+    } else if (mlir::db::Union unionOp = mlir::dyn_cast<mlir::db::Union>(operation)) {
+        lowerUnion(unionOp);
+    } else if (mlir::db::Conditional conditional = mlir::dyn_cast<mlir::db::Conditional>(operation)) {
+        lowerConditional(conditional);
+    } else if (mlir::db::DistinctSet distinctSet = mlir::dyn_cast<mlir::db::DistinctSet>(operation)) {
+        lowerDistinctSet(distinctSet);
+    } else if (mlir::db::Materialize materialize = mlir::dyn_cast<mlir::db::Materialize>(operation)) {
+        lowerMaterialize(materialize);
+    } else if (mlir::db::ScanMaterialized scan = mlir::dyn_cast<mlir::db::ScanMaterialized>(operation)) {
+        lowerScanMaterialized(scan);
+    } else if (mlir::db::OptionalMatch optionalMatch = mlir::dyn_cast<mlir::db::OptionalMatch>(operation)) {
+        lowerOptionalMatch(optionalMatch);
+    } else if (mlir::db::CallSubquery callSubquery = mlir::dyn_cast<mlir::db::CallSubquery>(operation)) {
+        lowerCallSubquery(callSubquery);
+    } else if (mlir::db::ExistsSubquery existsSubquery = mlir::dyn_cast<mlir::db::ExistsSubquery>(operation)) {
+        lowerSubqueryExpression<mlir::db::ExistsSubquery, mlir::db::ExistsYield>(existsSubquery);
+    } else if (mlir::db::CountSubquery countSubquery = mlir::dyn_cast<mlir::db::CountSubquery>(operation)) {
+        lowerSubqueryExpression<mlir::db::CountSubquery, mlir::db::CountSubqueryYield>(countSubquery);
+    } else if (mlir::db::CollectSubquery collectSubquery = mlir::dyn_cast<mlir::db::CollectSubquery>(operation)) {
+        lowerSubqueryExpression<mlir::db::CollectSubquery, mlir::db::CollectSubqueryYield>(collectSubquery);
     } else if (mlir::db::Limit limit = mlir::dyn_cast<mlir::db::Limit>(operation)) {
         lowerLimit(limit);
     } else if (mlir::db::Skip skip = mlir::dyn_cast<mlir::db::Skip>(operation)) {
@@ -418,56 +1502,134 @@ void DBLowering::lowerOperation(mlir::Operation& operation) {
         lowerRemoveDuplicates(distinct);
     } else if (mlir::db::Count count = mlir::dyn_cast<mlir::db::Count>(operation)) {
         lowerCount(count);
+    } else if (mlir::db::CountScanRows countScanRows = mlir::dyn_cast<mlir::db::CountScanRows>(operation)) {
+        lowerCountScanRows(countScanRows);
     } else if (mlir::db::Sum sum = mlir::dyn_cast<mlir::db::Sum>(operation)) {
-        lowerAggregate(sum.getInput(), sum.getResult(), storage::AggregateKind::Sum);
+        lowerAggregate(sum.getInput(), sum.getResult(), storage::AggregateKind::Sum, sum.getDistinct());
     } else if (mlir::db::Min min = mlir::dyn_cast<mlir::db::Min>(operation)) {
-        lowerAggregate(min.getInput(), min.getResult(), storage::AggregateKind::Min);
+        lowerAggregate(min.getInput(), min.getResult(), storage::AggregateKind::Min, min.getDistinct());
     } else if (mlir::db::Max max = mlir::dyn_cast<mlir::db::Max>(operation)) {
-        lowerAggregate(max.getInput(), max.getResult(), storage::AggregateKind::Max);
+        lowerAggregate(max.getInput(), max.getResult(), storage::AggregateKind::Max, max.getDistinct());
     } else if (mlir::db::Avg avg = mlir::dyn_cast<mlir::db::Avg>(operation)) {
-        lowerAggregate(avg.getInput(), avg.getResult(), storage::AggregateKind::Avg);
+        lowerAggregate(avg.getInput(), avg.getResult(), storage::AggregateKind::Avg, avg.getDistinct());
+    } else if (mlir::db::StDev stDev = mlir::dyn_cast<mlir::db::StDev>(operation)) {
+        lowerAggregate(stDev.getInput(), stDev.getResult(), storage::AggregateKind::StDev, stDev.getDistinct());
+    } else if (mlir::db::StDevP stDevP = mlir::dyn_cast<mlir::db::StDevP>(operation)) {
+        lowerAggregate(stDevP.getInput(), stDevP.getResult(), storage::AggregateKind::StDevP, stDevP.getDistinct());
     } else if (mlir::db::ConstantOp constant = mlir::dyn_cast<mlir::db::ConstantOp>(operation)) {
         lowerConstant(constant);
-    } else if (mlir::db::AddOp add = mlir::dyn_cast<mlir::db::AddOp>(operation)) {
-        lowerAdd(add);
-    } else if (mlir::db::SubOp sub = mlir::dyn_cast<mlir::db::SubOp>(operation)) {
-        lowerSub(sub);
-    } else if (mlir::db::MulOp mul = mlir::dyn_cast<mlir::db::MulOp>(operation)) {
-        lowerMul(mul);
-    } else if (mlir::db::DivOp div = mlir::dyn_cast<mlir::db::DivOp>(operation)) {
-        lowerDiv(div);
-    } else if (mlir::db::EqOp eq = mlir::dyn_cast<mlir::db::EqOp>(operation)) {
-        lowerEq(eq);
-    } else if (mlir::db::GtOp gt = mlir::dyn_cast<mlir::db::GtOp>(operation)) {
-        lowerGt(gt);
-    } else if (mlir::db::LtOp lt = mlir::dyn_cast<mlir::db::LtOp>(operation)) {
-        lowerLt(lt);
-    } else if (mlir::db::GteOp gte = mlir::dyn_cast<mlir::db::GteOp>(operation)) {
-        lowerGte(gte);
-    } else if (mlir::db::LteOp lte = mlir::dyn_cast<mlir::db::LteOp>(operation)) {
-        lowerLte(lte);
-    } else if (mlir::db::AndOp nd = mlir::dyn_cast<mlir::db::AndOp>(operation)) {
-        lowerAnd(nd);
-    } else if (mlir::db::OrOp orOp = mlir::dyn_cast<mlir::db::OrOp>(operation)) {
-        lowerOr(orOp);
+    } else if (mlir::db::CurrentDateTime currentDateTime = mlir::dyn_cast<mlir::db::CurrentDateTime>(operation)) {
+        lowerCurrentDateTime(currentDateTime);
+    } else if (mlir::db::BroadcastConstant broadcast = mlir::dyn_cast<mlir::db::BroadcastConstant>(operation)) {
+        lowerBroadcastConstant(broadcast);
+    } else if (mlir::db::ToNullable toNullable = mlir::dyn_cast<mlir::db::ToNullable>(operation)) {
+        lowerToNullable(toNullable);
+    } else if (mlir::isa<mlir::db::AddOp>(operation)) {
+        lowerBinaryOp<nl::Add>(operation, BinaryResultKind::Numeric);
+    } else if (mlir::isa<mlir::db::ConcatOp>(operation)) {
+        lowerBinaryOp<nl::Concat>(operation, BinaryResultKind::Concat);
+    } else if (mlir::isa<mlir::db::ListIndex>(operation)) {
+        lowerBinaryOp<nl::ListIndex>(operation, BinaryResultKind::Index);
+    } else if (mlir::isa<mlir::db::SubOp>(operation)) {
+        lowerBinaryOp<nl::Sub>(operation, BinaryResultKind::Numeric);
+    } else if (mlir::isa<mlir::db::MulOp>(operation)) {
+        lowerBinaryOp<nl::Mul>(operation, BinaryResultKind::Numeric);
+    } else if (mlir::isa<mlir::db::DivOp>(operation)) {
+        lowerBinaryOp<nl::Div>(operation, BinaryResultKind::Numeric);
+    } else if (mlir::isa<mlir::db::ModOp>(operation)) {
+        lowerBinaryOp<nl::Mod>(operation, BinaryResultKind::Numeric);
+    } else if (mlir::isa<mlir::db::PowOp>(operation)) {
+        lowerBinaryOp<nl::Pow>(operation, BinaryResultKind::Double);
+    } else if (mlir::isa<mlir::db::EqOp>(operation)) {
+        lowerBinaryOp<nl::Eq>(operation, BinaryResultKind::Comparison);
+    } else if (mlir::isa<mlir::db::NeqOp>(operation)) {
+        lowerBinaryOp<nl::Neq>(operation, BinaryResultKind::Comparison);
+    } else if (mlir::isa<mlir::db::GtOp>(operation)) {
+        lowerBinaryOp<nl::Gt>(operation, BinaryResultKind::Comparison);
+    } else if (mlir::isa<mlir::db::LtOp>(operation)) {
+        lowerBinaryOp<nl::Lt>(operation, BinaryResultKind::Comparison);
+    } else if (mlir::isa<mlir::db::GteOp>(operation)) {
+        lowerBinaryOp<nl::Gte>(operation, BinaryResultKind::Comparison);
+    } else if (mlir::isa<mlir::db::LteOp>(operation)) {
+        lowerBinaryOp<nl::Lte>(operation, BinaryResultKind::Comparison);
+    } else if (mlir::isa<mlir::db::StartsWithOp>(operation)) {
+        lowerBinaryOp<nl::StartsWith>(operation, BinaryResultKind::Boolean);
+    } else if (mlir::isa<mlir::db::EndsWithOp>(operation)) {
+        lowerBinaryOp<nl::EndsWith>(operation, BinaryResultKind::Boolean);
+    } else if (mlir::isa<mlir::db::ContainsOp>(operation)) {
+        lowerBinaryOp<nl::Contains>(operation, BinaryResultKind::Boolean);
+    } else if (mlir::isa<mlir::db::InOp>(operation)) {
+        lowerBinaryOp<nl::In>(operation, BinaryResultKind::Membership);
+    } else if (mlir::isa<mlir::db::AndOp>(operation)) {
+        lowerBinaryOp<nl::And>(operation, BinaryResultKind::Boolean);
+    } else if (mlir::isa<mlir::db::OrOp>(operation)) {
+        lowerBinaryOp<nl::Or>(operation, BinaryResultKind::Boolean);
+    } else if (mlir::isa<mlir::db::XorOp>(operation)) {
+        lowerBinaryOp<nl::Xor>(operation, BinaryResultKind::Boolean);
     } else if (mlir::db::NotOp notOp = mlir::dyn_cast<mlir::db::NotOp>(operation)) {
         lowerNot(notOp);
+    } else if (mlir::db::Case caseOp = mlir::dyn_cast<mlir::db::Case>(operation)) {
+        lowerCase(caseOp);
+    } else if (mlir::db::LazyCase lazyCase = mlir::dyn_cast<mlir::db::LazyCase>(operation)) {
+        lowerLazyCase(lazyCase);
     } else if (mlir::db::FilterOp filter = mlir::dyn_cast<mlir::db::FilterOp>(operation)) {
         lowerFilter(filter);
+    } else if (mlir::db::FetchNodes fetch = mlir::dyn_cast<mlir::db::FetchNodes>(operation)) {
+        lowerFetchNodes(fetch);
     } else if (mlir::db::GroupAggregate groupAggregate = mlir::dyn_cast<mlir::db::GroupAggregate>(operation)) {
         lowerGroupAggregate(groupAggregate);
     } else if (mlir::db::Collect collect = mlir::dyn_cast<mlir::db::Collect>(operation)) {
         lowerCollect(collect);
     } else if (mlir::db::UnwindCollect unwindCollect = mlir::dyn_cast<mlir::db::UnwindCollect>(operation)) {
         lowerUnwindCollect(unwindCollect);
+    } else if (mlir::db::ShortestPath shortestPath = mlir::dyn_cast<mlir::db::ShortestPath>(operation)) {
+        lowerShortestPath(shortestPath);
+    } else if (mlir::db::CallProcedure call = mlir::dyn_cast<mlir::db::CallProcedure>(operation)) {
+        lowerCallProcedure(call);
     } else if (mlir::db::Output output = mlir::dyn_cast<mlir::db::Output>(operation)) {
         lowerOutput(output);
+    } else if (mlir::isa<mlir::db::Head, mlir::db::Last>(operation)) {
+        lowerHeadOrLast(operation);
+    } else if (lookupUnaryFunctionLowering(operation)) {
+        lowerUnaryFunction(&operation);
+    } else if (lookupBinaryFunctionLowering(operation)) {
+        lowerBinaryFunction(&operation);
     } else if (mlir::isa<mlir::func::ReturnOp>(operation)) {
         // We already added a ReturnOp to the nl function
-    } else {
+    } else if (!lowerSystemCommand(operation)) {
         throw IRException("DBLowering cannot lower operation '"
                           + operation.getName().getStringRef().str() + "'");
     }
+}
+
+bool DBLowering::lowerSystemCommand(mlir::Operation& operation) {
+    const auto siblingIt = systemCommandSiblings.find(operation.getName().getStringRef());
+    if (siblingIt == systemCommandSiblings.end()) {
+        return false;
+    }
+
+    // A system command reads no column, so nothing constrains where it sits, and it
+    // opens no loop: it materializes its whole (small) result table in one step at
+    // function scope, the way nl.count_result materializes its single row.
+    setInsertionInto(_entryBlock);
+
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    mlir::OperationState state(_builder.getUnknownLoc(), siblingIt->second);
+    state.addAttributes(operation.getAttrs());
+
+    for (const mlir::Value result : operation.getResults()) {
+        const mlir::db::ColumnType columnType = mlir::cast<mlir::db::ColumnType>(result.getType());
+        state.addTypes(nl::ChunkType::get(context, columnType.getType()));
+    }
+
+    mlir::Operation* const nlOperation = _builder.create(state);
+
+    for (size_t resultIndex = 0; resultIndex < operation.getNumResults(); resultIndex++) {
+        _valueMap[operation.getResult(resultIndex)] = nlOperation->getResult(resultIndex);
+    }
+
+    return true;
 }
 
 void DBLowering::lowerScanNodes(mlir::db::ScanNodes scanNodes) {
@@ -505,6 +1667,1072 @@ void DBLowering::lowerConstScanNodes(mlir::db::ConstScanNodes constScanNodes) {
     buildLoopForSource(nodes.getResult(), constScanNodes.getOperation());
 }
 
+void DBLowering::lowerScanNodesByPropertyValue(mlir::db::ScanNodesByPropertyValue scanNodesByPropertyValue) {
+    setInsertionInto(_rootBlock);
+
+    nl::ScanNodesByPropertyValue nodes = _builder.create<nl::ScanNodesByPropertyValue>(_builder.getUnknownLoc(),
+                                                                                       scanNodesByPropertyValue.getPropertyAttr(),
+                                                                                       scanNodesByPropertyValue.getValue(),
+                                                                                       scanNodesByPropertyValue.getLabelsAttr());
+    buildLoopForSource(nodes.getResult(), scanNodesByPropertyValue.getOperation());
+}
+
+void DBLowering::lowerUnwindConst(mlir::db::UnwindConst unwindConst) {
+    // The literal-list sibling of lowerConstScanNodes: a source reads no column, so
+    // its loop sits at the top of the current root block. The literals are the rows to
+    // emit, forwarded as-is; translation materializes them into a ListView. Unlike a
+    // node-ID scan the chunk element type varies with the list (a homogeneous value
+    // type, or !storage.any for a heterogeneous one), so - like nl.collect - the
+    // iterator type is spelled here from the db column's element type rather than
+    // inferred.
+    setInsertionInto(_rootBlock);
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const mlir::db::ColumnType column = mlir::cast<mlir::db::ColumnType>(unwindConst.getResult().getType());
+    const mlir::Type elementType = column.getType();
+
+    // A homogeneous list rides a nullable value chunk, as a property fetch and the
+    // unwind_collect drain do: the elements are never null, but every value-chunk
+    // consumer (a cross product broadcast, a filter, a skip, an aggregate) dispatches
+    // on nullable<T>, so the uniform shape is what makes the unwound column composable.
+    // A heterogeneous list keeps its type-erased !storage.any chunk, which only
+    // pass-through consumers accept.
+    const bool heterogeneous = mlir::isa<storage::AnyType>(elementType);
+    const mlir::Type chunkElementType = heterogeneous ? elementType
+                                                      : storage::NullableType::get(context, elementType);
+
+    const nl::ChunkType chunk = nl::ChunkType::get(context, chunkElementType);
+    const nl::IteratorType iteratorType = nl::IteratorType::get(context, {chunk});
+
+    nl::UnwindConst rows = _builder.create<nl::UnwindConst>(_builder.getUnknownLoc(),
+                                                            iteratorType,
+                                                            unwindConst.getElementsAttr());
+    buildLoopForSource(rows.getResult(), unwindConst.getOperation());
+}
+
+void DBLowering::lowerLoadCSV(mlir::db::LoadCSV loadCSV) {
+    // The file sibling of lowerUnwindConst: a source reads no column, so its loop sits at
+    // the top of the current root block. The path, the field list and the flags are
+    // forwarded as-is; the path and the header names are resolved when the loop runs. One
+    // string chunk per field, so - like nl.unwind_const - the iterator type is
+    // spelled here rather than inferred.
+    setInsertionInto(_rootBlock);
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const nl::ChunkType chunk = nl::ChunkType::get(context, storage::StringType::get(context));
+
+    const llvm::SmallVector<mlir::Type> chunks(loadCSV.getResults().size(), chunk);
+    const nl::IteratorType iteratorType = nl::IteratorType::get(context, chunks);
+
+    nl::LoadCSV records = _builder.create<nl::LoadCSV>(_builder.getUnknownLoc(),
+                                                       iteratorType,
+                                                       loadCSV.getPathAttr(),
+                                                       loadCSV.getFieldsAttr(),
+                                                       loadCSV.getWithHeadersAttr(),
+                                                       loadCSV.getSkipOnErrorAttr());
+    buildLoopForSource(records.getResult(), loadCSV.getOperation());
+}
+
+void DBLowering::lowerVectorSearch(mlir::db::VectorSearch vectorSearch) {
+    // The neighbour sibling of lowerUnwindConst: a source reads no column, so its loop
+    // sits at the top of the current root block. The index, the neighbour count and the
+    // query vector are forwarded as-is; the two chunk types are fixed, so the iterator
+    // type is inferred rather than spelled.
+    setInsertionInto(_rootBlock);
+
+    nl::VectorSearch neighbours = _builder.create<nl::VectorSearch>(_builder.getUnknownLoc(),
+                                                                    vectorSearch.getIndexNameAttr(),
+                                                                    vectorSearch.getKAttr(),
+                                                                    vectorSearch.getQueryVectorAttr());
+    buildLoopForSource(neighbours.getResult(), vectorSearch.getOperation());
+}
+
+
+void DBLowering::lowerUnwind(mlir::db::Unwind unwind) {
+    llvm::SmallVector<mlir::Value, 4> carriedChunks;
+    for (const mlir::Value carriedColumn : unwind.getColumnsToFilter()) {
+        carriedChunks.push_back(mapValue(carriedColumn));
+    }
+
+    // A constant source holds one cell standing for every row rather than one per row, so
+    // it is laid out over the rows it expands - the carried ones, or the single row a
+    // scope of constants alone is.
+    const mlir::Value cardinality = cardinalityDriver(carriedChunks);
+    const mlir::Value sourceChunk = rowAlignedChunk(mapValue(unwind.getSource()), cardinality);
+
+    // Inserted into the deepest block, where every operand is bound - as lowerFilter's is.
+    // The unwind opens a loop, so like a scan it sits no higher than the root block: a
+    // factor unwinding a list of constants loops inside the factor, not where they were hoisted.
+    llvm::SmallVector<mlir::Value, 4> operandChunks {sourceChunk};
+    operandChunks.append(carriedChunks.begin(), carriedChunks.end());
+
+    setInsertionInto(deepestOwnerBlock(operandChunks, _rootBlock));
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const mlir::Type sourceElement = mlir::cast<nl::ChunkType>(sourceChunk.getType()).getElementType();
+
+    llvm::SmallVector<mlir::Type, 4> chunkTypes;
+    chunkTypes.push_back(nl::ChunkType::get(context, ::db::unwoundElementType(context, sourceElement)));
+
+    for (const mlir::Value carriedChunk : carriedChunks) {
+        chunkTypes.push_back(carriedChunk.getType());
+    }
+
+    const nl::IteratorType iteratorType = nl::IteratorType::get(context, chunkTypes);
+
+    nl::Unwind rows = _builder.create<nl::Unwind>(_builder.getUnknownLoc(),
+                                                  iteratorType,
+                                                  sourceChunk,
+                                                  carriedChunks);
+    buildLoopForSource(rows.getResult(), unwind.getOperation());
+}
+
+void DBLowering::lowerUnwindRange(mlir::db::UnwindRange unwindRange) {
+    llvm::SmallVector<mlir::Value, 4> carriedChunks;
+    for (const mlir::Value carriedColumn : unwindRange.getColumnsToFilter()) {
+        carriedChunks.push_back(mapValue(carriedColumn));
+    }
+
+    const mlir::Value from = unwindRange.getFrom();
+    const mlir::Value to = unwindRange.getTo();
+
+    llvm::SmallVector<mlir::Value, 5> bounds {mapValue(unwindRange.getStart()),
+                                              mapValue(unwindRange.getEnd()),
+                                              mapValue(unwindRange.getStep())};
+
+    if (from) {
+        bounds.push_back(mapValue(from));
+    }
+
+    if (to) {
+        bounds.push_back(mapValue(to));
+    }
+
+    llvm::SmallVector<mlir::Value, 8> operandChunks(carriedChunks.begin(), carriedChunks.end());
+    operandChunks.append(bounds.begin(), bounds.end());
+
+    const mlir::Value cardinality = cardinalityDriver(operandChunks);
+
+    for (mlir::Value& bound : bounds) {
+        bound = nullableValueChunk(rowAlignedChunk(bound, cardinality));
+    }
+
+    operandChunks.assign(bounds.begin(), bounds.end());
+    operandChunks.append(carriedChunks.begin(), carriedChunks.end());
+
+    setInsertionInto(deepestOwnerBlock(operandChunks, _rootBlock));
+
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    llvm::SmallVector<mlir::Type, 4> chunkTypes;
+    chunkTypes.push_back(nl::ChunkType::get(context, storage::NullableType::get(context, _builder.getI64Type())));
+
+    for (const mlir::Value carriedChunk : carriedChunks) {
+        chunkTypes.push_back(carriedChunk.getType());
+    }
+
+    const nl::IteratorType iteratorType = nl::IteratorType::get(context, chunkTypes);
+
+    const mlir::Value fromChunk = from ? bounds[3] : mlir::Value {};
+    const mlir::Value toChunk = to ? bounds.back() : mlir::Value {};
+
+    nl::UnwindRange rows = _builder.create<nl::UnwindRange>(_builder.getUnknownLoc(),
+                                                            iteratorType,
+                                                            bounds[0],
+                                                            bounds[1],
+                                                            bounds[2],
+                                                            fromChunk,
+                                                            toChunk,
+                                                            carriedChunks,
+                                                            unwindRange.getReversed());
+    buildLoopForSource(rows.getResult(), unwindRange.getOperation());
+}
+
+void DBLowering::lowerUnwindComputed(mlir::db::UnwindComputed unwind) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    llvm::SmallVector<mlir::Value, 4> carriedChunks;
+    llvm::SmallVector<mlir::Type, 4> carriedTypes;
+    llvm::SmallVector<mlir::Location, 4> carriedLocations;
+    for (const mlir::Value carriedColumn : unwind.getColumnsToFilter()) {
+        const mlir::Value carriedChunk = mapValue(carriedColumn);
+        carriedChunks.push_back(carriedChunk);
+        carriedTypes.push_back(carriedChunk.getType());
+        carriedLocations.push_back(loc);
+    }
+
+    setInsertionInto(deepestOwnerBlock(carriedChunks, _rootBlock));
+
+    // The element type is the source's to decide, and the source is only known once the
+    // region is lowered, so the iterator is typed after it
+    nl::UnwindComputed rows = _builder.create<nl::UnwindComputed>(loc,
+                                                                  nl::IteratorType::get(context, carriedTypes),
+                                                                  carriedChunks);
+
+    mlir::Block& dbSource = unwind.getSource().front();
+    mlir::Block* const nlSource = &rows.getSource().emplaceBlock();
+    nlSource->addArguments(carriedTypes, carriedLocations);
+
+    for (size_t argumentIndex = 0; argumentIndex < carriedChunks.size(); argumentIndex++) {
+        const unsigned index = static_cast<unsigned>(argumentIndex);
+        _valueMap[dbSource.getArgument(index)] = nlSource->getArgument(index);
+    }
+
+    const mlir::Value runCardinality = nlSource->getArgument(0);
+
+    _builder.setInsertionPointToEnd(nlSource);
+    mlir::Operation* const placeholderYield = _builder.create<nl::UnwindYield>(loc, runCardinality);
+
+    mlir::Block* const previousInnermostLoopBody = _innermostLoopBody;
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+    _innermostLoopBody = nlSource;
+    _innermostCardinality = runCardinality;
+
+    mlir::Value sourceChunk;
+    for (mlir::Operation& operation : dbSource) {
+        mlir::db::UnwindYield yield = mlir::dyn_cast<mlir::db::UnwindYield>(operation);
+        if (yield) {
+            sourceChunk = rowAlignedChunk(yieldedChunk(yield.getSource()), runCardinality);
+        } else {
+            lowerOperation(operation);
+        }
+    }
+
+    _innermostLoopBody = previousInnermostLoopBody;
+    _innermostCardinality = previousInnermostCardinality;
+
+    _builder.setInsertionPointToEnd(nlSource);
+    _builder.create<nl::UnwindYield>(loc, sourceChunk);
+    placeholderYield->erase();
+
+    const mlir::Type sourceElement = mlir::cast<nl::ChunkType>(sourceChunk.getType()).getElementType();
+
+    llvm::SmallVector<mlir::Type, 4> chunkTypes;
+    chunkTypes.push_back(nl::ChunkType::get(context, ::db::unwoundElementType(context, sourceElement)));
+    chunkTypes.append(carriedTypes.begin(), carriedTypes.end());
+
+    rows.getResult().setType(nl::IteratorType::get(context, chunkTypes));
+
+    _builder.setInsertionPointAfter(rows);
+    buildLoopForSource(rows.getResult(), unwind.getOperation());
+}
+
+void DBLowering::lowerElementOperands(mlir::Value source, mlir::OperandRange carried, ElementOperands& operands) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    for (const mlir::Value carriedColumn : carried) {
+        operands._carriedChunks.push_back(mapValue(carriedColumn));
+    }
+
+    // A constant source holds one cell standing for every row rather than one per row, so
+    // it is laid out over the rows it is read against - as lowerUnwind lays its own out
+    const mlir::Value cardinality = cardinalityDriver(operands._carriedChunks);
+    operands._sourceChunk = rowAlignedChunk(mapValue(source), cardinality);
+
+    const mlir::Type sourceElement = mlir::cast<nl::ChunkType>(operands._sourceChunk.getType()).getElementType();
+
+    const nl::ChunkType rowTagType = nl::ChunkType::get(context,
+                                                        _builder.getIntegerType(64, /*isSigned=*/false));
+
+    operands._argumentTypes = {nl::ChunkType::get(context, ::db::unwoundElementType(context, sourceElement)), rowTagType};
+    operands._argumentLocations = {loc, loc};
+
+    for (const mlir::Value carriedChunk : operands._carriedChunks) {
+        operands._argumentTypes.push_back(carriedChunk.getType());
+        operands._argumentLocations.push_back(loc);
+    }
+
+    llvm::SmallVector<mlir::Value, 8> operandChunks {operands._sourceChunk};
+    operandChunks.append(operands._carriedChunks.begin(), operands._carriedChunks.end());
+
+    setInsertionForNaryOp(operandChunks);
+}
+
+mlir::Operation* DBLowering::lowerElementBody(mlir::Block& dbBody,
+                                              mlir::Block* nlBody,
+                                              mlir::Value& rowTagChunk,
+                                              mlir::Value& valueChunk) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    const mlir::Value elementChunk = nlBody->getArgument(0);
+
+    // Every insertion into a block goes before its terminator, so the body needs one
+    // before anything is lowered into it. This one stands for the yield the lowered body
+    // decides, which the caller replaces.
+    _builder.setInsertionPointToEnd(nlBody);
+    mlir::Operation* const placeholderYield =
+        _builder.create<nl::ComprehensionYield>(loc, nlBody->getArgument(1), elementChunk);
+
+    for (size_t argumentIndex = 0; argumentIndex < nlBody->getNumArguments(); argumentIndex++) {
+        const unsigned index = static_cast<unsigned>(argumentIndex);
+        _valueMap[dbBody.getArgument(index)] = nlBody->getArgument(index);
+    }
+
+    // The rows the body computes over are the elements of one row's list, so a constant it
+    // reads is laid out over those rather than over the rows the op is read on
+    mlir::Block* const previousInnermostLoopBody = _innermostLoopBody;
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+    _innermostLoopBody = nlBody;
+    _innermostCardinality = elementChunk;
+
+    for (mlir::Operation& operation : dbBody) {
+        mlir::db::ComprehensionYield yield = mlir::dyn_cast<mlir::db::ComprehensionYield>(operation);
+        if (!yield) {
+            lowerOperation(operation);
+            continue;
+        }
+
+        rowTagChunk = mapValue(yield.getRowTags());
+        valueChunk = yieldedChunk(yield.getValue());
+    }
+
+    _innermostLoopBody = previousInnermostLoopBody;
+    _innermostCardinality = previousInnermostCardinality;
+
+    // ComprehensionYield::verify guarantees both, so an empty one here means unverified
+    // IR - the defensive backstop lowerOptionalMatch keeps too.
+    if (!rowTagChunk || !valueChunk) {
+        throw IRException("The body of an op over the elements of a list yields no value");
+    }
+
+    // A value computed from constants alone holds one cell standing for every element, so
+    // it is laid out over the elements it is read against - the ones the tag counts, since
+    // a WHERE has cut both together
+    valueChunk = rowAlignedChunk(valueChunk, rowTagChunk);
+
+    return placeholderYield;
+}
+
+void DBLowering::lowerListComprehension(mlir::db::ListComprehension comprehension) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    ElementOperands operands;
+    lowerElementOperands(comprehension.getSource(), comprehension.getColumnsToFilter(), operands);
+
+    // What the body yields names the type of the lists, and that is only known once the
+    // body is lowered. The op is created before it all the same, with the source's type
+    // standing in: an op in the body reading a chunk bound above it takes the deeper of
+    // the two blocks, which only holds when the body region hangs under them.
+    nl::ListComprehension lists = _builder.create<nl::ListComprehension>(loc,
+                                                                         operands._sourceChunk.getType(),
+                                                                         operands._sourceChunk,
+                                                                         operands._carriedChunks);
+
+    mlir::Block* const bodyBlock = &lists.getBody().emplaceBlock();
+    bodyBlock->addArguments(operands._argumentTypes, operands._argumentLocations);
+
+    mlir::Value rowTagChunk;
+    mlir::Value valueChunk;
+    mlir::Operation* const placeholderYield =
+        lowerElementBody(comprehension.getBody().front(), bodyBlock, rowTagChunk, valueChunk);
+
+    // An entity ID, a list and a tagged cell are present in every row and go into the list
+    // as they stand; only a scalar value column is read as nullable, the way lowerMakeList
+    // reads the columns it builds from
+    const mlir::Type valueElement = mlir::cast<nl::ChunkType>(valueChunk.getType()).getElementType();
+    const bool holdsCellsPresentInEveryRow = mlir::isa<storage::NodeIDType,
+                                                       storage::EdgeIDType,
+                                                       storage::ListType,
+                                                       storage::MapType,
+                                                       storage::AnyType>(valueElement);
+
+    if (!holdsCellsPresentInEveryRow) {
+        valueChunk = nullableValueChunk(valueChunk);
+    }
+
+    _builder.setInsertionPointToEnd(bodyBlock);
+    _builder.create<nl::ComprehensionYield>(loc, rowTagChunk, valueChunk);
+    placeholderYield->erase();
+
+    const mlir::Type listType = storage::ListType::get(context, listedElementType(context, valueChunk));
+    const nl::ChunkType resultType = nl::ChunkType::get(context,
+                                                        storage::NullableType::get(context, listType));
+
+    mlir::Value listsChunk = lists.getResult();
+    listsChunk.setType(resultType);
+
+    _valueMap[comprehension.getResult()] = listsChunk;
+}
+
+void DBLowering::lowerListPredicate(mlir::db::ListPredicate predicate) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    ElementOperands operands;
+    lowerElementOperands(predicate.getSource(), predicate.getColumnsToFilter(), operands);
+
+    const nl::ChunkType resultType =
+        nl::ChunkType::get(context, storage::NullableType::get(context, _builder.getI1Type()));
+
+    nl::ListPredicate truths = _builder.create<nl::ListPredicate>(loc,
+                                                                  resultType,
+                                                                  operands._sourceChunk,
+                                                                  operands._carriedChunks,
+                                                                  predicate.getKind());
+
+    mlir::Block* const bodyBlock = &truths.getBody().emplaceBlock();
+    bodyBlock->addArguments(operands._argumentTypes, operands._argumentLocations);
+
+    mlir::Value rowTagChunk;
+    mlir::Value valueChunk;
+    mlir::Operation* const placeholderYield =
+        lowerElementBody(predicate.getBody().front(), bodyBlock, rowTagChunk, valueChunk);
+
+    _builder.setInsertionPointToEnd(bodyBlock);
+    _builder.create<nl::ComprehensionYield>(loc, rowTagChunk, valueChunk);
+    placeholderYield->erase();
+
+    _valueMap[predicate.getResult()] = truths.getResult();
+}
+
+void DBLowering::lowerReduce(mlir::db::Reduce reduce) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+
+    ElementOperands operands;
+    lowerElementOperands(reduce.getSource(), reduce.getColumnsToFilter(), operands);
+
+    const mlir::Value initialChunk = rowAlignedChunk(mapValue(reduce.getInitialValue()), operands._sourceChunk);
+
+    // The body is lowered over an accumulator of the type the initial value has, and again
+    // over a wider one whenever what it computes does not fit: `s + x` over an integer s
+    // and a float x needs a float s. Each round widens, so this settles.
+    mlir::Type accumulated = accumulatedElement(mlir::Type {}, initialChunk.getType());
+
+    while (true) {
+        const nl::ChunkType accumulatorType = accumulatorChunkType(accumulated);
+        const mlir::Value initialAccumulator = promotedToAccumulated(initialChunk, accumulated);
+
+        llvm::SmallVector<mlir::Value, 8> operandChunks {operands._sourceChunk, initialAccumulator};
+        operandChunks.append(operands._carriedChunks.begin(), operands._carriedChunks.end());
+        setInsertionForNaryOp(operandChunks);
+
+        nl::Reduce reduced = _builder.create<nl::Reduce>(loc,
+                                                         accumulatorType,
+                                                         operands._sourceChunk,
+                                                         initialAccumulator,
+                                                         operands._carriedChunks);
+
+        llvm::SmallVector<mlir::Type, 4> argumentTypes = operands._argumentTypes;
+        argumentTypes[1] = accumulatorType;
+
+        mlir::Block* const bodyBlock = &reduced.getBody().emplaceBlock();
+        bodyBlock->addArguments(argumentTypes, operands._argumentLocations);
+
+        mlir::Value valueChunk;
+        mlir::Operation* const placeholderYield = lowerReduceBody(reduce.getBody().front(), bodyBlock, valueChunk);
+
+        const mlir::Type widened = accumulatedElement(accumulated, valueChunk.getType());
+        if (widened != accumulated) {
+            reduced->erase();
+            accumulated = widened;
+            continue;
+        }
+
+        valueChunk = promotedToAccumulated(valueChunk, accumulated);
+
+        _builder.setInsertionPointToEnd(bodyBlock);
+        _builder.create<nl::ReduceYield>(loc, valueChunk);
+        placeholderYield->erase();
+
+        _valueMap[reduce.getResult()] = reduced.getResult();
+        return;
+    }
+}
+
+mlir::Operation* DBLowering::lowerReduceBody(mlir::Block& dbBody, mlir::Block* nlBody, mlir::Value& valueChunk) {
+    const mlir::Value elementChunk = nlBody->getArgument(0);
+
+    // The yield the body decides is only known once it is lowered, and every insertion
+    // goes before a block's terminator, so one stands in for it meanwhile
+    _builder.setInsertionPointToEnd(nlBody);
+    mlir::Operation* const placeholderYield = _builder.create<nl::ReduceYield>(_builder.getUnknownLoc(), elementChunk);
+
+    for (size_t argumentIndex = 0; argumentIndex < nlBody->getNumArguments(); argumentIndex++) {
+        const unsigned index = static_cast<unsigned>(argumentIndex);
+        _valueMap[dbBody.getArgument(index)] = nlBody->getArgument(index);
+    }
+
+    mlir::Block* const previousInnermostLoopBody = _innermostLoopBody;
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+    _innermostLoopBody = nlBody;
+    _innermostCardinality = elementChunk;
+
+    for (mlir::Operation& operation : dbBody) {
+        mlir::db::ReduceYield yield = mlir::dyn_cast<mlir::db::ReduceYield>(operation);
+        if (yield) {
+            valueChunk = yieldedChunk(yield.getValue());
+        } else {
+            lowerOperation(operation);
+        }
+    }
+
+    _innermostLoopBody = previousInnermostLoopBody;
+    _innermostCardinality = previousInnermostCardinality;
+
+    valueChunk = rowAlignedChunk(valueChunk, elementChunk);
+
+    return placeholderYield;
+}
+
+mlir::Type DBLowering::accumulatedElement(mlir::Type accumulated, mlir::Type chunkType) {
+    if (isUntypedNullChunk(chunkType)) {
+        return accumulated;
+    }
+
+    const mlir::Type element = chunkValueElement(_builder, chunkType);
+    if (!accumulated) {
+        return element;
+    }
+
+    const mlir::Type unified = unifiedValueElement(_builder, accumulated, element);
+    if (!unified) {
+        return storage::AnyType::get(_builder.getContext());
+    }
+
+    return unified;
+}
+
+nl::ChunkType DBLowering::accumulatorChunkType(mlir::Type accumulated) {
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    // An accumulator that only ever held the null literal is that literal, which a CASE
+    // branch or a null test reads as the null it is rather than as a value of some type
+    if (!accumulated) {
+        return nl::ChunkType::get(context, storage::NullableType::get(context, _builder.getNoneType()));
+    }
+
+    return caseResultChunkType(accumulated);
+}
+
+mlir::Value DBLowering::promotedToAccumulated(mlir::Value chunk, mlir::Type accumulated) {
+    if (isUntypedNullChunk(chunk.getType())) {
+        return chunk;
+    }
+
+    const mlir::Type element = chunkValueElement(_builder, chunk.getType());
+    const bool promotes = element != accumulated && isNumericElement(element) && isNumericElement(accumulated);
+
+    return promotes ? chunkAsElement(chunk, accumulated) : chunk;
+}
+
+void DBLowering::lowerPatternComprehension(mlir::db::PatternComprehension comprehension) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    llvm::SmallVector<mlir::Value, 4> inputChunks;
+    for (const mlir::Value column : comprehension.getInputColumns()) {
+        inputChunks.push_back(mapValue(column));
+    }
+
+    // The step the accumulator covers is the one binding the columns the comprehension is
+    // read beside, so it is emptied once per chunk of them - and the pattern's nest and
+    // the build both go there, the build after the nest.
+    mlir::Block* const stepBlock = deepestOwnerBlock(inputChunks, _rootBlock);
+
+    // Any chunk of the step counts its rows; a comprehension read where nothing is in
+    // flight has none, and covers the single empty row instead.
+    const mlir::Value cardinality = inputChunks.empty() ? mlir::Value {} : cardinalityDriver(inputChunks);
+
+    setInsertionInto(stepBlock);
+    nl::RowListsBuffer buffer = _builder.create<nl::RowListsBuffer>(loc, cardinality);
+    const mlir::Value state = buffer.getState();
+
+    // The pattern reads this step's rows through its block arguments, and the row tag
+    // through the trailing one; a pattern with nothing to join onto has neither.
+    mlir::Block& patternBlock = comprehension.getPattern().front();
+    for (size_t inputIndex = 0; inputIndex < inputChunks.size(); inputIndex++) {
+        _valueMap[patternBlock.getArgument(static_cast<unsigned>(inputIndex))] = inputChunks[inputIndex];
+    }
+
+    if (!inputChunks.empty()) {
+        _valueMap[patternBlock.getArgument(static_cast<unsigned>(inputChunks.size()))] = buffer.getTag();
+    }
+
+    // A dataflow of its own, rooted where the accumulator sits so its loops nest inside
+    // this step; the caller's root and innermost loop are restored once it is lowered.
+    mlir::Block* const previousRoot = _rootBlock;
+    mlir::Block* const previousInnermostLoopBody = _innermostLoopBody;
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+    _rootBlock = stepBlock;
+    _innermostLoopBody = nullptr;
+    _innermostCardinality = mlir::Value();
+
+    mlir::Value rowTagChunk;
+    mlir::Value valueChunk;
+
+    for (mlir::Operation& operation : patternBlock) {
+        mlir::db::ComprehensionYield yield = mlir::dyn_cast<mlir::db::ComprehensionYield>(operation);
+        if (!yield) {
+            lowerOperation(operation);
+            continue;
+        }
+
+        if (yield.getRowTags()) {
+            rowTagChunk = mapValue(yield.getRowTags());
+        }
+
+        valueChunk = yieldedChunk(yield.getValue());
+    }
+
+    // PatternComprehension::verify guarantees the yield, so an empty one here means
+    // unverified IR - the defensive backstop lowerOptionalMatch keeps too.
+    if (!valueChunk) {
+        throw IRException("db.pattern_comprehension yields no value");
+    }
+
+    // The matches the value is read against are the ones the tag counts, since a WHERE has
+    // cut both together
+    valueChunk = rowListsValueChunk(valueChunk, rowTagChunk ? rowTagChunk : _innermostCardinality);
+
+    llvm::SmallVector<mlir::Value, 2> stagedChunks {valueChunk};
+    if (rowTagChunk) {
+        stagedChunks.push_back(rowTagChunk);
+    }
+
+    setInsertionInto(deepestOwnerBlock(stagedChunks, stepBlock));
+    _builder.create<nl::RowListsCollect>(loc, state, rowTagChunk, valueChunk);
+
+    _rootBlock = previousRoot;
+    _innermostLoopBody = previousInnermostLoopBody;
+    _innermostCardinality = previousInnermostCardinality;
+
+    // Every row gets a list, the empty one where the pattern matched nothing, so the
+    // lists are a container chunk rather than the nullable one a list comprehension builds
+    const mlir::Type listType = storage::ListType::get(context, listedElementType(context, valueChunk));
+    const nl::ChunkType resultType = nl::ChunkType::get(context, listType);
+
+    setInsertionInto(stepBlock);
+    nl::RowListsResult lists = _builder.create<nl::RowListsResult>(loc, resultType, state, cardinality);
+
+    _valueMap[comprehension.getResult()] = lists.getResult();
+}
+
+mlir::Value DBLowering::rowListsValueChunk(mlir::Value valueChunk, mlir::Value rows) {
+    // A value computed from constants alone holds one cell standing for every row, so it is
+    // laid out over the rows it is read against
+    const mlir::Value aligned = rowAlignedChunk(valueChunk, rows);
+
+    // An entity ID, a list and a tagged cell are present in every row and go into the list
+    // as they stand; only a scalar value column is read as nullable, the way lowerMakeList
+    // reads the columns it builds from
+    const mlir::Type valueElement = mlir::cast<nl::ChunkType>(aligned.getType()).getElementType();
+    const bool holdsCellsPresentInEveryRow = mlir::isa<storage::NodeIDType,
+                                                       storage::EdgeIDType,
+                                                       storage::ListType,
+                                                       storage::AnyType>(valueElement);
+
+    if (holdsCellsPresentInEveryRow) {
+        return aligned;
+    }
+
+    return nullableValueChunk(aligned);
+}
+
+mlir::Type DBLowering::listedElementType(mlir::MLIRContext* context, llvm::ArrayRef<mlir::Value> chunks) {
+    mlir::Type shared;
+
+    for (const mlir::Value chunk : chunks) {
+        mlir::Type element = mlir::cast<nl::ChunkType>(chunk.getType()).getElementType();
+
+        // A cell that is absent is a tagged null of the list its neighbours are in, so a
+        // nullable column names the type of the value it holds.
+        if (const auto nullable = mlir::dyn_cast<storage::NullableType>(element)) {
+            element = nullable.getValueType();
+        }
+
+        if (mlir::isa<mlir::NoneType>(element)) {
+            continue;
+        }
+
+        if (!shared) {
+            shared = element;
+        } else if (shared != element) {
+            return storage::AnyType::get(context);
+        }
+    }
+
+    if (!shared) {
+        return mlir::NoneType::get(context);
+    }
+
+    return shared;
+}
+
+void DBLowering::lowerDynamicMapKey(mlir::db::DynamicMapKey mapKey) {
+    const mlir::Value mapChunk = mapValue(mapKey.getMap());
+    const mlir::Value keyChunk = mapValue(mapKey.getKey());
+
+    if (!holdsAMapPerRow(mapChunk.getType())) {
+        throw IRException("db.dynamic_map_key reads from a map column, or from a column of tagged cells");
+    }
+
+    const mlir::Type keyElement = mlir::cast<nl::ChunkType>(keyChunk.getType()).getElementType();
+    const auto nullableKey = mlir::dyn_cast<storage::NullableType>(keyElement);
+    const mlir::Type key = nullableKey ? nullableKey.getValueType() : keyElement;
+
+    const bool readsAStringKey = mlir::isa<storage::StringType>(key);
+    const bool readsANullKey = mlir::isa<mlir::NoneType>(key);
+
+    if (!readsAStringKey && !readsANullKey) {
+        throw IRException("db.dynamic_map_key reads its key out of a string column");
+    }
+
+    // The entry carries its own null in its tag, so the result is never wrapped in a
+    // nullable: a missing key, an absent map and a null key all read back as a Null-tagged
+    // entry
+    const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(),
+                                                        storage::MapElementType::get(_builder.getContext()));
+
+    setInsertionForBinaryOp(mapChunk, keyChunk);
+
+    nl::DynamicMapKey value = _builder.create<nl::DynamicMapKey>(_builder.getUnknownLoc(),
+                                                                 resultType,
+                                                                 mapChunk,
+                                                                 keyChunk);
+
+    _valueMap[mapKey.getResult()] = value.getResult();
+}
+
+void DBLowering::lowerStaticMapKey(mlir::db::StaticMapKey mapKey) {
+    const mlir::Value mapChunk = mapValue(mapKey.getMap());
+
+    if (!holdsAMapPerRow(mapChunk.getType())) {
+        throw IRException("db.static_map_key reads from a map column, or from a column of tagged cells");
+    }
+
+    // The entry carries its own null in its tag, so the result is never wrapped in a
+    // nullable: a missing key and an absent map both read back as a Null-tagged entry
+    const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(),
+                                                        storage::MapElementType::get(_builder.getContext()));
+
+    setInsertionForUnaryOp(mapChunk);
+
+    nl::StaticMapKey value = _builder.create<nl::StaticMapKey>(_builder.getUnknownLoc(),
+                                                   resultType,
+                                                   mapChunk,
+                                                   mapKey.getKeyAttr());
+
+    _valueMap[mapKey.getResult()] = value.getResult();
+}
+
+void DBLowering::containerCellChunks(mlir::ValueRange columns, llvm::SmallVectorImpl<mlir::Value>& chunks) {
+    for (const mlir::Value column : columns) {
+        chunks.push_back(mapValue(column));
+    }
+
+    // An element holding one value for every row rather than one per row is laid out over
+    // the rows the others carry, so every cell of a container is read at the same row index.
+    const mlir::Value cardinality = cardinalityDriver(chunks);
+
+    for (mlir::Value& chunk : chunks) {
+        chunk = listItemChunk(rowAlignedChunk(chunk, cardinality));
+    }
+}
+
+mlir::Value DBLowering::listItemChunk(mlir::Value chunk) {
+    // An entity ID, a list, a map and a tagged cell are present in every row and are read
+    // as they stand; only a scalar value column is read as nullable, the way lowerCollect
+    // reads the column it gathers.
+    const mlir::Type element = mlir::cast<nl::ChunkType>(chunk.getType()).getElementType();
+    const bool holdsCellsPresentInEveryRow = mlir::isa<storage::NodeIDType,
+                                                       storage::EdgeIDType,
+                                                       storage::ListType,
+                                                       storage::MapType,
+                                                       storage::AnyType>(element);
+
+    if (holdsCellsPresentInEveryRow) {
+        return chunk;
+    }
+
+    return nullableValueChunk(chunk);
+}
+
+void DBLowering::lowerMakeList(mlir::db::MakeList makeList) {
+    // MakeList::verify guarantees an element column, so an empty operand list here means
+    // unverified IR - the defensive backstop lowerCollect keeps too.
+    if (makeList.getElements().empty()) {
+        throw IRException("db.make_list requires at least one element column");
+    }
+
+    llvm::SmallVector<mlir::Value, 4> chunks;
+    containerCellChunks(makeList.getElements(), chunks);
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const mlir::Type listType = storage::ListType::get(context, listedElementType(context, chunks));
+    const nl::ChunkType resultType = nl::ChunkType::get(context, listType);
+
+    setInsertionForNaryOp(chunks);
+
+    nl::MakeList lists = _builder.create<nl::MakeList>(_builder.getUnknownLoc(), resultType, chunks);
+    _valueMap[makeList.getResult()] = lists.getResult();
+}
+
+void DBLowering::lowerListSlice(mlir::db::ListSlice slice) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    mlir::Value listChunk = mapValue(slice.getList());
+
+    llvm::SmallVector<mlir::Value, 3> operands {listChunk};
+
+    mlir::Value fromChunk = slice.getFrom() ? mapValue(slice.getFrom()) : mlir::Value {};
+    mlir::Value toChunk = slice.getTo() ? mapValue(slice.getTo()) : mlir::Value {};
+
+    if (fromChunk) {
+        operands.push_back(fromChunk);
+    }
+
+    if (toChunk) {
+        operands.push_back(toChunk);
+    }
+
+    // A list or a bound holding one value for every row rather than one per row is laid
+    // out over the rows the others carry, as lowerRange lays its bounds out
+    const mlir::Value cardinality = cardinalityDriver(operands);
+
+    listChunk = rowAlignedChunk(listChunk, cardinality);
+
+    if (fromChunk) {
+        fromChunk = nullableValueChunk(rowAlignedChunk(fromChunk, cardinality));
+    }
+
+    if (toChunk) {
+        toChunk = nullableValueChunk(rowAlignedChunk(toChunk, cardinality));
+    }
+
+    // The slice holds the elements the sliced value holds, and is read as nullable: a row
+    // whose list or whose bound is null gets no slice. Slicing a type-erased cell answers
+    // the list its tag says it holds, whose elements are cells in their turn
+    const mlir::Type listElement = mlir::cast<nl::ChunkType>(listChunk.getType()).getElementType();
+    const auto nullable = mlir::dyn_cast<storage::NullableType>(listElement);
+    const mlir::Type value = nullable ? nullable.getValueType() : listElement;
+
+    const mlir::Type sliced =
+        mlir::isa<storage::AnyType>(value)
+            ? storage::ListType::get(context, storage::AnyType::get(context))
+            : value;
+
+    const nl::ChunkType resultType = nl::ChunkType::get(context,
+                                                        storage::NullableType::get(context, sliced));
+
+    // The op goes where the chunks it reads stand, which are the laid-out ones
+    operands.clear();
+    operands.push_back(listChunk);
+
+    if (fromChunk) {
+        operands.push_back(fromChunk);
+    }
+
+    if (toChunk) {
+        operands.push_back(toChunk);
+    }
+
+    setInsertionForNaryOp(operands);
+
+    nl::ListSlice run = _builder.create<nl::ListSlice>(loc, resultType, listChunk, fromChunk, toChunk);
+
+    _valueMap[slice.getResult()] = run.getResult();
+}
+
+void DBLowering::lowerPercentile(mlir::Operation* operation) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    mlir::Value listChunk = mapValue(operation->getOperand(0));
+    mlir::Value percentileChunk = mapValue(operation->getOperand(1));
+
+    const mlir::Value cardinality = cardinalityDriver({listChunk, percentileChunk});
+    listChunk = rowAlignedChunk(listChunk, cardinality);
+    percentileChunk = nullableValueChunk(rowAlignedChunk(percentileChunk, cardinality));
+
+    // percentileDisc answers one of the values, which keeps the number type a list of
+    // numbers names; a list of tagged cells - or of untyped nulls - answers the tagged
+    // cell, which carries its own null
+    const mlir::Type listElement = mlir::cast<nl::ChunkType>(listChunk.getType()).getElementType();
+    const auto listType = mlir::dyn_cast<storage::ListType>(listElement);
+    const mlir::Type valueType = listType ? listType.getElementType() : mlir::Type {};
+
+    const auto integerType = mlir::dyn_cast_if_present<mlir::IntegerType>(valueType);
+    const bool listsIntegers = integerType && integerType.getWidth() == 64;
+    const bool listsDoubles = valueType && mlir::isa<mlir::Float64Type>(valueType);
+
+    const bool interpolates = mlir::isa<mlir::db::PercentileCont>(operation);
+    const bool listsNumbers = listsIntegers || listsDoubles;
+
+    mlir::Type resultElement = storage::AnyType::get(context);
+    if (interpolates) {
+        resultElement = storage::NullableType::get(context, _builder.getF64Type());
+    } else if (listsNumbers) {
+        resultElement = storage::NullableType::get(context, valueType);
+    }
+
+    const nl::ChunkType resultType = nl::ChunkType::get(context, resultElement);
+
+    setInsertionForNaryOp({listChunk, percentileChunk});
+
+    mlir::Value result;
+    if (interpolates) {
+        result = _builder.create<nl::PercentileCont>(loc, resultType, listChunk, percentileChunk).getResult();
+    } else {
+        result = _builder.create<nl::PercentileDisc>(loc, resultType, listChunk, percentileChunk).getResult();
+    }
+
+    _valueMap[operation->getResult(0)] = result;
+}
+
+void DBLowering::lowerMakeMap(mlir::db::MakeMap makeMap) {
+    if (makeMap.getValues().empty()) {
+        throw IRException("db.make_map requires at least one value column");
+    }
+
+    llvm::SmallVector<mlir::Value, 4> chunks;
+    containerCellChunks(makeMap.getValues(), chunks);
+
+    setInsertionForNaryOp(chunks);
+
+    nl::MakeMap maps = _builder.create<nl::MakeMap>(_builder.getUnknownLoc(), chunks, makeMap.getKeys());
+    _valueMap[makeMap.getResult()] = maps.getResult();
+}
+
+void DBLowering::lowerRange(mlir::db::Range range) {
+    llvm::SmallVector<mlir::Value, 3> bounds {mapValue(range.getStart()), mapValue(range.getEnd())};
+
+    const mlir::Value step = range.getStep();
+    if (step) {
+        bounds.push_back(mapValue(step));
+    }
+
+    // A bound holding one value for every row rather than one per row is laid out over the
+    // rows the others carry, as lowerMakeList lays its element columns out
+    const mlir::Value cardinality = cardinalityDriver(bounds);
+
+    for (mlir::Value& bound : bounds) {
+        bound = nullableValueChunk(rowAlignedChunk(bound, cardinality));
+    }
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const mlir::Type listType = storage::ListType::get(context, _builder.getI64Type());
+    const nl::ChunkType resultType = nl::ChunkType::get(context,
+                                                        storage::NullableType::get(context, listType));
+
+    setInsertionForNaryOp(bounds);
+
+    nl::Range lists = _builder.create<nl::Range>(_builder.getUnknownLoc(),
+                                                 resultType,
+                                                 bounds[0],
+                                                 bounds[1],
+                                                 step ? bounds[2] : mlir::Value {});
+
+    _valueMap[range.getResult()] = lists.getResult();
+}
+
+void DBLowering::lowerSubstring(mlir::db::Substring substring) {
+    const mlir::Type stringChunkType = mapValue(substring.getString()).getType();
+    const bool stringMayBeNull = mayHoldANull(stringChunkType);
+
+    llvm::SmallVector<mlir::Value, 3> columns {substring.getString(), substring.getStart()};
+
+    const mlir::Value length = substring.getLength();
+    if (length) {
+        columns.push_back(length);
+    }
+
+    llvm::SmallVector<mlir::Value, 3> arguments;
+    containerCellChunks(columns, arguments);
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const mlir::Type stringType = storage::StringType::get(context);
+    const mlir::Type resultElement = stringMayBeNull ? storage::NullableType::get(context, stringType) : stringType;
+    const nl::ChunkType resultType = nl::ChunkType::get(context, resultElement);
+
+    setInsertionForNaryOp(arguments);
+
+    nl::Substring substrings = _builder.create<nl::Substring>(_builder.getUnknownLoc(),
+                                                              resultType,
+                                                              arguments[0],
+                                                              arguments[1],
+                                                              length ? arguments[2] : mlir::Value {});
+
+    _valueMap[substring.getResult()] = substrings.getResult();
+}
+
+void DBLowering::lowerSplit(mlir::db::Split split) {
+    const mlir::Type stringChunkType = mapValue(split.getString()).getType();
+    const mlir::Type delimiterChunkType = mapValue(split.getDelimiter()).getType();
+
+    const bool stringMayBeNull = mayHoldANull(stringChunkType);
+    const bool delimiterMayBeNull = mayHoldANull(delimiterChunkType);
+
+    llvm::SmallVector<mlir::Value, 2> arguments;
+    containerCellChunks(split->getOperands(), arguments);
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const mlir::Type stringType = storage::StringType::get(context);
+    const mlir::Type listType = storage::ListType::get(context, stringType);
+
+    const bool resultMayBeNull = stringMayBeNull || delimiterMayBeNull;
+    const mlir::Type resultElement = resultMayBeNull ? storage::NullableType::get(context, listType) : listType;
+    const nl::ChunkType resultType = nl::ChunkType::get(context, resultElement);
+
+    setInsertionForNaryOp(arguments);
+
+    nl::Split parts = _builder.create<nl::Split>(_builder.getUnknownLoc(),
+                                                 resultType,
+                                                 arguments[0],
+                                                 arguments[1]);
+
+    _valueMap[split.getResult()] = parts.getResult();
+}
+
+template <typename NLStringEndOp, typename StringEndOp>
+void DBLowering::lowerStringEnd(StringEndOp stringEnd) {
+    const mlir::Type stringChunkType = mapValue(stringEnd.getString()).getType();
+    const bool stringMayBeNull = mayHoldANull(stringChunkType);
+
+    llvm::SmallVector<mlir::Value, 2> arguments;
+    containerCellChunks(stringEnd->getOperands(), arguments);
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const mlir::Type stringType = storage::StringType::get(context);
+    const mlir::Type resultElement = stringMayBeNull ? storage::NullableType::get(context, stringType) : stringType;
+    const nl::ChunkType resultType = nl::ChunkType::get(context, resultElement);
+
+    setInsertionForNaryOp(arguments);
+
+    NLStringEndOp ends = _builder.create<NLStringEndOp>(_builder.getUnknownLoc(),
+                                                        resultType,
+                                                        arguments[0],
+                                                        arguments[1]);
+
+    _valueMap[stringEnd.getResult()] = ends.getResult();
+}
+
+void DBLowering::lowerReplace(mlir::db::Replace replace) {
+    const bool anArgumentMayBeNull = llvm::any_of(replace->getOperands(), [this](mlir::Value operand) {
+        return mayHoldANull(mapValue(operand).getType());
+    });
+
+    llvm::SmallVector<mlir::Value, 3> arguments;
+    containerCellChunks(replace->getOperands(), arguments);
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const mlir::Type stringType = storage::StringType::get(context);
+    const mlir::Type resultElement = anArgumentMayBeNull ? storage::NullableType::get(context, stringType) : stringType;
+    const nl::ChunkType resultType = nl::ChunkType::get(context, resultElement);
+
+    setInsertionForNaryOp(arguments);
+
+    nl::Replace replaced = _builder.create<nl::Replace>(_builder.getUnknownLoc(),
+                                                        resultType,
+                                                        arguments[0],
+                                                        arguments[1],
+                                                        arguments[2]);
+
+    _valueMap[replace.getResult()] = replaced.getResult();
+}
+
 void DBLowering::lowerScanEdges(mlir::db::ScanEdges scanEdges) {
     // The edge sibling of lowerScanNodes: a scan reads no column, so its loop
     // sits at the top of the current root block. The nl.scan_edges iterator
@@ -514,6 +2742,73 @@ void DBLowering::lowerScanEdges(mlir::db::ScanEdges scanEdges) {
 
     nl::ScanEdges edges = _builder.create<nl::ScanEdges>(_builder.getUnknownLoc());
     buildLoopForSource(edges.getResult(), scanEdges.getOperation());
+}
+
+void DBLowering::lowerScanEdgesByType(mlir::db::ScanEdgesByType scanEdgesByType) {
+    // The by-type sibling of lowerScanEdges: same placement at the top of the root
+    // block, with the type names hoisted into the nl.get_edge_type_set handle the
+    // by-type hops already share.
+    const mlir::Value edgeTypeHandle = getOrCreateEdgeTypeSetHandle(scanEdgesByType.getEdgeTypes());
+
+    setInsertionInto(_rootBlock);
+
+    nl::ScanEdgesByType edges = _builder.create<nl::ScanEdgesByType>(_builder.getUnknownLoc(), edgeTypeHandle);
+    buildLoopForSource(edges.getResult(), scanEdgesByType.getOperation());
+}
+
+void DBLowering::lowerScanOutEdgesByLabelSrc(mlir::db::ScanOutEdgesByLabelSrc scanOutEdgesByLabelSrc) {
+    // The by-label sibling of lowerScanEdges: same placement at the top of the root
+    // block, with the label list forwarded as-is to the nl op - translation resolves
+    // the names against the schema, as it does for nl.scan_nodes_by_label.
+    setInsertionInto(_rootBlock);
+
+    nl::ScanOutEdgesByLabelSrc edges = _builder.create<nl::ScanOutEdgesByLabelSrc>(_builder.getUnknownLoc(),
+                                                                                   scanOutEdgesByLabelSrc.getLabelsAttr());
+    buildLoopForSource(edges.getResult(), scanOutEdgesByLabelSrc.getOperation());
+}
+
+void DBLowering::lowerScanInEdgesByLabelTgt(mlir::db::ScanInEdgesByLabelTgt scanInEdgesByLabelTgt) {
+    // The reverse-direction sibling of lowerScanOutEdgesByLabelSrc, placed and forwarded
+    // the same way.
+    setInsertionInto(_rootBlock);
+
+    nl::ScanInEdgesByLabelTgt edges = _builder.create<nl::ScanInEdgesByLabelTgt>(_builder.getUnknownLoc(),
+                                                                                 scanInEdgesByLabelTgt.getLabelsAttr());
+    buildLoopForSource(edges.getResult(), scanInEdgesByLabelTgt.getOperation());
+}
+
+void DBLowering::lowerScanOutEdgesByLabelTgt(mlir::db::ScanOutEdgesByLabelTgt scanOutEdgesByLabelTgt) {
+    setInsertionInto(_rootBlock);
+
+    nl::ScanOutEdgesByLabelTgt edges = _builder.create<nl::ScanOutEdgesByLabelTgt>(_builder.getUnknownLoc(),
+                                                                                   scanOutEdgesByLabelTgt.getLabelsAttr());
+    buildLoopForSource(edges.getResult(), scanOutEdgesByLabelTgt.getOperation());
+}
+
+void DBLowering::lowerScanInEdgesByLabelSrc(mlir::db::ScanInEdgesByLabelSrc scanInEdgesByLabelSrc) {
+    setInsertionInto(_rootBlock);
+
+    nl::ScanInEdgesByLabelSrc edges = _builder.create<nl::ScanInEdgesByLabelSrc>(_builder.getUnknownLoc(),
+                                                                                 scanInEdgesByLabelSrc.getLabelsAttr());
+    buildLoopForSource(edges.getResult(), scanInEdgesByLabelSrc.getOperation());
+}
+
+void DBLowering::lowerScanOutEdgesByLabelSrcTgt(mlir::db::ScanOutEdgesByLabelSrcTgt scanOutEdgesByLabelSrcTgt) {
+    setInsertionInto(_rootBlock);
+
+    nl::ScanOutEdgesByLabelSrcTgt edges = _builder.create<nl::ScanOutEdgesByLabelSrcTgt>(_builder.getUnknownLoc(),
+                                                                                         scanOutEdgesByLabelSrcTgt.getSrcLabelsAttr(),
+                                                                                         scanOutEdgesByLabelSrcTgt.getTgtLabelsAttr());
+    buildLoopForSource(edges.getResult(), scanOutEdgesByLabelSrcTgt.getOperation());
+}
+
+void DBLowering::lowerScanInEdgesByLabelSrcTgt(mlir::db::ScanInEdgesByLabelSrcTgt scanInEdgesByLabelSrcTgt) {
+    setInsertionInto(_rootBlock);
+
+    nl::ScanInEdgesByLabelSrcTgt edges = _builder.create<nl::ScanInEdgesByLabelSrcTgt>(_builder.getUnknownLoc(),
+                                                                                       scanInEdgesByLabelSrcTgt.getSrcLabelsAttr(),
+                                                                                       scanInEdgesByLabelSrcTgt.getTgtLabelsAttr());
+    buildLoopForSource(edges.getResult(), scanInEdgesByLabelSrcTgt.getOperation());
 }
 
 void DBLowering::lowerGetOutEdges(mlir::db::GetOutEdges getOutEdges) {
@@ -553,14 +2848,25 @@ void DBLowering::lowerGetInEdges(mlir::db::GetInEdges getInEdges) {
     buildLoopForSource(edges.getResult(), getInEdges.getOperation());
 }
 
+void DBLowering::lowerGetEdges(mlir::db::GetEdges getEdges) {
+    const mlir::Value inputChunk = mapValue(getEdges.getInputNodes());
+
+    llvm::SmallVector<mlir::Value, 4> carriedChunks;
+    for (const mlir::Value carriedColumn : getEdges.getColumnsToFilter()) {
+        carriedChunks.push_back(mapValue(carriedColumn));
+    }
+
+    setInsertionInto(ownerBlock(inputChunk));
+
+
+    const mlir::Location uloc = _builder.getUnknownLoc();
+    nl::GetEdges edges = _builder.create<nl::GetEdges>(uloc, inputChunk, carriedChunks);
+    buildLoopForSource(edges.getResult(), getEdges.getOperation());
+}
+
 void DBLowering::lowerGetOutEdgesByType(mlir::db::GetOutEdgesByType getOutEdgesByType) {
-    // The by-type sibling of lowerGetOutEdges: identical shape, plus the edge type.
-    // The name is hoisted into an nl.get_edge_type handle at the top of the entry
-    // block, so it is resolved once above the loops rather than carried on the hop
-    // (the same split lowerGetNodeProperties uses for a property name). The handle
-    // is created before the loop's insertion point is set below.
     const mlir::Value inputChunk = mapValue(getOutEdgesByType.getInputNodes());
-    const mlir::Value edgeTypeHandle = getOrCreateEdgeTypeHandle(getOutEdgesByType.getEdgeType());
+    const mlir::Value edgeTypeHandle = getOrCreateEdgeTypeSetHandle(getOutEdgesByType.getEdgeTypes());
 
     llvm::SmallVector<mlir::Value, 4> carriedChunks;
     for (const mlir::Value carriedColumn : getOutEdgesByType.getColumnsToFilter()) {
@@ -569,8 +2875,6 @@ void DBLowering::lowerGetOutEdgesByType(mlir::db::GetOutEdgesByType getOutEdgesB
 
     setInsertionInto(ownerBlock(inputChunk));
 
-    // The result iterator type - the four fixed edge chunks plus one per carried
-    // chunk - is inferred from the operands, exactly as for get_out_edges.
     nl::GetOutEdgesByType edges = _builder.create<nl::GetOutEdgesByType>(_builder.getUnknownLoc(),
                                                                          inputChunk,
                                                                          edgeTypeHandle,
@@ -580,9 +2884,9 @@ void DBLowering::lowerGetOutEdgesByType(mlir::db::GetOutEdgesByType getOutEdgesB
 
 void DBLowering::lowerGetInEdgesByType(mlir::db::GetInEdgesByType getInEdgesByType) {
     // The predecessor counterpart of lowerGetOutEdgesByType: same shape, reverse
-    // direction, edge type hoisted into the same nl.get_edge_type handle.
+    // direction, edge types hoisted into the same nl.get_edge_type_set handle.
     const mlir::Value inputChunk = mapValue(getInEdgesByType.getInputNodes());
-    const mlir::Value edgeTypeHandle = getOrCreateEdgeTypeHandle(getInEdgesByType.getEdgeType());
+    const mlir::Value edgeTypeHandle = getOrCreateEdgeTypeSetHandle(getInEdgesByType.getEdgeTypes());
 
     llvm::SmallVector<mlir::Value, 4> carriedChunks;
     for (const mlir::Value carriedColumn : getInEdgesByType.getColumnsToFilter()) {
@@ -600,13 +2904,89 @@ void DBLowering::lowerGetInEdgesByType(mlir::db::GetInEdgesByType getInEdgesByTy
     buildLoopForSource(edges.getResult(), getInEdgesByType.getOperation());
 }
 
+void DBLowering::lowerGetOutEdgesByLabel(mlir::db::GetOutEdgesByLabel getOutEdgesByLabel) {
+    const mlir::Value inputChunk = mapValue(getOutEdgesByLabel.getInputNodes());
+
+    llvm::SmallVector<mlir::Value, 4> carriedChunks;
+    for (const mlir::Value carriedColumn : getOutEdgesByLabel.getColumnsToFilter()) {
+        carriedChunks.push_back(mapValue(carriedColumn));
+    }
+
+    setInsertionInto(ownerBlock(inputChunk));
+
+    // The label list rides on the op the way a by-label scan carries it, rather than
+    // through a handle: it is resolved to a LabelSet when the loop is translated.
+    nl::GetOutEdgesByLabel edges = _builder.create<nl::GetOutEdgesByLabel>(_builder.getUnknownLoc(),
+                                                                           inputChunk,
+                                                                           getOutEdgesByLabel.getLabelsAttr(),
+                                                                           carriedChunks);
+    buildLoopForSource(edges.getResult(), getOutEdgesByLabel.getOperation());
+}
+
+void DBLowering::lowerGetInEdgesByLabel(mlir::db::GetInEdgesByLabel getInEdgesByLabel) {
+    // The predecessor counterpart of lowerGetOutEdgesByLabel: same shape, reverse
+    // direction, the labels constraining the source the hop leaves.
+    const mlir::Value inputChunk = mapValue(getInEdgesByLabel.getInputNodes());
+
+    llvm::SmallVector<mlir::Value, 4> carriedChunks;
+    for (const mlir::Value carriedColumn : getInEdgesByLabel.getColumnsToFilter()) {
+        carriedChunks.push_back(mapValue(carriedColumn));
+    }
+
+    setInsertionInto(ownerBlock(inputChunk));
+
+    nl::GetInEdgesByLabel edges = _builder.create<nl::GetInEdgesByLabel>(_builder.getUnknownLoc(),
+                                                                         inputChunk,
+                                                                         getInEdgesByLabel.getLabelsAttr(),
+                                                                         carriedChunks);
+    buildLoopForSource(edges.getResult(), getInEdgesByLabel.getOperation());
+}
+
+void DBLowering::lowerGetOutEdgesByTypeAndLabel(mlir::db::GetOutEdgesByTypeAndLabel getOutEdgesByTypeAndLabel) {
+    const mlir::Value inputChunk = mapValue(getOutEdgesByTypeAndLabel.getInputNodes());
+    const mlir::Value edgeTypeHandle = getOrCreateEdgeTypeSetHandle(getOutEdgesByTypeAndLabel.getEdgeTypes());
+
+    llvm::SmallVector<mlir::Value, 4> carriedChunks;
+    for (const mlir::Value carriedColumn : getOutEdgesByTypeAndLabel.getColumnsToFilter()) {
+        carriedChunks.push_back(mapValue(carriedColumn));
+    }
+
+    setInsertionInto(ownerBlock(inputChunk));
+
+    nl::GetOutEdgesByTypeAndLabel edges = _builder.create<nl::GetOutEdgesByTypeAndLabel>(_builder.getUnknownLoc(),
+                                                                                         inputChunk,
+                                                                                         edgeTypeHandle,
+                                                                                         getOutEdgesByTypeAndLabel.getLabelsAttr(),
+                                                                                         carriedChunks);
+    buildLoopForSource(edges.getResult(), getOutEdgesByTypeAndLabel.getOperation());
+}
+
+void DBLowering::lowerGetInEdgesByTypeAndLabel(mlir::db::GetInEdgesByTypeAndLabel getInEdgesByTypeAndLabel) {
+    const mlir::Value inputChunk = mapValue(getInEdgesByTypeAndLabel.getInputNodes());
+    const mlir::Value edgeTypeHandle = getOrCreateEdgeTypeSetHandle(getInEdgesByTypeAndLabel.getEdgeTypes());
+
+    llvm::SmallVector<mlir::Value, 4> carriedChunks;
+    for (const mlir::Value carriedColumn : getInEdgesByTypeAndLabel.getColumnsToFilter()) {
+        carriedChunks.push_back(mapValue(carriedColumn));
+    }
+
+    setInsertionInto(ownerBlock(inputChunk));
+
+    nl::GetInEdgesByTypeAndLabel edges = _builder.create<nl::GetInEdgesByTypeAndLabel>(_builder.getUnknownLoc(),
+                                                                                       inputChunk,
+                                                                                       edgeTypeHandle,
+                                                                                       getInEdgesByTypeAndLabel.getLabelsAttr(),
+                                                                                       carriedChunks);
+    buildLoopForSource(edges.getResult(), getInEdgesByTypeAndLabel.getOperation());
+}
+
 void DBLowering::lowerGetNodeProperties(mlir::db::GetNodeProperties getNodeProperties) {
     const mlir::Value inputChunk = mapValue(getNodeProperties.getInputNodes());
     const llvm::StringRef property = getNodeProperties.getProperty();
 
-    // Resolve the name once, hoisted above the loops, and bake the value type.
+    // Resolve the name once, hoisted above the loops.
     const mlir::Value handle = getOrCreatePropertyTypeHandle(property);
-    const mlir::Type valueChunkType = propertyValueChunkType(property);
+    const mlir::Type valueChunkType = nl::ChunkType::get(_builder.getContext(), columnType(getNodeProperties.getResult()));
 
     // A property read maps the input chunk in place, one value per node, so the
     // fetch nests in the loop that binds that chunk - it opens no loop of its own.
@@ -615,7 +2995,9 @@ void DBLowering::lowerGetNodeProperties(mlir::db::GetNodeProperties getNodePrope
     nl::GetNodeProperties fetch = _builder.create<nl::GetNodeProperties>(_builder.getUnknownLoc(),
                                                                          valueChunkType,
                                                                          inputChunk,
-                                                                         handle);
+                                                                         handle,
+                                                                         mapOptionalMask(getNodeProperties.getPending()),
+                                                                         getNodeProperties.getAllPending());
     _valueMap[getNodeProperties.getResult()] = fetch.getValues();
 }
 
@@ -624,14 +3006,16 @@ void DBLowering::lowerGetEdgeProperties(mlir::db::GetEdgeProperties getEdgePrope
     const llvm::StringRef property = getEdgeProperties.getProperty();
 
     const mlir::Value handle = getOrCreatePropertyTypeHandle(property);
-    const mlir::Type valueChunkType = propertyValueChunkType(property);
+    const mlir::Type valueChunkType = nl::ChunkType::get(_builder.getContext(), columnType(getEdgeProperties.getResult()));
 
     setInsertionInto(ownerBlock(inputChunk));
 
     nl::GetEdgeProperties fetch = _builder.create<nl::GetEdgeProperties>(_builder.getUnknownLoc(),
                                                                          valueChunkType,
                                                                          inputChunk,
-                                                                         handle);
+                                                                         handle,
+                                                                         mapOptionalMask(getEdgeProperties.getPending()),
+                                                                         getEdgeProperties.getAllPending());
     _valueMap[getEdgeProperties.getResult()] = fetch.getValues();
 }
 
@@ -652,75 +3036,702 @@ void DBLowering::lowerGetNodeLabelSet(mlir::db::GetNodeLabelSet getNodeLabelSet)
     _valueMap[getNodeLabelSet.getResult()] = fetch.getLabelSetIds();
 }
 
+void DBLowering::lowerGetEdgeTypes(mlir::db::GetEdgeTypes getEdgeTypes) {
+    const mlir::Value inputChunk = mapValue(getEdgeTypes.getInputEdges());
+
+    setInsertionInto(ownerBlock(inputChunk));
+
+    const mlir::Type edgeTypeIDChunkType = nl::ChunkType::get(
+        _builder.getContext(),
+        storage::EdgeTypeIDType::get(_builder.getContext()));
+
+    nl::GetEdgeTypes fetch = _builder.create<nl::GetEdgeTypes>(
+        _builder.getUnknownLoc(),
+        edgeTypeIDChunkType,
+        inputChunk);
+
+    _valueMap[getEdgeTypes.getResult()] = fetch.getEdgeTypeIds();
+}
+
 void DBLowering::lowerCheckLabelConstraint(mlir::db::CheckLabelConstraint checkLabelConstraint) {
-    const LabelMap& labelMap = _view->metadata().labels();
-
-    LabelSet constraintLabelSet;
-    for (const mlir::Attribute labelAttr : checkLabelConstraint.getLabels()) {
-        const llvm::StringRef labelName = mlir::cast<mlir::StringAttr>(labelAttr).getValue();
-        const std::optional<LabelID> labelID = labelMap.get(
-            std::string_view(labelName.data(), labelName.size()));
-
-        bioassert(labelID.has_value(), "Invalid label passed analyzer.");
-
-        constraintLabelSet.set(*labelID);
-    }
-
-    llvm::SmallVector<int64_t> matchingIDs;
-    const LabelSetHandle constraintHandle(constraintLabelSet);
-    for (const LabelSetMap::Pair& pair : _view->metadata().labelsets()) {
-        const LabelSetHandle candidate(*pair._value);
-        if (candidate.hasAtLeastLabels(constraintHandle)) {
-            matchingIDs.push_back(static_cast<int64_t>(pair._id.getValue()));
-        }
-    }
-
     const mlir::Value inputChunk = mapValue(checkLabelConstraint.getLabelsetIds());
 
     setInsertionInto(ownerBlock(inputChunk));
 
-    const mlir::Type boolChunkType = nl::ChunkType::get(
-        _builder.getContext(),
-        storage::BoolType::get(_builder.getContext()));
+    const mlir::Type boolChunkType = checkResultChunkType(checkLabelConstraint.getNullable());
 
     nl::CheckLabelConstraint check = _builder.create<nl::CheckLabelConstraint>(
         _builder.getUnknownLoc(),
         boolChunkType,
         inputChunk,
-        _builder.getDenseI64ArrayAttr(matchingIDs));
+        checkLabelConstraint.getAlternatives());
 
     _valueMap[checkLabelConstraint.getResult()] = check.getResult();
 }
 
 void DBLowering::lowerCheckEdgeTypeConstraint(mlir::db::CheckEdgeTypeConstraint checkEdgeTypeConstraint) {
-    const EdgeTypeMap& edgeTypeMap = _view->metadata().edgeTypes();
-
-    llvm::SmallVector<int64_t> matchingIDs;
-    for (const mlir::Attribute typeAttr : checkEdgeTypeConstraint.getEdgeTypes()) {
-        const llvm::StringRef typeName = mlir::cast<mlir::StringAttr>(typeAttr).getValue();
-        const std::optional<EdgeTypeID> edgeTypeID = edgeTypeMap.get(
-            std::string_view(typeName.data(), typeName.size()));
-
-        bioassert(edgeTypeID.has_value(), "Invalid edge type passed analyzer.");
-
-        matchingIDs.push_back(static_cast<int64_t>(edgeTypeID->getValue()));
-    }
-
     const mlir::Value inputChunk = mapValue(checkEdgeTypeConstraint.getEdgeTypeIds());
 
     setInsertionInto(ownerBlock(inputChunk));
 
-    const mlir::Type boolChunkType = nl::ChunkType::get(
-        _builder.getContext(),
-        storage::BoolType::get(_builder.getContext()));
+    const mlir::Type boolChunkType = checkResultChunkType(checkEdgeTypeConstraint.getNullable());
 
     nl::CheckEdgeTypeConstraint check = _builder.create<nl::CheckEdgeTypeConstraint>(
         _builder.getUnknownLoc(),
         boolChunkType,
         inputChunk,
-        _builder.getDenseI64ArrayAttr(matchingIDs));
+        checkEdgeTypeConstraint.getEdgeTypes());
 
     _valueMap[checkEdgeTypeConstraint.getResult()] = check.getResult();
+}
+
+mlir::Type DBLowering::checkResultChunkType(bool nullable) {
+    mlir::MLIRContext* const context = _builder.getContext();
+    if (nullable) {
+        return nl::ChunkType::get(context, storage::NullableType::get(context, _builder.getI1Type()));
+    }
+
+    return nl::ChunkType::get(context, storage::BoolType::get(context));
+}
+
+mlir::Block* DBLowering::deepestOwnerBlock(llvm::ArrayRef<mlir::Value> chunks, mlir::Block* fallback) {
+    mlir::Block* deepest = fallback;
+
+    for (const mlir::Value chunk : chunks) {
+        deepest = deeperOfBlocks(deepest, ownerBlock(chunk));
+    }
+
+    return deepest;
+}
+
+void DBLowering::lowerOptionalMatch(mlir::db::OptionalMatch optionalMatch) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+
+    llvm::SmallVector<mlir::Value, 4> inputChunks;
+    for (const mlir::Value column : optionalMatch.getInputColumns()) {
+        inputChunks.push_back(mapValue(column));
+    }
+
+    // The step the accumulator covers is the one binding the columns the pattern joins
+    // onto, so it is emptied once per chunk of them - and the pattern's nest and the drain
+    // loop both go there, the drain after the nest.
+    mlir::Block* const stepBlock = deepestOwnerBlock(inputChunks, _rootBlock);
+
+    setInsertionInto(stepBlock);
+    nl::OptionalBuffer buffer = _builder.create<nl::OptionalBuffer>(loc, inputChunks);
+    const mlir::Value state = buffer.getState();
+
+    // Every row drained reaches the cut, so once the pattern has matched as many rows as
+    // the cut still admits, the drain spends the budget before it reaches a missed row.
+    mlir::Value patternLimit;
+    if (const mlir::Value cutLimit = _optionalMatchLimits.lookup(optionalMatch.getOperation())) {
+        patternLimit = _builder.create<nl::LimitRemaining>(loc, cutLimit).getState();
+    }
+
+    // The pattern reads this step's rows through its block arguments, and the row tag
+    // through the trailing one; a pattern with nothing to join onto has neither.
+    mlir::Block& patternBlock = optionalMatch.getPattern().front();
+    for (size_t inputIndex = 0; inputIndex < inputChunks.size(); inputIndex++) {
+        _valueMap[patternBlock.getArgument(static_cast<unsigned>(inputIndex))] = inputChunks[inputIndex];
+    }
+
+    if (!inputChunks.empty()) {
+        _valueMap[patternBlock.getArgument(static_cast<unsigned>(inputChunks.size()))] = buffer.getTag();
+    }
+
+    // A dataflow of its own, rooted where the accumulator sits so its loops nest inside
+    // this step; the caller's root and innermost loop are restored once it is lowered.
+    mlir::Block* const previousRoot = _rootBlock;
+    mlir::Block* const previousInnermostLoopBody = _innermostLoopBody;
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+    _rootBlock = stepBlock;
+    _innermostLoopBody = nullptr;
+    _innermostCardinality = mlir::Value();
+
+    if (patternLimit) {
+        mlir::db::OptionalYield patternYield = mlir::cast<mlir::db::OptionalYield>(patternBlock.getTerminator());
+
+        _producerWalkVisits.clear();
+        for (const mlir::Value column : patternYield.getColumns()) {
+            assignProducerLoops(column, patternLimit, /*rowsDroppedBeforeTheCut=*/false, optionalMatch.getOperation());
+        }
+    }
+
+    llvm::SmallVector<mlir::Value, 4> matchedChunks;
+    mlir::Value matchedTag;
+
+    for (mlir::Operation& operation : patternBlock) {
+        mlir::db::OptionalYield yield = mlir::dyn_cast<mlir::db::OptionalYield>(operation);
+        if (!yield) {
+            lowerOperation(operation);
+            continue;
+        }
+
+        for (const mlir::Value column : yield.getColumns()) {
+            matchedChunks.push_back(mapValue(column));
+        }
+
+        if (yield.getTag()) {
+            matchedTag = mapValue(yield.getTag());
+        }
+    }
+
+    // OptionalMatch::verify rejects a pattern yielding no column, so reaching this means
+    // unverified IR - a defensive backstop, as in lowerFactor and lowerSort.
+    if (matchedChunks.empty()) {
+        throw IRException("db.optional_match pattern yields no column");
+    }
+
+    // The drain rebuilds a missed row's carried columns out of this step's input chunks, so
+    // the two must be the same chunk type however the db types were spelled: a column a
+    // CALL yielded enters type-erased and comes back refined, and the chunk behind it is
+    // the same one either way.
+    for (size_t inputIndex = 0; inputIndex < inputChunks.size(); inputIndex++) {
+        if (matchedChunks[inputIndex].getType() != inputChunks[inputIndex].getType()) {
+            throw IRException("db.optional_match carries an input column back as another chunk type");
+        }
+    }
+
+    for (size_t chunkIndex = inputChunks.size(); chunkIndex < matchedChunks.size(); chunkIndex++) {
+        matchedChunks[chunkIndex] = paddedColumnChunk(matchedChunks[chunkIndex]);
+    }
+
+    setInsertionInto(deepestOwnerBlock(matchedChunks, stepBlock));
+    _builder.create<nl::OptionalCollect>(loc, state, matchedTag, matchedChunks);
+
+    if (patternLimit) {
+        _builder.create<nl::LimitUpdate>(loc, patternLimit, matchedChunks.front());
+    }
+
+    _rootBlock = previousRoot;
+    _innermostLoopBody = previousInnermostLoopBody;
+    _innermostCardinality = previousInnermostCardinality;
+
+    llvm::SmallVector<mlir::Type, 4> chunkTypes;
+    for (const mlir::Value chunk : matchedChunks) {
+        chunkTypes.push_back(chunk.getType());
+    }
+
+    const nl::IteratorType iteratorType = nl::IteratorType::get(_builder.getContext(), chunkTypes);
+    setInsertionInto(stepBlock);
+    nl::OptionalDrain drain = _builder.create<nl::OptionalDrain>(loc, iteratorType, state);
+
+    buildLoopForSource(drain.getResult(), optionalMatch.getOperation());
+}
+
+void DBLowering::lowerCallSubquery(mlir::db::CallSubquery call) {
+    llvm::SmallVector<mlir::Value, 4> inputChunks;
+    for (const mlir::Value column : call.getInputColumns()) {
+        inputChunks.push_back(mapValue(column));
+    }
+
+    // The step the body runs over is the one binding the columns it reads, so its loops
+    // nest in that block and re-run once per chunk of them.
+    mlir::Block* const stepBlock = deepestOwnerBlock(inputChunks, _rootBlock);
+
+    const bool returning = !call.getUnit();
+    if (returning && call.getOptional()) {
+        lowerOptionalSubquery(call, stepBlock, inputChunks);
+        return;
+    } else if (runsPerRow(call)) {
+        lowerSubqueryPerRow(call, stepBlock, inputChunks);
+        return;
+    }
+
+    mlir::Block* const previousInnermostLoopBody = _innermostLoopBody;
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+
+    llvm::SmallVector<mlir::Value, 4> yieldedChunks;
+    mlir::Value yieldedTag;
+    lowerSubqueryBody(call, stepBlock, inputChunks, yieldedChunks, yieldedTag);
+
+    // A unit body leaves the rows in flight as they were, so what follows the op reads the
+    // step's own chunks again. A body carrying its scope hands the rows on: its yielded
+    // chunks are the results, bound in the body's innermost loop, which is where the rest
+    // of the query goes on from - unless the body opened no loop and the step is still the
+    // relation in flight.
+    const bool bodyOpenedALoop = _innermostLoopBody != nullptr;
+    if (!returning || !bodyOpenedALoop) {
+        _innermostLoopBody = previousInnermostLoopBody;
+        _innermostCardinality = previousInnermostCardinality;
+    }
+
+    if (!returning) {
+        setInsertionInto(stepBlock);
+        return;
+    }
+
+    const mlir::ResultRange results = call.getResults();
+    for (size_t resultIndex = 0; resultIndex < results.size(); resultIndex++) {
+        _valueMap[results[resultIndex]] = yieldedChunks[resultIndex];
+    }
+}
+
+void DBLowering::lowerSubqueryBody(mlir::db::CallSubquery call,
+                                   mlir::Block* stepBlock,
+                                   llvm::ArrayRef<mlir::Value> inputChunks,
+                                   llvm::SmallVectorImpl<mlir::Value>& yieldedChunks,
+                                   mlir::Value& yieldedTag) {
+    mlir::Block& bodyBlock = call.getBody().front();
+    for (size_t inputIndex = 0; inputIndex < inputChunks.size(); inputIndex++) {
+        _valueMap[bodyBlock.getArgument(static_cast<unsigned>(inputIndex))] = inputChunks[inputIndex];
+    }
+
+    // A dataflow of its own, rooted in the step so its loops nest inside it - and so its
+    // accumulators, hoisted to the root, reset once per step. The caller's root comes back
+    // once the body is lowered; the innermost loop is left as the body set it.
+    mlir::Block* const previousRoot = _rootBlock;
+    _rootBlock = stepBlock;
+    _innermostLoopBody = nullptr;
+    _innermostCardinality = mlir::Value();
+
+    for (mlir::Operation& operation : bodyBlock) {
+        mlir::db::SubqueryYield yield = mlir::dyn_cast<mlir::db::SubqueryYield>(operation);
+        if (!yield) {
+            lowerOperation(operation);
+            continue;
+        }
+
+        for (const mlir::Value column : yield.getColumns()) {
+            yieldedChunks.push_back(mapValue(column));
+        }
+
+        if (yield.getTag()) {
+            yieldedTag = mapValue(yield.getTag());
+        }
+    }
+
+    _rootBlock = previousRoot;
+}
+
+void DBLowering::lowerSubqueryPerRow(mlir::db::CallSubquery call,
+                                     mlir::Block* stepBlock,
+                                     llvm::ArrayRef<mlir::Value> inputChunks) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    const bool unit = call.getUnit();
+
+    mlir::Block* const previousInnermostLoopBody = _innermostLoopBody;
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+
+    llvm::SmallVector<mlir::Value, 4> yieldedChunks;
+
+    // No input column means the step is the single empty row Cypher starts from: the body
+    // runs once, in the step block, and what it yields is the result
+    if (inputChunks.empty()) {
+        hoistLimitHandles(call.getBody(), stepBlock, call);
+
+        mlir::Value yieldedTag;
+        lowerSubqueryBody(call, stepBlock, inputChunks, yieldedChunks, yieldedTag);
+
+        if (unit) {
+            _innermostLoopBody = nullptr;
+            _innermostCardinality = mlir::Value();
+
+            setInsertionInto(stepBlock);
+        } else if (!_innermostLoopBody) {
+            _innermostLoopBody = previousInnermostLoopBody;
+            _innermostCardinality = previousInnermostCardinality;
+
+            setInsertionInto(stepBlock);
+        }
+
+        const mlir::ResultRange results = call.getResults();
+        for (size_t resultIndex = 0; resultIndex < results.size(); resultIndex++) {
+            _valueMap[results[resultIndex]] = yieldedChunks[resultIndex];
+        }
+
+        return;
+    }
+
+    // The loop over the step's rows carries the handle of a limit downstream of the op,
+    // as the loops feeding that limit do, so a spent budget stops the walk over the rows
+    const mlir::Value limitHandle = _loopLimitHandle.lookup(call.getOperation());
+
+    setInsertionInto(stepBlock);
+    nl::EachRow eachRow = _builder.create<nl::EachRow>(loc, inputChunks);
+    nl::For rowLoop = _builder.create<nl::For>(loc, eachRow.getResult(), limitHandle);
+    mlir::Block* const rowBody = rowLoop.getBody();
+
+    llvm::SmallVector<mlir::Value, 4> rowChunks;
+    for (const mlir::BlockArgument rowChunk : rowBody->getArguments()) {
+        rowChunks.push_back(rowChunk);
+    }
+
+    // The body roots in the row loop, so its accumulators and the handles of its own
+    // limits are hoisted into that body and cover one input row at a time
+    hoistLimitHandles(call.getBody(), rowBody, call);
+
+    mlir::Value yieldedTag;
+    lowerSubqueryBody(call, rowBody, rowChunks, yieldedChunks, yieldedTag);
+
+    // A unit body hands nothing back, so there is no chunk to pair the row with and no
+    // relation for what follows to walk: the step's own rows are in flight still
+    if (unit) {
+        _innermostLoopBody = previousInnermostLoopBody;
+        _innermostCardinality = previousInnermostCardinality;
+
+        setInsertionInto(stepBlock);
+        return;
+    }
+
+    // A constant the body returned stands for one value over the rows beside it rather
+    // than for a row of its own, and the product reads its row count off the first chunk
+    // it is handed, so the constants are laid out over those rows first.
+    rowAlignFactorChunks(yieldedChunks);
+
+    // One row against N pairs the input row with each of the N rows the body yielded for
+    // it, which is the op's result: the inputs then the body's columns
+    setInsertionInto(deepestOwnerBlock(yieldedChunks, rowBody));
+    nl::CrossProduct cross = _builder.create<nl::CrossProduct>(loc, rowChunks, yieldedChunks);
+
+    buildLoopForSource(cross.getResult(), call.getOperation());
+}
+
+void DBLowering::lowerOptionalSubquery(mlir::db::CallSubquery call,
+                                       mlir::Block* stepBlock,
+                                       llvm::ArrayRef<mlir::Value> inputChunks) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+
+    // A body run one row at a time makes the accumulator's step one input row: the loop
+    // over the rows is opened first and the body roots in it. A body carrying the scope,
+    // and one over the single empty row, run in the step block as they otherwise would.
+    const bool perRow = runsPerRow(call) && !inputChunks.empty();
+
+    mlir::Block* bodyRoot = stepBlock;
+    llvm::SmallVector<mlir::Value, 4> stepChunks(inputChunks.begin(), inputChunks.end());
+
+    if (perRow) {
+        const mlir::Value limitHandle = _loopLimitHandle.lookup(call.getOperation());
+
+        setInsertionInto(stepBlock);
+        nl::EachRow eachRow = _builder.create<nl::EachRow>(loc, inputChunks);
+        nl::For rowLoop = _builder.create<nl::For>(loc, eachRow.getResult(), limitHandle);
+        bodyRoot = rowLoop.getBody();
+
+        stepChunks.clear();
+        for (const mlir::BlockArgument rowChunk : bodyRoot->getArguments()) {
+            stepChunks.push_back(rowChunk);
+        }
+    }
+
+    setInsertionInto(bodyRoot);
+    nl::OptionalBuffer buffer = _builder.create<nl::OptionalBuffer>(loc, stepChunks);
+    const mlir::Value state = buffer.getState();
+
+    // A body carrying the scope reads the tag through its trailing argument and hands it
+    // back; the others are tagged here
+    mlir::Block& bodyBlock = call.getBody().front();
+    if (bodyBlock.getNumArguments() > inputChunks.size()) {
+        _valueMap[bodyBlock.getArgument(static_cast<unsigned>(inputChunks.size()))] = buffer.getTag();
+    }
+
+    if (runsPerRow(call)) {
+        hoistLimitHandles(call.getBody(), bodyRoot, call);
+    }
+
+    llvm::SmallVector<mlir::Value, 4> yieldedChunks;
+    mlir::Value yieldedTag;
+    lowerSubqueryBody(call, bodyRoot, stepChunks, yieldedChunks, yieldedTag);
+
+    // The accumulator appends one buffer per column and the drain reads them back by
+    // position, so a constant the body returned is laid out over the rows beside it before
+    // any of them is collected.
+    rowAlignFactorChunks(yieldedChunks);
+
+    // A body carrying the scope hands the input columns back ahead of its own. The drain
+    // rebuilds those out of the step's chunks rather than padding them, so they stay the
+    // chunk the accumulator recorded; only the body's own columns need a null to pad with.
+    const size_t carriedInputs = call.getCarriesScope() ? stepChunks.size() : 0;
+
+    for (size_t inputIndex = 0; inputIndex < carriedInputs; inputIndex++) {
+        if (yieldedChunks[inputIndex].getType() != stepChunks[inputIndex].getType()) {
+            throw IRException("db.call_subquery carries an input column back as another chunk type");
+        }
+    }
+
+    for (size_t chunkIndex = carriedInputs; chunkIndex < yieldedChunks.size(); chunkIndex++) {
+        yieldedChunks[chunkIndex] = paddedColumnChunk(yieldedChunks[chunkIndex]);
+    }
+
+    // What the collect appends: the inputs as the body left them then its own columns
+    // when it carries the scope, and the row's chunks crossed with its columns when it
+    // runs per row - one row against N, with the tag in the outer group so it lines up
+    llvm::SmallVector<mlir::Value, 4> collected;
+    mlir::Value collectedTag = yieldedTag;
+
+    if (perRow) {
+        llvm::SmallVector<mlir::Value, 4> outer(stepChunks.begin(), stepChunks.end());
+        outer.push_back(buffer.getTag());
+
+        setInsertionInto(deepestOwnerBlock(yieldedChunks, bodyRoot));
+        nl::CrossProduct cross = _builder.create<nl::CrossProduct>(loc, outer, yieldedChunks);
+        nl::For pairs = _builder.create<nl::For>(loc, cross.getResult(), mlir::Value {});
+
+        const mlir::Block::BlockArgListType pairChunks = pairs.getBody()->getArguments();
+        const size_t inputCount = stepChunks.size();
+
+        collected.assign(pairChunks.begin(), pairChunks.begin() + inputCount);
+        collectedTag = pairChunks[inputCount];
+        collected.append(pairChunks.begin() + inputCount + 1, pairChunks.end());
+    } else {
+        collected.assign(yieldedChunks.begin(), yieldedChunks.end());
+    }
+
+    setInsertionInto(deepestOwnerBlock(collected, bodyRoot));
+    _builder.create<nl::OptionalCollect>(loc, state, collectedTag, collected);
+
+    llvm::SmallVector<mlir::Type, 4> chunkTypes;
+    for (const mlir::Value chunk : collected) {
+        chunkTypes.push_back(chunk.getType());
+    }
+
+    // The drain's loop binds the op's results: the inputs then the body's columns, padded
+    // where it yielded nothing
+    const nl::IteratorType iteratorType = nl::IteratorType::get(_builder.getContext(), chunkTypes);
+    setInsertionInto(bodyRoot);
+    nl::OptionalDrain drain = _builder.create<nl::OptionalDrain>(loc, iteratorType, state);
+
+    buildLoopForSource(drain.getResult(), call.getOperation());
+}
+
+template <typename SubqueryOp, typename YieldOp>
+void DBLowering::lowerSubqueryExpression(SubqueryOp subquery) {
+    constexpr bool countsRows = std::is_same_v<SubqueryOp, mlir::db::CountSubquery>;
+    constexpr bool collectsValues = std::is_same_v<SubqueryOp, mlir::db::CollectSubquery>;
+
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+    const mlir::OperandRange inputColumns = subquery.getInputColumns();
+
+    llvm::SmallVector<mlir::Value, 4> inputChunks;
+    for (const mlir::Value column : inputColumns) {
+        inputChunks.push_back(mapValue(column));
+    }
+
+    // The step the accumulator covers is the one binding the columns the subquery answers
+    // for, so it is emptied once per chunk of them - and the body's nest and the read of
+    // the answers both go there, the read after the nest.
+    mlir::Block* const stepBlock = deepestOwnerBlock(inputChunks, _rootBlock);
+
+    // A body run one row at a time makes the accumulator's step one input row: the loop
+    // over the rows is opened first and the body roots in it. A body carrying the scope,
+    // and one over the single empty row, run in the step block as they otherwise would.
+    const bool bodyRunsPerRow = runsPerRow(subquery);
+    const bool perRow = bodyRunsPerRow && !inputChunks.empty();
+
+    mlir::Block* bodyRoot = stepBlock;
+    llvm::SmallVector<mlir::Value, 4> stepChunks(inputChunks.begin(), inputChunks.end());
+
+    llvm::SmallVector<mlir::Value, 4> readPast;
+
+    if (perRow) {
+        const mlir::Value limitHandle = _loopLimitHandle.lookup(subquery.getOperation());
+
+        collectReadPastRowLoop(subquery, stepBlock, readPast);
+
+        llvm::SmallVector<mlir::Value, 4> rowChunks(inputChunks.begin(), inputChunks.end());
+        for (const mlir::Value value : readPast) {
+            rowChunks.push_back(mapValue(value));
+        }
+
+        setInsertionInto(stepBlock);
+        nl::EachRow eachRow = _builder.create<nl::EachRow>(loc, rowChunks);
+        nl::For rowLoop = _builder.create<nl::For>(loc, eachRow.getResult(), limitHandle);
+        bodyRoot = rowLoop.getBody();
+
+        stepChunks.assign(bodyRoot->args_begin(), bodyRoot->args_begin() + inputChunks.size());
+    }
+
+    const mlir::Value cardinality = stepChunks.empty() ? mlir::Value() : stepChunks.front();
+
+    setInsertionInto(bodyRoot);
+
+    mlir::Value state;
+    mlir::Value tag;
+
+    if constexpr (collectsValues) {
+        nl::RowListsBuffer buffer = _builder.create<nl::RowListsBuffer>(loc, cardinality);
+        state = buffer.getState();
+        tag = buffer.getTag();
+    } else if constexpr (countsRows) {
+        nl::CountSubqueryBuffer buffer = _builder.create<nl::CountSubqueryBuffer>(loc, stepChunks);
+        state = buffer.getState();
+        tag = buffer.getTag();
+    } else {
+        nl::ExistsBuffer buffer = _builder.create<nl::ExistsBuffer>(loc, stepChunks);
+        state = buffer.getState();
+        tag = buffer.getTag();
+    }
+
+    // The body reads this step's rows through its block arguments, and the row tag through
+    // the trailing one; a body run per row, or with nothing to join onto, takes no tag.
+    mlir::Region& body = subquery.getBody();
+    mlir::Block& bodyBlock = body.front();
+    for (size_t inputIndex = 0; inputIndex < stepChunks.size(); inputIndex++) {
+        _valueMap[bodyBlock.getArgument(static_cast<unsigned>(inputIndex))] = stepChunks[inputIndex];
+    }
+
+    if (bodyBlock.getNumArguments() > inputChunks.size()) {
+        _valueMap[bodyBlock.getArgument(static_cast<unsigned>(inputChunks.size()))] = tag;
+    }
+
+    if (bodyRunsPerRow) {
+        hoistLimitHandles(body, bodyRoot, subquery);
+    }
+
+    // A dataflow of its own, rooted where the accumulator sits so its loops nest inside
+    // this step; the caller's root and innermost loop are restored once it is lowered.
+    mlir::Block* const previousRoot = _rootBlock;
+    mlir::Block* const previousInnermostLoopBody = _innermostLoopBody;
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+    _rootBlock = bodyRoot;
+    _innermostLoopBody = nullptr;
+    _innermostCardinality = mlir::Value();
+
+    for (mlir::Operation& operation : bodyBlock.without_terminator()) {
+        lowerOperation(operation);
+    }
+
+    YieldOp yield = mlir::cast<YieldOp>(bodyBlock.getTerminator());
+
+    llvm::SmallVector<mlir::Value, 4> heldChunks;
+    for (const mlir::Value column : yield.getColumns()) {
+        heldChunks.push_back(mapValue(column));
+    }
+
+    mlir::Value heldTag;
+    if (const mlir::Value yieldedTag = yield.getTag()) {
+        heldTag = mapValue(yieldedTag);
+    }
+
+    // A constant holds one cell standing for every row the body produced, so an untagged
+    // body is answered off a chunk that carries those rows, where one does
+    mlir::Value heldRows;
+    if (!heldTag) {
+        heldRows = cardinalityDriver(heldChunks);
+        if (!heldRows) {
+            heldRows = heldChunks.front();
+        }
+    }
+
+    // The answer is taken where the body left its rows - its innermost loop body - which is
+    // the deepest block the tag or the rows it holds are bound in.
+    llvm::SmallVector<mlir::Value, 4> answeredChunks = heldChunks;
+    answeredChunks.push_back(heldTag ? heldTag : heldRows);
+
+    mlir::Value collectedValue;
+    if constexpr (collectsValues) {
+        collectedValue = rowListsValueChunk(yieldedChunk(yield.getValue()), heldTag ? heldTag : heldRows);
+        answeredChunks.push_back(collectedValue);
+    }
+
+    setInsertionInto(deepestOwnerBlock(answeredChunks, bodyRoot));
+
+    if constexpr (collectsValues) {
+        _builder.create<nl::RowListsCollect>(loc, state, heldTag, collectedValue);
+    } else if constexpr (countsRows) {
+        _builder.create<nl::CountSubqueryTally>(loc, state, heldTag, heldRows);
+    } else {
+        llvm::SmallVector<mlir::Value, 1> markedRows;
+        if (heldRows) {
+            markedRows.push_back(heldRows);
+        }
+
+        _builder.create<nl::ExistsMark>(loc, state, heldTag, markedRows);
+    }
+
+    _rootBlock = previousRoot;
+    _innermostLoopBody = previousInnermostLoopBody;
+    _innermostCardinality = previousInnermostCardinality;
+
+    setInsertionInto(bodyRoot);
+
+    mlir::Value answer;
+
+    if constexpr (collectsValues) {
+        const mlir::Type listType = storage::ListType::get(context, listedElementType(context, collectedValue));
+        const nl::ChunkType listChunk = nl::ChunkType::get(context, listType);
+
+        nl::RowListsResult result = _builder.create<nl::RowListsResult>(loc, listChunk, state, cardinality);
+        answer = result.getResult();
+    } else if constexpr (countsRows) {
+        nl::CountSubqueryResult result = _builder.create<nl::CountSubqueryResult>(loc, state, cardinality);
+        answer = result.getResult();
+    } else {
+        const nl::ChunkType boolChunk = nl::ChunkType::get(context, mlir::storage::BoolType::get(context));
+
+        nl::ExistsResult result = _builder.create<nl::ExistsResult>(loc, boolChunk, state, cardinality);
+        answer = result.getResult();
+    }
+
+    _valueMap[subquery.getResult()] = answer;
+
+    if (!perRow) {
+        return;
+    }
+
+    // The answer is one per row of the loop's own chunks, so what follows the op reads the
+    // rows in flight through those: the rest of the query goes on inside the loop, where
+    // every column of the step is bound a row at a time.
+    for (size_t inputIndex = 0; inputIndex < inputChunks.size(); inputIndex++) {
+        _valueMap[inputColumns[inputIndex]] = stepChunks[inputIndex];
+    }
+
+    for (size_t readIndex = 0; readIndex < readPast.size(); readIndex++) {
+        _valueMap[readPast[readIndex]] = bodyRoot->getArgument(static_cast<unsigned>(inputChunks.size() + readIndex));
+    }
+
+    _innermostLoopBody = bodyRoot;
+    _innermostCardinality = stepChunks.front();
+}
+
+void DBLowering::collectReadPastRowLoop(mlir::Operation* subquery,
+                                        mlir::Block* stepBlock,
+                                        llvm::SmallVectorImpl<mlir::Value>& readPast) {
+    mlir::Block* const block = subquery->getBlock();
+    const mlir::OperandRange inputs = subqueryInputColumns(subquery);
+
+    const auto readAfterTheOp = [block, subquery](mlir::Value value) {
+        for (mlir::Operation* user : value.getUsers()) {
+            mlir::Operation* const userInBlock = block->findAncestorOpInBlock(*user);
+
+            if (userInBlock && subquery->isBeforeInBlock(userInBlock)) {
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    const auto collect = [&](mlir::Value value) {
+        const auto chunkIt = _valueMap.find(value);
+        if (chunkIt == _valueMap.end()) {
+            return;
+        }
+
+        const mlir::Value chunk = chunkIt->second;
+        const bool holdsTheStep = mlir::isa<nl::ChunkType>(chunk.getType())
+                                  && !yieldsConstantColumn(chunk, _constantColumns)
+                                  && ownerBlock(chunk) == stepBlock;
+
+        if (holdsTheStep && !llvm::is_contained(inputs, value) && readAfterTheOp(value)) {
+            readPast.push_back(value);
+        }
+    };
+
+    for (const mlir::BlockArgument argument : block->getArguments()) {
+        collect(argument);
+    }
+
+    for (mlir::Operation& operation : *block) {
+        if (&operation == subquery) {
+            break;
+        }
+
+        for (const mlir::Value result : operation.getResults()) {
+            collect(result);
+        }
+    }
 }
 
 void DBLowering::lowerCrossProduct(mlir::db::CrossProduct product) {
@@ -737,38 +3748,73 @@ void DBLowering::lowerCrossProduct(mlir::db::CrossProduct product) {
     mlir::Block* const innerBody = lowerFactor(product.getRightFactor(), outerBody, innerColumns);
 
     // The cross sits at the deepest point - the inner factor's innermost loop
-    // body, where both factors have a chunk bound - just before whatever
-    // consumes the product (the lowered db.output).
+    // body, where both factors have a chunk bound.
     setInsertionInto(innerBody);
 
-    // Null when no limit governs this product (built in full); otherwise the
-    // handle whose budget caps the build, so the cross lays out only the prefix
-    // the limit can emit this step.
-    const mlir::Value limitHandle = _loopLimitHandle.lookup(product.getOperation());
     nl::CrossProduct cross = _builder.create<nl::CrossProduct>(_builder.getUnknownLoc(),
                                                                outerColumns,
-                                                               innerColumns,
-                                                               limitHandle);
+                                                               innerColumns);
 
-    // The product's results are the outer factor's yielded columns followed by
-    // the inner's, the same order nl.cross_product lays out its results.
-    const mlir::ResultRange dbResults = product.getResults();
-    const mlir::ResultRange crossResults = cross.getResults();
-    for (size_t resultIndex = 0; resultIndex < dbResults.size(); resultIndex++) {
-        _valueMap[dbResults[resultIndex]] = crossResults[resultIndex];
+    // The pairs come out chunk by chunk, so the product drives a loop of its own
+    // nested in the inner factor's - the third level of the nest, below the two the
+    // factors opened. That binds the db results to the loop variables, carries the
+    // limit handle when one governs the product, and leaves the loop body as the
+    // innermost one, which is where the consumer (the lowered db.output) goes and
+    // where an enclosing factor roots when this product is itself a factor - the
+    // three-way MATCH (a), (b), (c).
+    buildLoopForSource(cross.getResult(), product.getOperation());
+}
+
+void DBLowering::lowerHashJoin(mlir::db::HashJoin join) {
+    // Both nests root where this op stands - the entry block at top level, the enclosing
+    // factor's innermost loop body inside a product - so they are siblings rather than
+    // nested: the built side is read once, not once per chunk of the other.
+    mlir::Block* const rootBlock = _rootBlock;
+
+    llvm::SmallVector<mlir::Value, 4> buildColumns;
+    mlir::Block* const buildBody = lowerFactor(join.getRightFactor(), rootBlock, buildColumns);
+    rowAlignFactorChunks(buildColumns);
+
+    const mlir::Location loc = _builder.getUnknownLoc();
+
+    _builder.setInsertionPointToStart(rootBlock);
+    nl::HashJoinBuffer buffer = _builder.create<nl::HashJoinBuffer>(loc,
+                                                                    join.getRightKey(),
+                                                                    join.getLeftKey());
+    const mlir::Value state = buffer.getState();
+
+    setInsertionInto(buildBody);
+    _builder.create<nl::HashJoinCollect>(loc, state, buildColumns);
+
+    llvm::SmallVector<mlir::Value, 4> probeColumns;
+    mlir::Block* const probeBody = lowerFactor(join.getLeftFactor(), rootBlock, probeColumns);
+    rowAlignFactorChunks(probeColumns);
+
+    setInsertionInto(probeBody);
+
+    llvm::SmallVector<mlir::Type, 8> resultTypes;
+    for (const mlir::Value column : probeColumns) {
+        resultTypes.push_back(column.getType());
+    }
+    for (const mlir::Value column : buildColumns) {
+        resultTypes.push_back(column.getType());
     }
 
-    // The crossed columns live in innerBody, so when this product is itself
-    // nested in a factor - e.g. the three-way MATCH (a), (b), (c), where a
-    // cross_product's factor is another cross_product - it stands in for that
-    // factor's innermost loop: the enclosing factor roots its next op (or a
-    // deeper product) there. Record it the way buildLoopForSource records a real
-    // loop, so lowerFactor sees a factor whose innermost "loop" is this product.
-    // At top level nothing reads _innermostLoopBody, so this is a no-op there.
-    _innermostLoopBody = innerBody;
+    // The join's chunks are the left factor's yielded columns followed by the right
+    // factor's, which is how the probe lays its own out: probed side then built side.
+    const nl::IteratorType iteratorType = nl::IteratorType::get(_builder.getContext(), resultTypes);
+    nl::HashJoinProbe probe = _builder.create<nl::HashJoinProbe>(loc,
+                                                                 iteratorType,
+                                                                 state,
+                                                                 probeColumns);
 
-    // Cross prod result defines cardinality
-    _innermostCardinality = crossResults.front();
+    // A key many build rows carry makes more pairs than the probe chunk holds, so the
+    // pairs come out chunk by chunk and the probe drives a loop of its own nested in the
+    // probe factor's - as a cross product's pairs do. That binds the db results to the
+    // loop variables, carries the limit handle when one governs the join, and leaves the
+    // loop body as the innermost one, where the consumer goes and where an enclosing
+    // factor roots when this join is itself a factor.
+    buildLoopForSource(probe.getResult(), join.getOperation());
 }
 
 mlir::Block* DBLowering::lowerFactor(mlir::Region& factor,
@@ -796,10 +3842,6 @@ mlir::Block* DBLowering::lowerFactor(mlir::Region& factor,
         }
     }
 
-    if (!_innermostLoopBody) {
-        throw IRException("cross_product factor opened no loop to iterate");
-    }
-
     // A factor's row count is read from its first yielded column, so a factor
     // that yields none cannot size its side of the product. The db.cross_product
     // verifier rejects this, so reaching it here means unverified IR - a
@@ -808,12 +3850,17 @@ mlir::Block* DBLowering::lowerFactor(mlir::Region& factor,
         throw IRException("cross_product factor yields no column");
     }
 
-    mlir::Block* const innermostBody = _innermostLoopBody;
+    // The block the factor's columns are bound in, which is where the other factor has to
+    // root: the innermost loop body of a factor that walks a relation, and the root block
+    // itself for one whose columns are a single row bound above every loop - a scalar
+    // aggregate, or a constant laid out over the one row it is
+    mlir::Block* const factorBody = deepestOwnerBlock(yieldedChunks, rootBlock);
+
     _rootBlock = previousRoot;
     _innermostLoopBody = previousInnermostLoopBody;
     _innermostCardinality = previousInnermostCardinality;
 
-    return innermostBody;
+    return factorBody;
 }
 
 mlir::Value DBLowering::getOrCreatePropertyTypeHandle(llvm::StringRef propertyName) {
@@ -824,7 +3871,7 @@ mlir::Value DBLowering::getOrCreatePropertyTypeHandle(llvm::StringRef propertyNa
 
     // The handle reads no chunk, so it sits at the very top of the entry block,
     // above every loop, where it dominates all the fetches that use it.
-    _builder.setInsertionPointToStart(_entryBlock);
+    setInsertionToEntryBlockStart();
 
     nl::GetPropertyType handleOp = _builder.create<nl::GetPropertyType>(_builder.getUnknownLoc(),
                                                                         _builder.getStringAttr(propertyName));
@@ -834,39 +3881,27 @@ mlir::Value DBLowering::getOrCreatePropertyTypeHandle(llvm::StringRef propertyNa
     return handle;
 }
 
-mlir::Value DBLowering::getOrCreateEdgeTypeHandle(llvm::StringRef edgeTypeName) {
-    // The edge sibling of getOrCreatePropertyTypeHandle: dedup per name and hoist
-    // the handle to the top of the entry block, above every loop, so a by-type hop
-    // nested in a loop reuses one resolved handle rather than re-carrying the name.
-    const auto existing = _edgeTypes.find(edgeTypeName);
-    if (existing != _edgeTypes.end()) {
+mlir::Value DBLowering::getOrCreateEdgeTypeSetHandle(mlir::ArrayAttr edgeTypeNames) {
+    // The edge sibling of getOrCreatePropertyTypeHandle: dedup per set of names and
+    // hoist the handle to the top of the entry block, above every loop, so a by-type
+    // hop nested in a loop reuses one resolved handle rather than re-carrying them.
+    const auto existing = _edgeTypeSets.find(edgeTypeNames);
+    if (existing != _edgeTypeSets.end()) {
         return existing->second;
     }
 
-    _builder.setInsertionPointToStart(_entryBlock);
+    setInsertionToEntryBlockStart();
 
-    nl::GetEdgeType handleOp = _builder.create<nl::GetEdgeType>(_builder.getUnknownLoc(),
-                                                               _builder.getStringAttr(edgeTypeName));
+    nl::GetEdgeTypeSet handleOp = _builder.create<nl::GetEdgeTypeSet>(_builder.getUnknownLoc(),
+                                                                     edgeTypeNames);
     const mlir::Value handle = handleOp.getResult();
-    _edgeTypes[edgeTypeName] = handle;
+    _edgeTypeSets[edgeTypeNames] = handle;
 
     return handle;
 }
 
-mlir::Type DBLowering::propertyValueChunkType(llvm::StringRef propertyName) {
-    if (!_view) {
-        throw IRException("Lowering a property fetch needs a graph to resolve the type of '" + propertyName.str() + "'");
-    }
-
-    const std::optional<PropertyType> propertyType = _view->metadata().propTypes().get(propertyName);
-    if (!propertyType) {
-        throw IRException("Unknown property '" + propertyName.str() + "'");
-    }
-
-    const mlir::Type elementType = valueTypeToElementType(_builder, propertyType->_valueType);
-    storage::NullableType nullableType = storage::NullableType::get(_builder.getContext(), elementType);
-
-    return nl::ChunkType::get(_builder.getContext(), nullableType);
+mlir::Type DBLowering::columnType(mlir::Value column) {
+    return mlir::cast<mlir::db::ColumnType>(column.getType()).getType();
 }
 
 void DBLowering::lowerLimit(mlir::db::Limit limit) {
@@ -897,6 +3932,8 @@ void DBLowering::lowerLimit(mlir::db::Limit limit) {
         throw IRException("db.limit requires at least one column");
     }
 
+    rowAlignCutChunks(chunks);
+
     const mlir::Location loc = _builder.getUnknownLoc();
     const mlir::Value handle = _limitHandles.lookup(limit.getOperation());
 
@@ -919,6 +3956,8 @@ void DBLowering::lowerLimit(mlir::db::Limit limit) {
     for (size_t resultIndex = 0; resultIndex < dbResults.size(); resultIndex++) {
         _valueMap[dbResults[resultIndex]] = truncatedChunks[resultIndex];
     }
+
+    followCardinalityThrough(chunks, truncatedChunks);
 }
 
 void DBLowering::lowerSkip(mlir::db::Skip skip) {
@@ -935,15 +3974,18 @@ void DBLowering::lowerSkip(mlir::db::Skip skip) {
         throw IRException("db.skip requires at least one column");
     }
 
+    rowAlignCutChunks(chunks);
+
     const mlir::Location loc = _builder.getUnknownLoc();
 
-    // Hoist the skip handle to the top of the entry block, above every loop, so it
-    // dominates the update and the truncate placed in the producing loop body.
+    // Hoist the skip handle to the top of the root block, above every loop of this
+    // dataflow, so it dominates the update and the truncate placed in the producing loop
+    // body.
     // Unlike a limit, a skip threads no operand onto the loops (it cannot
     // early-exit - every row past the dropped prefix must still be produced), so it
     // needs no up-front pre-scan: the handle is created here, in program order,
     // once the producing loops already exist.
-    _builder.setInsertionPointToStart(_entryBlock);
+    _builder.setInsertionPointToStart(_rootBlock);
     const mlir::Value handle = _builder.create<nl::Skip>(loc, skip.getCount()).getState();
 
     // The representative is the first skipped column, in the innermost producing
@@ -968,6 +4010,8 @@ void DBLowering::lowerSkip(mlir::db::Skip skip) {
     for (size_t resultIndex = 0; resultIndex < dbResults.size(); resultIndex++) {
         _valueMap[dbResults[resultIndex]] = truncatedChunks[resultIndex];
     }
+
+    followCardinalityThrough(chunks, truncatedChunks);
 }
 
 void DBLowering::detectTopKFusion(mlir::func::FuncOp dbFunction) {
@@ -1021,14 +4065,16 @@ void DBLowering::lowerSort(mlir::db::Sort sort) {
         throw IRException("db.sort requires at least one column");
     }
 
+    rowAlignBufferedChunks(chunks);
+
     const mlir::Location loc = _builder.getUnknownLoc();
 
-    // The accumulator and its sort spec are hoisted to the top of the entry
-    // block, above every loop, so the buffers exist before the producing loop
-    // fills them and the handle dominates the collect and the emit loop. A sort
+    // The accumulator and its sort spec are hoisted to the top of the root block,
+    // above every loop of this dataflow, so the buffers exist before the producing
+    // loop fills them and the handle dominates the collect and the emit loop. A sort
     // fused with a terminal db.limit carries that count as its top-K bound, so the
     // accumulator keeps only the best k rows; an unfused sort keeps every row.
-    _builder.setInsertionPointToStart(_entryBlock);
+    _builder.setInsertionPointToStart(_rootBlock);
 
     const auto topK = _sortTopK.find(sort.getOperation());
     mlir::IntegerAttr topKAttr;
@@ -1061,15 +4107,481 @@ void DBLowering::lowerSort(mlir::db::Sort sort) {
 
     const nl::IteratorType iteratorType = nl::IteratorType::get(_builder.getContext(), chunkTypes);
 
-    setInsertionInto(_entryBlock);
+    setInsertionInto(_rootBlock);
     nl::Sort sortOp = _builder.create<nl::Sort>(loc, iteratorType, state);
 
-    // The emit loop binds one variable per sorted column and is never bounded by
-    // a limit (sort must see every row), so the iterator-only loop builder is
-    // used. buildLoopForSource maps db.sort's results to the loop variables, so
-    // the db.output that follows lowers into the emit loop body reading the
-    // sorted chunks.
+    // The emit loop binds one variable per sorted column. It is the only loop of this
+    // sort a limit may bound - assignProducerLoops stops at the sort and hands the
+    // handle to it, never to the producing loops, which had to see every row - so it
+    // stops re-chunking once a downstream streaming limit is spent. A limit fused into
+    // the top-K bounds nothing here: the accumulator already holds at most k rows.
+    // buildLoopForSource maps db.sort's results to the loop variables, so the
+    // db.output that follows lowers into the emit loop body reading the sorted chunks.
     buildLoopForSource(sortOp.getResult(), sort.getOperation());
+}
+
+// Each branch is lowered as a program of its own rooted in the entry block, so its loops
+// are appended after the ones the branch before it opened and the sink sees one branch's
+// rows and then the next. What a branch binds is unreachable from the next, so the
+// innermost-loop record is cleared between them rather than carried over.
+void DBLowering::lowerUnion(mlir::db::Union unionOp) {
+    if (unionOp.getNumResults() > 0) {
+        lowerUnionResults(unionOp);
+        return;
+    }
+
+    const mlir::MutableArrayRef<mlir::Region> branches = unionOp.getBranches();
+
+    mlir::Block* const previousRoot = _rootBlock;
+    mlir::Block* const previousInnermostLoopBody = _innermostLoopBody;
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+
+    llvm::SmallVector<nl::Output, 4> branchOutputs;
+
+    for (mlir::Region& branch : branches) {
+        _rootBlock = _entryBlock;
+        _innermostLoopBody = nullptr;
+        _innermostCardinality = mlir::Value();
+
+        mlir::db::Output branchOutput = mlir::cast<mlir::db::Output>(branch.front().back());
+
+        for (mlir::Operation& operation : branch.front()) {
+            llvm::SmallVector<std::pair<mlir::Value, mlir::Value>, 4> replacedMappings;
+            convertUnionResultChunks(operation, branchOutput.getColumns(), replacedMappings);
+
+            if (&operation == branchOutput.getOperation()) {
+                branchOutputs.push_back(lowerOutput(branchOutput));
+            } else {
+                lowerOperation(operation);
+            }
+
+            for (const auto& [column, chunk] : replacedMappings) {
+                _valueMap[column] = chunk;
+            }
+        }
+    }
+
+    llvm::SmallVector<mlir::MutableOperandRange, 4> branchColumns;
+    for (nl::Output branchOutput : branchOutputs) {
+        branchColumns.push_back(branchOutput.getColumnsMutable());
+    }
+
+    nl::Output firstOutput = branchOutputs.front();
+    const std::optional<mlir::ArrayAttr> columnNames = firstOutput.getColumnNames();
+
+    reconcileBranchResultTypes(branchColumns, columnNames.value_or(mlir::ArrayAttr()));
+
+    _rootBlock = previousRoot;
+    _innermostLoopBody = previousInnermostLoopBody;
+    _innermostCardinality = previousInnermostCardinality;
+}
+
+// The branches of a union inside a CALL body feed the rest of the body, which is lowered
+// once, so their rows meet in an accumulator: each branch is rooted in the block the body
+// runs over, collects what it yields there, and the loop draining it is where the body
+// goes on from.
+void DBLowering::lowerUnionResults(mlir::db::Union unionOp) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::Block* const root = _rootBlock;
+
+    _builder.setInsertionPointToStart(root);
+    const mlir::Value state = _builder.create<nl::RowBuffer>(loc).getState();
+
+    llvm::SmallVector<nl::RowCollect, 4> collects;
+
+    for (mlir::Region& branch : unionOp.getBranches()) {
+        lowerCollectedBranch(branch, root, state, collects);
+    }
+
+    drainCollectedBranches(collects, state, root, unionOp.getOperation());
+}
+
+void DBLowering::lowerConditional(mlir::db::Conditional conditional) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+    const nl::ChunkType maskType = nl::ChunkType::get(context, storage::BoolType::get(context));
+
+    mlir::Block* const root = _rootBlock;
+    mlir::Block* const previousInnermostLoopBody = _innermostLoopBody;
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+    mlir::Block* const previousConstantComputationBlock = _constantComputationBlock;
+
+    const bool returning = conditional.getNumResults() > 0;
+
+    mlir::Value state;
+    if (returning) {
+        _builder.setInsertionPointToStart(root);
+        state = _builder.create<nl::RowBuffer>(loc).getState();
+    }
+
+    _constantComputationBlock = root;
+
+    llvm::SmallVector<mlir::Value, 4> readColumns;
+    collectRowColumnsReadByBranches(conditional, readColumns);
+
+    llvm::SmallVector<mlir::Value, 8> outerChunks;
+    for (const mlir::Value column : readColumns) {
+        outerChunks.push_back(mapValue(column));
+    }
+
+    llvm::SmallVector<mlir::Value, 8> reaching(outerChunks.begin(), outerChunks.end());
+    mlir::Value reachingCardinality = cardinalityDriver(reaching);
+
+    const mlir::MutableArrayRef<mlir::Region> regions = conditional.getBranches();
+    const size_t conditionCount = regions.size() / 2;
+    const bool hasDefault = regions.size() % 2 == 1;
+
+    llvm::SmallVector<nl::RowCollect, 4> collects;
+
+    for (size_t conditionIndex = 0; conditionIndex < conditionCount; conditionIndex++) {
+        for (size_t columnIndex = 0; columnIndex < readColumns.size(); columnIndex++) {
+            _valueMap[readColumns[columnIndex]] = reaching[columnIndex];
+        }
+
+        const mlir::Value condition = lowerBlockOverRows(regions[2 * conditionIndex].front(), reachingCardinality);
+
+        llvm::SmallVector<mlir::Value, 8> taken;
+        filterCaseRows(condition, reaching, taken);
+        lowerConditionalBranch(regions[2 * conditionIndex + 1], readColumns, taken, state, collects);
+
+        const bool rowsFallThrough = hasDefault || conditionIndex + 1 < conditionCount;
+        if (!rowsFallThrough) {
+            break;
+        }
+
+        setInsertionForUnaryOp(condition);
+        const mlir::Value fallsThrough = _builder.create<nl::IsNotTrue>(loc, maskType, condition).getResult();
+
+        llvm::SmallVector<mlir::Value, 8> rest;
+        filterCaseRows(fallsThrough, reaching, rest);
+
+        reachingCardinality = rest.front();
+        reaching.assign(rest.begin() + 1, rest.end());
+    }
+
+    if (hasDefault) {
+        llvm::SmallVector<mlir::Value, 8> taken {reachingCardinality};
+        taken.append(reaching.begin(), reaching.end());
+
+        lowerConditionalBranch(regions.back(), readColumns, taken, state, collects);
+    }
+
+    for (size_t columnIndex = 0; columnIndex < readColumns.size(); columnIndex++) {
+        _valueMap[readColumns[columnIndex]] = outerChunks[columnIndex];
+    }
+
+    _constantComputationBlock = previousConstantComputationBlock;
+
+    if (!returning) {
+        _innermostLoopBody = previousInnermostLoopBody;
+        _innermostCardinality = previousInnermostCardinality;
+
+        setInsertionInto(root);
+        return;
+    }
+
+    drainCollectedBranches(collects, state, root, conditional.getOperation());
+}
+
+void DBLowering::lowerConditionalBranch(mlir::Region& branch,
+                                        llvm::ArrayRef<mlir::Value> readColumns,
+                                        llvm::ArrayRef<mlir::Value> taken,
+                                        mlir::Value state,
+                                        llvm::SmallVectorImpl<nl::RowCollect>& collects) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::Block* const root = _rootBlock;
+
+    setInsertionInto(deepestOwnerBlock(taken, root));
+    nl::EachRow eachRow = _builder.create<nl::EachRow>(loc, taken);
+    nl::For branchLoop = _builder.create<nl::For>(loc, eachRow.getResult(), mlir::Value());
+    mlir::Block* const branchRoot = branchLoop.getBody();
+
+    for (size_t columnIndex = 0; columnIndex < readColumns.size(); columnIndex++) {
+        const unsigned argumentIndex = static_cast<unsigned>(columnIndex + 1);
+        _valueMap[readColumns[columnIndex]] = branchRoot->getArgument(argumentIndex);
+    }
+
+    _rootBlock = branchRoot;
+    _constantComputationBlock = branchRoot;
+
+    lowerCollectedBranch(branch, branchRoot, state, collects);
+
+    _rootBlock = root;
+    _constantComputationBlock = root;
+}
+
+void DBLowering::lowerCollectedBranch(mlir::Region& branch,
+                                      mlir::Block* root,
+                                      mlir::Value state,
+                                      llvm::SmallVectorImpl<nl::RowCollect>& collects) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+
+    _innermostLoopBody = nullptr;
+    _innermostCardinality = mlir::Value();
+
+    mlir::db::Yield branchYield = mlir::cast<mlir::db::Yield>(branch.front().back());
+
+    for (mlir::Operation& operation : branch.front()) {
+        llvm::SmallVector<std::pair<mlir::Value, mlir::Value>, 4> replacedMappings;
+        convertUnionResultChunks(operation, branchYield.getColumns(), replacedMappings);
+
+        if (&operation != branchYield.getOperation()) {
+            lowerOperation(operation);
+        } else if (state) {
+            llvm::SmallVector<mlir::Value, 4> chunks;
+            for (const mlir::Value column : branchYield.getColumns()) {
+                chunks.push_back(mapValue(column));
+            }
+
+            rowAlignBufferedChunks(chunks);
+
+            // A branch of constants alone lays them out where they are bound, above the
+            // root, which the collect must still run once per step of
+            setInsertionInto(deepestOwnerBlock(chunks, root));
+            collects.push_back(_builder.create<nl::RowCollect>(loc, state, chunks));
+        }
+
+        for (const auto& [column, chunk] : replacedMappings) {
+            _valueMap[column] = chunk;
+        }
+    }
+}
+
+void DBLowering::drainCollectedBranches(llvm::ArrayRef<nl::RowCollect> collects,
+                                        mlir::Value state,
+                                        mlir::Block* root,
+                                        mlir::Operation* holder) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+
+    llvm::SmallVector<mlir::MutableOperandRange, 4> branchColumns;
+    for (nl::RowCollect collect : collects) {
+        branchColumns.push_back(collect.getColumnsMutable());
+    }
+
+    reconcileBranchResultTypes(branchColumns, mlir::ArrayAttr());
+
+    nl::RowCollect firstCollect = collects.front();
+    const llvm::SmallVector<mlir::Type, 4> chunkTypes(firstCollect.getColumns().getTypes());
+    const nl::IteratorType iteratorType = nl::IteratorType::get(_builder.getContext(), chunkTypes);
+
+    setInsertionInto(root);
+    nl::RowDrain drain = _builder.create<nl::RowDrain>(loc, iteratorType, state);
+
+    buildLoopForSource(drain.getResult(), holder);
+}
+
+void DBLowering::collectRowColumnsReadByBranches(mlir::db::Conditional conditional,
+                                                 llvm::SmallVectorImpl<mlir::Value>& columns) {
+    mlir::Operation* const holder = conditional.getOperation();
+    llvm::SmallPtrSet<mlir::Value, 8> seen;
+
+    holder->walk([&](mlir::Operation* operation) {
+        if (operation == holder) {
+            return;
+        }
+
+        for (mlir::Value operand : operation->getOperands()) {
+            const bool readFromAbove = !holder->isAncestor(operand.getParentRegion()->getParentOp());
+            const bool isColumn = mlir::isa<mlir::db::ColumnType>(operand.getType());
+            if (!readFromAbove || !isColumn || seen.contains(operand)) {
+                continue;
+            }
+
+            seen.insert(operand);
+
+            if (!yieldsConstantColumn(mapValue(operand), _constantColumns)) {
+                columns.push_back(operand);
+            }
+        }
+    });
+}
+
+// A dedup keys a row on the bytes of the chunk it is handed, so a branch's result columns
+// are converted on their way into it rather than on their way out: a count keyed as a
+// plain ui64 and a property keyed as a nullable i64 spell the same number two different
+// ways, and the duplicate the union exists to drop survives.
+void DBLowering::convertUnionResultChunks(mlir::Operation& operation,
+                                          mlir::OperandRange resultColumns,
+                                          llvm::SmallVectorImpl<std::pair<mlir::Value, mlir::Value>>& replacedMappings) {
+    llvm::SmallVector<mlir::Value, 4> columns;
+
+    if (mlir::isa<mlir::db::Output, mlir::db::Yield>(operation)) {
+        columns.assign(resultColumns.begin(), resultColumns.end());
+    } else if (mlir::db::RemoveDuplicates dedup = mlir::dyn_cast<mlir::db::RemoveDuplicates>(operation)) {
+        const mlir::OperandRange dedupColumns = dedup.getColumns();
+        const mlir::ResultRange results = dedup.getResults();
+
+        for (size_t columnIndex = 0; columnIndex < results.size(); columnIndex++) {
+            if (llvm::is_contained(resultColumns, results[columnIndex])) {
+                columns.push_back(dedupColumns[columnIndex]);
+            }
+        }
+    }
+
+    if (columns.empty()) {
+        return;
+    }
+
+    // A constant is converted once it holds rows: a union inside a CALL body lays its
+    // constants out here rather than in codegen
+    llvm::SmallVector<mlir::Value, 4> chunks;
+    for (const mlir::Value column : columns) {
+        chunks.push_back(mapValue(column));
+    }
+
+    rowAlignBufferedChunks(chunks);
+
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        const mlir::Value column = columns[columnIndex];
+        replacedMappings.emplace_back(column, mapValue(column));
+        _valueMap[column] = unionColumnChunk(chunks[columnIndex]);
+    }
+}
+
+// A result column carries one value type for the whole result, so the branches have to
+// resolve their columns to the same types. The types are only known here: a property fetch
+// is typed none until its name is resolved against the schema, so a union of columns that
+// turn out to disagree is a program the db level cannot tell from a valid one.
+void DBLowering::reconcileBranchResultTypes(llvm::ArrayRef<mlir::MutableOperandRange> branchColumns,
+                                            mlir::ArrayAttr columnNames) {
+    const size_t columnCount = branchColumns.front().size();
+
+    for (size_t columnIndex = 0; columnIndex < columnCount; columnIndex++) {
+        const mlir::Type columnType = unionResultType(branchColumns, columnIndex, columnNames);
+
+        for (const mlir::MutableOperandRange& columns : branchColumns) {
+            mlir::OpOperand& operand = columns[static_cast<unsigned>(columnIndex)];
+            const mlir::Value chunk = operand.get();
+            if (chunk.getType() == columnType) {
+                continue;
+            }
+
+            operand.set(typedNullChunk(chunk, columnType));
+        }
+    }
+}
+
+// The one type a result column carries: the type the branches saying what the column holds
+// agree on. A branch spelling the value null names no type of its own, so it is laid out as
+// that column - and where every branch spells it null, the first branch's untyped null is
+// the column, there being nothing else it could hold.
+mlir::Type DBLowering::unionResultType(llvm::ArrayRef<mlir::MutableOperandRange> branchColumns,
+                                       size_t columnIndex,
+                                       mlir::ArrayAttr columnNames) {
+    const unsigned operandIndex = static_cast<unsigned>(columnIndex);
+
+    mlir::Type resultType;
+
+    for (const mlir::MutableOperandRange& columns : branchColumns) {
+        const mlir::Type branchType = columns[operandIndex].get().getType();
+        if (isUntypedNullChunk(branchType)) {
+            continue;
+        }
+
+        if (!resultType) {
+            resultType = branchType;
+            continue;
+        }
+
+        if (branchType != resultType) {
+            throwOnDisagreeingBranchTypes(branchType, resultType, columnNames, columnIndex);
+        }
+    }
+
+    if (!resultType) {
+        return branchColumns.front()[operandIndex].get().getType();
+    }
+
+    // A null rides a nullable value column, so a column of anything else - an entity, a
+    // path, an embedding - has no row a branch spelling the value null could fill
+    const mlir::Type resultElement = mlir::cast<nl::ChunkType>(resultType).getElementType();
+    if (mlir::isa<storage::NullableType>(resultElement)) {
+        return resultType;
+    }
+
+    for (const mlir::MutableOperandRange& columns : branchColumns) {
+        const mlir::Type branchType = columns[operandIndex].get().getType();
+        if (isUntypedNullChunk(branchType)) {
+            throwOnDisagreeingBranchTypes(branchType, resultType, columnNames, columnIndex);
+        }
+    }
+
+    return resultType;
+}
+
+void DBLowering::throwOnDisagreeingBranchTypes(mlir::Type branchType,
+                                               mlir::Type resultType,
+                                               mlir::ArrayAttr columnNames,
+                                               size_t columnIndex) {
+    std::string branchName;
+    describeColumnType(branchType, branchName);
+
+    std::string resultName;
+    describeColumnType(resultType, resultName);
+
+    const llvm::StringRef columnName = columnNames ? mlir::cast<mlir::StringAttr>(columnNames[columnIndex]).getValue()
+                                                   : llvm::StringRef();
+
+    throw IRException(fmt::format("A UNION column holds one value type for the whole result: "
+                                  "'{}' is {} in this sub-query and {} in another",
+                                  std::string_view {columnName.data(), columnName.size()},
+                                  branchName,
+                                  resultName));
+}
+
+// The null literal's chunk read as the column the result carries: one absent value per row,
+// in the type the branches saying what the column holds resolved it to.
+mlir::Value DBLowering::typedNullChunk(mlir::Value chunk, mlir::Type chunkType) {
+    mlir::OpBuilder::InsertionGuard guard(_builder);
+    _builder.setInsertionPointAfterValue(chunk);
+
+    return _builder.create<nl::ToNullable>(_builder.getUnknownLoc(), chunkType, chunk).getResult();
+}
+
+// The shared seen-set is hoisted to the top of the root block, above every branch's
+// loops, so it is emptied once per step of that block and dominates each branch's filter -
+// the same placement lowerRemoveDuplicates gives a dedup's private set.
+void DBLowering::lowerDistinctSet(mlir::db::DistinctSet distinctSet) {
+    _builder.setInsertionPointToStart(_rootBlock);
+
+    _valueMap[distinctSet.getSet()] = _builder.create<nl::Distinct>(_builder.getUnknownLoc()).getState();
+}
+
+void DBLowering::lowerMaterialize(mlir::db::Materialize materialize) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+
+    llvm::SmallVector<mlir::Value, 4> chunks;
+    for (const mlir::Value column : materialize.getColumns()) {
+        chunks.push_back(mapValue(column));
+    }
+
+    rowAlignBufferedChunks(chunks);
+
+    _builder.setInsertionPointToStart(_rootBlock);
+    const mlir::Value state = _builder.create<nl::RowBuffer>(loc).getState();
+
+    setInsertionInto(deepestOwnerBlock(chunks, _rootBlock));
+    _builder.create<nl::RowCollect>(loc, state, chunks);
+
+    _valueMap[materialize.getRows()] = state;
+}
+
+void DBLowering::lowerScanMaterialized(mlir::db::ScanMaterialized scan) {
+    const mlir::Value state = mapValue(scan.getRows());
+
+    nl::RowCollect collect;
+    for (mlir::Operation* user : state.getUsers()) {
+        if (nl::RowCollect stateCollect = mlir::dyn_cast<nl::RowCollect>(user)) {
+            collect = stateCollect;
+            break;
+        }
+    }
+
+    if (!collect) {
+        throw IRException("db.scan_materialized reads rows no db.materialize collected");
+    }
+
+    drainCollectedBranches({collect}, state, _rootBlock, scan.getOperation());
 }
 
 void DBLowering::lowerRemoveDuplicates(mlir::db::RemoveDuplicates distinct) {
@@ -1086,23 +4598,28 @@ void DBLowering::lowerRemoveDuplicates(mlir::db::RemoveDuplicates distinct) {
         throw IRException("db.remove_duplicates requires at least one column");
     }
 
+    rowAlignBufferedChunks(chunks);
+
     const mlir::Location loc = _builder.getUnknownLoc();
 
-    // The seen-set handle is hoisted to the top of the entry block, above every
-    // loop, so it is reset once at function scope and dominates the filter placed
-    // in the producing loop body. A correlated DISTINCT (reset per enclosing step)
-    // would hoist into its enclosing loop body instead - future work, as for the
-    // streaming limit.
-    _builder.setInsertionPointToStart(_entryBlock);
-    const mlir::Value state = _builder.create<nl::Distinct>(loc).getState();
+    // The seen-set handle is hoisted to the top of the root block, above every loop
+    // of this dataflow, so it is reset once per step of that block and dominates the
+    // filter placed in the producing loop body. A dedup naming a shared set reads that
+    // one instead, so every branch of a union records its rows in the same set.
+    mlir::Value state;
+    if (const mlir::Value sharedSet = distinct.getSet()) {
+        state = mapValue(sharedSet);
+    } else {
+        _builder.setInsertionPointToStart(_rootBlock);
+        state = _builder.create<nl::Distinct>(loc).getState();
+    }
 
     // The filter sits in the innermost producing loop body, where all deduped
     // columns are bound together (the same block db.output would emit from), and
     // emits each step's not-yet-seen rows as fresh survivor chunks. It opens no
     // loop of its own: DISTINCT streams, so - unlike db.sort - the rows are
     // filtered in place in the producing loop, not accumulated and re-emitted.
-    const mlir::Value representative = chunks.front();
-    setInsertionInto(ownerBlock(representative));
+    setInsertionInto(deepestOwnerBlock(chunks, _rootBlock));
     nl::DistinctFilter filter = _builder.create<nl::DistinctFilter>(loc, state, chunks);
 
     // Map db.remove_duplicates' results to the survivor chunks, so its consumer
@@ -1119,95 +4636,147 @@ void DBLowering::lowerRemoveDuplicates(mlir::db::RemoveDuplicates distinct) {
 
 void DBLowering::lowerCount(mlir::db::Count count) {
     // The nl chunk the counted column lowered to; the update reads its per-step
-    // non-null row count.
-    const mlir::Value inputChunk = mapValue(count.getInput());
+    // non-null row count. A constant column counts the rows it stands for, not the
+    // one row it is, so it is laid out over the driving relation first.
+    const mlir::Value inputChunk = rowAlignedChunk(mapValue(count.getInput()), _innermostCardinality);
 
     const mlir::Location loc = _builder.getUnknownLoc();
 
-    // The tally is hoisted to the top of the entry block, above every loop, so it
-    // is reset once at function scope and dominates the update placed in the
-    // producing loop body and the emit that reads it after the loop. A correlated
-    // COUNT (reset per enclosing step) would hoist into its enclosing loop body
-    // instead - future work, as for the streaming limit.
-    _builder.setInsertionPointToStart(_entryBlock);
+    // The tally is hoisted to the top of the root block, above every loop of this
+    // dataflow, so it is reset once per step of that block and dominates the update
+    // placed in the producing loop body and the emit that reads it after the loop.
+    _builder.setInsertionPointToStart(_rootBlock);
     const mlir::Value state = _builder.create<nl::Count>(loc).getState();
+
+    // count(DISTINCT x) feeds the tally the survivors of a DISTINCT instead of the raw
+    // column. A null does survive the filter - all nulls share one key - but is still
+    // never charged, since nl.count_update counts only non-null rows, so the tally
+    // comes out as the distinct non-null value count Cypher asks for.
+    mlir::Value distinctState;
+    if (count.getDistinct()) {
+        distinctState = _builder.create<nl::Distinct>(loc).getState();
+    }
 
     // The update sits in the innermost producing loop body, where the counted
     // column is bound (the same block db.output would emit from), and charges each
     // step's non-null rows against the tally.
-    setInsertionInto(ownerBlock(inputChunk));
-    _builder.create<nl::CountUpdate>(loc, state, inputChunk);
+    mlir::Block* const producingBlock = accumulatorUpdateBlock(ownerBlock(inputChunk));
+    setInsertionInto(producingBlock);
+
+    mlir::Value countedChunk = inputChunk;
+    if (distinctState) {
+        nl::DistinctFilter filter = _builder.create<nl::DistinctFilter>(loc, distinctState, mlir::ValueRange {inputChunk});
+        countedChunk = filter.getResults().front();
+    }
+
+    _builder.create<nl::CountUpdate>(loc, state, countedChunk, count.getRows());
 
     // COUNT is a pipeline breaker: the tally is final only once every row has been
     // seen. Since it collapses to exactly one row there is nothing to iterate, so -
     // unlike db.sort - it opens no emit loop: nl.count_result materializes the tally
-    // chunk in place at function scope (after the producing loop, before the
-    // func.return), and db.output consumes it there. The chunk is the single-row
-    // count as an unsigned i64 (!nl.chunk<ui64>) - a non-negative tally that is
-    // never null, so no nullable wrapper.
+    // chunk in place at function scope, right after the producing loop, and db.output
+    // consumes it there. The chunk is the single-row count as an unsigned i64
+    // (!nl.chunk<ui64>) - a non-negative tally that is never null, so no nullable
+    // wrapper.
     mlir::MLIRContext* const context = _builder.getContext();
     const mlir::Type countElementType = _builder.getIntegerType(64, /*isSigned=*/false);
     const nl::ChunkType countChunkType = nl::ChunkType::get(context, countElementType);
 
-    setInsertionInto(_entryBlock);
+    setInsertionAfterProducingLoop(producingBlock);
     nl::CountResult result = _builder.create<nl::CountResult>(loc, countChunkType, state);
 
     // db.count's result maps to that chunk, so the db.output that follows lowers
     // into a function-scope nl.output reading it - the block that holds the chunk is
     // the entry block, so lowerOutput places nl.output there.
     _valueMap[count.getResult()] = result.getResult();
+
+    // The count collapses the rows in flight to its one row, so from here on that row is
+    // what sizes a projection of constants alone
+    _innermostCardinality = result.getResult();
 }
 
-void DBLowering::lowerAggregate(mlir::Value input, mlir::Value result, storage::AggregateKind kind) {
+void DBLowering::lowerCountScanRows(mlir::db::CountScanRows countScanRows) {
+    // The tally comes from the graph's node counts rather than from a relation, so the op
+    // reads no column and is loop-invariant: hoist it the way lowerConstant hoists a
+    // constant, where it dominates every loop a later op may emit from.
+    setInsertionToEntryBlockStart();
+
+    nl::CountScanRows rows = _builder.create<nl::CountScanRows>(_builder.getUnknownLoc(),
+                                                                countScanRows.getLabelsAttr(),
+                                                                countScanRows.getPropertyAttr(),
+                                                                countScanRows.getPropertyScanAttr());
+
+    _valueMap[countScanRows.getResult()] = rows.getResult();
+    _innermostCardinality = rows.getResult();
+}
+
+void DBLowering::lowerAggregate(mlir::Value input, mlir::Value result, storage::AggregateKind kind, bool distinct) {
     // The nl chunk the aggregated column lowered to; the update folds its per-step
-    // non-null values into the accumulator.
-    const mlir::Value inputChunk = mapValue(input);
+    // non-null values into the accumulator. A constant column is reduced over the
+    // rows it stands for, so it is laid out over the driving relation first.
+    const mlir::Value alignedChunk = rowAlignedChunk(mapValue(input), _innermostCardinality);
+
+    const mlir::Value inputChunk = reducedValueChunk(alignedChunk);
 
     mlir::MLIRContext* const context = _builder.getContext();
     const mlir::Location loc = _builder.getUnknownLoc();
 
-    // The input must be a property value column - a nullable value chunk - since
-    // these reduce the values themselves (unlike count(*), which tallies IDs). An
-    // ID chunk has no value to reduce, so reject it here.
-    const nl::ChunkType inputChunkType = mlir::cast<nl::ChunkType>(inputChunk.getType());
-    const auto inputNullable = mlir::dyn_cast<storage::NullableType>(inputChunkType.getElementType());
-    if (!inputNullable) {
-        throw IRException("db aggregate requires a property value column");
-    }
+    // A type-erased column is read as the tagged cell it holds; every other input is a
+    // nullable value chunk, and the reduction is resolved from the value type it wraps.
+    const mlir::Type inputChunkElement = mlir::cast<nl::ChunkType>(inputChunk.getType()).getElementType();
+    const bool taggedCells = mlir::isa<storage::AnyType>(inputChunkElement);
+    const mlir::Type inputElement = taggedCells
+        ? inputChunkElement
+        : mlir::cast<storage::NullableType>(inputChunkElement).getValueType();
 
     // The accumulator (and result) element type: avg widens to f64, the rest keep
     // the input type. This also validates the reduction against the value type.
-    const mlir::Type resultElement = aggregateResultElementType(_builder, kind, inputNullable.getValueType());
+    const mlir::Type resultElement = aggregateResultElementType(_builder, kind, inputElement);
 
-    // The accumulator is hoisted to the top of the entry block, above every loop,
-    // so it is reset once at function scope and dominates the update in the
-    // producing loop body and the emit that reads it after the loop. The count
-    // sibling; a correlated aggregate (reset per enclosing step) would hoist into
-    // its enclosing loop body instead - future work, as for the streaming limit.
-    _builder.setInsertionPointToStart(_entryBlock);
+    // The accumulator is hoisted to the top of the root block, above every loop of
+    // this dataflow, so it is reset once per step of that block and dominates the
+    // update in the producing loop body and the emit that reads it after the loop.
+    _builder.setInsertionPointToStart(_rootBlock);
     const nl::AggregateStateType stateType = nl::AggregateStateType::get(context, resultElement);
     const mlir::Value state = _builder.create<nl::Aggregate>(loc, stateType, kind).getState();
+
+    // sum(DISTINCT x) folds the survivors of a DISTINCT instead of the raw column, so a
+    // value repeated across rows is charged once. A null does survive the filter - all
+    // nulls share one key - but the update skips nulls as it always does.
+    mlir::Value distinctState;
+    if (distinct) {
+        distinctState = _builder.create<nl::Distinct>(loc).getState();
+    }
 
     // The update sits in the innermost producing loop body, where the aggregated
     // column is bound (the same block db.output would emit from), and folds each
     // step's non-null values into the accumulator.
-    setInsertionInto(ownerBlock(inputChunk));
-    _builder.create<nl::AggregateUpdate>(loc, state, inputChunk, kind);
+    mlir::Block* const producingBlock = accumulatorUpdateBlock(ownerBlock(inputChunk));
+    setInsertionInto(producingBlock);
+
+    mlir::Value reducedChunk = inputChunk;
+    if (distinctState) {
+        nl::DistinctFilter filter = _builder.create<nl::DistinctFilter>(loc, distinctState, mlir::ValueRange {inputChunk});
+        reducedChunk = filter.getResults().front();
+    }
+
+    _builder.create<nl::AggregateUpdate>(loc, state, reducedChunk, kind);
 
     // Like db.count, an aggregate is a pipeline breaker that collapses to one row,
     // so it opens no emit loop: nl.aggregate_result materializes the reduced value
-    // in place at function scope (after the producing loop, before the func.return).
-    // The result is a single-row nullable value chunk - an aggregate can be null
-    // (min/max/avg of no non-null row), and sum rides the same representation.
+    // in place at function scope, right after the producing loop. The result is a
+    // single-row nullable value chunk - an aggregate can be null (min/max/avg of no
+    // non-null row), and sum rides the same representation.
     const storage::NullableType resultNullable = storage::NullableType::get(context, resultElement);
     const nl::ChunkType resultChunkType = nl::ChunkType::get(context, resultNullable);
 
-    setInsertionInto(_entryBlock);
+    setInsertionAfterProducingLoop(producingBlock);
     nl::AggregateResult aggregateResult = _builder.create<nl::AggregateResult>(loc, resultChunkType, state, kind);
 
     // The db aggregate's result maps to that chunk, so the db.output that follows
     // lowers into a function-scope nl.output reading it, exactly as db.count does.
     _valueMap[result] = aggregateResult.getResult();
+    _innermostCardinality = aggregateResult.getResult();
 }
 
 void DBLowering::lowerGroupAggregate(mlir::db::GroupAggregate groupAggregate) {
@@ -1230,14 +4799,38 @@ void DBLowering::lowerGroupAggregate(mlir::db::GroupAggregate groupAggregate) {
         throw IRException("db.group_aggregate requires at least one column");
     }
 
+    // The group assignment reads one row of every key per row of the step, which a constant
+    // key - one value standing for every row - has none of. The keys are laid out first, so
+    // that the aggregate inputs behind them are laid out over a key chunk holding rows.
+    rowAlignBufferedChunks(llvm::MutableArrayRef<mlir::Value>(chunks).take_front(keyCount));
+
+    // A constant aggregate input is reduced over the rows of the group it falls in,
+    // not over the single row it is, so it is laid out over the chunk the grouping
+    // keys are read from - the same rows the group assignment is computed for. A
+    // reduction then reads its input as a nullable value chunk, so a column carrying
+    // no null is laid out as one; a count reads the chunk it is anchored on as it comes.
+    for (size_t inputIndex = keyCount; inputIndex < chunks.size(); inputIndex++) {
+        chunks[inputIndex] = rowAlignedChunk(chunks[inputIndex], chunks.front());
+    }
+
+    for (size_t aggregateIndex = 0; aggregateIndex < kinds.size(); aggregateIndex++) {
+        const auto kind = static_cast<storage::GroupAggregateKind>(kinds[aggregateIndex]);
+        const size_t chunkIndex = keyCount + aggregateIndex;
+
+        if (reducesValues(kind)) {
+            chunks[chunkIndex] = reducedValueChunk(chunks[chunkIndex]);
+        }
+    }
+
     mlir::MLIRContext* const context = _builder.getContext();
     const mlir::Location loc = _builder.getUnknownLoc();
 
     // The accumulator - with its keyCount / aggregate-kind spec - is hoisted to the
-    // top of the entry block, above every loop, so the group table exists before the
-    // producing loop fills it and the handle dominates the update and the emit loop.
+    // top of the root block, above every loop of this dataflow, so the group table
+    // exists before the producing loop fills it and the handle dominates the update
+    // and the emit loop.
     // The grouped sibling of lowerSort's nl.sort_buffer.
-    _builder.setInsertionPointToStart(_entryBlock);
+    _builder.setInsertionPointToStart(_rootBlock);
     nl::GroupAggregateBuffer bufferOp = _builder.create<nl::GroupAggregateBuffer>(loc,
                                                                                  keyCount,
                                                                                  groupAggregate.getKindsAttr());
@@ -1277,8 +4870,11 @@ void DBLowering::lowerGroupAggregate(mlir::db::GroupAggregate groupAggregate) {
     // after the producing loop (before the func.return) so every row has been folded
     // when the loop first steps. buildLoopForSource binds one loop variable per
     // output column and maps db.group_aggregate's results to them, so the db.output
-    // that follows lowers into the emit loop body reading the group rows.
-    setInsertionInto(_entryBlock);
+    // that follows lowers into the emit loop body reading the group rows. As for a
+    // sort, this emit loop is the only loop of this aggregation a limit may bound -
+    // assignProducerLoops stops at the breaker and hands the handle to it, never to
+    // the producing loops, which had to fold every row.
+    setInsertionInto(_rootBlock);
     nl::GroupAggregate groupOp = _builder.create<nl::GroupAggregate>(loc, iteratorType, state);
     buildLoopForSource(groupOp.getResult(), groupAggregate.getOperation());
 }
@@ -1286,27 +4882,77 @@ void DBLowering::lowerGroupAggregate(mlir::db::GroupAggregate groupAggregate) {
 void DBLowering::lowerCollect(mlir::db::Collect collect) {
     const mlir::OperandRange columns = collect.getColumns();
     const uint64_t keyCount = collect.getKeyCount();
+    const llvm::ArrayRef<int64_t> kinds = collect.getKinds().value_or(llvm::ArrayRef<int64_t> {});
 
-    // The nl chunks the columns lowered to: the grouping keys first, then the single
-    // collected value column. nl.collect_update appends these to the per-group lists.
+    // The nl chunks the columns lowered to: the grouping keys first, then the collected
+    // value columns, then the aggregate inputs. nl.collect_update appends these to the
+    // per-group lists.
     llvm::SmallVector<mlir::Value, 4> chunks;
     for (const mlir::Value column : columns) {
         chunks.push_back(mapValue(column));
     }
 
-    // Collect::verify guarantees columns.size() == keyCount + 1, so an empty column set
-    // here means unverified IR - a defensive backstop, as in lowerGroupAggregate.
+    // Collect::verify guarantees at least one value column after the keys, so an empty
+    // column set here means unverified IR - a defensive backstop, as in
+    // lowerGroupAggregate.
     if (chunks.empty()) {
         throw IRException("db.collect requires at least one column");
     }
 
+    const size_t valueCount = chunks.size() - keyCount - kinds.size();
+
+    // The grouping keys are laid out first, as lowerGroupAggregate lays its own: the group
+    // assignment reads a row of every key per row of the step, which a constant key has none of.
+    rowAlignBufferedChunks(llvm::MutableArrayRef<mlir::Value>(chunks).take_front(keyCount));
+
+    // A constant collected column is folded over the rows of the group it falls in, not
+    // over the single row it is, so it is laid out over the chunk the grouping keys are
+    // read from - the driving relation when the collect has no keys. The aggregate
+    // inputs beside it are laid out the same way, as lowerGroupAggregate lays its own.
+    const mlir::Value cardinality = keyCount > 0 ? chunks.front() : _innermostCardinality;
+    for (size_t inputIndex = keyCount; inputIndex < chunks.size(); inputIndex++) {
+        chunks[inputIndex] = rowAlignedChunk(chunks[inputIndex], cardinality);
+    }
+
+    // An entity column collects as the IDs it carries, a list column as the cells it
+    // holds, and a type-erased one as the tagged cells - all present in every row, the
+    // tagged null among them, which the fold drops rather than the column. Only a scalar
+    // value column is read as nullable, the way a property fetch is.
+    for (size_t valueIndex = 0; valueIndex < valueCount; valueIndex++) {
+        const size_t chunkIndex = keyCount + valueIndex;
+        const mlir::Type collectedElement = mlir::cast<nl::ChunkType>(chunks[chunkIndex].getType()).getElementType();
+        const bool collectsCellsPresentInEveryRow = mlir::isa<storage::NodeIDType,
+                                                              storage::EdgeIDType,
+                                                              storage::ListType,
+                                                              storage::AnyType>(collectedElement);
+
+        if (!collectsCellsPresentInEveryRow) {
+            chunks[chunkIndex] = nullableValueChunk(chunks[chunkIndex]);
+        }
+    }
+
+    // A reduction beside the lists reads its input as it does under a grouped
+    // aggregation; a count tallies rows and takes the chunk as it is.
+    for (size_t aggregateIndex = 0; aggregateIndex < kinds.size(); aggregateIndex++) {
+        const auto kind = static_cast<storage::GroupAggregateKind>(kinds[aggregateIndex]);
+        const size_t chunkIndex = keyCount + valueCount + aggregateIndex;
+
+        if (reducesValues(kind)) {
+            chunks[chunkIndex] = reducedValueChunk(chunks[chunkIndex]);
+        }
+    }
+
     const mlir::Location loc = _builder.getUnknownLoc();
 
-    // The accumulator is hoisted to the top of the entry block, above every loop, so
-    // the group table exists before the producing loop fills it and the handle
-    // dominates the update. The collect sibling of lowerGroupAggregate's buffer.
-    _builder.setInsertionPointToStart(_entryBlock);
-    nl::CollectBuffer bufferOp = _builder.create<nl::CollectBuffer>(loc, keyCount);
+    // The accumulator is hoisted to the top of the root block, above every loop of
+    // this dataflow, so the group table exists before the producing loop fills it and
+    // the handle dominates the update. The collect sibling of lowerGroupAggregate's
+    // buffer.
+    _builder.setInsertionPointToStart(_rootBlock);
+    nl::CollectBuffer bufferOp = _builder.create<nl::CollectBuffer>(loc,
+                                                                    keyCount,
+                                                                    collect.getKindsAttr(),
+                                                                    collect.getDistinctValuesAttr());
     const mlir::Value state = bufferOp.getState();
 
     // The update folds each step's chunk of every column into the per-group lists. It
@@ -1314,14 +4960,14 @@ void DBLowering::lowerCollect(mlir::db::Collect collect) {
     // (the same block db.output would emit from), so the group assignment and the
     // per-group appends stay row-aligned.
     const mlir::Value representative = chunks.front();
-    setInsertionInto(ownerBlock(representative));
+    setInsertionInto(accumulatorUpdateBlock(ownerBlock(representative)));
     _builder.create<nl::CollectUpdate>(loc, state, chunks);
 
     // The emit phase: an nl.collect source iterator yielding one row per group - the
-    // key columns then the per-group list cell - drained by an nl.for after the
-    // producing loop. The list chunk's element is the resolved value type (unwrapped
-    // from the collected column's nullable) wrapped in a storage list; the key chunks
-    // keep their input types.
+    // key columns then one per-group list cell per collected column - drained by an
+    // nl.for after the producing loop. Each list chunk's element is the resolved value
+    // type (unwrapped from the collected column's nullable) wrapped in a storage list;
+    // the key chunks keep their input types.
     mlir::MLIRContext* const context = _builder.getContext();
 
     llvm::SmallVector<mlir::Type, 4> chunkTypes;
@@ -1329,20 +4975,84 @@ void DBLowering::lowerCollect(mlir::db::Collect collect) {
         chunkTypes.push_back(chunks[keyIndex].getType());
     }
 
-    const mlir::Type valueElement = mlir::cast<nl::ChunkType>(chunks[keyCount].getType()).getElementType();
-    mlir::Type listElement = valueElement;
-    if (const auto nullable = mlir::dyn_cast<storage::NullableType>(valueElement)) {
-        listElement = nullable.getValueType();
+    for (size_t valueIndex = 0; valueIndex < valueCount; valueIndex++) {
+        const mlir::Type valueElement = mlir::cast<nl::ChunkType>(chunks[keyCount + valueIndex].getType()).getElementType();
+
+        mlir::Type listElement = valueElement;
+        if (const auto nullable = mlir::dyn_cast<storage::NullableType>(valueElement)) {
+            listElement = nullable.getValueType();
+        }
+
+        chunkTypes.push_back(nl::ChunkType::get(context, storage::ListType::get(context, listElement)));
     }
 
-    const nl::ChunkType listChunk = nl::ChunkType::get(context, storage::ListType::get(context, listElement));
-    chunkTypes.push_back(listChunk);
+    const mlir::Type ui64Element = _builder.getIntegerType(64, /*isSigned=*/false);
+    const nl::ChunkType countChunkType = nl::ChunkType::get(context, ui64Element);
+
+    for (size_t aggregateIndex = 0; aggregateIndex < kinds.size(); aggregateIndex++) {
+        const storage::GroupAggregateKind kind = static_cast<storage::GroupAggregateKind>(kinds[aggregateIndex]);
+        const mlir::Value inputChunk = chunks[keyCount + valueCount + aggregateIndex];
+
+        chunkTypes.push_back(groupAggregateResultChunkType(_builder, kind, inputChunk, countChunkType));
+    }
 
     const nl::IteratorType iteratorType = nl::IteratorType::get(context, chunkTypes);
 
-    setInsertionInto(_entryBlock);
+    setInsertionInto(_rootBlock);
     nl::Collect collectOp = _builder.create<nl::Collect>(loc, iteratorType, state);
     buildLoopForSource(collectOp.getResult(), collect.getOperation());
+}
+
+void DBLowering::lowerShortestPath(mlir::db::ShortestPath shortestPath) {
+    const mlir::Value sourceChunk = mapValue(shortestPath.getSource());
+    const mlir::Value targetChunk = mapValue(shortestPath.getTarget());
+    const llvm::StringRef edgeProperty = shortestPath.getEdgeProperty();
+
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    // The search accumulator is hoisted above every loop, so its node-set buffers exist
+    // before the producing loops fill them and the handle dominates both updates.
+    _builder.setInsertionPointToStart(_rootBlock);
+    const mlir::Value state = _builder.create<nl::ShortestPathBuffer>(loc).getState();
+
+    // The source and target sets are filled by two updates, each spliced into the loop that
+    // binds its node chunk. Disconnected patterns are cross-producted upstream, so in
+    // practice both chunks are bound by the same loop and both updates land in it; placing
+    // the drain after that loop guarantees each set is complete before the search runs.
+    setInsertionInto(ownerBlock(sourceChunk));
+    _builder.create<nl::ShortestPathUpdate>(loc, state, sourceChunk, /*target=*/false);
+
+    setInsertionInto(ownerBlock(targetChunk));
+    _builder.create<nl::ShortestPathUpdate>(loc, state, targetChunk, /*target=*/true);
+
+    // The emit phase: an nl.shortest_path source runs the weighted search once, reading
+    // the edge weight through the hoisted property handle, and yields the one result row.
+    // The distance chunk is the weight property's value type (resolved here against the
+    // schema, since the db distance column is a none placeholder), and it is plain, not
+    // nullable - the one emitted row always carries a distance. The path chunk is a path.
+    const mlir::Value handle = getOrCreatePropertyTypeHandle(edgeProperty);
+
+    if (!_view) {
+        throw IRException("Lowering a shortest path needs a graph to resolve the weight property '" + edgeProperty.str() + "'");
+    }
+
+    const std::optional<PropertyType> weightType = _view->metadata().propTypes().get(edgeProperty);
+    if (!weightType) {
+        throw IRException("Unknown property '" + edgeProperty.str() + "'");
+    }
+
+    const mlir::Type distanceElement = valueTypeToElementType(_builder, weightType->_valueType);
+
+    llvm::SmallVector<mlir::Type, 2> chunkTypes;
+    chunkTypes.push_back(nl::ChunkType::get(context, distanceElement));
+    chunkTypes.push_back(nl::ChunkType::get(context, storage::PathType::get(context)));
+
+    const nl::IteratorType iteratorType = nl::IteratorType::get(context, chunkTypes);
+
+    setInsertionInto(_rootBlock);
+    nl::ShortestPath searchOp = _builder.create<nl::ShortestPath>(loc, iteratorType, state, handle);
+    buildLoopForSource(searchOp.getResult(), shortestPath.getOperation());
 }
 
 void DBLowering::lowerUnwindCollect(mlir::db::UnwindCollect unwindCollect) {
@@ -1367,12 +5077,15 @@ void DBLowering::lowerUnwindCollect(mlir::db::UnwindCollect unwindCollect) {
 
     // The accumulate phase is identical to lowerCollect: a hoisted nl.collect_buffer
     // and an nl.collect_update in the producing loop body.
-    _builder.setInsertionPointToStart(_entryBlock);
-    nl::CollectBuffer bufferOp = _builder.create<nl::CollectBuffer>(loc, keyCount);
+    _builder.setInsertionPointToStart(_rootBlock);
+    nl::CollectBuffer bufferOp = _builder.create<nl::CollectBuffer>(loc,
+                                                                    keyCount,
+                                                                    mlir::DenseI64ArrayAttr {},
+                                                                    mlir::DenseI64ArrayAttr {});
     const mlir::Value state = bufferOp.getState();
 
     const mlir::Value representative = chunks.front();
-    setInsertionInto(ownerBlock(representative));
+    setInsertionInto(accumulatorUpdateBlock(ownerBlock(representative)));
     _builder.create<nl::CollectUpdate>(loc, state, chunks);
 
     // The emit phase: an nl.unwind_collect source iterator yielding one row per element - the
@@ -1387,53 +5100,376 @@ void DBLowering::lowerUnwindCollect(mlir::db::UnwindCollect unwindCollect) {
 
     const nl::IteratorType iteratorType = nl::IteratorType::get(context, chunkTypes);
 
-    setInsertionInto(_entryBlock);
+    setInsertionInto(_rootBlock);
     nl::UnwindCollect unwindCollectOp = _builder.create<nl::UnwindCollect>(loc, iteratorType, state);
     buildLoopForSource(unwindCollectOp.getResult(), unwindCollect.getOperation());
 }
 
-void DBLowering::assignProducerLoops(mlir::Value column, mlir::Value handle) {
+void DBLowering::lowerCallProcedure(mlir::db::CallProcedure call) {
+    const Procedure* procedure = procedureFor(call.getProcedure());
+
+    // One column per written argument, in declaration order, so operand i is argument
+    // i - the call cannot bind an argument by name. The optional arguments come last
+    // and a call may stop short of them, leaving the procedure to read their slots as
+    // unbound, so the required count is the floor rather than the count itself.
+    const mlir::OperandRange inputs = call.getInputs();
+    const ProcedureTypeVector& argumentTypes = procedure->argumentTypes();
+    const size_t requiredCount = procedure->getRequiredArgumentCount();
+    const bool tooFewArguments = inputs.size() < requiredCount;
+    const bool tooManyArguments = inputs.size() > argumentTypes.size();
+    if (tooFewArguments || tooManyArguments) {
+        throw IRException("db.call_procedure of '" + call.getProcedure().str() + "' passes "
+                          + std::to_string(inputs.size()) + " arguments, but the procedure declares "
+                          + std::to_string(argumentTypes.size()) + ", "
+                          + std::to_string(requiredCount) + " of them required");
+    }
+
+    // CallProcedure::verify guarantees one result per yielded name plus one per carried
+    // column, with at least one yield, so the ranges below line up. Each yielded name
+    // resolves to one of the procedure's declared return values, whose type is the
+    // chunk the result is read as; an unknown name throws here.
+    const mlir::ArrayAttr yields = call.getYields();
+    llvm::SmallVector<mlir::Type, 4> chunkTypes;
+    for (const mlir::Attribute yield : yields) {
+        const llvm::StringRef name = mlir::cast<mlir::StringAttr>(yield).getValue();
+        const std::string_view yieldName(name.data(), name.size());
+        const size_t returnIndex = procedure->getReturnValueIndex(yieldName);
+        const NamedProcedureType& returnValue = procedure->returnValues()[returnIndex];
+
+        chunkTypes.push_back(procedureChunkType(_builder, returnValue));
+    }
+
+    // Each carried column comes back with its own chunk type - the call replicates its
+    // rows, it never retypes them - so the carried chunks follow the yields in both the
+    // result types and the result mapping.
+    const mlir::OperandRange carriedColumns = call.getCarriedColumns();
+
+    // A carried row is replicated once per row the procedure emitted for it, which only
+    // the procedure can say - it reports the input row behind each row it emits. One
+    // that does not declare that report cannot be carried past at all, and this is where
+    // that is settled: at plan time, rather than mid-execution once the rows fail to
+    // line up.
+    if (!carriedColumns.empty() && !procedure->hasIndices()) {
+        throw IRException("db.call_procedure of '" + call.getProcedure().str()
+                          + "' carries columns past it, but the procedure does not report the input"
+                            " row of the rows it emits, so they could not be aligned with its"
+                            " result");
+    }
+
+    llvm::SmallVector<mlir::Value, 4> carriedChunks;
+    for (const mlir::Value carried : carriedColumns) {
+        const mlir::Value carriedChunk = mapValue(carried);
+
+        carriedChunks.push_back(carriedChunk);
+        chunkTypes.push_back(carriedChunk.getType());
+    }
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const mlir::Location loc = _builder.getUnknownLoc();
+
+    // The call handle is hoisted to the top of the root block, above every loop of
+    // this dataflow, so the procedure is prepared once per step of that block - its
+    // data allocated and its result columns bound - before the loops that drive it,
+    // and the handle dominates every op that names it.
+    _builder.setInsertionPointToStart(_rootBlock);
+    const mlir::Value state = _builder.create<nl::Procedure>(loc, call.getProcedureAttr(), yields).getState();
+
+    llvm::SmallVector<mlir::Value, 4> inputChunks;
+    for (const mlir::Value input : inputs) {
+        inputChunks.push_back(mapValue(input));
+    }
+
+    // A procedure is driven by a loop of its own, the way a scan or a hop is, and each
+    // step of that nl.for runs the procedure once until it has answered that chunk of
+    // arguments in full - so one chunk of arguments may yield many chunks of rows.
+    //
+    // The loop opens where the arguments are bound: the innermost producing loop body. A
+    // call whose arguments are all loop-invariant - constants, or none at all - has no
+    // producing loop to sit in, so it opens its loop where the current dataflow is
+    // rooted, exactly as a scan does: the entry block at top level, or the outer factor's
+    // innermost loop body inside a db.cross_product, so the factor nests under it.
+    // Rooting such a call at the entry block instead would leave it outside the product's
+    // nest, referring to chunks that do not dominate it.
+    llvm::SmallVector<mlir::Value, 8> operandChunks(inputChunks.begin(), inputChunks.end());
+    operandChunks.append(carriedChunks.begin(), carriedChunks.end());
+
+    // Anchored on the deepest-bound operand, so a loop-bound argument or carried column
+    // is found wherever it sits in the operand list, behind any hoisted constants.
+    const mlir::Value anchorChunk = deepestBoundChunk(operandChunks);
+
+    mlir::Block* insertionBlock = _rootBlock;
+    if (anchorChunk) {
+        mlir::Block* const argumentBlock = ownerBlock(anchorChunk);
+
+        // A factor shares no SSA value with its sibling, so an argument bound anywhere
+        // but function scope is bound inside this factor's own nest.
+        if (argumentBlock != _entryBlock) {
+            insertionBlock = argumentBlock;
+        }
+    }
+
+    setInsertionInto(insertionBlock);
+
+    const nl::IteratorType iteratorType = nl::IteratorType::get(context, chunkTypes);
+    nl::ProcedureInit init = _builder.create<nl::ProcedureInit>(loc,
+                                                               iteratorType,
+                                                               state,
+                                                               inputChunks,
+                                                               carriedChunks);
+
+    // buildLoopForSource binds one loop variable per yielded return value and then per
+    // carried column, and maps db.call_procedure's results to them, so the db.output that
+    // follows lowers into the drive loop's body reading that step's rows.
+    buildLoopForSource(init.getResult(), call.getOperation());
+}
+
+const Procedure* DBLowering::procedureFor(llvm::StringRef name) const {
+    if (!_procedures) {
+        throw IRException("db.call_procedure requires a procedure registry, but the lowering was "
+                          "created without one");
+    }
+
+    const Procedure* procedure = _procedures->getProcedure(std::string_view(name.data(), name.size()));
+    if (!procedure) {
+        throw IRException("Procedure '" + name.str() + "' does not exist");
+    }
+
+    return procedure;
+}
+
+bool DBLowering::assignProducerLoops(mlir::Value column,
+                                     mlir::Value handle,
+                                     bool rowsDroppedBeforeTheCut,
+                                     mlir::Operation* holder) {
+    bool reachedALoop = false;
+    if (findCoveringProducerVisit(column, rowsDroppedBeforeTheCut, reachedALoop)) {
+        return reachedALoop;
+    }
+
+    llvm::SmallVector<ProducerWalkFrame> frames;
+    frames.emplace_back();
+    visitProducer(column, handle, rowsDroppedBeforeTheCut, holder, frames.back());
+
+    for (;;) {
+        ProducerWalkFrame& frame = frames.back();
+
+        if (frame._nextOperand < frame._operands.size()) {
+            const mlir::Value operand = frame._operands[frame._nextOperand];
+            const bool operandRowsDropped = frame._operandsRowsDropped;
+            frame._nextOperand++;
+
+            bool operandReachedALoop = false;
+            if (findCoveringProducerVisit(operand, operandRowsDropped, operandReachedALoop)) {
+                frame._reachedALoop = frame._reachedALoop || operandReachedALoop;
+                continue;
+            }
+
+            frames.emplace_back();
+            visitProducer(operand, handle, operandRowsDropped, holder, frames.back());
+            continue;
+        }
+
+        _producerWalkVisits[frame._column] = ProducerWalkVisit {frame._reachedALoop, frame._rowsDroppedBeforeTheCut};
+        const bool frameReachedALoop = frame._reachedALoop;
+        frames.pop_back();
+
+        if (frames.empty()) {
+            return frameReachedALoop;
+        }
+
+        ProducerWalkFrame& parent = frames.back();
+        parent._reachedALoop = parent._reachedALoop || frameReachedALoop;
+    }
+}
+
+// A visit with rows dropped claims a subset of what one without claims, and reaches the
+// same loops, so only a visit without them can add to one made with them
+bool DBLowering::findCoveringProducerVisit(mlir::Value column, bool rowsDroppedBeforeTheCut, bool& reachedALoop) const {
+    const auto visitIt = _producerWalkVisits.find(column);
+    const bool wasVisited = visitIt != _producerWalkVisits.end();
+    const bool isCovered = wasVisited && (rowsDroppedBeforeTheCut || !visitIt->second._rowsDroppedBeforeTheCut);
+    if (isCovered) {
+        reachedALoop = visitIt->second._reachedALoop;
+    }
+
+    return isCovered;
+}
+
+void DBLowering::visitProducer(mlir::Value column,
+                               mlir::Value handle,
+                               bool rowsDroppedBeforeTheCut,
+                               mlir::Operation* holder,
+                               ProducerWalkFrame& frame) {
+    frame._column = column;
+    frame._rowsDroppedBeforeTheCut = rowsDroppedBeforeTheCut;
+    frame._operandsRowsDropped = rowsDroppedBeforeTheCut;
+
     mlir::Operation* const definingOp = column.getDefiningOp();
     if (!definingOp) {
-        // A cross-product factor's loop variable is a block argument with no
-        // defining op; its producing loop is reached through the factor's yield
-        // in the cross-product branch below, not from here.
+        // A subquery body reads the rows in flight through its block arguments, so the
+        // walk carries on from the input column each one stands for. A cross-product
+        // factor's loop variable is a block argument too, with no producer to reach from
+        // here: its loop is reached through the factor's yield in the branch below.
+        const mlir::BlockArgument argument = mlir::cast<mlir::BlockArgument>(column);
+        mlir::Operation* const bodyHolder = argument.getOwner()->getParentOp();
+        const mlir::OperandRange inputs = subqueryInputColumns(bodyHolder);
+
+        if (argument.getArgNumber() >= inputs.size()) {
+            return;
+        }
+
+        // The handle this body holds is created inside the loop over its input rows, so a
+        // loop outside the body cannot carry it: the walk stops at the boundary.
+        if (bodyHolder == holder) {
+            return;
+        }
+
+        frame._operands.push_back(inputs[argument.getArgNumber()]);
         return;
     }
 
-    const bool opensLoop = mlir::isa<mlir::db::ScanNodes,
-                                     mlir::db::ConstScanNodes,
-                                     mlir::db::ScanNodesByLabel,
-                                     mlir::db::ScanEdges,
-                                     mlir::db::GetOutEdges,
-                                     mlir::db::GetInEdges,
-                                     mlir::db::GetOutEdgesByType,
-                                     mlir::db::GetInEdgesByType>(definingOp);
+    const bool opensLoop = opensSourceLoop(definingOp);
     const bool isCrossProduct = mlir::isa<mlir::db::CrossProduct>(definingOp);
+    const bool isHashJoin = mlir::isa<mlir::db::HashJoin>(definingOp);
+    const bool isSubquery = mlir::isa<mlir::db::CallSubquery>(definingOp);
+
+    const bool emitsThroughLoop = isSubquery
+                                  || mlir::isa<mlir::db::Sort,
+                                               mlir::db::GroupAggregate,
+                                               mlir::db::OptionalMatch>(definingOp);
+
+    // A subquery expression run one row at a time loops over the rows in flight, a row a
+    // step, and the rest of the query goes on inside that loop
+    const bool loopsOverSingleRows = isSubqueryExpression(definingOp)
+                                     && runsPerRow(definingOp)
+                                     && !subqueryInputColumns(definingOp).empty();
+
+    // A sort or a grouped aggregate accumulates the whole relation before emitting any of
+    // it, so the loops feeding it have to see every row: the walk stops and the limit
+    // budgets the emit loop alone. So does a materialize, whose scans are the emit loops.
+    // An optional match accumulates one step of the rows it joins onto rather than the
+    // relation, and emits them in input order, so once the budget is spent no later step
+    // can contribute a row - the walk carries on and bounds the loops feeding it too.
+    const bool accumulatesTheRelation = mlir::isa<mlir::db::Sort,
+                                                  mlir::db::GroupAggregate,
+                                                  mlir::db::Materialize>(definingOp);
+    const bool breaksPipeline = accumulatesTheRelation || reducesToOneRow(definingOp);
+
+    frame._reachedALoop = opensLoop || isCrossProduct || isHashJoin || emitsThroughLoop || loopsOverSingleRows;
+
+    // A loop's budget only stops it from taking another step, so bounding one never trims
+    // the step it is in. A cross product's or a hash join's budget cuts the rows it pairs,
+    // which stands only while every row it makes reaches the output: an op below the cut
+    // that drops rows - a filter, a skip, a dedup - would leave it discarding rows that
+    // would have survived, and the cut short of its count. So either keeps the handle only
+    // on a path that drops nothing; its factor loops take it either way.
+    // Declining the handle is not the same as reaching no loop: a cross product is still a
+    // producer the walk found, so reachedALoop stands and the cut keeps its nest.
+    const bool boundsCrossProduct = isCrossProduct && !rowsDroppedBeforeTheCut;
+    const bool boundsHashJoin = isHashJoin && !rowsDroppedBeforeTheCut;
+    const bool takesTheHandle = opensLoop || boundsCrossProduct || boundsHashJoin || emitsThroughLoop || loopsOverSingleRows;
 
     // The first limit, in program order, to claim a producer wins, so a loop
     // shared by two limits' nests carries the outer one and never two handles.
-    if ((opensLoop || isCrossProduct) && !_loopLimitHandle.count(definingOp)) {
+    if (takesTheHandle && !_loopLimitHandle.count(definingOp)) {
         _loopLimitHandle[definingOp] = handle;
     }
 
-    if (isCrossProduct) {
+    if (breaksPipeline) {
+        return;
+    }
+
+    const bool rowsDropped = rowsDroppedBeforeTheCut || dropsRows(definingOp);
+    frame._operandsRowsDropped = rowsDropped;
+
+    if (isHashJoin) {
+        // A hash join's built side has to be read whole - a build loop stopped short of
+        // its rows would leave the probe unable to match them - so the budget reaches only
+        // the probed factor's loops. That is the left factor, the one the probe walks.
+        mlir::db::HashJoin join = mlir::cast<mlir::db::HashJoin>(definingOp);
+        mlir::Operation* const probeYield = join.getLeftFactor().front().getTerminator();
+        for (const mlir::Value yielded : probeYield->getOperands()) {
+            frame._operands.push_back(yielded);
+        }
+    } else if (isCrossProduct) {
         // A cross product takes no column operands - its factors are regions - so
-        // recurse through each factor's db.yield operands to reach the factor
+        // walk through each factor's db.yield operands to reach the factor
         // scans/edge loops that produce the crossed columns.
         mlir::db::CrossProduct cross = mlir::cast<mlir::db::CrossProduct>(definingOp);
         mlir::Region* const factors[] = {&cross.getLeftFactor(), &cross.getRightFactor()};
         for (mlir::Region* const factor : factors) {
             mlir::Operation* const yield = factor->front().getTerminator();
             for (const mlir::Value yielded : yield->getOperands()) {
-                assignProducerLoops(yielded, handle);
+                frame._operands.push_back(yielded);
+            }
+        }
+    } else if (isSubquery) {
+        // A subquery's results come out of its body, so the walk goes through the body's
+        // yield to the loops inside it, and from them through the block arguments back to
+        // the inputs' own loops. A body that carries nothing hands its inputs back through
+        // the op itself, so the walk reaches them from here.
+        mlir::db::CallSubquery call = mlir::cast<mlir::db::CallSubquery>(definingOp);
+        mlir::Operation* const yield = call.getBody().front().getTerminator();
+        for (const mlir::Value yielded : yield->getOperands()) {
+            frame._operands.push_back(yielded);
+        }
+
+        if (!call.getCarriesScope()) {
+            for (const mlir::Value input : call.getInputColumns()) {
+                frame._operands.push_back(input);
             }
         }
     } else {
         // A non-loop producer (a property fetch) is traversed but not assigned -
         // it opens no loop - so its input chunk's loop is still reached.
         for (const mlir::Value operand : definingOp->getOperands()) {
-            assignProducerLoops(operand, handle);
+            frame._operands.push_back(operand);
+        }
+    }
+}
+
+void DBLowering::assignCardinalityDriverLoop(mlir::db::Limit limit, mlir::Value handle, mlir::Operation* holder) {
+    mlir::Operation* const limitOp = limit.getOperation();
+
+    // The relation driving the projection is the loop opened last before the cut: its rows
+    // are the ones nl.output emits the constants over, so they are the rows this budget
+    // cuts. A reduction in between leaves no such loop - it emits its one row at function
+    // scope, and the relation behind it had to be read in full to reduce it.
+    // A row-dropping op only matters once the driver is behind it: what it drops are the
+    // driver's rows, which is what bars a cross-product driver from the budget.
+    mlir::Operation* driver = nullptr;
+    bool rowsDropped = false;
+    for (mlir::Operation& operation : *limitOp->getBlock()) {
+        if (&operation == limitOp) {
+            break;
+        }
+
+        if (opensRowLoop(&operation)) {
+            driver = &operation;
+            rowsDropped = false;
+        } else if (reducesToOneRow(&operation)) {
+            driver = nullptr;
+        } else if (dropsRows(&operation)) {
+            rowsDropped = true;
+        }
+    }
+
+    if (!driver) {
+        return;
+    }
+
+    assignProducerLoops(driver->getResult(0), handle, rowsDropped, holder);
+}
+
+void DBLowering::assignOptionalMatchLimits(mlir::db::Limit limit, mlir::Value handle) {
+    for (mlir::Operation* operation = limit->getPrevNode(); operation; operation = operation->getPrevNode()) {
+        const bool isOptionalMatch = mlir::isa<mlir::db::OptionalMatch>(operation);
+        const bool drainedUnderThisCut = isOptionalMatch && _loopLimitHandle.lookup(operation) == handle;
+
+        if (drainedUnderThisCut) {
+            _optionalMatchLimits[operation] = handle;
+        } else if (!keepsEveryRow(operation)) {
+            return;
         }
     }
 }
@@ -1482,9 +5518,12 @@ void DBLowering::foldTruncatesIntoOutputs(mlir::func::FuncOp nlFunction) {
         // The preceding nl.limit_update still sets that count. Drop the old output
         // and the now-unused truncate.
         _builder.setInsertionPoint(output);
-        _builder.create<nl::Output>(output.getLoc(), truncate.getColumns(),
-                                    truncate.getState(), mlir::Value(),
-                                    output.getCardinality());
+        _builder.create<nl::Output>(output.getLoc(),
+                                    truncate.getColumns(),
+                                    truncate.getState(),
+                                    mlir::Value(),
+                                    output.getCardinality(),
+                                    output.getColumnNamesAttr());
 
         output.erase();
         truncate.erase();
@@ -1545,11 +5584,112 @@ void DBLowering::foldSkipTruncatesIntoOutputs(mlir::func::FuncOp nlFunction) {
         // preceding nl.skip_update still sets that offset and count. Drop the old
         // output and the now-unused truncate.
         _builder.setInsertionPoint(output);
-        _builder.create<nl::Output>(output.getLoc(), truncate.getColumns(), mlir::Value(),
-                                    truncate.getState(), output.getCardinality());
+        _builder.create<nl::Output>(output.getLoc(),
+                                    truncate.getColumns(),
+                                    mlir::Value(),
+                                    truncate.getState(),
+                                    output.getCardinality(),
+                                    output.getColumnNamesAttr());
 
         output.erase();
         truncate.erase();
+    }
+}
+
+void DBLowering::foldBroadcastsIntoOutputs(mlir::func::FuncOp nlFunction) {
+    llvm::SmallVector<nl::Output, 4> foldable;
+
+    nlFunction.walk([&foldable](nl::Output output) {
+        const mlir::OperandRange columns = output.getColumns();
+        if (output.getCardinality() || columns.empty()) {
+            return;
+        }
+
+        mlir::Value sharedCardinality;
+        for (const mlir::Value column : columns) {
+            nl::BroadcastConstant broadcast = column.getDefiningOp<nl::BroadcastConstant>();
+            if (!broadcast || !column.hasOneUse()) {
+                return;
+            }
+
+            const mlir::Value cardinality = broadcast.getCardinality();
+            if (!cardinality) {
+                return;
+            } else if (!sharedCardinality) {
+                sharedCardinality = cardinality;
+            } else if (cardinality != sharedCardinality) {
+                return;
+            }
+        }
+
+        foldable.push_back(output);
+    });
+
+    for (nl::Output output : foldable) {
+        llvm::SmallVector<mlir::Value, 4> constants;
+        llvm::SmallVector<nl::BroadcastConstant, 4> broadcasts;
+        for (const mlir::Value column : output.getColumns()) {
+            nl::BroadcastConstant broadcast = column.getDefiningOp<nl::BroadcastConstant>();
+            constants.push_back(broadcast.getValue());
+            broadcasts.push_back(broadcast);
+        }
+
+        _builder.setInsertionPoint(output);
+        _builder.create<nl::Output>(output.getLoc(),
+                                    constants,
+                                    output.getLimit(),
+                                    output.getSkip(),
+                                    broadcasts.front().getCardinality(),
+                                    output.getColumnNamesAttr());
+
+        output.erase();
+        for (nl::BroadcastConstant broadcast : broadcasts) {
+            broadcast.erase();
+        }
+    }
+}
+
+mlir::Value DBLowering::propertyWriteChunk(llvm::StringRef propertyName, mlir::Value chunk) {
+    if (!_view || !_view->isValid()) {
+        return chunk;
+    }
+
+    // if the property type is a double in the db, but an integer was provided, convert
+    // that int to double
+    const GraphMetadata& metadata = _view->metadata();
+    const PropertyTypeMap& propTypes = metadata.propTypes();
+    const std::optional<PropertyType> propertyType = propTypes.get(propertyName);
+    if (!propertyType || propertyType->_valueType != ValueType::Double) {
+        return chunk;
+    }
+
+    const mlir::Type element = chunkValueElement(_builder, chunk.getType());
+    const auto integerElement = mlir::dyn_cast<mlir::IntegerType>(element);
+    if (!integerElement || integerElement.getWidth() != 64) {
+        return chunk;
+    }
+
+    return chunkAsElement(chunk, _builder.getF64Type());
+}
+
+void DBLowering::coercePropertyWriteChunks(mlir::ArrayAttr names,
+                                           llvm::SmallVectorImpl<mlir::Value>& chunks) {
+    for (size_t index = 0; index < chunks.size(); index++) {
+        const llvm::StringRef name = mlir::cast<mlir::StringAttr>(names[index]).getValue();
+
+        chunks[index] = propertyWriteChunk(name, chunks[index]);
+    }
+}
+
+void DBLowering::coerceGroupedPropertyWriteChunks(mlir::ArrayAttr groupedNames,
+                                                  llvm::SmallVectorImpl<mlir::Value>& chunks) {
+    size_t index = 0;
+
+    for (const mlir::Attribute group : groupedNames) {
+        for (const mlir::Attribute name : mlir::cast<mlir::ArrayAttr>(group)) {
+            chunks[index] = propertyWriteChunk(mlir::cast<mlir::StringAttr>(name).getValue(), chunks[index]);
+            index++;
+        }
     }
 }
 
@@ -1561,10 +5701,17 @@ void DBLowering::lowerCreateNode(mlir::db::CreateNode createNode) {
         propChunks.push_back(mapValue(propValue));
     }
 
-    if (propChunks.empty()) {
-        // Try find a block where the result of this create_node is used to create an edge
-        // Otherwise: entry block
-        mlir::Block* targetBlock = _entryBlock;
+    coercePropertyWriteChunks(createNode.getPropNames(), propChunks);
+
+    mlir::Value cardinalityChunk;
+    if (createNode.getCardinality()) {
+        cardinalityChunk = mapValue(createNode.getCardinality());
+    }
+
+    if (cardinalityChunk) {
+        setInsertionInto(ownerBlock(cardinalityChunk));
+    } else {
+        mlir::Block* targetBlock = _rootBlock;
         for (const mlir::OpOperand& use : createNode.getResult().getUses()) {
             auto createEdge = mlir::dyn_cast<mlir::db::CreateEdge>(use.getOwner());
             if (!createEdge) {
@@ -1579,33 +5726,25 @@ void DBLowering::lowerCreateNode(mlir::db::CreateNode createNode) {
                     continue;
                 }
                 mlir::Block* const candidateBlock = ownerBlock(it->second);
-                if (candidateBlock != _entryBlock) {
+                if (candidateBlock != _rootBlock) {
                     targetBlock = candidateBlock;
                     break;
                 }
             }
-            if (targetBlock != _entryBlock) {
+            if (targetBlock != _rootBlock) {
                 break;
             }
         }
 
         setInsertionInto(targetBlock);
-    } else {
-        mlir::Value reference = propChunks[0];
-        for (size_t i = 1; i < propChunks.size(); i++) {
-            mlir::Block* const block = deeperBlock(reference, propChunks[i]);
-            if (ownerBlock(propChunks[i]) == block) {
-                reference = propChunks[i];
-            }
-        }
-        setInsertionInto(ownerBlock(reference));
     }
 
     nl::CreateNode create = _builder.create<nl::CreateNode>(
         loc,
         createNode.getLabelsAttr(),
         createNode.getPropNamesAttr(),
-        propChunks);
+        propChunks,
+        cardinalityChunk);
     _valueMap[createNode.getResult()] = create.getResult();
 }
 
@@ -1619,19 +5758,12 @@ void DBLowering::lowerCreateEdge(mlir::db::CreateEdge createEdge) {
         propChunks.push_back(mapValue(propValue));
     }
 
-    mlir::Value reference = srcChunk;
-    {
-        mlir::Block* const block = deeperBlock(reference, tgtChunk);
-        if (ownerBlock(tgtChunk) == block) {
-            reference = tgtChunk;
-        }
-    }
-    for (const mlir::Value propChunk : propChunks) {
-        mlir::Block* const block = deeperBlock(reference, propChunk);
-        if (ownerBlock(propChunk) == block) {
-            reference = propChunk;
-        }
-    }
+    coercePropertyWriteChunks(createEdge.getPropNames(), propChunks);
+
+    llvm::SmallVector<mlir::Value, 8> operandChunks {srcChunk, tgtChunk};
+    operandChunks.append(propChunks.begin(), propChunks.end());
+
+    const mlir::Value reference = deepestBoundChunk(operandChunks);
     setInsertionInto(ownerBlock(reference));
 
     nl::CreateEdge create = _builder.create<nl::CreateEdge>(
@@ -1640,306 +5772,915 @@ void DBLowering::lowerCreateEdge(mlir::db::CreateEdge createEdge) {
         tgtChunk,
         createEdge.getEdgeTypeAttr(),
         createEdge.getPropNamesAttr(),
-        propChunks);
+        propChunks,
+        mapOptionalMask(createEdge.getSrcPending()),
+        mapOptionalMask(createEdge.getTgtPending()),
+        createEdge.getSrcAllPending(),
+        createEdge.getTgtAllPending());
     _valueMap[createEdge.getResult()] = create.getResult();
 }
 
+mlir::Value DBLowering::mapOptionalMask(mlir::Value mask) {
+    if (!mask) {
+        return mlir::Value();
+    }
+
+    return pendingMaskChunk(mapValue(mask));
+}
+
+// An OPTIONAL CALL pads the mask of a merged entity it returns with null, and the row it
+// pads names no entity, so none this change wrote
+mlir::Value DBLowering::pendingMaskChunk(mlir::Value chunk) {
+    if (!isNullableChunk(chunk.getType())) {
+        return chunk;
+    }
+
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+    const nl::ChunkType maskType = nl::ChunkType::get(context, storage::BoolType::get(context));
+
+    const mlir::Value notPending = _builder.create<nl::IsNotTrue>(loc, maskType, chunk).getResult();
+    return _builder.create<nl::Not>(loc, maskType, notPending).getResult();
+}
+
+void DBLowering::mapColumns(mlir::OperandRange columns, llvm::SmallVectorImpl<mlir::Value>& chunks) {
+    chunks.clear();
+    for (const mlir::Value column : columns) {
+        chunks.push_back(mapValue(column));
+    }
+}
+
+void DBLowering::lowerMerge(mlir::db::Merge merge) {
+    llvm::SmallVector<mlir::Value, 8> boundNodes;
+    llvm::SmallVector<mlir::Value, 8> boundPending;
+    llvm::SmallVector<mlir::Value, 8> nodePropValues;
+    llvm::SmallVector<mlir::Value, 8> edgePropValues;
+    llvm::SmallVector<mlir::Value, 8> carriedColumns;
+
+    mapColumns(merge.getBoundNodes(), boundNodes);
+    mapColumns(merge.getBoundPending(), boundPending);
+
+    for (mlir::Value& pending : boundPending) {
+        pending = rowAlignedChunk(pending, boundNodes.front());
+    }
+    mapColumns(merge.getNodePropValues(), nodePropValues);
+    mapColumns(merge.getEdgePropValues(), edgePropValues);
+    mapColumns(merge.getCarriedColumns(), carriedColumns);
+
+    coerceGroupedPropertyWriteChunks(merge.getNodePropNames(), nodePropValues);
+    coerceGroupedPropertyWriteChunks(merge.getEdgePropNames(), edgePropValues);
+
+    llvm::SmallVector<mlir::Value, 8> operandChunks(boundNodes);
+    operandChunks.append(boundPending.begin(), boundPending.end());
+    operandChunks.append(nodePropValues.begin(), nodePropValues.end());
+    operandChunks.append(edgePropValues.begin(), edgePropValues.end());
+    operandChunks.append(carriedColumns.begin(), carriedColumns.end());
+
+    // Inserted into the deepest block, where all the operands are defined. A merge whose
+    // operands are all bound above the root - literals alone - opens in the root, as a
+    // CREATE does, so a subquery branch that is not taken merges nothing.
+    mlir::Block* targetBlock = _rootBlock;
+    if (const mlir::Value insertionReference = deepestBoundChunk(operandChunks)) {
+        mlir::Block* const referenceBlock = ownerBlock(insertionReference);
+        if (enclosesBlock(_rootBlock, referenceBlock)) {
+            targetBlock = referenceBlock;
+        }
+    }
+
+    setInsertionInto(targetBlock);
+
+    for (mlir::Value& pending : boundPending) {
+        pending = pendingMaskChunk(pending);
+    }
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const mlir::Type nodeChunkType = nl::ChunkType::get(context, storage::NodeIDType::get(context));
+    const mlir::Type edgeChunkType = nl::ChunkType::get(context, storage::EdgeIDType::get(context));
+    const mlir::Type maskChunkType = nl::ChunkType::get(context, storage::BoolType::get(context));
+
+    const mlir::ArrayAttr nodeLabels = merge.getNodeLabels();
+    const size_t hopCount = nodeLabels.size() - 1;
+    const size_t matchedNodeCount = mlir::mergeMatchedNodeCount(nodeLabels);
+
+    llvm::SmallVector<mlir::Type, 8> resultTypes;
+    for (size_t nodeIndex = 0; nodeIndex < matchedNodeCount; nodeIndex++) {
+        resultTypes.push_back(nodeChunkType);
+        resultTypes.push_back(maskChunkType);
+    }
+
+    for (size_t hopIndex = 0; hopIndex < hopCount; hopIndex++) {
+        resultTypes.push_back(edgeChunkType);
+        resultTypes.push_back(maskChunkType);
+    }
+
+    resultTypes.push_back(maskChunkType);
+
+    for (const mlir::Value carriedChunk : carriedColumns) {
+        resultTypes.push_back(carriedChunk.getType());
+    }
+
+    nl::Merge nlMerge = _builder.create<nl::Merge>(_builder.getUnknownLoc(),
+                                                   resultTypes,
+                                                   merge.getNodeLabelsAttr(),
+                                                   merge.getNodePropNamesAttr(),
+                                                   merge.getEdgeTypesAttr(),
+                                                   merge.getEdgePropNamesAttr(),
+                                                   merge.getEdgeDirectionsAttr(),
+                                                   merge.getPendingNodesAttr(),
+                                                   boundNodes,
+                                                   boundPending,
+                                                   nodePropValues,
+                                                   edgePropValues,
+                                                   carriedColumns);
+
+    const mlir::ResultRange dbResults = merge.getResults();
+    const mlir::ResultRange nlResults = nlMerge.getResults();
+    for (size_t index = 0; index < dbResults.size(); index++) {
+        _valueMap[dbResults[index]] = nlResults[index];
+    }
+
+    // The merge grows or shrinks the rows in flight, so from here on what sizes a
+    // projection of constants alone is its own node chunk
+    _innermostCardinality = nlResults.front();
+}
+
+void DBLowering::lowerSetNodeProperty(mlir::db::SetNodeProperty setNodeProperty) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    const mlir::Value inputChunk = mapValue(setNodeProperty.getInputNodes());
+    const mlir::Value valueChunk = propertyWriteChunk(setNodeProperty.getProperty(),
+                                                      mapValue(setNodeProperty.getValue()));
+
+    mlir::Value reference = inputChunk;
+    mlir::Block* const block = deeperBlock(reference, valueChunk);
+    if (ownerBlock(valueChunk) == block) {
+        reference = valueChunk;
+    }
+    setInsertionInto(ownerBlock(reference));
+
+    _builder.create<nl::SetNodeProperty>(
+        loc,
+        inputChunk,
+        setNodeProperty.getPropertyAttr(),
+        valueChunk,
+        mapOptionalMask(setNodeProperty.getPending()),
+        mapOptionalMask(setNodeProperty.getRows()),
+        setNodeProperty.getAllPending());
+}
+
+void DBLowering::lowerSetEdgeProperty(mlir::db::SetEdgeProperty setEdgeProperty) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    const mlir::Value inputChunk = mapValue(setEdgeProperty.getInputEdges());
+    const mlir::Value valueChunk = propertyWriteChunk(setEdgeProperty.getProperty(),
+                                                      mapValue(setEdgeProperty.getValue()));
+
+    mlir::Value reference = inputChunk;
+    mlir::Block* const block = deeperBlock(reference, valueChunk);
+    if (ownerBlock(valueChunk) == block) {
+        reference = valueChunk;
+    }
+    setInsertionInto(ownerBlock(reference));
+
+    _builder.create<nl::SetEdgeProperty>(
+        loc,
+        inputChunk,
+        setEdgeProperty.getPropertyAttr(),
+        valueChunk,
+        mapOptionalMask(setEdgeProperty.getPending()),
+        mapOptionalMask(setEdgeProperty.getRows()),
+        setEdgeProperty.getAllPending());
+}
+
+void DBLowering::lowerDeleteNode(mlir::db::DeleteNode deleteNode) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    const mlir::Value inputChunk = mapValue(deleteNode.getInputNodes());
+
+    // The delete runs where its node chunk is live - the block that owns it.
+    setInsertionInto(ownerBlock(inputChunk));
+
+    _builder.create<nl::DeleteNode>(loc,
+                                    inputChunk,
+                                    deleteNode.getDetach(),
+                                    mapOptionalMask(deleteNode.getPending()),
+                                    deleteNode.getAllPending());
+}
+
+void DBLowering::lowerDeleteEdge(mlir::db::DeleteEdge deleteEdge) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    const mlir::Value inputChunk = mapValue(deleteEdge.getInputEdges());
+
+    setInsertionInto(ownerBlock(inputChunk));
+
+    _builder.create<nl::DeleteEdge>(loc,
+                                    inputChunk,
+                                    mapOptionalMask(deleteEdge.getPending()),
+                                    deleteEdge.getAllPending());
+}
+
 void DBLowering::lowerConstant(mlir::db::ConstantOp constant) {
-    // Constants are loop-invariant so hoist
-    _builder.setInsertionPointToStart(_entryBlock);
+    // Constants are loop-invariant so hoist, each behind the ones hoisted before it: an op
+    // goes after its own operands, and landing in front of an earlier constant would put it
+    // - and every region hanging under it - above a constant its body still reads.
+    setInsertionAfterHoistedConstants();
 
     nl::Constant nlConstant = _builder.create<nl::Constant>(_builder.getUnknownLoc(), constant.getValue());
     _valueMap[constant.getResult()] = nlConstant.getResult();
+    _lastHoistedConstant = nlConstant.getOperation();
 }
 
-void DBLowering::lowerAdd(mlir::db::AddOp add) {
-    const mlir::Value lhsChunk = mapValue(add.getLhs());
-    const mlir::Value rhsChunk = mapValue(add.getRhs());
+void DBLowering::lowerCurrentDateTime(mlir::db::CurrentDateTime currentDateTime) {
+    setInsertionAfterHoistedConstants();
 
-    const NumericOperand lhs = numericOperand(lhsChunk.getType());
-    const NumericOperand rhs = numericOperand(rhsChunk.getType());
+    const nl::ChunkType resultType
+        = nl::ChunkType::get(_builder.getContext(), storage::DateTimeType::get(_builder.getContext()));
 
-    const mlir::Type promoted = promoteNumeric(_builder, lhs.numeric, rhs.numeric);
-    const bool resultNullable = lhs.nullable || rhs.nullable;
+    nl::CurrentDateTime lowered
+        = _builder.create<nl::CurrentDateTime>(_builder.getUnknownLoc(), resultType);
 
-    mlir::Type resultElement = promoted;
-    if (resultNullable) {
-        resultElement = storage::NullableType::get(_builder.getContext(), promoted);
+    _valueMap[currentDateTime.getResult()] = lowered.getResult();
+    _lastHoistedConstant = lowered.getOperation();
+}
+
+void DBLowering::setInsertionAfterHoistedConstants() {
+    if (_lastHoistedConstant) {
+        _builder.setInsertionPointAfter(_lastHoistedConstant);
+    } else {
+        _builder.setInsertionPointToStart(_entryBlock);
+    }
+}
+
+void DBLowering::setInsertionToEntryBlockStart() {
+    _builder.setInsertionPointToStart(_entryBlock);
+    _lastHoistedConstant = nullptr;
+}
+
+void DBLowering::lowerBroadcastConstant(mlir::db::BroadcastConstant broadcast) {
+    const mlir::Value driver = broadcast.getDriver();
+    const mlir::Value driverChunk = driver ? mapValue(driver) : mlir::Value();
+
+    _valueMap[broadcast.getResult()] = rowAlignedChunk(mapValue(broadcast.getValue()), driverChunk);
+}
+
+void DBLowering::lowerToNullable(mlir::db::ToNullable toNullable) {
+    const mlir::Value chunk = mapValue(toNullable.getOperand());
+    const mlir::Type element = mlir::cast<nl::ChunkType>(chunk.getType()).getElementType();
+
+    _valueMap[toNullable.getResult()] = toNullableChunk(chunk, element);
+}
+
+mlir::Type DBLowering::binaryResultElement(BinaryResultKind kind,
+                                           mlir::Type lhsType,
+                                           mlir::Type rhsType) {
+    mlir::MLIRContext* const ctx = _builder.getContext();
+
+    // The mask of a null test on a column carrying its own null holds no null of its own,
+    // unlike the one a nullable value column gives.
+    const bool testsACarriedNull =
+        (carriesItsOwnNull(lhsType) && isUntypedNullChunk(rhsType))
+        || (carriesItsOwnNull(rhsType) && isUntypedNullChunk(lhsType));
+
+    const bool operandNullable = !testsACarriedNull
+                              && (isNullableChunk(lhsType) || isNullableChunk(rhsType));
+
+    switch (kind) {
+        case BinaryResultKind::Boolean:
+        case BinaryResultKind::Comparison: {
+            const mlir::Type boolElement = _builder.getI1Type();
+
+            // List comparison always nullable; either having a null element => null
+            const bool comparesTwoLists = isListChunk(lhsType) && isListChunk(rhsType);
+
+            // A cell may hold a null, or a value of another type than the one it meets
+            const bool comparesATaggedCell = !testsACarriedNull
+                                          && (holdsTaggedCells(lhsType) || holdsTaggedCells(rhsType));
+
+            const bool comparesAMapValue = !testsACarriedNull
+                                        && (isMapElementChunk(lhsType) || isMapElementChunk(rhsType));
+
+            // An ID column carries its null in the ID: the invalid one an OPTIONAL MATCH leaves
+            const bool lhsIsAnEntity = isEntityChunk(lhsType);
+            const bool rhsIsAnEntity = isEntityChunk(rhsType);
+            const bool comparesAnEntity = kind == BinaryResultKind::Comparison
+                                       && ((lhsIsAnEntity && (rhsIsAnEntity || isIntegerChunk(_builder, rhsType)))
+                                           || (rhsIsAnEntity && isIntegerChunk(_builder, lhsType)));
+
+            const bool alwaysNullable = operandNullable
+                                     || comparesTwoLists
+                                     || comparesATaggedCell
+                                     || comparesAMapValue
+                                     || comparesAnEntity;
+
+            return alwaysNullable ? storage::NullableType::get(ctx, boolElement)
+                                  : boolElement;
+        }
+        break;
+
+        case BinaryResultKind::Numeric: {
+            if (holdsTaggedCells(lhsType) || holdsTaggedCells(rhsType)) {
+                const mlir::Type cell = storage::AnyType::get(ctx);
+
+                // A cell beside a list joins it, as the list it holds or as one element
+                if (isListChunk(lhsType) || isListChunk(rhsType)) {
+                    return storage::NullableType::get(ctx, storage::ListType::get(ctx, cell));
+                }
+
+                return storage::NullableType::get(ctx, cell);
+            }
+
+            const mlir::Type lhsElement = chunkValueElement(_builder, lhsType);
+            const mlir::Type rhsElement = chunkValueElement(_builder, rhsType);
+
+            const bool lhsIsAnInstant = mlir::isa<storage::DateTimeType>(lhsElement);
+            const bool rhsIsAnInstant = mlir::isa<storage::DateTimeType>(rhsElement);
+            const bool lhsIsADuration = mlir::isa<storage::DurationType>(lhsElement);
+            const bool rhsIsADuration = mlir::isa<storage::DurationType>(rhsElement);
+            const bool computesTime = lhsIsAnInstant || rhsIsAnInstant || lhsIsADuration || rhsIsADuration;
+
+            if (computesTime) {
+                const mlir::Type duration = storage::DurationType::get(ctx);
+                const mlir::Type instant = storage::DateTimeType::get(ctx);
+                const mlir::Type temporal = lhsIsAnInstant != rhsIsAnInstant ? instant : duration;
+
+                return operandNullable ? storage::NullableType::get(ctx, temporal) : temporal;
+            }
+
+            const NumericOperand lhs = numericOperand(lhsType);
+            const NumericOperand rhs = numericOperand(rhsType);
+            const mlir::Type promoted = promoteNumeric(_builder, lhs.numeric, rhs.numeric);
+            const bool nullable = operandNullable || lhs.nullable || rhs.nullable;
+            return nullable ? storage::NullableType::get(ctx, promoted) : promoted;
+        }
+        break;
+
+        case BinaryResultKind::Double: {
+            const NumericOperand lhs = numericOperand(lhsType);
+            const NumericOperand rhs = numericOperand(rhsType);
+            const bool nullable = operandNullable || lhs.nullable || rhs.nullable;
+
+            const mlir::Type doubleElement = _builder.getF64Type();
+            return nullable ? storage::NullableType::get(ctx, doubleElement) : doubleElement;
+        }
+        break;
+
+        case BinaryResultKind::Concat: {
+            const bool lhsIsAList = isListChunk(lhsType);
+            const bool rhsIsAList = isListChunk(rhsType);
+            const bool lhsIsACell = holdsTaggedCells(lhsType);
+            const bool rhsIsACell = holdsTaggedCells(rhsType);
+            const bool readsACell = lhsIsACell || rhsIsACell;
+
+            // A type-erased cell holds a string or a list only where its row says so, and
+            // a row holding a null concatenates to null
+            const mlir::Type cell = storage::AnyType::get(ctx);
+
+            if (lhsIsACell && rhsIsACell) {
+                return storage::NullableType::get(ctx, cell);
+            } else if (readsACell && (lhsIsAList || rhsIsAList)) {
+                return storage::NullableType::get(ctx, storage::ListType::get(ctx, cell));
+            }
+
+            const bool concatenatesLists = lhsIsAList && rhsIsAList;
+
+            if (!concatenatesLists) {
+                if (lhsIsAList || rhsIsAList) {
+                    throw IRException("db.concat joins two lists or two strings, not one of each");
+                }
+
+                const mlir::Type stringElement = storage::StringType::get(ctx);
+                return operandNullable || readsACell ? storage::NullableType::get(ctx, stringElement)
+                                                     : stringElement;
+            }
+
+            // list concat
+            const mlir::Type lhsInnerType = listInternalType(lhsType);
+            const mlir::Type rhsInnerType = listInternalType(rhsType);
+
+            const bool sharedType = lhsInnerType == rhsInnerType;
+            const mlir::Type resultInnerType =
+                sharedType ? lhsInnerType : storage::AnyType::get(ctx);
+            const mlir::Type concatenated = storage::ListType::get(ctx, resultInnerType);
+
+            return operandNullable ? storage::NullableType::get(ctx, concatenated)
+                                   : concatenated;
+
+        }
+        break;
+
+        case BinaryResultKind::Index: {
+            if (!isIndexableChunk(lhsType)) {
+                throw IRException("db.list_index requires a list as its indexed operand");
+            }
+
+            const mlir::Type element = indexedListElementType(lhsType);
+
+            // An entity column carries its null in the ID, so a list of nodes or edges
+            // hands its elements back as the entity column they were gathered from
+            if (namesAnEntityType(element)) {
+                return element;
+            }
+
+            const mlir::Type indexed = namesAnIndexedValueType(element)
+                                           ? element
+                                           : storage::AnyType::get(ctx);
+
+            return storage::NullableType::get(ctx, indexed);
+        }
+        break;
+
+        case BinaryResultKind::Membership: {
+            // A tagged cell holds whatever its row put there, a list among it, so the test
+            // reads the list out of the tag rather than out of the column's own type
+            if (!isListChunk(rhsType) && !holdsTaggedCells(rhsType)) {
+                throw IRException("db.in requires a list as its right operand");
+            }
+
+            return storage::NullableType::get(ctx, _builder.getI1Type());
+        }
+        break;
     }
 
+    bioassert(false, "Unhandled binary result kind");
+}
+
+template <typename NLOp>
+void DBLowering::lowerBinaryOp(mlir::Operation& op, BinaryResultKind kind) {
+    mlir::Value lhsChunk = mapValue(op.getOperand(0));
+    mlir::Value rhsChunk = mapValue(op.getOperand(1));
+
+    const mlir::Type lhsChunkType = lhsChunk.getType();
+    const mlir::Type rhsChunkType = rhsChunk.getType();
+
+    const bool readsScalarOperands = kind != BinaryResultKind::Index
+                                  && kind != BinaryResultKind::Membership;
+
+    // A column carrying its own null is compared as it stands
+    const bool lhsReadsItsOwnNull = mayHoldANull(lhsChunkType) || carriesItsOwnNull(lhsChunkType);
+    const bool rhsReadsItsOwnNull = mayHoldANull(rhsChunkType) || carriesItsOwnNull(rhsChunkType);
+
+    const bool nullAgainstRhs = readsScalarOperands
+                             && isUntypedNullChunk(rhsChunkType)
+                             && !lhsReadsItsOwnNull;
+
+    const bool nullAgainstLhs = readsScalarOperands
+                             && isUntypedNullChunk(lhsChunkType)
+                             && !rhsReadsItsOwnNull;
+
+    // x IS NULL over a plain scalar column meets kernels reading a nullable value column
+    if (nullAgainstRhs) {
+        lhsChunk = nullTestedChunk(lhsChunk);
+    } else if (nullAgainstLhs) {
+        rhsChunk = nullTestedChunk(rhsChunk);
+    }
+
+    // AND, OR and XOR read a cell's truth value against a nullable boolean
+    constexpr bool CONNECTS_TRUTH_VALUES = std::is_same_v<NLOp, nl::And>
+                                      || std::is_same_v<NLOp, nl::Or>
+                                      || std::is_same_v<NLOp, nl::Xor>;
+
+    if constexpr (CONNECTS_TRUTH_VALUES) {
+        const bool lhsHoldsCells = holdsTaggedCells(lhsChunkType);
+        const bool rhsHoldsCells = holdsTaggedCells(rhsChunkType);
+
+        if (lhsHoldsCells && !rhsHoldsCells && !isUntypedNullChunk(rhsChunkType)) {
+            rhsChunk = nullableValueChunk(rhsChunk);
+        } else if (rhsHoldsCells && !lhsHoldsCells && !isUntypedNullChunk(lhsChunkType)) {
+            lhsChunk = nullableValueChunk(lhsChunk);
+        }
+    }
+
+    const mlir::Type resultElement = binaryResultElement(kind, lhsChunk.getType(), rhsChunk.getType());
     const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(), resultElement);
 
     setInsertionForBinaryOp(lhsChunk, rhsChunk);
 
-    const mlir::Location uloc = _builder.getUnknownLoc();
-    nl::Add addOp = _builder.create<nl::Add>(uloc, resultType, lhsChunk, rhsChunk);
-    _valueMap[add.getResult()] = addOp.getResult();
+    NLOp nlOp = _builder.create<NLOp>(_builder.getUnknownLoc(), resultType, lhsChunk, rhsChunk);
+    _valueMap[op.getResult(0)] = nlOp.getResult();
 }
 
-void DBLowering::lowerSub(mlir::db::SubOp sub) {
-    const mlir::Value lhsChunk = mapValue(sub.getLhs());
-    const mlir::Value rhsChunk = mapValue(sub.getRhs());
+mlir::Type DBLowering::caseResultElement(llvm::ArrayRef<mlir::Value> valueChunks) {
+    mlir::Type unified;
 
-    const NumericOperand lhs = numericOperand(lhsChunk.getType());
-    const NumericOperand rhs = numericOperand(rhsChunk.getType());
+    for (const mlir::Value chunk : valueChunks) {
+        const mlir::Type chunkType = chunk.getType();
 
-    const mlir::Type promoted = promoteNumeric(_builder, lhs.numeric, rhs.numeric);
-    const bool resultNullable = lhs.nullable || rhs.nullable;
+        // A null branch names no type of its own; what the others share is the column
+        if (isUntypedNullChunk(chunkType)) {
+            continue;
+        }
 
-    mlir::Type resultElement = promoted;
-    if (resultNullable) {
-        resultElement = storage::NullableType::get(_builder.getContext(), promoted);
+        const mlir::Type element = chunkValueElement(_builder, chunkType);
+        if (!unified) {
+            unified = element;
+            continue;
+        }
+
+        const mlir::Type shared = unifiedValueElement(_builder, unified, element);
+        unified = shared ? shared : storage::AnyType::get(_builder.getContext());
     }
 
-    const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(), resultElement);
-
-    setInsertionForBinaryOp(lhsChunk, rhsChunk);
-
-    const mlir::Location uloc = _builder.getUnknownLoc();
-    nl::Sub subOp = _builder.create<nl::Sub>(uloc, resultType, lhsChunk, rhsChunk);
-    _valueMap[sub.getResult()] = subOp.getResult();
-}
-
-void DBLowering::lowerMul(mlir::db::MulOp mul) {
-    const mlir::Value lhsChunk = mapValue(mul.getLhs());
-    const mlir::Value rhsChunk = mapValue(mul.getRhs());
-
-    const NumericOperand lhs = numericOperand(lhsChunk.getType());
-    const NumericOperand rhs = numericOperand(rhsChunk.getType());
-
-    const mlir::Type promoted = promoteNumeric(_builder, lhs.numeric, rhs.numeric);
-    const bool resultNullable = lhs.nullable || rhs.nullable;
-
-    mlir::Type resultElement = promoted;
-    if (resultNullable) {
-        resultElement = storage::NullableType::get(_builder.getContext(), promoted);
+    // Every branch is the null literal, so no branch says what the column holds. The rows
+    // are all absent whichever type carries them, so they ride the integer column an
+    // untyped null is laid out over anywhere else.
+    if (!unified) {
+        return _builder.getIntegerType(64);
     }
 
-    const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(), resultElement);
+    // A node or an edge is selected as the entity it is rather than as its ID's integer,
+    // so the selection answers a column the rest of the query still reads as an entity.
+    const bool isEntity = mlir::isa<storage::NodeIDType, storage::EdgeIDType>(unified);
+    const bool isValue = elementTypeToValueType(unified) != ValueType::Invalid;
+    const bool isAny = mlir::isa<storage::AnyType>(unified);
 
-    setInsertionForBinaryOp(lhsChunk, rhsChunk);
-
-    const mlir::Location uloc = _builder.getUnknownLoc();
-    nl::Mul mulOp = _builder.create<nl::Mul>(uloc, resultType, lhsChunk, rhsChunk);
-    _valueMap[mul.getResult()] = mulOp.getResult();
-}
-
-void DBLowering::lowerDiv(mlir::db::DivOp div) {
-    const mlir::Value lhsChunk = mapValue(div.getLhs());
-    const mlir::Value rhsChunk = mapValue(div.getRhs());
-
-    const NumericOperand lhs = numericOperand(lhsChunk.getType());
-    const NumericOperand rhs = numericOperand(rhsChunk.getType());
-
-    const mlir::Type promoted = promoteNumeric(_builder, lhs.numeric, rhs.numeric);
-
-    // Division by zero yields null, so the result is always nullable.
-    const mlir::Type resultElement = storage::NullableType::get(_builder.getContext(), promoted);
-    const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(), resultElement);
-
-    setInsertionForBinaryOp(lhsChunk, rhsChunk);
-
-    const mlir::Location uloc = _builder.getUnknownLoc();
-    nl::Div divOp = _builder.create<nl::Div>(uloc, resultType, lhsChunk, rhsChunk);
-    _valueMap[div.getResult()] = divOp.getResult();
-}
-
-void DBLowering::lowerEq(mlir::db::EqOp eq) {
-    const mlir::Value lhsChunk = mapValue(eq.getLhs());
-    const mlir::Value rhsChunk = mapValue(eq.getRhs());
-
-    const mlir::Type lhsType = lhsChunk.getType();
-    const mlir::Type rhsType = rhsChunk.getType();
-
-    const bool resultNull = isNullableChunk(lhsType) || isNullableChunk(rhsType);
-
-    const mlir::Type boolElement = _builder.getI1Type();
-    mlir::Type resultElement = boolElement;
-    mlir::MLIRContext* bldCtxt = _builder.getContext();
-    if (resultNull) {
-        resultElement = storage::NullableType::get(bldCtxt, boolElement);
+    if (!isEntity && !isValue && !isAny) {
+        throw IRException("db.case requires value or entity branches");
     }
 
-    const nl::ChunkType resultType = nl::ChunkType::get(bldCtxt, resultElement);
-
-    setInsertionForBinaryOp(lhsChunk, rhsChunk);
-
-    nl::Eq eqOp = _builder.create<nl::Eq>(_builder.getUnknownLoc(), resultType, lhsChunk, rhsChunk);
-    _valueMap[eq.getResult()] = eqOp.getResult();
+    return unified;
 }
 
-void DBLowering::lowerGt(mlir::db::GtOp gt) {
-    const mlir::Value lhsChunk = mapValue(gt.getLhs());
-    const mlir::Value rhsChunk = mapValue(gt.getRhs());
+mlir::Value DBLowering::chunkAsElement(mlir::Value chunk, mlir::Type resultElement) {
+    const mlir::Type chunkType = chunk.getType();
 
-    const bool resultNull = isNullableChunk(lhsChunk.getType()) || isNullableChunk(rhsChunk.getType());
-
-    const mlir::Type boolElement = _builder.getI1Type();
-    mlir::MLIRContext* bldCtxt = _builder.getContext();
-    mlir::Type resultElement = boolElement;
-    if (resultNull) {
-        resultElement = storage::NullableType::get(bldCtxt, boolElement);
+    // A null branch is left as the untyped null it is: the selection writes an absent
+    // value for the rows that take it, whatever the column holds elsewhere
+    if (isUntypedNullChunk(chunkType)) {
+        return chunk;
+    } else if (chunkValueElement(_builder, chunkType) == resultElement) {
+        return chunk;
+    } else if (mlir::isa<storage::ListType>(resultElement)) {
+        return chunk;
+    } else if (mlir::isa<storage::AnyType>(resultElement)) {
+        return listItemChunk(chunk);
     }
 
-    const nl::ChunkType resultType = nl::ChunkType::get(bldCtxt, resultElement);
+    mlir::MLIRContext* const context = _builder.getContext();
+    const nl::ChunkType convertedType
+        = nl::ChunkType::get(context, storage::NullableType::get(context, resultElement));
 
-    setInsertionForBinaryOp(lhsChunk, rhsChunk);
+    mlir::OpBuilder::InsertionGuard guard(_builder);
+    setInsertionForUnaryOp(chunk);
 
-    nl::Gt gtOp = _builder.create<nl::Gt>(_builder.getUnknownLoc(), resultType, lhsChunk, rhsChunk);
-    _valueMap[gt.getResult()] = gtOp.getResult();
+    if (mlir::isa<mlir::Float64Type>(resultElement)) {
+        return _builder.create<nl::ToFloat>(_builder.getUnknownLoc(), convertedType, chunk).getResult();
+    }
+
+    return _builder.create<nl::ToInteger>(_builder.getUnknownLoc(), convertedType, chunk).getResult();
 }
 
-void DBLowering::lowerLt(mlir::db::LtOp lt) {
-    const mlir::Value lhsChunk = mapValue(lt.getLhs());
-    const mlir::Value rhsChunk = mapValue(lt.getRhs());
-
-    const bool resultNull = isNullableChunk(lhsChunk.getType()) || isNullableChunk(rhsChunk.getType());
-
-    const mlir::Type boolElement = _builder.getI1Type();
-    mlir::MLIRContext* bldCtxt = _builder.getContext();
-    mlir::Type resultElement = boolElement;
-    if (resultNull) {
-        resultElement = storage::NullableType::get(bldCtxt, boolElement);
+void DBLowering::lowerCase(mlir::db::Case caseOp) {
+    llvm::SmallVector<mlir::Value, 4> conditions;
+    for (const mlir::Value condition : caseOp.getConditions()) {
+        conditions.push_back(mapValue(condition));
     }
 
-    const nl::ChunkType resultType = nl::ChunkType::get(bldCtxt, resultElement);
+    llvm::SmallVector<mlir::Value, 4> values;
+    for (const mlir::Value value : caseOp.getValues()) {
+        values.push_back(mapValue(value));
+    }
 
-    setInsertionForBinaryOp(lhsChunk, rhsChunk);
+    const mlir::Value dbDefault = caseOp.getDefaultValue();
+    mlir::Value defaultValue = dbDefault ? mapValue(dbDefault) : mlir::Value();
 
-    nl::Lt ltOp = _builder.create<nl::Lt>(_builder.getUnknownLoc(), resultType, lhsChunk, rhsChunk);
-    _valueMap[lt.getResult()] = ltOp.getResult();
+    const auto gatherOperands = [&](llvm::SmallVectorImpl<mlir::Value>& gathered) {
+        gathered.assign(conditions.begin(), conditions.end());
+        gathered.append(values.begin(), values.end());
+
+        if (defaultValue) {
+            gathered.push_back(defaultValue);
+        }
+    };
+
+    llvm::SmallVector<mlir::Value, 8> operands;
+    gatherOperands(operands);
+
+    // A selection walks rows and a constant carries none of its own, so every branch is
+    // first laid out over the relation driving the CASE - the kernel then reads one cell
+    // of each condition and each value per row it writes
+    const mlir::Value cardinality = cardinalityDriver(operands);
+
+    for (mlir::Value& condition : conditions) {
+        condition = rowAlignedChunk(condition, cardinality);
+    }
+
+    for (mlir::Value& value : values) {
+        value = rowAlignedChunk(value, cardinality);
+    }
+
+    if (defaultValue) {
+        defaultValue = rowAlignedChunk(defaultValue, cardinality);
+    }
+
+    llvm::SmallVector<mlir::Value, 5> valueChunks(values.begin(), values.end());
+    if (defaultValue) {
+        valueChunks.push_back(defaultValue);
+    }
+
+    const mlir::Type resultElement = caseResultElement(valueChunks);
+
+    for (mlir::Value& value : values) {
+        value = chunkAsElement(value, resultElement);
+    }
+
+    if (defaultValue) {
+        defaultValue = chunkAsElement(defaultValue, resultElement);
+    }
+
+    gatherOperands(operands);
+
+    const nl::ChunkType resultType = caseResultChunkType(resultElement);
+
+    setInsertionForNaryOp(operands);
+
+    nl::Case nlCase = _builder.create<nl::Case>(_builder.getUnknownLoc(),
+                                                resultType,
+                                                conditions,
+                                                values,
+                                                defaultValue);
+    _valueMap[caseOp.getResult()] = nlCase.getResult();
 }
 
-void DBLowering::lowerGte(mlir::db::GteOp gte) {
-    const mlir::Value lhsChunk = mapValue(gte.getLhs());
-    const mlir::Value rhsChunk = mapValue(gte.getRhs());
+nl::ChunkType DBLowering::caseResultChunkType(mlir::Type resultElement) {
+    // A row matching no branch of a defaultless CASE is absent, and so is one taking a
+    // null branch, so the selection always lands in a column that can hold an absent row.
+    // An entity column already can - it carries its null in the ID an OPTIONAL MATCH left
+    // invalid - and so can a !storage.any column, in the tag; every scalar lands in a
+    // nullable one.
+    mlir::MLIRContext* const context = _builder.getContext();
+    const bool holdsItsNull = mlir::isa<storage::NodeIDType, storage::EdgeIDType, storage::AnyType>(resultElement);
+    const mlir::Type resultChunkElement = holdsItsNull
+        ? resultElement
+        : storage::NullableType::get(context, resultElement);
 
-    const bool resultNull = isNullableChunk(lhsChunk.getType()) || isNullableChunk(rhsChunk.getType());
-
-    const mlir::Type boolElement = _builder.getI1Type();
-    mlir::MLIRContext* bldCtxt = _builder.getContext();
-    mlir::Type resultElement = boolElement;
-    if (resultNull) {
-        resultElement = storage::NullableType::get(bldCtxt, boolElement);
-    }
-
-    const nl::ChunkType resultType = nl::ChunkType::get(bldCtxt, resultElement);
-
-    setInsertionForBinaryOp(lhsChunk, rhsChunk);
-
-    nl::Gte gteOp = _builder.create<nl::Gte>(_builder.getUnknownLoc(), resultType, lhsChunk, rhsChunk);
-    _valueMap[gte.getResult()] = gteOp.getResult();
+    return nl::ChunkType::get(context, resultChunkElement);
 }
 
-void DBLowering::lowerLte(mlir::db::LteOp lte) {
-    const mlir::Value lhsChunk = mapValue(lte.getLhs());
-    const mlir::Value rhsChunk = mapValue(lte.getRhs());
+void DBLowering::lowerLazyCase(mlir::db::LazyCase caseOp) {
+    const mlir::Location loc = _builder.getUnknownLoc();
+    mlir::MLIRContext* const context = _builder.getContext();
+    const nl::ChunkType maskType = nl::ChunkType::get(context, storage::BoolType::get(context));
 
-    const bool resultNull = isNullableChunk(lhsChunk.getType()) || isNullableChunk(rhsChunk.getType());
-
-    const mlir::Type boolElement = _builder.getI1Type();
-    mlir::MLIRContext* bldCtxt = _builder.getContext();
-    mlir::Type resultElement = boolElement;
-    if (resultNull) {
-        resultElement = storage::NullableType::get(bldCtxt, boolElement);
+    llvm::SmallVector<mlir::Value, 8> reaching;
+    for (const mlir::Value column : caseOp.getColumnsToFilter()) {
+        reaching.push_back(mapValue(column));
     }
 
-    const nl::ChunkType resultType = nl::ChunkType::get(bldCtxt, resultElement);
+    mlir::Value reachingCardinality = cardinalityDriver(reaching);
 
-    setInsertionForBinaryOp(lhsChunk, rhsChunk);
+    const mlir::MutableArrayRef<mlir::Region> regions = caseOp.getBranches();
+    const size_t branchCount = regions.size() / 2;
+    const bool hasDefault = regions.size() % 2 == 1;
 
-    nl::Lte lteOp = _builder.create<nl::Lte>(_builder.getUnknownLoc(), resultType, lhsChunk, rhsChunk);
-    _valueMap[lte.getResult()] = lteOp.getResult();
+    llvm::SmallVector<mlir::Value, 4> conditions;
+    llvm::SmallVector<mlir::Value, 4> values;
+
+    for (size_t branchIndex = 0; branchIndex < branchCount; branchIndex++) {
+        const mlir::Value condition = lowerCaseRegion(regions[2 * branchIndex], reaching, reachingCardinality);
+        conditions.push_back(condition);
+
+        llvm::SmallVector<mlir::Value, 8> taken;
+        filterCaseRows(condition, reaching, taken);
+
+        const llvm::ArrayRef<mlir::Value> takenChunks = llvm::ArrayRef<mlir::Value>(taken).drop_front();
+        values.push_back(lowerCaseRegion(regions[2 * branchIndex + 1], takenChunks, taken.front()));
+
+        const bool rowsFallThrough = hasDefault || branchIndex + 1 < branchCount;
+        if (!rowsFallThrough) {
+            break;
+        }
+
+        setInsertionForUnaryOp(condition);
+        const mlir::Value fallsThrough = _builder.create<nl::IsNotTrue>(loc, maskType, condition).getResult();
+
+        llvm::SmallVector<mlir::Value, 8> rest;
+        filterCaseRows(fallsThrough, reaching, rest);
+
+        reachingCardinality = rest.front();
+        reaching.assign(rest.begin() + 1, rest.end());
+    }
+
+    mlir::Value defaultValue;
+    if (hasDefault) {
+        defaultValue = lowerCaseRegion(regions.back(), reaching, reachingCardinality);
+    }
+
+    llvm::SmallVector<mlir::Value, 5> valueChunks(values.begin(), values.end());
+    if (defaultValue) {
+        valueChunks.push_back(defaultValue);
+    }
+
+    const mlir::Type resultElement = caseResultElement(valueChunks);
+
+    for (mlir::Value& value : values) {
+        value = chunkAsElement(value, resultElement);
+    }
+
+    if (defaultValue) {
+        defaultValue = chunkAsElement(defaultValue, resultElement);
+    }
+
+    llvm::SmallVector<mlir::Value, 8> operands(conditions.begin(), conditions.end());
+    operands.append(values.begin(), values.end());
+    if (defaultValue) {
+        operands.push_back(defaultValue);
+    }
+
+    setInsertionForNaryOp(operands);
+
+    nl::CaseMerge merge = _builder.create<nl::CaseMerge>(loc,
+                                                         caseResultChunkType(resultElement),
+                                                         conditions,
+                                                         values,
+                                                         defaultValue);
+    _valueMap[caseOp.getResult()] = merge.getResult();
 }
 
-void DBLowering::lowerAnd(mlir::db::AndOp andOp) {
-    const mlir::Value lhsChunk = mapValue(andOp.getLhs());
-    const mlir::Value rhsChunk = mapValue(andOp.getRhs());
+mlir::Value DBLowering::lowerCaseRegion(mlir::Region& region,
+                                        llvm::ArrayRef<mlir::Value> chunks,
+                                        mlir::Value cardinality) {
+    mlir::Block& block = region.front();
 
-    const mlir::Type lhsType = lhsChunk.getType();
-    const mlir::Type rhsType = rhsChunk.getType();
-
-    // Kleene logic can still yield null (e.g. null AND true), so the result is
-    // nullable whenever either operand is.
-    const bool resultNull = isNullableChunk(lhsType) || isNullableChunk(rhsType);
-
-    const mlir::Type boolElement = _builder.getI1Type();
-    mlir::Type resultElement = boolElement;
-    mlir::MLIRContext* bldCtxt = _builder.getContext();
-    if (resultNull) {
-        resultElement = storage::NullableType::get(bldCtxt, boolElement);
+    for (size_t argumentIndex = 0; argumentIndex < chunks.size(); argumentIndex++) {
+        _valueMap[block.getArgument(static_cast<unsigned>(argumentIndex))] = chunks[argumentIndex];
     }
 
-    const nl::ChunkType resultType = nl::ChunkType::get(bldCtxt, resultElement);
-
-    setInsertionForBinaryOp(lhsChunk, rhsChunk);
-
-    nl::And nlAndOp = _builder.create<nl::And>(_builder.getUnknownLoc(), resultType, lhsChunk, rhsChunk);
-    _valueMap[andOp.getResult()] = nlAndOp.getResult();
+    return lowerBlockOverRows(block, cardinality);
 }
 
-void DBLowering::lowerOr(mlir::db::OrOp orOp) {
-    const mlir::Value lhsChunk = mapValue(orOp.getLhs());
-    const mlir::Value rhsChunk = mapValue(orOp.getRhs());
+mlir::Value DBLowering::lowerBlockOverRows(mlir::Block& block, mlir::Value cardinality) {
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+    _innermostCardinality = cardinality;
 
-    const mlir::Type lhsType = lhsChunk.getType();
-    const mlir::Type rhsType = rhsChunk.getType();
-
-    // Kleene logic can still yield null (e.g. null OR false), so the result is
-    // nullable whenever either operand is.
-    const bool resultNull = isNullableChunk(lhsType) || isNullableChunk(rhsType);
-
-    const mlir::Type boolElement = _builder.getI1Type();
-    mlir::Type resultElement = boolElement;
-    mlir::MLIRContext* bldCtxt = _builder.getContext();
-    if (resultNull) {
-        resultElement = storage::NullableType::get(bldCtxt, boolElement);
+    mlir::Value value;
+    for (mlir::Operation& operation : block) {
+        if (operation.hasTrait<mlir::OpTrait::IsTerminator>()) {
+            value = yieldedChunk(operation.getOperand(0));
+        } else {
+            lowerOperation(operation);
+        }
     }
 
-    const nl::ChunkType resultType = nl::ChunkType::get(bldCtxt, resultElement);
+    _innermostCardinality = previousInnermostCardinality;
 
-    setInsertionForBinaryOp(lhsChunk, rhsChunk);
+    return rowAlignedChunk(value, cardinality);
+}
 
-    nl::Or nlOrOp = _builder.create<nl::Or>(_builder.getUnknownLoc(), resultType, lhsChunk, rhsChunk);
-    _valueMap[orOp.getResult()] = nlOrOp.getResult();
+void DBLowering::filterCaseRows(mlir::Value mask,
+                                llvm::ArrayRef<mlir::Value> chunks,
+                                llvm::SmallVectorImpl<mlir::Value>& filtered) {
+    llvm::SmallVector<mlir::Value, 8> columns {mask};
+    columns.append(chunks.begin(), chunks.end());
+
+    llvm::SmallVector<mlir::Type, 8> types;
+    for (const mlir::Value column : columns) {
+        types.push_back(column.getType());
+    }
+
+    setInsertionForNaryOp(columns);
+
+    nl::Filter filter = _builder.create<nl::Filter>(_builder.getUnknownLoc(), types, mask, columns);
+
+    const mlir::ResultRange results = filter.getResults();
+    filtered.assign(results.begin(), results.end());
 }
 
 void DBLowering::lowerNot(mlir::db::NotOp notOp) {
     const mlir::Value operandChunk = mapValue(notOp.getOperand());
 
     const mlir::Type operandType = operandChunk.getType();
-    const bool resultNull = isNullableChunk(operandType);
 
-    const mlir::Type boolElement = _builder.getI1Type();
+    // A cell may hold a null, so its negation may be one
+    const bool resultNull = isNullableChunk(operandType) || holdsTaggedCells(operandType);
+
     mlir::MLIRContext* bldCtxt = _builder.getContext();
+
+    // A mask stays a mask through the negation - what nl.merge and the constraint checks
+    // produce - while a predicate over values keeps the i1 element they carry
+    const bool operandIsMask = isa<storage::BoolType>(mlir::cast<nl::ChunkType>(operandType).getElementType());
+    const mlir::Type boolElement = operandIsMask ? storage::BoolType::get(bldCtxt)
+                                                 : mlir::Type(_builder.getI1Type());
+
     mlir::Type resultElement = boolElement;
     if (resultNull) {
         resultElement = storage::NullableType::get(bldCtxt, boolElement);
     }
 
+    // NOT of an unknown truth value is unknown, and an untyped null names no boolean
+    // column to carry it: the negation is the same untyped null its operand is
+    if (isUntypedNullChunk(operandType)) {
+        resultElement = mlir::cast<nl::ChunkType>(operandType).getElementType();
+    }
+
     const nl::ChunkType resultType = nl::ChunkType::get(bldCtxt, resultElement);
 
-    mlir::Block* const insertBlock = ownerBlock(operandChunk);
-    if (insertBlock != _entryBlock) {
-        setInsertionInto(insertBlock);
-    } else {
-        mlir::Operation* const operandDef = operandChunk.getDefiningOp();
-        if (operandDef) {
-            _builder.setInsertionPointAfter(operandDef);
-        } else {
-            _builder.setInsertionPointToStart(_entryBlock);
-        }
-    }
+    setInsertionForUnaryOp(operandChunk);
 
     nl::Not nlNotOp = _builder.create<nl::Not>(_builder.getUnknownLoc(), resultType, operandChunk);
     _valueMap[notOp.getResult()] = nlNotOp.getResult();
 }
 
-void DBLowering::lowerFilter(mlir::db::FilterOp filter) {
-    // Map mask and carry set -> nl chunks
-    const mlir::Value mask = filter.getMask();
-    const mlir::Value maskChunk = mapValue(mask);
+void DBLowering::setInsertionForUnaryOp(mlir::Value operandChunk) {
+    mlir::Block* const insertBlock = ownerBlock(operandChunk);
+    mlir::Block* const constantBlock = _constantComputationBlock ? _constantComputationBlock : _entryBlock;
 
+    const bool readsAConstant = yieldsConstantColumn(operandChunk, _constantColumns)
+                             && enclosesBlock(insertBlock, constantBlock);
+
+    mlir::Operation* const operandDef = operandChunk.getDefiningOp();
+
+    if (!readsAConstant) {
+        setInsertionInto(deepestOwnerBlock({operandChunk}, _rootBlock));
+    } else if (insertBlock != constantBlock) {
+        _builder.setInsertionPointToStart(constantBlock);
+    } else if (operandDef) {
+        _builder.setInsertionPointAfter(operandDef);
+    } else {
+        setInsertionToEntryBlockStart();
+    }
+}
+
+void DBLowering::lowerUnaryFunction(mlir::Operation* op) {
+    const UnaryFunctionLowering* spec = lookupUnaryFunctionLowering(*op);
+    bioassert(spec, "lowerUnaryFunction called on a non-function op");
+
+    const mlir::Value inputChunk = mapValue(op->getOperand(0));
+
+    const mlir::Type inputElement = mlir::cast<nl::ChunkType>(inputChunk.getType()).getElementType();
+    const auto inputNullableElement = mlir::dyn_cast<storage::NullableType>(inputElement);
+    const mlir::Type inputValueElement = inputNullableElement ? inputNullableElement.getValueType() : inputElement;
+
+    const mlir::Type baseElement = unaryFunctionElement(op, inputValueElement);
+    if (!baseElement) {
+        const mlir::OperationName name = op->getName();
+        throw IRException(fmt::format("{} reads no column of this element type", name.getStringRef().str()));
+    }
+
+    const bool inputCanBeNull = mayHoldANull(inputChunk.getType());
+
+    const bool alwaysNull = spec->nullability == ResultNullability::AlwaysNullable;
+    const bool specNull = spec->nullability == ResultNullability::FollowsInput && inputCanBeNull;
+    const bool resultNullable = alwaysNull || specNull;
+
+    mlir::Type resultElement = baseElement;
+    if (resultNullable) {
+        resultElement = storage::NullableType::get(_builder.getContext(), baseElement);
+    }
+
+    const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(), resultElement);
+
+    setInsertionForUnaryOp(inputChunk);
+
+    _valueMap[op->getResult(0)] = spec->emit(_builder, _builder.getUnknownLoc(), resultType, inputChunk, op);
+}
+
+void DBLowering::lowerHeadOrLast(mlir::Operation& operation) {
+    const mlir::Value listChunk = mapValue(operation.getOperand(0));
+    const mlir::Type listChunkType = listChunk.getType();
+
+    const bool listsTypedElements = isListChunk(listChunkType)
+                                 && !mlir::isa<storage::AnyType, mlir::NoneType>(indexedListElementType(listChunkType));
+    if (!listsTypedElements) {
+        lowerUnaryFunction(&operation);
+        return;
+    }
+
+    const int64_t position = mlir::isa<mlir::db::Head>(operation) ? 0 : -1;
+
+    setInsertionAfterHoistedConstants();
+    nl::Constant positionConstant = _builder.create<nl::Constant>(_builder.getUnknownLoc(), _builder.getI64IntegerAttr(position));
+    _lastHoistedConstant = positionConstant.getOperation();
+
+    const mlir::Value positionChunk = positionConstant.getResult();
+    const mlir::Type resultElement = binaryResultElement(BinaryResultKind::Index, listChunkType, positionChunk.getType());
+    const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(), resultElement);
+
+    setInsertionForBinaryOp(listChunk, positionChunk);
+
+    nl::ListIndex element = _builder.create<nl::ListIndex>(_builder.getUnknownLoc(), resultType, listChunk, positionChunk);
+    _valueMap[operation.getResult(0)] = element.getResult();
+}
+
+void DBLowering::lowerBinaryFunction(mlir::Operation* op) {
+    const BinaryFunctionLowering* spec = lookupBinaryFunctionLowering(*op);
+    bioassert(spec, "lowerBinaryFunction called on a non-function op");
+
+    const mlir::Value lhsChunk = mapValue(op->getOperand(0));
+    const mlir::Value rhsChunk = mapValue(op->getOperand(1));
+
+    const mlir::Type lhsElement = mlir::cast<nl::ChunkType>(lhsChunk.getType()).getElementType();
+    const mlir::Type baseElement = spec->element(_builder, lhsElement);
+
+    mlir::Type resultElement = baseElement;
+    if (isNullableChunk(lhsChunk.getType()) || isNullableChunk(rhsChunk.getType())) {
+        resultElement = storage::NullableType::get(_builder.getContext(), baseElement);
+    }
+
+    const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(), resultElement);
+
+    setInsertionForBinaryOp(lhsChunk, rhsChunk);
+
+    _valueMap[op->getResult(0)] = spec->emit(_builder, _builder.getUnknownLoc(), resultType, lhsChunk, rhsChunk);
+}
+
+void DBLowering::lowerFilter(mlir::db::FilterOp filter) {
     llvm::SmallVector<mlir::Value, 4> columnChunks;
     llvm::SmallVector<mlir::Type, 4> resultTypes;
     for (const mlir::Value column : filter.getColumnsToFilter()) {
@@ -1949,6 +6690,14 @@ void DBLowering::lowerFilter(mlir::db::FilterOp filter) {
         columnChunks.push_back(columnChunk);
         resultTypes.push_back(chunkType);
     }
+
+    // A predicate over constants alone holds one value standing for every row, and the cut
+    // reads a mask row by row: it is laid out over the rows of the columns it cuts, so the
+    // mask has exactly as many rows as they do - the driving relation's when a column of
+    // it is what the cut carries, and the single row a projection of constants is when
+    // nothing drives it.
+    const mlir::Value maskDriver = cardinalityDriver(columnChunks);
+    const mlir::Value maskChunk = rowAlignedChunk(mapValue(filter.getMask()), maskDriver);
 
     // Inserted into the deepest block, where all operands are defined
     mlir::Value insertionReference = maskChunk;
@@ -1970,25 +6719,81 @@ void DBLowering::lowerFilter(mlir::db::FilterOp filter) {
         const mlir::Value outputChunk = nlFilter.getResult(columnIndex);
         _valueMap[filteredCol] = outputChunk;
     }
+
+    followCardinalityThrough(columnChunks, nlFilter.getResults());
+}
+
+void DBLowering::lowerFetchNodes(mlir::db::FetchNodes fetch) {
+    mlir::MLIRContext* const context = _builder.getContext();
+
+    llvm::SmallVector<mlir::Value, 4> carriedChunks;
+    llvm::SmallVector<mlir::Type, 4> resultTypes {nl::ChunkType::get(context, storage::NodeIDType::get(context))};
+    for (const mlir::Value column : fetch.getColumnsToFilter()) {
+        const mlir::Value columnChunk = mapValue(column);
+
+        carriedChunks.push_back(columnChunk);
+        resultTypes.push_back(columnChunk.getType());
+    }
+
+    const mlir::Value idsChunk = rowAlignedChunk(mapValue(fetch.getIds()), cardinalityDriver(carriedChunks));
+
+    llvm::SmallVector<mlir::Value, 4> inputChunks {idsChunk};
+    llvm::append_range(inputChunks, carriedChunks);
+
+    setInsertionInto(deeperOfBlocks(_rootBlock, ownerBlock(deepestBoundChunk(inputChunks))));
+
+    nl::FetchNodes nlFetch = _builder.create<nl::FetchNodes>(_builder.getUnknownLoc(),
+                                                             resultTypes,
+                                                             idsChunk,
+                                                             carriedChunks);
+
+    const mlir::ResultRange results = fetch->getResults();
+    for (size_t resultIndex = 0; resultIndex < results.size(); resultIndex++) {
+        _valueMap[results[resultIndex]] = nlFetch->getResult(resultIndex);
+    }
+
+    followCardinalityThrough(inputChunks, nlFetch->getResults());
+}
+
+mlir::Value DBLowering::deepestBoundChunk(llvm::ArrayRef<mlir::Value> chunks) {
+    mlir::Value deepest;
+    for (const mlir::Value chunk : chunks) {
+        if (!deepest) {
+            deepest = chunk;
+            continue;
+        }
+
+        mlir::Block* const block = deeperBlock(deepest, chunk);
+        if (ownerBlock(chunk) == block) {
+            deepest = chunk;
+        }
+    }
+
+    return deepest;
 }
 
 mlir::Block* DBLowering::deeperBlock(mlir::Value first, mlir::Value second) {
-    mlir::Block* const firstBlock = ownerBlock(first);
-    mlir::Block* const secondBlock = ownerBlock(second);
-    if (firstBlock == secondBlock) {
-        return firstBlock;
-    }
-
-    if (firstBlock == _entryBlock) {
-        return secondBlock;
-    } else if (secondBlock == _entryBlock) {
-        return firstBlock;
-    }
-
-    throw IRException("db operands to deeperBlock must be bound in the same loop");
+    return deeperOfBlocks(ownerBlock(first), ownerBlock(second));
 }
 
-void DBLowering::lowerOutput(mlir::db::Output output) {
+mlir::Block* DBLowering::deeperOfBlocks(mlir::Block* first, mlir::Block* second) {
+    if (first == second) {
+        return first;
+    }
+
+    // A chunk bound in a block that encloses the other is read once per step of it - a
+    // hoisted constant, a metadata tally, the one row a per-row body walks - so the op
+    // reading both belongs in the deeper block.
+    if (enclosesBlock(first, second)) {
+        return second;
+    } else if (enclosesBlock(second, first)) {
+        return first;
+    }
+
+    throw IRException("db operands read together must be bound in the same loop");
+}
+
+nl::Output DBLowering::lowerOutput(mlir::db::Output output) {
     llvm::SmallVector<mlir::Value, 4> columns;
     for (const mlir::Value column : output.getColumns()) {
         columns.push_back(mapValue(column));
@@ -2006,9 +6811,8 @@ void DBLowering::lowerOutput(mlir::db::Output output) {
     // dropping the copy.
 
     // If there is a column which is produced by a block which is not the entry block
-    // (e.g. a loop block), then set the anchor to be that block. Otherwise, we have no
-    // loops, i.e. we are in a MATCH (n) RETURN 5 case, where the output can just be in
-    // the entry block since it is independent of any loop (over n in this case).
+    // (e.g. a loop block), then set the anchor to be that block. Otherwise no relation
+    // drives the projection, as in RETURN 1, and the output is the single row it holds.
     // Getting the owner block of the returned column is sufficient because in nested
     // loops, each Cypher variable is redefined each op due to the carry set implictly
     // filtering. Otherwise we would need to check for the *deepest* block of all
@@ -2022,28 +6826,224 @@ void DBLowering::lowerOutput(mlir::db::Output output) {
         }
     }
 
-    // Custom cardinality calculation for e.g. MATCH (n) RETURN 5
-    mlir::Value cardinality;
-    // Output would not normally be in a loop body, but toplevel
-    const bool returningNonLooped = anchorBlock == _entryBlock;
-    if (returningNonLooped && _innermostLoopBody) {
-        // but if we have all constants, then it need be moved to the inner most loop to
-        // match cardinality
-        const bool allConstants =
-            std::ranges::all_of(columns, [](const mlir::Value column) {
-                mlir::Operation* const definingOp = column.getDefiningOp();
-                return llvm::isa_and_nonnull<nl::Constant>(definingOp);
-            });
+    setInsertionInto(anchorBlock);
 
-        if (allConstants) {
-            anchorBlock = _innermostLoopBody;
-            cardinality = _innermostCardinality;
+    return _builder.create<nl::Output>(_builder.getUnknownLoc(),
+                                       columns,
+                                       mlir::Value(),
+                                       mlir::Value(),
+                                       mlir::Value(),
+                                       output.getColumnNamesAttr());
+}
+
+mlir::Operation* DBLowering::topLevelNestOf(mlir::Block* block) const {
+    if (block == _entryBlock) {
+        return nullptr;
+    }
+
+    mlir::Operation* enclosing = block->getParentOp();
+    while (enclosing->getBlock() != _entryBlock) {
+        enclosing = enclosing->getBlock()->getParentOp();
+    }
+
+    return enclosing;
+}
+
+mlir::Value DBLowering::buildEndNodeSet(mlir::Value endNodeColumn, mlir::Value inputChunk) {
+    const mlir::Value endChunk = mapValue(endNodeColumn);
+    mlir::Block* const collectBlock = ownerBlock(endChunk);
+
+    mlir::Operation* const collectNest = topLevelNestOf(collectBlock);
+    mlir::Operation* const walkNest = topLevelNestOf(ownerBlock(inputChunk));
+    const bool fillsBeforeTheWalk = collectNest && walkNest && collectNest->isBeforeInBlock(walkNest);
+    if (!fillsBeforeTheWalk) {
+        throw IRException("The end nodes of an exploration must be bound by a loop of their own, closing before the loop the walk runs in");
+    }
+
+    const mlir::Location loc = _builder.getUnknownLoc();
+
+    _builder.setInsertionPointToStart(_entryBlock);
+    const mlir::Value state = _builder.create<nl::NodeSetBuffer>(loc).getState();
+
+    setInsertionInto(collectBlock);
+    _builder.create<nl::NodeSetCollect>(loc, state, endChunk);
+
+    return state;
+}
+
+void DBLowering::lowerExplorePaths(mlir::db::ExplorePaths explorePaths) {
+    const mlir::Value inputChunk = mapValue(explorePaths.getInputNodes());
+
+    llvm::SmallVector<mlir::Value, 4> carriedChunks;
+    for (const mlir::Value carriedColumn : explorePaths.getColumnsToFilter()) {
+        carriedChunks.push_back(mapValue(carriedColumn));
+    }
+
+    mlir::Value endNodeSet;
+    if (const mlir::Value endNodeColumn = explorePaths.getEndNodes()) {
+        endNodeSet = buildEndNodeSet(endNodeColumn, inputChunk);
+    }
+
+    const size_t stepCount = explorePaths.getStepCount();
+
+    llvm::SmallVector<mlir::Value, 2> edgeTypeSets;
+    llvm::SmallVector<int64_t, 2> typedSteps;
+    for (size_t step = 0; step < stepCount; step++) {
+        if (const mlir::ArrayAttr edgeTypes = explorePaths.getStepEdgeTypes(step)) {
+            edgeTypeSets.push_back(getOrCreateEdgeTypeSetHandle(edgeTypes));
+            typedSteps.push_back(static_cast<int64_t>(step));
         }
     }
 
-    setInsertionInto(anchorBlock);
-    _builder.create<nl::Output>(_builder.getUnknownLoc(), columns, mlir::Value(),
-                                mlir::Value(), cardinality);
+    const bool typesEveryStep = typedSteps.size() == stepCount || typedSteps.empty();
+    const mlir::DenseI64ArrayAttr edgeTypeSteps = typesEveryStep ? mlir::DenseI64ArrayAttr() : _builder.getDenseI64ArrayAttr(typedSteps);
+
+    llvm::SmallVector<mlir::Value, 2> importChunks;
+    for (const mlir::Value importColumn : explorePaths.getHopImports()) {
+        importChunks.push_back(mapValue(importColumn));
+    }
+
+    setInsertionInto(ownerBlock(inputChunk));
+
+    nl::ExplorePaths exploration = _builder.create<nl::ExplorePaths>(_builder.getUnknownLoc(),
+                                                                     inputChunk,
+                                                                     carriedChunks,
+                                                                     endNodeSet,
+                                                                     edgeTypeSets,
+                                                                     importChunks,
+                                                                     explorePaths.getDirectionsAttr(),
+                                                                     explorePaths.getMinHopsAttr(),
+                                                                     explorePaths.getMaxHopsAttr(),
+                                                                     edgeTypeSteps,
+                                                                     explorePaths.getEndLabelsAttr(),
+                                                                     explorePaths.getHopLabelsAttr(),
+                                                                     explorePaths.getEndColumnAttr(),
+                                                                     explorePaths.getEndsOnSeedAttr(),
+                                                                     explorePaths.getDistinctAttr(),
+                                                                     static_cast<unsigned>(stepCount));
+
+    const mlir::MutableArrayRef<mlir::Region> dbHops = explorePaths.getHops();
+    const mlir::MutableArrayRef<mlir::Region> nlHops = exploration.getHops();
+    for (size_t step = 0; step < stepCount; step++) {
+        mlir::Region& dbHop = dbHops[step];
+        if (!dbHop.empty()) {
+            const mlir::OpBuilder::InsertionGuard guard(_builder);
+            lowerHopRegion(dbHop.front(), nlHops[step], step, importChunks);
+        }
+    }
+
+    buildLoopForSource(exploration.getResult(), explorePaths.getOperation());
+}
+
+void DBLowering::lowerHopRegion(mlir::Block& dbHop, mlir::Region& nlHop, size_t step, mlir::ValueRange imports) {
+    mlir::MLIRContext* context = _builder.getContext();
+    const mlir::Location loc = _builder.getUnknownLoc();
+
+    const mlir::Type nodeChunk = nl::ChunkType::get(context, storage::NodeIDType::get(context));
+    const mlir::Type edgeChunk = nl::ChunkType::get(context, storage::EdgeIDType::get(context));
+    llvm::SmallVector<mlir::Type> argumentTypes;
+    mlir::buildHopArgumentTypes(step, nodeChunk, edgeChunk, imports, argumentTypes);
+
+    const llvm::SmallVector<mlir::Location> argumentLocations(argumentTypes.size(), loc);
+
+    mlir::Block* nlBlock = _builder.createBlock(&nlHop, nlHop.end(), argumentTypes, argumentLocations);
+    for (unsigned argumentIndex = 0; argumentIndex < argumentTypes.size(); argumentIndex++) {
+        _valueMap[dbHop.getArgument(argumentIndex)] = nlBlock->getArgument(argumentIndex);
+    }
+
+    // The ops lowered into the block insert ahead of its terminator, so the block gets one
+    // before the mask that the real terminator yields exists
+    nl::Yield placeholder = _builder.create<nl::Yield>(loc);
+
+    // The rows the predicate computes over are the hop's edges, so a constant it reads is
+    // laid out over those rather than over the rows the walk is read on
+    const mlir::Value edges = nlBlock->getArgument(mlir::hopEdgeArgument(step));
+    mlir::Block* const previousInnermostLoopBody = _innermostLoopBody;
+    const mlir::Value previousInnermostCardinality = _innermostCardinality;
+    _innermostLoopBody = nlBlock;
+    _innermostCardinality = edges;
+
+    mlir::Value mask;
+    for (mlir::Operation& operation : dbHop) {
+        if (mlir::db::Yield yield = mlir::dyn_cast<mlir::db::Yield>(operation)) {
+            mask = yieldedChunk(yield.getColumns().front());
+        } else {
+            lowerOperation(operation);
+        }
+    }
+
+    _innermostLoopBody = previousInnermostLoopBody;
+    _innermostCardinality = previousInnermostCardinality;
+
+    _builder.setInsertionPoint(placeholder);
+    const mlir::Value maskChunk = rowAlignedChunk(mask, edges);
+    _builder.create<nl::Yield>(loc, mlir::ValueRange {maskChunk});
+    placeholder.erase();
+}
+
+void DBLowering::lowerExpandPath(mlir::db::ExpandPath expandPath) {
+    const mlir::Value pathsChunk = mapValue(expandPath.getPaths());
+    const mlir::Value seedsChunk = expandPath.getSrcids() ? mapValue(expandPath.getSrcids()) : mlir::Value();
+
+    setInsertionInto(ownerBlock(pathsChunk));
+
+    const auto resultColumn = mlir::cast<mlir::db::ColumnType>(expandPath.getResult().getType());
+    const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(), resultColumn.getType());
+
+    nl::ExpandPath expansion = _builder.create<nl::ExpandPath>(_builder.getUnknownLoc(),
+                                                               resultType,
+                                                               pathsChunk,
+                                                               seedsChunk,
+                                                               expandPath.getKindAttr(),
+                                                               expandPath.getReversedAttr(),
+                                                               expandPath.getStepAttr(),
+                                                               expandPath.getStepsAttr());
+    _valueMap[expandPath.getResult()] = expansion.getResult();
+}
+
+void DBLowering::lowerPathLength(mlir::db::PathLength pathLength) {
+    const mlir::Value pathsChunk = mapValue(pathLength.getPaths());
+
+    setInsertionInto(ownerBlock(pathsChunk));
+
+    mlir::MLIRContext* context = _builder.getContext();
+    const nl::ChunkType resultType = nl::ChunkType::get(context, mlir::IntegerType::get(context, 64, mlir::IntegerType::Unsigned));
+
+    nl::PathLength length = _builder.create<nl::PathLength>(_builder.getUnknownLoc(), resultType, pathsChunk);
+    _valueMap[pathLength.getResult()] = length.getResult();
+}
+
+void DBLowering::lowerPathElements(mlir::db::PathElements pathElements) {
+    const mlir::Value pathChunk = mapValue(pathElements.getPath());
+
+    setInsertionInto(ownerBlock(pathChunk));
+
+    const auto resultColumn = mlir::cast<mlir::db::ColumnType>(pathElements.getResult().getType());
+    const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(), resultColumn.getType());
+
+    nl::PathElements elements = _builder.create<nl::PathElements>(_builder.getUnknownLoc(),
+                                                                  resultType,
+                                                                  pathChunk,
+                                                                  pathElements.getKind());
+    _valueMap[pathElements.getResult()] = elements.getResult();
+}
+
+void DBLowering::lowerMakePath(mlir::db::MakePath makePath) {
+    llvm::SmallVector<mlir::Value, 4> entityChunks;
+    for (const mlir::Value entityColumn : makePath.getEntities()) {
+        entityChunks.push_back(mapValue(entityColumn));
+    }
+
+    setInsertionForNaryOp(entityChunks);
+
+    const auto resultColumn = mlir::cast<mlir::db::ColumnType>(makePath.getResult().getType());
+    const nl::ChunkType resultType = nl::ChunkType::get(_builder.getContext(), resultColumn.getType());
+
+    nl::MakePath path = _builder.create<nl::MakePath>(_builder.getUnknownLoc(),
+                                                      resultType,
+                                                      entityChunks,
+                                                      makePath.getReversedPathsAttr());
+    _valueMap[makePath.getResult()] = path.getResult();
 }
 
 void DBLowering::buildLoopForSource(mlir::Value iterator, mlir::Operation* dbOp) {
@@ -2064,7 +7064,11 @@ void DBLowering::buildLoopForSource(mlir::Value iterator, mlir::Operation* dbOp)
     // This is the innermost loop opened so far in the current factor (loops
     // nest in dataflow order), so a cross product nests at this body.
     _innermostLoopBody = loopBody;
-    _innermostCardinality = loopBody->getArguments().front();
+
+    // A loop over a call that binds no return value has no variable, so there is no chunk
+    // here for a constant projection to be sized against.
+    _innermostCardinality = loopBody->getNumArguments() > 0 ? loopBody->getArgument(0)
+                                                           : mlir::Value();
 
     const mlir::ResultRange dbResults = dbOp->getResults();
     for (size_t resultIndex = 0; resultIndex < dbResults.size(); resultIndex++) {
@@ -2073,38 +7077,74 @@ void DBLowering::buildLoopForSource(mlir::Value iterator, mlir::Operation* dbOp)
 }
 
 void DBLowering::setInsertionInto(mlir::Block* block) {
-    // Every home block already has a terminator - the entry block's func.return
-    // or a loop body's implicit nl.yield - so the next op goes just before it,
-    // after any siblings already lowered here.
-    _builder.setInsertionPoint(block->getTerminator());
+    // The next op goes before the block's terminator, after the siblings already lowered
+    // here - or, in a block enclosing the root, before the nest the root's factor reads it
+    // from.
+    mlir::Operation* const nest = block->findAncestorOpInBlock(*_rootBlock->getParentOp());
+    _builder.setInsertionPoint(nest ? nest : block->getTerminator());
+}
+
+void DBLowering::setInsertionAfterProducingLoop(mlir::Block* updateBlock) {
+    if (updateBlock == _rootBlock) {
+        setInsertionInto(_rootBlock);
+        return;
+    }
+
+    mlir::Operation* const enclosing = _rootBlock->findAncestorOpInBlock(*updateBlock->getParentOp());
+    if (!enclosing) {
+        setInsertionInto(_rootBlock);
+        return;
+    }
+
+    _builder.setInsertionPointAfter(enclosing);
 }
 
 void DBLowering::setInsertionForBinaryOp(mlir::Value lhs, mlir::Value rhs) {
-    // If both operands are top-level constants (in `_entryBlock`), then place the op
-    // after the latter defined constant. Otherwise place the op in the more deeply nested
-    // block.
-    mlir::Block* const insertBlock = deeperBlock(lhs, rhs);
+    const std::array<mlir::Value, 2> operands {lhs, rhs};
+    setInsertionForNaryOp(operands);
+}
 
-    if (insertBlock != _entryBlock) {
+void DBLowering::setInsertionForNaryOp(llvm::ArrayRef<mlir::Value> operands) {
+    // If every operand is a top-level constant (in `_entryBlock`), then place the op
+    // after the last defined constant. Otherwise place the op in the more deeply nested
+    // block.
+    mlir::Value deepest = operands.front();
+    for (const mlir::Value operand : operands.drop_front()) {
+        if (deeperBlock(deepest, operand) != ownerBlock(deepest)) {
+            deepest = operand;
+        }
+    }
+
+    mlir::Block* const insertBlock = ownerBlock(deepest);
+    mlir::Block* const constantBlock = _constantComputationBlock ? _constantComputationBlock : _entryBlock;
+
+    const bool allConstants = llvm::all_of(operands, [this](mlir::Value operand) { return yieldsConstantColumn(operand, _constantColumns); });
+    const bool readsConstantsAlone = insertBlock == _entryBlock
+                                  || (allConstants && enclosesBlock(insertBlock, constantBlock));
+
+    if (!readsConstantsAlone) {
         setInsertionInto(insertBlock);
         return;
     }
 
-    const mlir::Operation* lhsDef = lhs.getDefiningOp();
-    const mlir::Operation* rhsDef = rhs.getDefiningOp();
-    const size_t defsToFind = (lhsDef == rhsDef) ? 1 : 2;
+    llvm::SmallPtrSet<const mlir::Operation*, 4> defs;
+    for (const mlir::Value operand : operands) {
+        if (const mlir::Operation* const definingOp = operand.getDefiningOp()) {
+            defs.insert(definingOp);
+        }
+    }
 
-    // Walk the entry block to find which of the two defining ops appears later —
-    // the new op must go after that one to stay before any nl.for that follows.
-    // Each op appears once in the block, so stop as soon as both defs are seen.
+    // Walk the block to find which of the defining ops appears last — the new op
+    // must go after that one to stay before any nl.for that follows. Each op appears once
+    // in the block, so stop as soon as every def is seen.
     mlir::Operation* lastDef = nullptr;
     size_t defsFound = 0;
-    for (mlir::Operation& op : *_entryBlock) {
-        if (&op == lhsDef || &op == rhsDef) {
+    for (mlir::Operation& op : *constantBlock) {
+        if (defs.contains(&op)) {
             lastDef = &op;
             defsFound++;
 
-            if (defsFound == defsToFind) {
+            if (defsFound == defs.size()) {
                 break;
             }
         }
@@ -2112,8 +7152,10 @@ void DBLowering::setInsertionForBinaryOp(mlir::Value lhs, mlir::Value rhs) {
 
     if (lastDef) {
         _builder.setInsertionPointAfter(lastDef);
+    } else if (constantBlock != _entryBlock) {
+        _builder.setInsertionPointToStart(constantBlock);
     } else {
-        _builder.setInsertionPointToStart(_entryBlock);
+        setInsertionToEntryBlockStart();
     }
 }
 
@@ -2124,6 +7166,290 @@ mlir::Value DBLowering::mapValue(mlir::Value dbValue) const {
     }
 
     return slotIt->second;
+}
+
+void DBLowering::followCardinalityThrough(mlir::ValueRange inputChunks, mlir::ValueRange resultChunks) {
+    if (!_innermostCardinality) {
+        return;
+    }
+
+    // Any chunk of the driver's relation stands for it: a cut trimmed down to a column other
+    // than the driver itself still narrows the relation the driver counts.
+    for (size_t chunkIndex = 0; chunkIndex < inputChunks.size(); chunkIndex++) {
+        if (!rowAlignedWith(inputChunks[chunkIndex], _innermostCardinality)) {
+            continue;
+        }
+
+        _innermostCardinality = resultChunks[chunkIndex];
+        return;
+    }
+}
+
+void DBLowering::rowAlignFactorChunks(llvm::SmallVectorImpl<mlir::Value>& chunks) {
+    mlir::Value cardinality;
+    for (const mlir::Value chunk : chunks) {
+        if (!yieldsConstantColumn(chunk, _constantColumns)) {
+            cardinality = chunk;
+            break;
+        }
+    }
+
+    for (mlir::Value& chunk : chunks) {
+        chunk = rowAlignedChunk(chunk, cardinality);
+    }
+}
+
+// A buffer holds rows, and a constant holds one value standing for every row of the step
+// instead, so what an accumulator would append is a column with no rows in it. The
+// constants are laid out first: over the relation driving the step, or - where none drives
+// it - over the single row the projection is.
+void DBLowering::rowAlignBufferedChunks(llvm::MutableArrayRef<mlir::Value> chunks) {
+    mlir::Value cardinality = _innermostCardinality;
+    for (const mlir::Value chunk : chunks) {
+        if (!yieldsConstantColumn(chunk, _constantColumns)) {
+            cardinality = chunk;
+            break;
+        }
+    }
+
+    for (mlir::Value& chunk : chunks) {
+        chunk = rowAlignedChunk(chunk, cardinality);
+    }
+}
+
+void DBLowering::rowAlignCutChunks(llvm::SmallVectorImpl<mlir::Value>& chunks) {
+    // With no relation driving the projection a constant is the single row that
+    // projection is, and the cut charges it as it stands.
+    if (!_innermostCardinality) {
+        return;
+    }
+
+    for (mlir::Value& chunk : chunks) {
+        chunk = rowAlignedChunk(chunk, _innermostCardinality);
+    }
+}
+
+// A scalar a procedure yielded is a plain value chunk, while a reduction, a collect or a
+// comparison with null read a nullable one: the plain chunk is read as nullable right
+// where it is bound, so those kernels take it as they take a property value.
+mlir::Value DBLowering::nullableValueChunk(mlir::Value chunk) {
+    const auto chunkType = mlir::cast<nl::ChunkType>(chunk.getType());
+    const mlir::Type element = chunkType.getElementType();
+    if (mlir::isa<storage::NullableType>(element)) {
+        return chunk;
+    }
+
+    mlir::Type valueElement = element;
+    if (mlir::isa<storage::BoolType>(element)) {
+        valueElement = _builder.getI1Type();
+    }
+
+    // A node or an edge reads as its ID's integer, absent where an OPTIONAL MATCH left the
+    // ID invalid: that is what makes n IS NULL the ordinary null test over a value column
+    if (mlir::isa<storage::NodeIDType, storage::EdgeIDType>(element)) {
+        valueElement = _builder.getIntegerType(64, /*isSigned=*/false);
+    }
+
+    const ValueType valueType = elementTypeToValueType(valueElement);
+    const bool isScalar = valueType != ValueType::Invalid
+                       && valueType != ValueType::List
+                       && valueType != ValueType::Map;
+    if (!isScalar) {
+        throw IRException("Only a scalar value column can be read as a nullable value column");
+    }
+
+    return toNullableChunk(chunk, valueElement);
+}
+
+// A type-erased column of tagged cells - what a list mixing types, holding a null or
+// holding nothing unwinds into - is read as it stands, every cell carrying its own tag. A
+// list or a map, which min and max order as a whole, rides a nullable column of its own type.
+mlir::Value DBLowering::reducedValueChunk(mlir::Value chunk) {
+    const mlir::Type element = mlir::cast<nl::ChunkType>(chunk.getType()).getElementType();
+
+    if (mlir::isa<storage::AnyType>(element)) {
+        return chunk;
+    } else if (mlir::isa<storage::ListType, storage::MapType>(element)) {
+        return toNullableChunk(chunk, element);
+    } else {
+        return nullableValueChunk(chunk);
+    }
+}
+
+// A path's null is the empty path, and no value of a path is read here: tested against null
+// it reads as its entry count, absent where the path is empty. A walk's handle is an ID, absent
+// where it is invalid: the handle of a walk of no hops is valid.
+mlir::Value DBLowering::nullTestedChunk(mlir::Value chunk) {
+    const auto chunkType = mlir::cast<nl::ChunkType>(chunk.getType());
+    const mlir::Type element = chunkType.getElementType();
+    if (mlir::isa<storage::EntityListType, storage::PathRefType>(element)) {
+        return toNullableChunk(chunk, _builder.getIntegerType(64, /*isSigned=*/false));
+    } else if (mlir::isa<storage::ListType, storage::MapType>(element)) {
+        return nullableContainerChunk(chunk);
+    }
+
+    return nullableValueChunk(chunk);
+}
+
+// The nullable column a list or a map rides where a row of it can be absent - the drain
+// padding the input rows a subquery body yielded nothing for. Kept apart from the value
+// sibling so the reductions and comparisons that read only a scalar still turn one away.
+mlir::Value DBLowering::nullableContainerChunk(mlir::Value chunk) {
+    const auto chunkType = mlir::cast<nl::ChunkType>(chunk.getType());
+    const mlir::Type element = chunkType.getElementType();
+    if (mlir::isa<storage::NullableType>(element)) {
+        return chunk;
+    }
+
+    return toNullableChunk(chunk, element);
+}
+
+mlir::Value DBLowering::toNullableChunk(mlir::Value chunk, mlir::Type valueElement) {
+    mlir::MLIRContext* const context = _builder.getContext();
+    const storage::NullableType nullableType = storage::NullableType::get(context, valueElement);
+    const nl::ChunkType resultType = nl::ChunkType::get(context, nullableType);
+
+    mlir::OpBuilder::InsertionGuard guard(_builder);
+    if (mlir::Operation* const definingOp = chunk.getDefiningOp()) {
+        _builder.setInsertionPointAfter(definingOp);
+    } else {
+        _builder.setInsertionPointToStart(mlir::cast<mlir::BlockArgument>(chunk).getOwner());
+    }
+
+    return _builder.create<nl::ToNullable>(_builder.getUnknownLoc(), resultType, chunk).getResult();
+}
+
+// The one column a union result carries, whichever branch filled it. A count is an
+// unsigned tally that is never null and a property a nullable signed value, and the two
+// are one Cypher INTEGER, so a scalar reaches the column as the nullable signed form. An
+// entity, a path, a list and an embedding have one spelling already and are left alone.
+mlir::Value DBLowering::unionColumnChunk(mlir::Value chunk) {
+    const mlir::Type element = chunkValueElement(_builder, chunk.getType());
+
+    const bool isString = mlir::isa<storage::StringType>(element);
+    const bool isDouble = mlir::isa<mlir::Float64Type>(element);
+    const mlir::IntegerType integerType = mlir::dyn_cast<mlir::IntegerType>(element);
+
+    if (!isString && !isDouble && !integerType) {
+        return chunk;
+    }
+
+    // Wrapped before it is converted, and not instead: the kernel a conversion selects
+    // reads the column it was handed, so converting a plain chunk would allocate a plain
+    // column under a type naming a nullable one
+    const mlir::Value nullableChunk = nullableValueChunk(chunk);
+
+    const bool isUnsignedInteger = integerType && integerType.isUnsigned() && integerType.getWidth() == 64;
+    if (!isUnsignedInteger) {
+        return nullableChunk;
+    }
+
+    mlir::MLIRContext* const context = _builder.getContext();
+    const storage::NullableType signedElement = storage::NullableType::get(context, _builder.getIntegerType(64));
+    const nl::ChunkType signedChunk = nl::ChunkType::get(context, signedElement);
+
+    mlir::OpBuilder::InsertionGuard guard(_builder);
+    setInsertionForUnaryOp(nullableChunk);
+
+    return _builder.create<nl::ToInteger>(_builder.getUnknownLoc(), signedChunk, nullableChunk).getResult();
+}
+
+// The chunk shape a drain can pad a missed row of. A mask holds a bit and a number a zero,
+// which the query cannot tell from a value it was given, so those are read as nullable
+// value chunks. An ID
+// column needs none of it: it spells its null as the invalid ID.
+mlir::Value DBLowering::paddedColumnChunk(mlir::Value chunk) {
+    const nl::ChunkType chunkType = mlir::dyn_cast<nl::ChunkType>(chunk.getType());
+    if (!chunkType) {
+        return chunk;
+    }
+
+    const mlir::Type element = chunkType.getElementType();
+
+    if (mlir::isa<storage::ListType, storage::MapType>(element)) {
+        return nullableContainerChunk(chunk);
+    } else if (mlir::isa<storage::BoolType, storage::StringType, mlir::Float64Type, mlir::IntegerType>(element)) {
+        return nullableValueChunk(chunk);
+    }
+
+    return chunk;
+}
+
+mlir::Value DBLowering::cardinalityDriver(llvm::ArrayRef<mlir::Value> chunks) {
+    for (const mlir::Value chunk : chunks) {
+        if (!yieldsConstantColumn(chunk, _constantColumns)) {
+            return chunk;
+        }
+    }
+
+    return _innermostCardinality;
+}
+
+mlir::Value DBLowering::rowAlignedChunk(mlir::Value chunk, mlir::Value cardinality) {
+    // A chunk that carries rows is its own alignment
+    if (!yieldsConstantColumn(chunk, _constantColumns)) {
+        return chunk;
+    }
+
+    const auto chunkType = mlir::cast<nl::ChunkType>(chunk.getType());
+    mlir::Type valueElement = chunkType.getElementType();
+    const auto nullable = mlir::dyn_cast<storage::NullableType>(valueElement);
+    if (nullable) {
+        valueElement = nullable.getValueType();
+    }
+
+    // The rows are laid out as a nullable value chunk - present in every row - which is
+    // what every fold, key serialization and reduction reads a value column as. A list or
+    // a map literal is laid out as the plain container chunk an nl.collect drain emits
+    // instead, since no row of a literal is absent; one a function answered may be null.
+    // A map entry carries its null in its own tag.
+    mlir::MLIRContext* const context = _builder.getContext();
+    const bool isContainer = llvm::isa<storage::ListType, storage::MapType>(valueElement);
+    const bool isMapEntry = llvm::isa<storage::MapElementType>(valueElement);
+    const bool staysPlain = (isContainer && !nullable) || isMapEntry;
+    const mlir::Type resultElement = staysPlain ? valueElement
+                                                : storage::NullableType::get(context, valueElement);
+    const nl::ChunkType resultType = nl::ChunkType::get(context, resultElement);
+
+    // With no relation driving the projection the value is laid out over the single row
+    // that projection is, behind the constants hoisted so far: a layout read from a loop
+    // nested under it must not sit below that nest.
+    if (cardinality) {
+        setInsertionInto(ownerBlock(cardinality));
+    } else {
+        mlir::Operation* layoutPoint = chunk.getDefiningOp();
+
+        const bool constantsFollow = _lastHoistedConstant
+                                  && _lastHoistedConstant->getBlock() == layoutPoint->getBlock()
+                                  && layoutPoint->isBeforeInBlock(_lastHoistedConstant);
+        if (constantsFollow) {
+            layoutPoint = _lastHoistedConstant;
+        }
+
+        _builder.setInsertionPointAfter(layoutPoint);
+    }
+
+    nl::BroadcastConstant broadcast = _builder.create<nl::BroadcastConstant>(_builder.getUnknownLoc(), resultType, chunk, cardinality);
+
+    return broadcast.getResult();
+}
+
+bool DBLowering::enclosesBlock(mlir::Block* outer, mlir::Block* inner) {
+    if (outer == inner) {
+        return true;
+    }
+
+    mlir::Operation* const parent = inner->getParentOp();
+
+    return parent && outer->findAncestorOpInBlock(*parent);
+}
+
+mlir::Block* DBLowering::accumulatorUpdateBlock(mlir::Block* producingBlock) const {
+    if (enclosesBlock(_rootBlock, producingBlock)) {
+        return producingBlock;
+    }
+
+    return _rootBlock;
 }
 
 mlir::Block* DBLowering::ownerBlock(mlir::Value chunkValue) {

@@ -9,28 +9,41 @@ set(ast_sources
     ProcedureLookup.cpp
 
     decl/DeclContext.cpp
+    decl/ListShape.cpp
     decl/PatternData.cpp
+    decl/SchemaNameRef.cpp
     decl/VarDecl.cpp
 
     expr/ExprChain.cpp
     expr/BinaryExpr.cpp
+    expr/LogicalExpr.cpp
     expr/LiteralExpr.cpp
     expr/EntityTypeExpr.cpp
-    expr/PathExpr.cpp
     expr/PropertyExpr.cpp
+    expr/PropertyLookupExpr.cpp
     expr/StringExpr.cpp
     expr/SymbolExpr.cpp
     expr/UnaryExpr.cpp
     expr/FunctionInvocationExpr.cpp
     expr/IndexExpr.cpp
+    expr/ExistsExpr.cpp
+    expr/CountSubqueryExpr.cpp
+    expr/CollectSubqueryExpr.cpp
+    expr/ExprChildren.cpp
+    expr/ExprDepth.cpp
+    expr/StructuralExpressionComparator.cpp
 
     stmt/Stmt.cpp
     stmt/StmtContainer.cpp
     stmt/MatchStmt.cpp
     stmt/SetStmt.cpp
     stmt/SetItem.cpp
+    stmt/RemoveStmt.cpp
     stmt/CallStmt.cpp
+    stmt/CallSubqueryStmt.cpp
     stmt/CreateStmt.cpp
+    stmt/MergeStmt.cpp
+    stmt/NextSegmentStmt.cpp
     stmt/DeleteStmt.cpp
     stmt/ReturnStmt.cpp
     stmt/ShortestPathStmt.cpp
@@ -40,6 +53,7 @@ set(ast_sources
     stmt/Limit.cpp
     stmt/Skip.cpp
     stmt/UnwindStmt.cpp
+    stmt/WithStmt.cpp
 
     Pattern.cpp
     PatternElement.cpp
@@ -47,6 +61,8 @@ set(ast_sources
     Projection.cpp
     QueryCommand.cpp
     SinglePartQuery.cpp
+    UnionQuery.cpp
+    ConditionalQuery.cpp
     LoadGraphQuery.cpp
     ChangeQuery.cpp
     CommitQuery.cpp
@@ -69,10 +85,18 @@ set(ast_sources
     InstallExtensionQuery.cpp
     stmt/VectorSearchStmt.cpp
     expr/ListExpr.cpp
+    expr/ListSliceExpr.cpp
+    expr/ListComprehensionExpr.cpp
+    expr/PatternComprehensionExpr.cpp
+    expr/ListPredicateExpr.cpp
+    expr/ReduceExpr.cpp
+    expr/CaseExpr.cpp
     NodePattern.cpp
     EdgePattern.cpp
+    Parameter.cpp
     Symbol.cpp
     SymbolChain.cpp
+    LabelExpr.cpp
     Literal.cpp
     QualifiedName.cpp
     QuantifiedPath.cpp
@@ -95,10 +119,11 @@ target_include_directories(turing_db_ast_s
 
 target_link_libraries(turing_db_ast_s
   PRIVATE turing_db_query_common_s
-          turing_db_storage_s
           turing_db_import_common_s
+          turing_db_procedures_s
           turing_vector_s
           range-v3
-  PUBLIC turing_db_pipeline_s
-         turing_common_s)
+  PUBLIC  
+          turing_db_storage_s
+          turing_common_s)
 

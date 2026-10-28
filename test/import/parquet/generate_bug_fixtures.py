@@ -13,6 +13,8 @@ the importer expects). Run from this directory:
     python3 generate_bug_fixtures.py
 """
 
+import datetime
+
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -61,6 +63,166 @@ def multipage_string_nodes():
         write_batch_size=16,
     )
 
+def nested_list_property_nodes():
+    # A LIST<LIST<INT64>> property column: two repetition levels, so the importer has to
+    # reassemble the inner lists from the rep/def levels rather than flatten them. Covers
+    # an empty inner list, a null inner list, a null element and an empty outer list.
+    ids = [0, 1, 2, 3]
+    labels = [[b"Person"] for _ in ids]
+    groups = [
+        [[1, 2], [3]],
+        [[], [4, None]],
+        [None, [5]],
+        [],
+    ]
+    table = pa.table(
+        {
+            "__id": pa.array(ids, pa.int64()),
+            "__labels": pa.array(labels, LABELS_TYPE),
+            "groups": pa.array(groups, pa.list_(pa.list_(pa.int64()))),
+        }
+    )
+    write(table, "nested_list_property_nodes.parquet")
+
+
+def datetime_property_nodes():
+    # A TIMESTAMP column in each unit Parquet counts in, plus a tz-naive one and a list of
+    # timestamps. The importer reads the unit off the logical type and scales every column
+    # to the microseconds a DateTime holds, so all four scalar columns name one instant:
+    # 2024-03-14T09:30:00Z. The nanosecond column also carries a sub-microsecond digit on
+    # one row, which floors, and one row is null in every column.
+    instant = datetime.datetime(2024, 3, 14, 9, 30, 0, tzinfo=datetime.timezone.utc)
+    earlier = datetime.datetime(1969, 12, 31, 23, 59, 59, tzinfo=datetime.timezone.utc)
+
+    ids = [0, 1, 2]
+    labels = [[b"Event"], [b"Event"], [b"Event"]]
+
+    # Written through int64 arrays cast to each unit, so the exact on-disk counts are
+    # pinned here rather than left to a datetime object's own resolution
+    micros = [1710408600000000, -1000000, None]
+    millis = [1710408600000, -1000, None]
+    nanos = [1710408600000000000, -1000000000 - 1, None]
+
+    table = pa.table(
+        {
+            "__id": pa.array(ids, pa.int64()),
+            "__labels": pa.array(labels, LABELS_TYPE),
+            "atMicros": pa.array(micros, pa.int64()).cast(pa.timestamp("us", tz="UTC")),
+            "atMillis": pa.array(millis, pa.int64()).cast(pa.timestamp("ms", tz="UTC")),
+            "atNanos": pa.array(nanos, pa.int64()).cast(pa.timestamp("ns", tz="UTC")),
+            # No tz: Parquet records isAdjustedToUTC=false, and the wall clock is read as UTC
+            "atNaive": pa.array(micros, pa.int64()).cast(pa.timestamp("us")),
+            "atList": pa.array(
+                [[instant, earlier], [], None],
+                pa.list_(pa.timestamp("us", tz="UTC")),
+            ),
+        }
+    )
+    write(table, "datetime_property_nodes.parquet")
+
+
+def datetime_property_edges():
+    # One edge carrying a timestamp, so the edge visitor's own switch is exercised too
+    table = pa.table(
+        {
+            "__source": pa.array([0], pa.int64()),
+            "__target": pa.array([1], pa.int64()),
+            "__type": pa.array([b"HAPPENED"], pa.binary()),
+            "at": pa.array([1710408600000000], pa.int64()).cast(pa.timestamp("us", tz="UTC")),
+        }
+    )
+    write(table, "datetime_property_edges.parquet")
+
+
+def datetime_out_of_range_nodes():
+    # A TIMESTAMP(MILLIS) whose instant falls outside the year range an ISO-8601 string
+    # with a four-digit year can spell. 1e15 ms is year 33658: it clears the millis
+    # overflow guard, so only a range check on the instant itself turns it away.
+    # Two nodes, so minimal_edges.parquet's 0 -> 1 resolves and the import reaches the
+    # property it is really about
+    table = pa.table(
+        {
+            "__id": pa.array([0, 1], pa.int64()),
+            "__labels": pa.array([[b"Event"], [b"Event"]], LABELS_TYPE),
+            "at": pa.array([10**15, 0], pa.int64()).cast(pa.timestamp("ms", tz="UTC")),
+        }
+    )
+    write(table, "datetime_out_of_range_nodes.parquet")
+
+
+def datetime_name_clash_fixtures():
+    # One property name discovered at two types across a split export: TIMESTAMP on the
+    # nodes, plain INT64 on the edges. A DateTime and an Int64 are the same eight bytes, so
+    # without a check the edge's 42 reads back as 1970-01-01T00:00:00.000042Z.
+    nodes = pa.table(
+        {
+            "__id": pa.array([0, 1], pa.int64()),
+            "__labels": pa.array([[b"Event"], [b"Event"]], LABELS_TYPE),
+            "ts": pa.array([1710408600000000, 0], pa.int64()).cast(pa.timestamp("us", tz="UTC")),
+        }
+    )
+    write(nodes, "datetime_name_clash_nodes.parquet")
+
+    edges = pa.table(
+        {
+            "__source": pa.array([0], pa.int64()),
+            "__target": pa.array([1], pa.int64()),
+            "__type": pa.array([b"LINKS"], pa.binary()),
+            "ts": pa.array([42], pa.int64()),
+        }
+    )
+    write(edges, "datetime_name_clash_edges.parquet")
+
+
+def duration_property_fixtures():
+    # Parquet has no duration type, so LOAD PARQUET ... WITH DURATIONS names the INT64
+    # columns that count microseconds. "count" is an INT64 left unnamed, "startedAt" and
+    # "note" are columns a duration clause must refuse.
+    nodes = pa.table(
+        {
+            "__id": pa.array([0, 1, 2], pa.int64()),
+            "__labels": pa.array([[b"Task"], [b"Task"], [b"Task"]], LABELS_TYPE),
+            "elapsed": pa.array([90061000000, -1000000, None], pa.int64()),
+            "laps": pa.array([[1000000, 2000000], [], None], pa.list_(pa.int64())),
+            "count": pa.array([1, 2, 3], pa.int64()),
+            "startedAt": pa.array([1710408600000000, 0, 0], pa.int64()).cast(pa.timestamp("us", tz="UTC")),
+            "note": pa.array(["a", "b", "c"], pa.string()),
+        }
+    )
+    write(nodes, "duration_property_nodes.parquet")
+
+    edges = pa.table(
+        {
+            "__source": pa.array([0], pa.int64()),
+            "__target": pa.array([1], pa.int64()),
+            "__type": pa.array([b"WAITED"], pa.binary()),
+            "wait": pa.array([5000000], pa.int64()),
+        }
+    )
+    write(edges, "duration_property_edges.parquet")
+
+
+def duration_logical_type_nodes():
+    # INT64 columns whose logical type says they count something other than signed
+    # microseconds: an unsigned integer and a TIME(NANOS)
+    nodes = pa.table(
+        {
+            "__id": pa.array([0, 1], pa.int64()),
+            "__labels": pa.array([[b"Task"], [b"Task"]], LABELS_TYPE),
+            "unsignedCount": pa.array([2**63, 1], pa.uint64()),
+            "timeOfDay": pa.array([1000, 2000], pa.time64("ns")),
+        }
+    )
+    write(nodes, "duration_logical_type_nodes.parquet")
+
+
 if __name__ == "__main__":
     minimal_edges()
     multipage_string_nodes()
+    nested_list_property_nodes()
+    datetime_property_nodes()
+    datetime_property_edges()
+    datetime_out_of_range_nodes()
+    datetime_name_clash_fixtures()
+    duration_property_fixtures()
+    duration_logical_type_nodes()

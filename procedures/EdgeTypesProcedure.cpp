@@ -4,6 +4,7 @@
 #include "ProcedureState.h"
 #include "Procedure.h"
 #include "ProcedureNamespace.h"
+#include "TypedProcedure.h"
 #include "iterators/ScanEdgeTypesIterator.h"
 #include "columns/ColumnVector.h"
 #include "views/GraphView.h"
@@ -12,28 +13,14 @@ using namespace db;
 
 namespace {
 
-struct Data : public ProcedureData {
+struct Data : public TypedProcedureData<EdgeTypesProcedure> {
     std::unique_ptr<ScanEdgeTypesChunkWriter> _it;
 };
 
 }
 
-ProcedureData* EdgeTypesProcedure::allocData() {
-    return new Data();
-}
-
-void EdgeTypesProcedure::deallocData(ProcedureData* data) {
-    delete data;
-}
-
 void EdgeTypesProcedure::registerProcedure(ProcedureNamespace* ns) {
-    Procedure* proc = new Procedure("edgeTypes");
-    proc->setExecuteCallback(&execute);
-    proc->setAllocCallback(&allocData);
-    proc->setDeallocCallback(&deallocData);
-    proc->addReturnValue("id", ProcedureType::EDGE_TYPE_ID);
-    proc->addReturnValue("edgeType", ProcedureType::STRING_VIEW);
-    ns->addProcedure(proc);
+    ns->addProcedure(createTypedProcedure<Data>("edgeTypes"));
 }
 
 void EdgeTypesProcedure::execute(ProcedureState* proc) {
@@ -41,11 +28,8 @@ void EdgeTypesProcedure::execute(ProcedureState* proc) {
     const ProcedureContext* ctxt = proc->getContext();
     const GraphView& view = *ctxt->getGraphView();
 
-    Column* rawIdsCol = data.getReturnColumn(0);
-    Column* rawNamesCol = data.getReturnColumn(1);
-
-    auto* idsCol = static_cast<ColumnVector<EdgeTypeID>*>(rawIdsCol);
-    auto* namesCol = static_cast<ColumnVector<std::string_view>*>(rawNamesCol);
+    auto* idsCol = data.getReturnColumn<0>();
+    auto* namesCol = data.getReturnColumn<1>();
 
     switch (proc->getStep()) {
         case ProcedureState::Step::PREPARE: {

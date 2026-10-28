@@ -3,9 +3,8 @@
   "graph": "simpledb",
   "query": "RETURN COUNT(NULL)",
   "expect": {
-    "plan": "ANALYZE ERROR\n-------* Query error\n     1 | RETURN COUNT(NULL)\n       |        ^^^^^^^^^^^\n-------* Invalid arguments for function 'count'",
-    "result": "ANALYZE ERROR\n-------* Query error\n     1 | RETURN COUNT(NULL)\n       |        ^^^^^^^^^^^\n-------* Invalid arguments for function 'count'",
-    "resultJson": "{\"error\":\"ANALYZE_ERROR\",\"error_details\":\"-------* Query error\\n     1 | RETURN COUNT(NULL)\\n       |        ^^^^^^^^^^^\\n-------* Invalid arguments for function 'count'\"}"
+    "result": "COUNT(NULL)\n0",
+    "resultJson": "{\"header\":{\"column_names\":[\"COUNT(NULL)\"],\"column_types\":[\"UInt64\"]},\"data\":[[[0]]]}"
   },
   "tags": [
     "count",

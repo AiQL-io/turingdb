@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <optional>
+
 #include "TuringTest.h"
 
 #include "Graph.h"
@@ -9,7 +11,6 @@
 #include "metadata/GraphMetadata.h"
 #include "metadata/PropertyType.h"
 #include "reader/GraphReader.h"
-#include "iterators/GetPropertiesIterator.h"
 #include "versioning/Transaction.h"
 #include "views/GraphView.h"
 #include "writers/GraphWriter.h"
@@ -24,7 +25,7 @@ TEST(EmbeddingPropertyContainerTest, EmptyContainer) {
     ASSERT_EQ(container.getValueType(), ValueType::Embedding);
     ASSERT_EQ(container.all().size(), 0);
     ASSERT_FALSE(container.has(EntityID(0)));
-    ASSERT_EQ(container.tryGet(EntityID(0)), nullptr);
+    ASSERT_EQ(container.tryGetWithNull(EntityID(0)), nullptr);
 }
 
 TEST(EmbeddingPropertyContainerTest, AddAndGet) {
@@ -53,19 +54,103 @@ TEST(EmbeddingPropertyContainerTest, AddAndGet) {
     ASSERT_EQ(v2[2], 6.0f);
 }
 
-TEST(EmbeddingPropertyContainerTest, TryGet) {
+TEST(EmbeddingPropertyContainerTest, TryGetWithNull) {
     TypedPropertyContainer<types::Embedding> container(2);
 
     const float data[] = {1.0f, 2.0f};
     container.add(EntityID(5), data);
 
-    const auto* found = container.tryGet(EntityID(5));
-    ASSERT_NE(found, nullptr);
-    ASSERT_EQ((*found)[0], 1.0f);
-    ASSERT_EQ((*found)[1], 2.0f);
+    const std::optional<const types::Embedding::Primitive*> found = container.tryGetWithNull(EntityID(5));
+    ASSERT_TRUE(found.has_value());
+    ASSERT_NE(found.value(), nullptr);
+    ASSERT_EQ((*found.value())[0], 1.0f);
+    ASSERT_EQ((*found.value())[1], 2.0f);
 
-    const auto* notFound = container.tryGet(EntityID(99));
-    ASSERT_EQ(notFound, nullptr);
+    ASSERT_EQ(container.tryGetWithNull(EntityID(99)), nullptr);
+}
+
+TEST(EmbeddingPropertyContainerTest, ExplicitNullHoldsNoValue) {
+    TypedPropertyContainer<types::Embedding> container(2);
+
+    const float data[] = {1.0f, 2.0f};
+    container.add(EntityID(10), data);
+    container.add(EntityID(20), std::nullopt);
+
+    ASSERT_EQ(container.size(), 1);
+
+    ASSERT_TRUE(container.has(EntityID(10)));
+    ASSERT_FALSE(container.has(EntityID(20)));
+    ASSERT_FALSE(container.has(EntityID(30)));
+
+    const std::optional<const types::Embedding::Primitive*> value = container.tryGetWithNull(EntityID(10));
+    ASSERT_TRUE(value.has_value());
+    ASSERT_NE(value.value(), nullptr);
+
+    ASSERT_FALSE(container.tryGetWithNull(EntityID(20)).has_value());
+    ASSERT_EQ(container.tryGetWithNull(EntityID(30)), nullptr);
+}
+
+TEST(EmbeddingPropertyContainerTest, TryGetWithNullSeparatesNullFromAbsent) {
+    TypedPropertyContainer<types::Embedding> container(2);
+
+    const float data[] = {1.0f, 2.0f};
+    container.add(EntityID(10), data);
+    container.add(EntityID(20), std::nullopt);
+
+    const std::optional<const types::Embedding::Primitive*> value = container.tryGetWithNull(EntityID(10));
+    ASSERT_TRUE(value.has_value());
+    ASSERT_NE(value.value(), nullptr);
+    ASSERT_EQ((*value.value())[0], 1.0f);
+
+    ASSERT_FALSE(container.tryGetWithNull(EntityID(20)).has_value());
+
+    const std::optional<const types::Embedding::Primitive*> absent = container.tryGetWithNull(EntityID(30));
+    ASSERT_TRUE(absent.has_value());
+    ASSERT_EQ(absent.value(), nullptr);
+}
+
+TEST(EmbeddingPropertyContainerTest, SortKeepsExplicitNull) {
+    TypedPropertyContainer<types::Embedding> container(2);
+
+    const float data1[] = {1.0f, 2.0f};
+    const float data2[] = {3.0f, 4.0f};
+
+    container.add(EntityID(50), data2);
+    container.add(EntityID(30), std::nullopt);
+    container.add(EntityID(10), data1);
+
+    container.sort();
+
+    ASSERT_FALSE(container.has(EntityID(30)));
+    ASSERT_FALSE(container.tryGetWithNull(EntityID(30)).has_value());
+
+    const std::optional<const types::Embedding::Primitive*> first = container.tryGetWithNull(EntityID(10));
+    ASSERT_TRUE(first.has_value());
+    ASSERT_NE(first.value(), nullptr);
+    ASSERT_EQ((*first.value())[0], 1.0f);
+
+    const std::optional<const types::Embedding::Primitive*> second = container.tryGetWithNull(EntityID(50));
+    ASSERT_TRUE(second.has_value());
+    ASSERT_NE(second.value(), nullptr);
+    ASSERT_EQ((*second.value())[0], 3.0f);
+}
+
+TEST(EmbeddingPropertyContainerTest, SortKeepsNullsWithNoValues) {
+    TypedPropertyContainer<types::Embedding> container(2);
+
+    container.add(EntityID(1), std::nullopt);
+    container.add(EntityID(2), std::nullopt);
+
+    container.sort();
+
+    ASSERT_EQ(container.size(), 0);
+
+    ASSERT_FALSE(container.tryGetWithNull(EntityID(1)).has_value());
+    ASSERT_FALSE(container.tryGetWithNull(EntityID(2)).has_value());
+
+    const std::optional<const types::Embedding::Primitive*> absent = container.tryGetWithNull(EntityID(3));
+    ASSERT_TRUE(absent.has_value());
+    ASSERT_EQ(absent.value(), nullptr);
 }
 
 TEST(EmbeddingPropertyContainerTest, AllAndGetSpan) {
@@ -230,7 +315,7 @@ protected:
     std::unique_ptr<JobSystem> _jobSystem;
 };
 
-TEST_F(EmbeddingGraphTest, GetPropertiesIterator) {
+TEST_F(EmbeddingGraphTest, GetPropertiesWithNullIteratorAcrossBuckets) {
     const size_t dimension = 4;
 
     EmbeddingBucket probe(dimension);
@@ -270,16 +355,19 @@ TEST_F(EmbeddingGraphTest, GetPropertiesIterator) {
     }
 
     // Iterate embeddings and verify against the idx property
-    const auto vecRange = reader.getNodeProperties<types::Embedding>(vecType->_id, &nodeIDs);
+    const auto vecRange = reader.getNodePropertiesWithNull<types::Embedding>(vecType->_id, &nodeIDs);
 
     size_t total = 0;
     for (auto it = vecRange.begin(); it.isValid(); it.next()) {
-        const NodeID nodeID = it.getCurrentEntityID();
-        const auto view = it.get();
+        const NodeID nodeID = it.getCurrentID();
+        const auto value = it.get();
+        ASSERT_TRUE(value.has_value());
+
+        const auto view = value.value();
         ASSERT_EQ(view.size(), dimension);
 
         // Look up the original loop index via the idx property
-        const auto* origIdx = reader.tryGetNodeProperty<types::Int64>(idxType->_id, nodeID);
+        const auto* origIdx = reader.tryGetNodeProperty<types::Int64>(idxType->_id, nodeID).value_or(nullptr);
         ASSERT_NE(origIdx, nullptr);
         const size_t i = static_cast<size_t>(*origIdx);
 
@@ -337,7 +425,7 @@ TEST_F(EmbeddingGraphTest, GetPropertiesWithNullIterator) {
         const NodeID nodeID = it.getCurrentID();
         const auto value = it.get();
 
-        const auto* origIdx = reader.tryGetNodeProperty<types::Int64>(idxType->_id, nodeID);
+        const auto* origIdx = reader.tryGetNodeProperty<types::Int64>(idxType->_id, nodeID).value_or(nullptr);
         ASSERT_NE(origIdx, nullptr);
         const size_t i = static_cast<size_t>(*origIdx);
 
@@ -359,7 +447,5 @@ TEST_F(EmbeddingGraphTest, GetPropertiesWithNullIterator) {
 }
 
 int main(int argc, char** argv) {
-    return turing::test::turingTestMain(argc, argv, [] {
-        testing::GTEST_FLAG(repeat) = 3;
-    });
+    return turing::test::turingTestMain(argc, argv);
 }

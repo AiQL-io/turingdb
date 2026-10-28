@@ -2,6 +2,7 @@
 
 #include <cctype>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -11,6 +12,7 @@
 #include "ProcedureState.h"
 #include "Procedure.h"
 #include "ProcedureNamespace.h"
+#include "TypedProcedure.h"
 #include "ProcUtils.h"
 #include "ProcedureException.h"
 #include "columns/ColumnVector.h"
@@ -25,27 +27,26 @@
 #include "metadata/PropertyTypeMap.h"
 #include "metadata/PropertyType.h"
 #include "versioning/Tombstones.h"
+#include "buffers/StringBuffer.h"
 #include "list/ListBuffer.h"
 #include "list/ListView.h"
 #include "list/ListElementView.h"
 #include "list/ListBufferTypeTag.h"
+#include "map/MapBufferTypeTag.h"
+#include "map/MapEntryView.h"
+#include "map/MapView.h"
 #include "ID.h"
 
 using namespace db;
 
 namespace {
 
-using NodeIDCol = ColumnVector<NodeID>;
-using ListColumn = ColumnVector<ListView>;
-using StringColumn = ColumnVector<std::string>;
-
 constexpr std::string_view labelsErr = "listNodes: labels must be a constant list";
-constexpr std::string_view propKeysErr = "listNodes: propertyKeys must be a constant list";
-constexpr std::string_view propValuesErr = "listNodes: propertyValues must be a constant list";
+constexpr std::string_view propertiesErr = "listNodes: properties must be a constant map";
 constexpr std::string_view skipErr = "listNodes: skip must be a constant int";
 constexpr std::string_view limitErr = "listNodes: limit must be a constant int";
 
-struct Data : public ProcedureData {};
+struct Data : public TypedProcedureData<ListNodesProcedure> {};
 
 struct PropertyFilter {
     PropertyTypeID _id;
@@ -68,6 +69,31 @@ void readStringList(const ListView* view, std::vector<std::string>& out) {
             continue;
         }
         out.emplace_back(el.getAs<std::string_view>());
+    }
+}
+
+// Read `properties` into `out` as one filter per entry: the key names the property, the
+// string value is the substring query, lower-cased for case-insensitive matching. Entries
+// whose value is not a string, or that name an unknown or non-string property, are
+// skipped. The caller supplies the map view via `ProcUtils::constArg<MapView>`, which
+// enforces the constant-map rule.
+void readPropertyFilters(const MapView* properties,
+                         const PropertyTypeMap& propTypes,
+                         std::vector<PropertyFilter>& out) {
+    std::string lowered;
+
+    for (const MapEntryView& entry : properties->entries()) {
+        if (entry.getValueTag() != MapBufferTypeTag::String) {
+            continue;
+        }
+
+        const std::optional<PropertyType> propType = propTypes.get(entry.getKey());
+        if (!propType || propType.value()._valueType != ValueType::String) {
+            continue;
+        }
+
+        toLowerInto(entry.getValueAs<std::string_view>(), lowered);
+        out.push_back({propType.value()._id, std::move(lowered)});
     }
 }
 
@@ -94,12 +120,11 @@ void executeImpl(ProcedureState* proc) {
     const ProcedureContext* ctxt = proc->getContext();
 
     const Column* inputLabelNames = data.getInputColumn(0);
-    const Column* inputPropKeys = data.getInputColumn(1);
-    const Column* inputPropValues = data.getInputColumn(2);
+    const Column* inputProperties = data.getInputColumn(1);
 
-    auto* idCol = static_cast<NodeIDCol*>(data.getReturnColumn(0));
-    auto* labelsCol = static_cast<ListColumn*>(data.getReturnColumn(1));
-    auto* propsCol = static_cast<StringColumn*>(data.getReturnColumn(2));
+    auto* idCol = data.getReturnColumn<0>();
+    auto* labelsCol = data.getReturnColumn<1>();
+    auto* propsCol = data.getReturnColumn<2>();
 
     const GraphView& view = *ctxt->getGraphView();
     const GraphReader reader(view);
@@ -107,23 +132,20 @@ void executeImpl(ProcedureState* proc) {
     const LabelMap& labelMap = metadata.labels();
     const PropertyTypeMap& propTypes = metadata.propTypes();
     ListBuffer<4096>* listBuffer = ctxt->getListBuffer();
+    StringBuffer* stringBuffer = ctxt->getStringBuffer();
 
-    const bool hasTombstones = view.tombstones().hasNodes();
+    const bool hasTombstones = view.hasDeletedNodes();
 
     // --- Arguments -------------------------------------------------
     std::vector<std::string> labelNames;
-    std::vector<std::string> propKeys;
-    std::vector<std::string> propValues;
 
     const auto& labelsList = ProcUtils::constArg<ListView>(inputLabelNames, labelsErr);
     readStringList(&labelsList, labelNames);
-    const auto& propKeysList = ProcUtils::constArg<ListView>(inputPropKeys, propKeysErr);
-    readStringList(&propKeysList, propKeys);
-    const auto& propValuesList = ProcUtils::constArg<ListView>(inputPropValues, propValuesErr);
-    readStringList(&propValuesList, propValues);
 
-    const int64_t skipArg = ProcUtils::constArg<types::Int64::Primitive>(data.getInputColumn(3), skipErr);
-    const int64_t limitArg = ProcUtils::constArg<types::Int64::Primitive>(data.getInputColumn(4), limitErr);
+    const auto& propertiesMap = ProcUtils::constArg<MapView>(inputProperties, propertiesErr);
+
+    const int64_t skipArg = ProcUtils::constArg<types::Int64::Primitive>(data.getInputColumn(2), skipErr);
+    const int64_t limitArg = ProcUtils::constArg<types::Int64::Primitive>(data.getInputColumn(3), limitErr);
 
     if (skipArg < 0) {
         throw ProcedureException("Skip argument cannot be negative");
@@ -147,25 +169,9 @@ void executeImpl(ProcedureState* proc) {
     // Property filters: string properties only, queries lower-cased for
     // case-insensitive substring matching.
     std::vector<PropertyFilter> filters;
-    std::string lowered;
-    for (size_t i = 0; i < propKeys.size() && i < propValues.size(); ++i) {
-        const auto pType = propTypes.get(propKeys[i]);
-        if (!pType || pType.value()._valueType != ValueType::String) {
-            continue;
-        }
-        toLowerInto(propValues[i], lowered);
-        filters.push_back({pType.value()._id, std::move(lowered)});
-    }
+    readPropertyFilters(&propertiesMap, propTypes, filters);
 
-    if (idCol) {
-        idCol->clear();
-    }
-    if (labelsCol) {
-        labelsCol->clear();
-    }
-    if (propsCol) {
-        propsCol->clear();
-    }
+    data.clearReturnColumns();
 
     const size_t cap = skip + limit;
 
@@ -207,7 +213,7 @@ void executeImpl(ProcedureState* proc) {
 
         if (propsCol) {
             ProcUtils::encodeProperties(node.properties(), propTypes, propsJson);
-            propsCol->push_back(propsJson);
+            propsCol->push_back(stringBuffer->insert(propsJson));
         }
 
         return true;
@@ -275,27 +281,12 @@ void executeImpl(ProcedureState* proc) {
 
 }
 
-ProcedureData* ListNodesProcedure::allocData() {
-    return new Data();
-}
-
-void ListNodesProcedure::deallocData(ProcedureData* data) {
-    delete data;
-}
-
 void ListNodesProcedure::registerProcedure(ProcedureNamespace* ns) {
-    Procedure* proc = new Procedure("listNodes");
-    proc->setExecuteCallback(&execute);
-    proc->setAllocCallback(&allocData);
-    proc->setDeallocCallback(&deallocData);
-    proc->addArgument("labels", ProcedureType::LIST);
-    proc->addArgument("propertyKeys", ProcedureType::LIST);
-    proc->addArgument("propertyValues", ProcedureType::LIST);
-    proc->addArgument("skip", ProcedureType::INT64);
-    proc->addArgument("limit", ProcedureType::INT64);
-    proc->addReturnValue("id", ProcedureType::NODE);
-    proc->addReturnValue("labels", ProcedureType::LIST);
-    proc->addReturnValue("properties", ProcedureType::STRING);
+    Procedure* proc = createTypedProcedure<Data>("listNodes");
+    proc->addConstantArgument("labels", ProcedureType::LIST);
+    proc->addConstantArgument("properties", ProcedureType::MAP);
+    proc->addConstantArgument("skip", ProcedureType::INT64);
+    proc->addConstantArgument("limit", ProcedureType::INT64);
     ns->addProcedure(proc);
 }
 

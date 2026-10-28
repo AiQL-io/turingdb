@@ -18,13 +18,12 @@ fi
 
 # Build
 echo "PYTHON_VERSION=$PYTHON_VERSION"
-uv build --wheel $UV_PYTHON_FLAG
-cd build && make install && cd ..
+uv build --wheel $UV_PYTHON_FLAG --build-constraints build-constraints.txt
 
 if [[ "$(uname)" == "Darwin" ]]; then
     uv add delocate
-    uvx --from delocate delocate-wheel -v -w wheel dist/turingdb-*.whl
+    uvx --constraints build-constraints.txt --from delocate delocate-wheel -v -w wheel dist/turingdb-*.whl
 else
     uv add auditwheel
-    uvx auditwheel repair dist/*.whl -w wheel
+    uvx --constraints build-constraints.txt --with patchelf auditwheel repair dist/*.whl -w wheel
 fi

@@ -1,0 +1,362 @@
+#pragma once
+
+#include <array>
+#include <span>
+#include <stdint.h>
+#include <stddef.h>
+#include <limits.h>
+#include <unordered_map>
+#include <vector>
+
+#include "ChunkWriter.h"
+#include "PartDirectory.h"
+#include "PathCycleTable.h"
+#include "PathExplorationDir.h"
+#include "PathHopFilter.h"
+#include "PathReachTable.h"
+#include "PathStep.h"
+#include "PathTargetIndex.h"
+#include "versioning/PendingAdjacency.h"
+#include "columns/ColumnIDs.h"
+#include "columns/ColumnVector.h"
+#include "datapart/EdgeRecord.h"
+#include "metadata/LabelSetHandle.h"
+#include "views/GraphView.h"
+#include "ID.h"
+
+namespace db {
+
+class PathDistanceIndex;
+class PathTrie;
+class Tombstones;
+
+// Enumerates every trail of minHops to maxHops edges leaving each input node, depth first,
+// as a chunk writer: each fill emits up to maxCount rows of (input row, end node, path).
+// The walk repeats a body of steps and ends only after a whole number of repetitions.
+// With end labels, end nodes or an end node set only the paths ending on a node carrying
+// them, on the seed's own target, or on a node of the set are emitted, and with a distance
+// or target index set the prefixes that cannot reach such a node in time are not walked. In
+// the distinct mode the walk is a multi-source breadth-first search instead, emitting each
+// (seed, end) pair once and no path.
+class PathExplorator {
+public:
+    static constexpr size_t NO_TAINT = SIZE_MAX;
+
+    PathExplorator(const GraphView& view,
+                   const ColumnNodeIDs* inputNodeIDs,
+                   uint64_t minHops,
+                   uint64_t maxHops);
+    ~PathExplorator();
+
+    // The labels of a node, wherever it lives: a data part, or this change's buffer
+    LabelSetHandle labelSetOf(NodeID node) const;
+
+    void setIndices(ColumnVector<size_t>* indices) { _indices = indices; }
+    void setTargets(ColumnNodeIDs* targets) { _targets = targets; }
+    void setPaths(ColumnVector<PathRef>* paths, PathTrie* trie);
+    void addStep(const PathStep& step);
+    void setEndLabels(const LabelSet* labels);
+    void setEndNodes(const ColumnNodeIDs* endNodes) { _endNodes = endNodes; }
+    // The ends every seed shares, sorted and without duplicates
+    void setEndNodeSet(std::span<const NodeID> endNodeSet);
+    void setDistanceIndex(const PathDistanceIndex* index) { _distances = index; }
+    void setTargetIndex(const PathTargetIndex* index) { _targetIndex = index; }
+    // The edges this change has written and not committed, walked beside the graph's own, up
+    // to @param edgeIDBound: the index is shared between the walks of one program and only
+    // grows, so the bound is what holds this walk to the edges that existed when it started.
+    void setPendingAdjacency(const PendingAdjacency* adjacency, size_t edgeIDBound);
+
+    void setDistinctEnds(bool distinct);
+    void setCandidateLookahead(size_t lookahead) { _lookahead = lookahead; }
+
+    void reset();
+    void fill(size_t maxCount);
+    bool isValid() const { return _valid; }
+
+    bool searchesLevels() const;
+
+    // How many edge records the walk has examined since the last reset
+    size_t getCandidateCheckCount() const { return _candidateChecks; }
+
+private:
+    static constexpr size_t MAX_DEPENDENCIES = 4;
+
+    struct Step : PathStep {
+        std::vector<uint64_t> _edgeTypeWords;
+
+        bool readsRepetition() const { return _hopFilter && _hopFilter->readsRepetition(); }
+    };
+
+    // The candidates of one node on the path, a range of the candidate stacks. The held edges
+    // its subtree's ends depend on start at _dependencyBegin on the dependency stack; _taint is
+    // the shallowest path position of the ones folded away past MAX_DEPENDENCIES
+    struct Frame {
+        size_t _candidateBegin {0};
+        size_t _candidateEnd {0};
+        size_t _next {0};
+        NodeID _node;
+        uint64_t _budget {0};
+        size_t _dependencyBegin {0};
+        size_t _taint {NO_TAINT};
+    };
+
+    // An edge held at _position on the path that a subtree's ends depend on
+    struct Dependency {
+        EdgeID _edge;
+        size_t _position {0};
+    };
+
+    struct DependencyList {
+        std::array<EdgeID, MAX_DEPENDENCIES> _edges;
+        size_t _count {0};
+    };
+
+    // The expansions walked in full, keyed by node and remaining budget, each with the held
+    // edges its ends depend on: an arrival holding all of them reaches no end the walk missed
+    struct ExpansionMemo {
+        struct Slot {
+            uint64_t _key {0};
+            uint32_t _stamp {0};
+            uint32_t _list {0};
+        };
+
+        std::vector<Slot> _slots;
+        std::vector<DependencyList> _dependencyLists;
+        DependencyList _noDependencies;
+        uint32_t _generation {1};
+        size_t _used {0};
+
+        void clear();
+        void remember(uint64_t key, std::span<const Dependency> dependencies);
+        const DependencyList* find(uint64_t key) const;
+        void grow();
+    };
+
+    // A set of 64-bit keys emptied in constant time: an entry counts only while its stamp
+    // matches the generation, which a clear bumps
+    struct KeySet {
+        std::vector<uint64_t> _keys;
+        std::vector<uint32_t> _stamps;
+        uint32_t _generation {1};
+        size_t _used {0};
+
+        void clear();
+        bool insert(uint64_t key);
+        bool contains(uint64_t key) const;
+        void grow();
+    };
+
+    // The position of every edge on a path long enough to saturate the signature, one probe
+    // away; a shorter path is scanned. Edges leave in the order they came, so a pop only ever
+    // empties the last slot of its probe chain, and a slot counts only while its stamp is the
+    // table's generation, which dropping back to a scanned path bumps.
+    struct PathEdgeTable {
+        struct Slot {
+            EdgeID _edge;
+            size_t _position {0};
+            uint32_t _stamp {0};
+        };
+
+        std::vector<Slot> _slots;
+        uint32_t _generation {1};
+        bool _active {false};
+
+        void push(std::span<const EdgeID> path);
+        void pop(std::span<const EdgeID> path);
+        void clear();
+        size_t find(std::span<const EdgeID> path, EdgeID edge) const;
+        void rebuild(std::span<const EdgeID> path);
+        void place(EdgeID edge, size_t position);
+    };
+
+    // The multi-source search of the distinct mode: one bit per seed of the current batch in
+    // the words of every node it reaches, the rows a level gained emitted before the next
+    // level is expanded
+    struct Reachability {
+        std::vector<PathReachTable> _reached;
+        size_t _step {0};
+        std::vector<NodeID> _frontier;
+        std::vector<NodeID> _next;
+        std::vector<PathHopFrame> _frames;
+        std::vector<uint64_t> _frameWords;
+        std::vector<NodeID> _candidateNodes;
+        std::vector<EdgeID> _candidateEdges;
+        size_t _batchFirstRow {0};
+        uint64_t _level {0};
+        size_t _emitNode {0};
+        uint64_t _emitBits {0};
+        uint64_t _closedSeeds {0};
+        bool _batchActive {false};
+    };
+
+    // The search for a cycle through every seed of a batch of an undirected distinct walk, one
+    // bit per seed, walking out of each seed and never through it. A node keeps, for each seed,
+    // whether two arrivals left the seed by different edges, and the index of the first one's
+    // edge among the seed's, bit-sliced over the identity words.
+    struct CycleSearch {
+        struct FirstHop {
+            EdgeID _edge;
+            NodeID _node;
+        };
+
+        // A node of a component labelled in one depth-first walk: its discovery index, the
+        // lowest one its subtree reaches by an edge off the tree, and whether it is on a cycle
+        struct ComponentNode {
+            size_t _index {0};
+            size_t _low {0};
+            bool _onCycle {false};
+        };
+
+        struct ComponentFrame {
+            NodeID _node;
+            EdgeID _parentEdge;
+            size_t _candidateBegin {0};
+            size_t _candidateEnd {0};
+            size_t _next {0};
+        };
+
+        PathCycleTable _reached;
+        std::array<std::vector<FirstHop>, PathTargetIndex::targetsPerBatch> _firstHops;
+        std::vector<NodeID> _frontier;
+        std::vector<NodeID> _next;
+        std::unordered_map<uint64_t, bool> _seeds;
+        std::unordered_map<uint64_t, ComponentNode> _components;
+        std::vector<ComponentFrame> _frames;
+        std::vector<NodeID> _candidateNodes;
+        std::vector<EdgeID> _candidateEdges;
+    };
+
+    GraphView _view;
+    const ColumnNodeIDs* _input {nullptr};
+    std::vector<Step> _steps;
+    uint64_t _minHops {0};
+    uint64_t _maxHops {0};
+
+    ColumnVector<size_t>* _indices {nullptr};
+    ColumnNodeIDs* _targets {nullptr};
+    ColumnVector<PathRef>* _paths {nullptr};
+    PathTrie* _trie {nullptr};
+    LabelSetHandle _endLabels;
+    const ColumnNodeIDs* _endNodes {nullptr};
+    std::span<const NodeID> _endNodeSet;
+    bool _filtersByEndNodeSet {false};
+    const PathDistanceIndex* _distances {nullptr};
+    const PathTargetIndex* _targetIndex {nullptr};
+    const PendingAdjacency* _pendingAdjacency {nullptr};
+    size_t _pendingEdgeIDBound {0};
+    bool _distinctEnds {false};
+    size_t _lookahead {1};
+
+    PartDirectory _parts;
+    const Tombstones* _tombstones {nullptr};
+    bool _filterTombstones {false};
+
+    Reachability _reach;
+    CycleSearch _cycleSearch;
+
+    // The depth-first walk leaving the seed of row _seedRow: the edges and nodes it stands
+    // on, and the candidates of every node it descended through
+    bool _active {false};
+    size_t _seedRow {0};
+    size_t _arena {0};
+    // The arena's entries below this size are held by rows of the chunk being filled
+    size_t _pinned {0};
+    NodeID _targetNode;
+    PathTargetHandle _target;
+    std::vector<EdgeID> _pathEdges;
+    // The node at each depth of the walk, kept only for a body of several steps
+    std::vector<NodeID> _pathNodes;
+    PathEdgeTable _pathEdgeTable;
+    std::vector<PathRef> _pathEntries;
+    std::vector<uint64_t> _pathSignatures;
+    std::vector<Frame> _frames;
+    std::vector<NodeID> _candidateNodes;
+    std::vector<EdgeID> _candidateEdges;
+
+    // Set while the walk only owes its caller the set of nodes it ends on, which lets a
+    // subtree that no held edge constrained stand in for every later arrival at its node
+    bool _prunes {false};
+    // Off when a hop filter reads the repetition the walk is in, which the memo does not key
+    bool _remembersExpansions {false};
+    uint64_t _expansionSpan {0};
+    bool _keysDepth {false};
+    KeySet _emittedEnds;
+    ExpansionMemo _expansions;
+    std::vector<Dependency> _dependencies;
+
+    size_t _seedCursor {0};
+    size_t _written {0};
+    size_t _candidateChecks {0};
+    bool _valid {false};
+
+    // Whether the node is one this change wrote, which no data part holds and whose
+    // adjacency and labels are read from the write buffer instead
+    bool isPendingNode(NodeID node) const;
+    size_t nodeIDBound() const;
+
+    void prefetchNodeData(NodeID node, size_t partIndex) const;
+    bool hasWork() const;
+    // The step the hop leaving a node at that depth takes
+    const Step& stepAt(uint64_t depth) const;
+    bool endsRepetition(uint64_t depth) const;
+    bool isEnd(size_t seedRow, NodeID node) const;
+    bool canReachTargetWithin(NodeID node, uint64_t hops) const;
+    void resizeOutputs(size_t count);
+
+    uint64_t expansionKey(NodeID node, uint64_t budget) const;
+
+    void startSeed(size_t row);
+    void step();
+    void popFrame();
+    // Drops the dependencies from begin on that the subtree at that depth held itself, keeps at
+    // most MAX_DEPENDENCIES of the rest and folds the others into taint
+    void keepDependenciesAbove(size_t begin, size_t depth, size_t& taint);
+    void descend(NodeID node);
+    void generateCandidates(std::span<const EdgeRecord> edges);
+    void generatePendingCandidates(NodeID node);
+    size_t positionOnPath(EdgeID edge) const;
+    // Whether the path, extended by the arrival edge, holds every edge of the list
+    bool holdsDependencies(const DependencyList& dependencies, EdgeID arrival) const;
+    // The dependencies of the node's remembered expansion at that depth when the path, extended
+    // by the arrival edge, holds every one of them, or null when a walk there has to be redone
+    const DependencyList* findReusableExpansion(NodeID node, uint64_t depth, EdgeID arrival) const;
+    // Records that the subtree could not take the held edge to the node at that depth, unless
+    // the ends beyond it are all emitted or remembered under edges the path holds, or an index
+    // rules the node out
+    void dependOnBlockedEdge(EdgeID edge, NodeID node, uint64_t depth, size_t position);
+    void dependOn(const DependencyList& dependencies, EdgeID arrival);
+    void emit(size_t seedRow, NodeID target, PathRef path);
+
+    void acquireArena();
+    void releaseArena();
+    void retainWalkedPath();
+    void releasePathEntry();
+
+    void fillDistinct(size_t maxCount);
+    bool levelsFindTrails() const;
+    PathReachTable& reachTableAt(uint64_t level);
+    void startBatch();
+    bool searchesSeedCycles() const;
+    // The seeds of the batch, as bits, that a closed trail of at most _maxHops edges returns to
+    uint64_t closedSeedsOf(uint64_t seeds);
+    uint64_t searchCycles(uint64_t seeds);
+    uint64_t closingReturns(uint64_t returning, uint64_t twice, std::span<const uint64_t> identity, EdgeID edge) const;
+    // Whether any cycle closes a trail, however long, and every edge can be crossed both ways
+    bool labelsComponents() const;
+    void labelComponentOf(NodeID root);
+    void discoverComponentNode(NodeID node, EdgeID parentEdge);
+    void emitGainedRows(size_t maxCount);
+    void expandLevel();
+    void reachFrames();
+    void collectReachCandidates(NodeID node);
+    void appendReachFrame(NodeID node);
+    void filterReachFrames();
+    void clearReachFrames();
+    void appendReachCandidates(std::span<const EdgeRecord> edges);
+    void appendPendingReachCandidates(NodeID node);
+    void finishBatch();
+};
+
+static_assert(NonRootChunkWriter<PathExplorator>);
+
+}

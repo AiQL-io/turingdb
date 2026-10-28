@@ -105,11 +105,11 @@ class BinaryClient(CypherHelpersMixin):
             self._change = None
             return
         if isinstance(change, str):
-            change_int = int(change, 16)
+            change_int = int(change)
             change_str = change
         else:
             change_int = change
-            change_str = f"{change:x}"
+            change_str = str(change)
         self._call(self._inner.set_change_id, change_int)
         self._change = change_str
 
@@ -133,12 +133,12 @@ class BinaryClient(CypherHelpersMixin):
             "use the HTTP TuringDB client to enumerate on-disk graphs"
         )
 
-    def query(self, cypher: str) -> DataFrame:
+    def query(self, cypher: str, query_parameters: Optional[dict] = None) -> DataFrame:
         import pandas as pd
 
         from .protocol import DTYPE_MAP
 
-        raw = self._timed_query(cypher)
+        raw = self._timed_query(cypher, query_parameters)
         data = raw["data"]
         dtypes = raw["dtypes"]
         return pd.DataFrame(
@@ -148,14 +148,14 @@ class BinaryClient(CypherHelpersMixin):
             }
         )
 
-    def query_raw(self, cypher: str) -> dict:
-        return self._timed_query(cypher)
+    def query_raw(self, cypher: str, query_parameters: Optional[dict] = None) -> dict:
+        return self._timed_query(cypher, query_parameters)
 
-    def _timed_query(self, cypher: str) -> dict:
+    def _timed_query(self, cypher: str, query_parameters: Optional[dict] = None) -> dict:
         self._query_exec_time = None
         self._total_exec_time = None
         self._t0 = time.time()
-        result = self._call(self._inner.query, cypher)
+        result = self._call(self._inner.query, cypher, query_parameters)
         self._t1 = time.time()
         self._total_exec_time = (self._t1 - self._t0) * 1000
         self._query_exec_time = result.get("time")

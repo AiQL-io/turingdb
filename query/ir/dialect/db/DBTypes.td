@@ -40,8 +40,65 @@ class ColumnOf<string cppType, string mnemonic> : Type<
 def ColumnNodeIDs : ColumnOf<"::mlir::storage::NodeIDType", "nodeid">;
 def ColumnEdgeIDs : ColumnOf<"::mlir::storage::EdgeIDType", "edgeid">;
 def ColumnEdgeTypes : ColumnOf<"::mlir::storage::EdgeTypeIDType", "edge_type_id">;
+def ColumnPath : ColumnOf<"::mlir::storage::PathType", "path">;
+def ColumnPathRefs : ColumnOf<"::mlir::storage::PathRefType", "path_ref">;
+def ColumnEntityList : ColumnOf<"::mlir::storage::EntityListType", "entity_list">;
+
+def ColumnChangeIDs : ColumnOf<"::mlir::storage::ChangeIDType", "change_id">;
 
 // Property Types
 def ColumnBools : ColumnOf<"::mlir::storage::BoolType", "bool">;
+def ColumnNullables : ColumnOf<"::mlir::storage::NullableType", "nullable">;
+
+// The two element types the system commands report their result tables in: a
+// name or signature they looked up, and a size or tally they counted.
+def ColumnStrings : ColumnOf<"::mlir::storage::StringType", "string">;
+def ColumnCounts : ColumnOf<"::mlir::IntegerType", "ui64">;
+
+// The distance a vector search scored a neighbour at; the neighbour itself is a node,
+// so it rides the node ID column above.
+def ColumnDoubles : ColumnOf<"::mlir::Float64Type", "f64">;
+
+// The column an OPTIONAL MATCH's row tag rides on: the position of the input row
+// each matched row descends from. Unlike the ColumnOf constraints above it carries
+// a BuildableType recipe for its single concrete type, so db.optional_yield can
+// leave the tag's type out of its assembly and build it from here instead.
+def ColumnRowTags : Type<
+        CPred<"::llvm::isa<::mlir::db::ColumnType>($_self) && "
+              "::llvm::cast<::mlir::db::ColumnType>($_self).getType().isUnsignedInteger(64)">,
+        "column of row tags", "::mlir::db::ColumnType">,
+    BuildableType<"::mlir::db::ColumnType::get($_builder.getContext(), "
+                  "$_builder.getIntegerType(64, false))">;
+
+def ColumnMaps : Type<
+        CPred<"::llvm::isa<::mlir::db::ColumnType>($_self) && "
+              "::llvm::isa<::mlir::storage::MapType>(::llvm::cast<::mlir::db::ColumnType>($_self).getType())">,
+        "column of maps", "::mlir::db::ColumnType">,
+    BuildableType<"::mlir::db::ColumnType::get($_builder.getContext(), "
+                  "::mlir::storage::MapType::get($_builder.getContext()))">;
+
+def ColumnMapElements : ColumnOf<"::mlir::storage::MapElementType", "map_element">;
+
+// The seen-set several db.remove_duplicates share, so that one dedup spans dataflows
+// that never meet: the branches of a UNION, whose rows reach the result through one
+// db.output each and are still deduped against one another.
+def DistinctSetType : TuringType<"DistinctSet", "distinct_set"> {
+    let summary = "A dedup key set shared by several db.remove_duplicates";
+    let description = [{
+        Produced by db.distinct_set and read by every db.remove_duplicates that dedups
+        against the same rows. A dedup naming no set keeps one of its own, which is what
+        a plain RETURN DISTINCT emits.
+    }];
+}
+
+// The rows in flight held once for several dataflows to read in turn: the branches of a
+// UNION that a NEXT hands the whole table it returned.
+def MaterializedType : TuringType<"Materialized", "materialized"> {
+    let summary = "Rows held by db.materialize for each db.scan_materialized to read";
+    let description = [{
+        Produced by db.materialize and read by every db.scan_materialized that walks the
+        rows it holds.
+    }];
+}
 
 #endif // TURINGDB_TYPES

@@ -21,7 +21,7 @@ CLANG_BUILD=1 ./dependencies.sh
 # Fuzz only the query engine, forever
 ./fuzz/run_afl.sh --nostop --cypher
 
-# Fuzz only the HTTP parser, 10 minutes
+# Fuzz only the HTTP server, 10 minutes
 ./fuzz/run_afl.sh --http --time 600
 ```
 
@@ -29,10 +29,10 @@ CLANG_BUILD=1 ./dependencies.sh
 
 | Flag | Harness | What it tests |
 |------|---------|---------------|
-| `--cypher` | `fuzz_query_engine` | Full query pipeline: parse, analyze, plan, optimize, execute against SimpleGraph data |
-| `--http` | `fuzz_http_parser` | Custom HTTP parser: method, URI, headers, Content-Length, payload handling |
+| `--cypher` | `fuzz_query_engine` | Query engine: parse, analyze, generate the db program, lower and execute against SimpleGraph data |
+| `--http` | `fuzz_http_parser` | HTTP server: the request path of `TCPConnectionManager` after `recv()`, `DBServerProcessor` running the query against SimpleGraph data, and the chunked JSON response |
+| `--proto` | `fuzz_proto_parser` | Binary protocol end to end: a real `TuringServer` in-process, `net::proto::TuringClient` sends the fuzzed query and decodes the response. The input is the query string |
 | `--csv` | `fuzz_csv_parser` | CSV parser: `parseCSVLine()` and `peekFileStructure()` |
-| `--gml` | `fuzz_gml_importer` | GML importer: `importContent()` with arbitrary GML data |
 
 If no flag is specified, all harnesses are run.
 
@@ -83,24 +83,50 @@ valgrind --leak-check=full --track-origins=yes \
 
 ## Exception Policy
 
-The harnesses only catch expected user-input errors (`CompilerException`, `PipelineException`, `VersionControlException`). The following are **not caught** and will crash the process for AFL to report:
+The harnesses only catch expected user-input errors. For the query engine that is the `CompilerException` of the parser and analyzer, and the plain `TuringException` codegen and execution reject a query with. The following are **not caught** and will crash the process for AFL to report:
 
-- `FatalException` — internal logic errors
+- `FatalException` — internal logic errors, rethrown even where a `TuringException` is caught
 - `bioassert` failures — assertion violations (throw `FatalException`)
 - Any other unexpected exception
+
+`fuzz_http_parser` runs the server's own request path, where `QueryInterpreterV3` turns these
+into a JSON error response. The harness reads the response back and aborts when `error_details`
+starts with `Unexpected exception` or is `Unknown exception occurred`, when the body is not valid
+JSON, or when the chunked framing is broken.
+
+`fuzz_proto_parser` drives the binary protocol through the real `net::proto::TuringClient`: the
+client sends the query and decodes the response, so the harness writes no framing or decoding of
+its own. It aborts when the decoded status carries one of those internal-error messages, and any
+exception the client raises on a response it cannot decode crashes the process for AFL to report.
 
 ## Dictionaries
 
 Token dictionaries improve AFL's mutation quality for structured inputs:
 
-- `fuzz/cypher.dict` — 178 Cypher keywords, operators, functions, procedures
+- `fuzz/cypher.dict` — Cypher keywords, operators, functions, procedures and patterns
 - `fuzz/http.dict` — HTTP methods, headers, TuringDB endpoints, URI parameters
 
-These are automatically loaded by `run_afl.sh` for the corresponding harness.
+These are automatically loaded by `run_afl.sh` for the corresponding harness. The
+keyword, function and procedure sections come from `query/parser/CypherLexer.l`,
+`query/AST/FunctionDecls.cpp` and `procedures/`; refresh them when the language grows.
+`MERGE_DATAPARTS` is left out on purpose: the command is not meant to be used yet, so
+`fuzz_query_engine` skips any query that names it and `make_corpus.py` seeds none.
 
 ## Seed Corpus
 
-- `fuzz/corpus/cypher/` — 312 Cypher queries extracted from the test suite
-- `fuzz/corpus/http/` — 272 HTTP inputs (AFL++-generated corpus covering all parser edges)
+- `fuzz/corpus/cypher/` — Cypher queries from the query test suite, the regression tests and the C++ unit tests
+- `fuzz/corpus/http/` — 272 HTTP inputs (AFL++-generated corpus covering all parser edges),
+  and `cypher_*.raw`: each hand-written Cypher seed in the `POST /query` request the Python
+  HTTP client sends, on main, inside a change, on a commit and with a token
+- `fuzz/corpus/proto/` — the hand-written Cypher seeds as plain queries; the proto harness feeds
+  the query to `net::proto::TuringClient`, which frames the request
 - `fuzz/corpus/csv/` — 3 CSV files (basic, quoted, no headers)
-- `fuzz/corpus/gml/` — 1 GML graph file
+
+The Cypher seeds go stale as the language grows, so regenerate them from the
+repository's own queries. The same script rewrites the `cypher_*.raw` HTTP seeds:
+
+```bash
+python3 fuzz/make_corpus.py            # add every query the sources produce
+python3 fuzz/make_corpus.py --dry-run  # report what would change
+python3 fuzz/make_corpus.py --prune    # also drop seeds no source produces any more
+```

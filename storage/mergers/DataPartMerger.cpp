@@ -8,6 +8,7 @@
 #include "datapart/EdgeContainer.h"
 #include "datapart/NodeContainer.h"
 #include "versioning/TombstoneRanges.h"
+#include "metadata/PropertyTypeDispatcher.h"
 #include "properties/PropertyManager.h"
 #include "reader/GraphReader.h"
 
@@ -16,31 +17,6 @@
 using namespace db;
 namespace rg = ranges;
 namespace rv = rg::views;
-
-struct PropertyTypeDispatcher {
-    ValueType _valueType {ValueType::Invalid};
-
-    auto execute(const auto& executor) const {
-        switch (_valueType) {
-            case ValueType::Int64:
-                return executor.template operator()<types::Int64>();
-            case ValueType::UInt64:
-                return executor.template operator()<types::UInt64>();
-            case ValueType::Double:
-                return executor.template operator()<types::Double>();
-            case ValueType::Bool:
-                return executor.template operator()<types::Bool>();
-            case ValueType::String:
-                return executor.template operator()<types::String>();
-            case ValueType::Embedding:
-                return executor.template operator()<types::Embedding>();
-            case ValueType::_SIZE:
-            case ValueType::Invalid: {
-                throw TuringException("Unsupported property type");
-            }
-        }
-    }
-};
 
 DataPartMerger::DataPartMerger(const CommitData* commitData,
                                MetadataBuilder& metadataBuilder)
@@ -56,7 +32,7 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
     const size_t nodeCount = graphReader.getNodeCount();
     const size_t edgeCount = graphReader.getEdgeCount();
 
-    std::unique_ptr<DataPartBuilder> datapartBuilder = DataPartBuilder::prepare(_metadataBuilder, 0, 0, 0);
+    std::unique_ptr<DataPartBuilder> datapartBuilder = DataPartBuilder::prepareMerge(_metadataBuilder, _graphView);
 
     std::vector<LabelSetHandle>& labelSets = datapartBuilder->coreNodeLabelSets();
     std::vector<EdgeRecord>& edges = datapartBuilder->edges();
@@ -150,7 +126,7 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
 
                         auto& propertyContainer = nodePropertyManager.getMutableContainer<types::String>(propertyID);
                         propertyContainer._values._views.resize(_nodePropertiesCount[propertyID]);
-                        propertyContainer.ids().resize(_nodePropertiesCount[propertyID]);
+                        propertyContainer.getMutableIDs().resize(_nodePropertiesCount[propertyID]);
 
                         // Re-use for offsets;
                         _nodePropertiesCount[propertyID] = 0;
@@ -170,7 +146,7 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
                         std::memcpy(newContainer._values._views.data() + _nodePropertiesCount[propertyID],
                                     oldContainer._values._views.data() + start,
                                     (size * sizeof(std::string_view)));
-                        std::memcpy(newContainer.ids().data() + _nodePropertiesCount[propertyID],
+                        std::memcpy(newContainer.getMutableIDs().data() + _nodePropertiesCount[propertyID],
                                     oldContainer.ids().data() + start,
                                     (size * sizeof(EntityID)));
                         _nodePropertiesCount[propertyID] += size;
@@ -188,7 +164,7 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
 
                         auto& newEmbContainer = nodePropertyManager.getMutableContainer<types::Embedding>(propertyID);
                         newEmbContainer._values._views.resize(_nodePropertiesCount[propertyID]);
-                        newEmbContainer.ids().resize(_nodePropertiesCount[propertyID]);
+                        newEmbContainer.getMutableIDs().resize(_nodePropertiesCount[propertyID]);
 
                         // Re-use for offsets;
                         _nodePropertiesCount[propertyID] = 0;
@@ -202,7 +178,67 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
                         std::memcpy(newContainer._values._views.data() + _nodePropertiesCount[propertyID],
                                     oldContainer._values._views.data() + start,
                                     (size * sizeof(std::span<const float>)));
-                        std::memcpy(newContainer.ids().data() + _nodePropertiesCount[propertyID],
+                        std::memcpy(newContainer.getMutableIDs().data() + _nodePropertiesCount[propertyID],
+                                    oldContainer.ids().data() + start,
+                                    (size * sizeof(EntityID)));
+                        _nodePropertiesCount[propertyID] += size;
+                    }
+
+                } else if constexpr (std::is_same_v<Type, types::List>) {
+                    if (!nodePropertyManager.hasPropertyType(propertyID)) {
+                        if (_nodePropertiesCount[propertyID] == 0) {
+                            emptyNodeProperties.insert(propertyID);
+                            return;
+                        }
+                        nodePropertyManager.registerPropertyType<types::List>(propertyID);
+
+                        auto& propertyContainer = nodePropertyManager.getMutableContainer<types::List>(propertyID);
+                        propertyContainer._values._views.resize(_nodePropertiesCount[propertyID]);
+                        propertyContainer.getMutableIDs().resize(_nodePropertiesCount[propertyID]);
+
+                        // Re-use for offsets;
+                        _nodePropertiesCount[propertyID] = 0;
+                    }
+
+                    auto& oldContainer = propertyContainer->cast<types::List>();
+                    auto& newContainer = nodePropertyManager.getMutableContainer<types::List>(propertyID);
+
+                    const TombstoneRanges& keptRanges = nodeRangesPerPart.at(idx).at(propertyID);
+                    for (const auto& [start, size] : keptRanges) {
+                        std::memcpy(newContainer._values._views.data() + _nodePropertiesCount[propertyID],
+                                    oldContainer._values._views.data() + start,
+                                    (size * sizeof(ListView)));
+                        std::memcpy(newContainer.getMutableIDs().data() + _nodePropertiesCount[propertyID],
+                                    oldContainer.ids().data() + start,
+                                    (size * sizeof(EntityID)));
+                        _nodePropertiesCount[propertyID] += size;
+                    }
+
+                } else if constexpr (std::is_same_v<Type, types::Map>) {
+                    if (!nodePropertyManager.hasPropertyType(propertyID)) {
+                        if (_nodePropertiesCount[propertyID] == 0) {
+                            emptyNodeProperties.insert(propertyID);
+                            return;
+                        }
+                        nodePropertyManager.registerPropertyType<types::Map>(propertyID);
+
+                        auto& propertyContainer = nodePropertyManager.getMutableContainer<types::Map>(propertyID);
+                        propertyContainer._values._views.resize(_nodePropertiesCount[propertyID]);
+                        propertyContainer.getMutableIDs().resize(_nodePropertiesCount[propertyID]);
+
+                        // Re-use for offsets;
+                        _nodePropertiesCount[propertyID] = 0;
+                    }
+
+                    auto& oldContainer = propertyContainer->cast<types::Map>();
+                    auto& newContainer = nodePropertyManager.getMutableContainer<types::Map>(propertyID);
+
+                    const TombstoneRanges& keptRanges = nodeRangesPerPart.at(idx).at(propertyID);
+                    for (const auto& [start, size] : keptRanges) {
+                        std::memcpy(newContainer._values._views.data() + _nodePropertiesCount[propertyID],
+                                    oldContainer._values._views.data() + start,
+                                    (size * sizeof(MapView)));
+                        std::memcpy(newContainer.getMutableIDs().data() + _nodePropertiesCount[propertyID],
                                     oldContainer.ids().data() + start,
                                     (size * sizeof(EntityID)));
                         _nodePropertiesCount[propertyID] += size;
@@ -218,7 +254,7 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
 
                         auto& propertyContainer = nodePropertyManager.getMutableContainer<Type>(propertyID);
                         propertyContainer.values().resize(_nodePropertiesCount[propertyID]);
-                        propertyContainer.ids().resize(_nodePropertiesCount[propertyID]);
+                        propertyContainer.getMutableIDs().resize(_nodePropertiesCount[propertyID]);
 
                         // Re-use for offsets;
                         _nodePropertiesCount[propertyID] = 0;
@@ -232,7 +268,7 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
                         std::memcpy(newContainer.values().data() + _nodePropertiesCount[propertyID],
                                     oldContainer.values().data() + start,
                                     (size * sizeof(typename Type::Primitive)));
-                        std::memcpy(newContainer.ids().data() + _nodePropertiesCount[propertyID],
+                        std::memcpy(newContainer.getMutableIDs().data() + _nodePropertiesCount[propertyID],
                                     oldContainer.ids().data() + start,
                                     (size * sizeof(EntityID)));
                         _nodePropertiesCount[propertyID] += size;
@@ -260,7 +296,7 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
 
                         auto& propertyContainer = edgePropertyManager.getMutableContainer<types::String>(propertyID);
                         propertyContainer._values._views.resize(_edgePropertiesCount[propertyID]);
-                        propertyContainer.ids().resize(_edgePropertiesCount[propertyID]);
+                        propertyContainer.getMutableIDs().resize(_edgePropertiesCount[propertyID]);
 
                         // Re-use for offsets;
                         _edgePropertiesCount[propertyID] = 0;
@@ -274,7 +310,7 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
                         std::memcpy(newContainer._values._views.data() + _edgePropertiesCount[propertyID],
                                     oldContainer._values._views.data() + start,
                                     (size * sizeof(std::string_view)));
-                        std::memcpy(newContainer.ids().data() + _edgePropertiesCount[propertyID],
+                        std::memcpy(newContainer.getMutableIDs().data() + _edgePropertiesCount[propertyID],
                                     oldContainer.ids().data() + start,
                                     (size * sizeof(EntityID)));
                         _edgePropertiesCount[propertyID] += size;
@@ -292,7 +328,7 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
 
                         auto& newEmbContainer = edgePropertyManager.getMutableContainer<types::Embedding>(propertyID);
                         newEmbContainer._values._views.resize(_edgePropertiesCount[propertyID]);
-                        newEmbContainer.ids().resize(_edgePropertiesCount[propertyID]);
+                        newEmbContainer.getMutableIDs().resize(_edgePropertiesCount[propertyID]);
 
                         // Re-use for offsets;
                         _edgePropertiesCount[propertyID] = 0;
@@ -306,7 +342,67 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
                         std::memcpy(newContainer._values._views.data() + _edgePropertiesCount[propertyID],
                                     oldContainer._values._views.data() + start,
                                     (size * sizeof(std::span<const float>)));
-                        std::memcpy(newContainer.ids().data() + _edgePropertiesCount[propertyID],
+                        std::memcpy(newContainer.getMutableIDs().data() + _edgePropertiesCount[propertyID],
+                                    oldContainer.ids().data() + start,
+                                    (size * sizeof(EntityID)));
+                        _edgePropertiesCount[propertyID] += size;
+                    }
+
+                } else if constexpr (std::is_same_v<Type, types::List>) {
+                    if (!edgePropertyManager.hasPropertyType(propertyID)) {
+                        if (_edgePropertiesCount[propertyID] == 0) {
+                            emptyEdgeProperties.insert(propertyID);
+                            return;
+                        }
+                        edgePropertyManager.registerPropertyType<types::List>(propertyID);
+
+                        auto& propertyContainer = edgePropertyManager.getMutableContainer<types::List>(propertyID);
+                        propertyContainer._values._views.resize(_edgePropertiesCount[propertyID]);
+                        propertyContainer.getMutableIDs().resize(_edgePropertiesCount[propertyID]);
+
+                        // Re-use for offsets;
+                        _edgePropertiesCount[propertyID] = 0;
+                    }
+
+                    auto& oldContainer = propertyContainer->cast<types::List>();
+                    auto& newContainer = edgePropertyManager.getMutableContainer<types::List>(propertyID);
+
+                    const TombstoneRanges& keptRanges = edgeRangesPerPart.at(idx).at(propertyID);
+                    for (const auto& [start, size] : keptRanges) {
+                        std::memcpy(newContainer._values._views.data() + _edgePropertiesCount[propertyID],
+                                    oldContainer._values._views.data() + start,
+                                    (size * sizeof(ListView)));
+                        std::memcpy(newContainer.getMutableIDs().data() + _edgePropertiesCount[propertyID],
+                                    oldContainer.ids().data() + start,
+                                    (size * sizeof(EntityID)));
+                        _edgePropertiesCount[propertyID] += size;
+                    }
+
+                } else if constexpr (std::is_same_v<Type, types::Map>) {
+                    if (!edgePropertyManager.hasPropertyType(propertyID)) {
+                        if (_edgePropertiesCount[propertyID] == 0) {
+                            emptyEdgeProperties.insert(propertyID);
+                            return;
+                        }
+                        edgePropertyManager.registerPropertyType<types::Map>(propertyID);
+
+                        auto& propertyContainer = edgePropertyManager.getMutableContainer<types::Map>(propertyID);
+                        propertyContainer._values._views.resize(_edgePropertiesCount[propertyID]);
+                        propertyContainer.getMutableIDs().resize(_edgePropertiesCount[propertyID]);
+
+                        // Re-use for offsets;
+                        _edgePropertiesCount[propertyID] = 0;
+                    }
+
+                    auto& oldContainer = propertyContainer->cast<types::Map>();
+                    auto& newContainer = edgePropertyManager.getMutableContainer<types::Map>(propertyID);
+
+                    const TombstoneRanges& keptRanges = edgeRangesPerPart.at(idx).at(propertyID);
+                    for (const auto& [start, size] : keptRanges) {
+                        std::memcpy(newContainer._values._views.data() + _edgePropertiesCount[propertyID],
+                                    oldContainer._values._views.data() + start,
+                                    (size * sizeof(MapView)));
+                        std::memcpy(newContainer.getMutableIDs().data() + _edgePropertiesCount[propertyID],
                                     oldContainer.ids().data() + start,
                                     (size * sizeof(EntityID)));
                         _edgePropertiesCount[propertyID] += size;
@@ -322,7 +418,7 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
 
                         auto& propertyContainer = edgePropertyManager.getMutableContainer<Type>(propertyID);
                         propertyContainer.values().resize(_edgePropertiesCount[propertyID]);
-                        propertyContainer.ids().resize(_edgePropertiesCount[propertyID]);
+                        propertyContainer.getMutableIDs().resize(_edgePropertiesCount[propertyID]);
 
                         // Re-use for offsets;
                         _edgePropertiesCount[propertyID] = 0;
@@ -335,7 +431,7 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
                         std::memcpy(newContainer.values().data() + _edgePropertiesCount[propertyID],
                                     oldContainer.values().data() + start,
                                     (size * sizeof(typename Type::Primitive)));
-                        std::memcpy(newContainer.ids().data() + _edgePropertiesCount[propertyID],
+                        std::memcpy(newContainer.getMutableIDs().data() + _edgePropertiesCount[propertyID],
                                     oldContainer.ids().data() + start,
                                     (size * sizeof(EntityID)));
                         _edgePropertiesCount[propertyID] += size;

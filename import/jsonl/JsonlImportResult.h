@@ -17,6 +17,10 @@ enum class JsonlImportErrorType : uint8_t {
     MISSING_EDGE_TGT_ID,
     MISMATCH_EMB_DIM,
     NON_NUMERIC_EMB,
+    NON_DATETIME_VALUE,
+    NON_DURATION_VALUE,
+    UNKNOWN_EDGE_SRC_ID,
+    UNKNOWN_EDGE_TGT_ID,
 
     _SIZE
 };
@@ -32,7 +36,11 @@ using JsonlImportErrorTypeDescription = EnumToString<JsonlImportErrorType>::Crea
     EnumStringPair<JsonlImportErrorType::MISSING_EDGE_SRC_ID, "Missing edge source node id">,
     EnumStringPair<JsonlImportErrorType::MISSING_EDGE_TGT_ID, "Missing edge target node id">,
     EnumStringPair<JsonlImportErrorType::MISMATCH_EMB_DIM, "Found embedding property of differing dimensions">,
-    EnumStringPair<JsonlImportErrorType::NON_NUMERIC_EMB, "Found non-numeric value in embedding">
+    EnumStringPair<JsonlImportErrorType::NON_NUMERIC_EMB, "Found non-numeric value in embedding">,
+    EnumStringPair<JsonlImportErrorType::NON_DATETIME_VALUE, "Found a value naming no instant in a datetime property">,
+    EnumStringPair<JsonlImportErrorType::NON_DURATION_VALUE, "Found a value that is not a count of microseconds in a duration property">,
+    EnumStringPair<JsonlImportErrorType::UNKNOWN_EDGE_SRC_ID, "Edge source references an unknown node id">,
+    EnumStringPair<JsonlImportErrorType::UNKNOWN_EDGE_TGT_ID, "Edge target references an unknown node id">
 >;
 
 class JsonlImportError {

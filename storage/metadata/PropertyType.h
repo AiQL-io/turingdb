@@ -8,6 +8,16 @@
 #include "ID.h"
 #include "SupportedType.h"
 
+#include "metadata/DateTime.h"
+#include "metadata/Duration.h"
+
+#include "list/EncodedList.h"
+#include "list/ListHash.h"
+#include "list/ListView.h"
+#include "map/EncodedMap.h"
+#include "map/MapHash.h"
+#include "map/MapView.h"
+
 #include "FatalException.h"
 
 namespace db {
@@ -20,6 +30,10 @@ enum class ValueType : uint8_t {
     String,
     Bool,
     Embedding,
+    List,
+    DateTime,
+    Map,
+    Duration,
 
     _SIZE,
 };
@@ -31,7 +45,11 @@ using ValueTypeName = EnumToString<ValueType>::Create<
     EnumStringPair<ValueType::Double, "Double">,
     EnumStringPair<ValueType::String, "String">,
     EnumStringPair<ValueType::Bool, "Bool">,
-    EnumStringPair<ValueType::Embedding, "Embedding">>;
+    EnumStringPair<ValueType::Embedding, "Embedding">,
+    EnumStringPair<ValueType::List, "List">,
+    EnumStringPair<ValueType::DateTime, "DateTime">,
+    EnumStringPair<ValueType::Map, "Map">,
+    EnumStringPair<ValueType::Duration, "Duration">>;
 
 struct CustomBool {
     CustomBool() = default;
@@ -98,6 +116,7 @@ struct Double : public PropertyType {
 
 struct String : public PropertyType {
     using Primitive = std::string_view;
+    using OwningPrimitive = std::string;
     using MandatorySpan = std::span<const Primitive>;
     using OptionalSpan = std::span<const std::optional<Primitive>>;
     static constexpr auto _valueType = ValueType::String;
@@ -118,12 +137,44 @@ struct Embedding : public PropertyType {
     static constexpr auto _valueType = ValueType::Embedding;
 };
 
+struct List : public PropertyType {
+    using Primitive = ListView;
+    using OwningPrimitive = EncodedList;
+    using MandatorySpan = std::span<const Primitive>;
+    using OptionalSpan = std::span<const std::optional<Primitive>>;
+    static constexpr auto _valueType = ValueType::List;
+};
+
+struct DateTime : public PropertyType {
+    using Primitive = db::DateTime;
+    using MandatorySpan = std::span<const Primitive>;
+    using OptionalSpan = std::span<const std::optional<Primitive>>;
+    static constexpr auto _valueType = ValueType::DateTime;
+};
+
+struct Duration : public PropertyType {
+    using Primitive = db::Duration;
+    using MandatorySpan = std::span<const Primitive>;
+    using OptionalSpan = std::span<const std::optional<Primitive>>;
+    static constexpr auto _valueType = ValueType::Duration;
+};
+
+struct Map : public PropertyType {
+    using Primitive = MapView;
+    using OwningPrimitive = EncodedMap;
+    using MandatorySpan = std::span<const Primitive>;
+    using OptionalSpan = std::span<const std::optional<Primitive>>;
+    static constexpr auto _valueType = ValueType::Map;
+};
+
 }
 
 template <typename T>
 concept TrivialSupportedType = SupportedType<T>
     && !std::same_as<T, types::String>
-    && !std::same_as<T, types::Embedding>;
+    && !std::same_as<T, types::Embedding>
+    && !std::same_as<T, types::List>
+    && !std::same_as<T, types::Map>;
 
 enum class PropertyImportance : uint8_t {
     Mandatory = 0,
@@ -167,6 +218,18 @@ struct ValueTypeDispatcher {
             case ValueType::Embedding:
                 executor.template operator()<types::Embedding>();
             break;
+            case ValueType::List:
+                executor.template operator()<types::List>();
+            break;
+            case ValueType::DateTime:
+                executor.template operator()<types::DateTime>();
+            break;
+            case ValueType::Duration:
+                executor.template operator()<types::Duration>();
+            break;
+            case ValueType::Map:
+                executor.template operator()<types::Map>();
+            break;
             case ValueType::_SIZE:
             case ValueType::Invalid: {
                 throw FatalException("Unsupported property type");
@@ -190,6 +253,20 @@ struct std::hash<db::PropertyType> {
     std::size_t operator()(const db::PropertyType& pt) const noexcept {
         return std::hash<unsigned short> {}(pt._id.getValue())
              + std::hash<uint8_t> {}(static_cast<uint8_t>(pt._valueType));
+    }
+};
+
+template <>
+struct std::hash<db::ListView> {
+    std::size_t operator()(const db::ListView& list) const noexcept {
+        return db::hashList(list);
+    }
+};
+
+template <>
+struct std::hash<db::MapView> {
+    std::size_t operator()(const db::MapView& map) const noexcept {
+        return db::hashMap(map);
     }
 };
 

@@ -5,6 +5,7 @@ include "mlir/IR/AttrTypeBase.td"
 
 include "StorageDialect.td"
 include "StorageEnums.td"
+include "StorageAttributes.td"
 
 class StorageType<string name, string typeMnemonic, list<Trait> traits = []>
     : TypeDef<Storage, name, traits> {
@@ -44,12 +45,69 @@ def LabelSetID : StorageType<"LabelSetID", "labelset_id"> {
     let description = "The element type of a chunk holding label set IDs";
 }
 
+def LabelID : StorageType<"LabelID", "label_id"> {
+    let summary = "A single label identifier";
+    let description = [{
+        The element type of a chunk holding label IDs - one label, where
+        !storage.labelset_id names a whole set. A CALL of a procedure yielding a
+        LABEL_ID column (db.labels' `id`) produces such a chunk.
+    }];
+}
+
+def PropertyTypeID : StorageType<"PropertyTypeID", "property_type_id"> {
+    let summary = "A property type identifier";
+    let description = [{
+        The element type of a chunk holding property type IDs - the schema handle
+        an !nl.property_type resolves a name to, here as a column value rather
+        than a resolved handle. A CALL of a procedure yielding a PROPERTY_TYPE_ID
+        column (db.propertyTypes' `id`) produces such a chunk.
+    }];
+}
+
+def ValueType : StorageType<"ValueType", "value_type"> {
+    let summary = "The kind of a property value";
+    let description = [{
+        The element type of a chunk holding value-type codes - storage's
+        ValueType enum (String, Int64, Double, ...), the *kind* of a value rather
+        than a value of that kind. A CALL of a procedure yielding a VALUE_TYPE
+        column (db.propertyTypes' `valueType`) produces such a chunk.
+    }];
+}
+
 def Embedding : StorageType<"Embedding", "embedding"> {
     let summary = "An embedding property value";
     let description = [{
         The element type an embedding property's nullable value chunk wraps. The
         vector (a span of floats per row) lives in storage; the dimension is part
         of the schema, not spelled here, so this is a plain placeholder type.
+    }];
+}
+
+def ChangeID : StorageType<"ChangeID", "change_id"> {
+    let summary = "A change identifier";
+    let description = [{
+        The element type of a chunk holding change IDs - storage's ChangeID. It
+        wraps a 64-bit value but is not an integer: it is rendered in hexadecimal
+        and only ever compared for identity, so a plain i64 would print the wrong
+        thing. Produced by db.change / nl.change, which report the changes an
+        operation created, submitted, deleted or listed.
+    }];
+}
+
+def DateTime : StorageType<"DateTime", "datetime"> {
+    let summary = "A datetime property value";
+    let description = [{
+        The element type of a chunk holding one instant per row - storage's
+        ColumnVector<DateTime>. It wraps a 64-bit count of microseconds since the Unix
+        epoch.
+    }];
+}
+
+def Duration : StorageType<"Duration", "duration"> {
+    let summary = "A duration property value";
+    let description = [{
+        The element type of a chunk holding one length of time per row - storage's
+        ColumnVector<Duration>. It wraps a signed 64-bit count of microseconds.
     }];
 }
 
@@ -66,6 +124,46 @@ def Nullable : StorageType<"Nullable", "nullable"> {
     let assemblyFormat = "`<` $valueType `>`";
 }
 
+def Any : StorageType<"Any", "any"> {
+    let summary = "A value of any type, tagged per cell";
+    let description = [{
+        The element type of a chunk whose rows share no single type - storage's
+        ColumnVector<ListElementView>. Each cell carries its own type tag beside its
+        value. Produced where Cypher answers a value whose type is known only per row:
+        an element of a heterogeneous list, an UNWIND of one, a reduce accumulator
+        whose updates change type.
+    }];
+}
+
+def Path : StorageType<"Path", "path"> {
+    let summary = "A graph path value";
+    let description = [{
+        Chunk representation of ColumnVector<Path>.
+    }];
+}
+
+def PathRef : StorageType<"PathRef", "path_ref"> {
+    let summary = "A path handle";
+    let description = [{
+        The element type of a chunk holding one path per row - storage's
+        ColumnVector<PathRef>. Each cell is a handle into the query-scoped PathTrie,
+        which stores every enumerated path as a chain of parent pointers, so a row
+        copies in O(1) whatever the path's length and a prefix shared by many paths is
+        stored once. Produced by db.explore_paths; expanded into a list of edge or node
+        IDs by db.expand_path where a list is consumed, and at output.
+    }];
+}
+
+def EntityList : StorageType<"EntityList", "entity_list"> {
+    let summary = "A sequence of graph entities";
+    let description = [{
+        The element type of a chunk holding one entity sequence per row - storage's
+        ColumnVector<EntityList>. Each entry carries whether it is a node or an edge
+        beside its ID, so a path reads back as the nodes and the relationships it runs
+        through, told apart at output. Produced by db.make_path.
+    }];
+}
+
 def List : StorageType<"List", "list"> {
     let summary = "A list value";
     let description = [{
@@ -74,10 +172,59 @@ def List : StorageType<"List", "list"> {
         over the list's elements in the query-scoped ListBuffer, so a row copies in
         O(1) regardless of list length. The wrapped type is the (homogeneous) element
         type - `!storage.list<none>` until the element primitive is resolved. It is
-        produced by a collect and drained element-by-element by an unwind.
+        produced by a collect and drained element-by-element by an unwind, and by a
+        CALL of a procedure yielding a LIST return value.
     }];
     let parameters = (ins "::mlir::Type":$elementType);
     let assemblyFormat = "`<` $elementType `>`";
 }
+
+def Map : StorageType<"Map", "map"> {
+    let summary = "A Map Value";
+    let description = [{
+        The element type of a chunk holding one map per row - storage's ColumnVector<Map>.
+        Each cell is a MapView: a span over contiguous MapEntityViews forming one map.
+        }];
+}
+
+def MapElement : StorageType<"MapElement", "map_element"> {
+    let summary = "A single key-tagged scalar value read out of a map";
+    let description = [{
+        The element type of a chunk holding one map entry per row - storage's
+        ColumnVector<MapEntryView>. Each cell views the entry the map already holds: its
+        key, its own MapBufferTypeTag and its value, so a key read copies nothing. Like
+        !storage.any it is a fixed-width scalar rather than a container, and it
+        carries its null in the tag rather than in a !storage.nullable around it, so a
+        row whose map holds no such key - or no map at all - reads back as a Null-tagged
+        entry. Produced by db.static_map_key and db.dynamic_map_key, and only ever passed
+        through or rendered.
+    }];
+}
+
+// One string array per entity of a MERGE pattern: the label set of each chain node,
+// or the property names of each node and each hop. Both db.merge and nl.merge carry
+// these lists, so the constraint lives beside the types the two dialects share.
+def StrArrayArrayAttr : TypedArrayAttrBase<StrArrayAttr, "array of string arrays">;
+
+// A parameter standing in a label list carries the label type: what it binds is checked
+// against that type when the program runs, and nothing else may be written there
+def LabelParameterAttr : Attr<
+    And<[ParameterAttr.predicate,
+         CPred<"::llvm::isa<::mlir::storage::LabelIDType>(::llvm::cast<::mlir::storage::ParameterAttr>($_self).getType())">]>,
+    "parameter of label type">;
+
+def LabelRef : AnyAttrOf<[StrAttr, LabelParameterAttr], "label name or parameter of label type">;
+def LabelRefArrayAttr : TypedArrayAttrBase<LabelRef, "array of label names or parameters">;
+def LabelRefArrayArrayAttr : TypedArrayAttrBase<LabelRefArrayAttr, "array of label conjunctions">;
+
+// The edge type sibling: a parameter in an edge type list carries the edge type id type
+def EdgeTypeParameterAttr : Attr<
+    And<[ParameterAttr.predicate,
+         CPred<"::llvm::isa<::mlir::storage::EdgeTypeIDType>(::llvm::cast<::mlir::storage::ParameterAttr>($_self).getType())">]>,
+    "parameter typed edge_type_id">;
+
+def EdgeTypeRef : AnyAttrOf<[StrAttr, EdgeTypeParameterAttr], "edge type name or parameter typed edge_type_id">;
+def EdgeTypeRefArrayAttr : TypedArrayAttrBase<EdgeTypeRef, "array of edge type names or parameters">;
+def EdgeTypeRefArrayArrayAttr : TypedArrayAttrBase<EdgeTypeRefArrayAttr, "array of edge type disjunctions">;
 
 #endif // STORAGE_TYPES

@@ -1,0 +1,7419 @@
+#include "NLTranslator.h"
+
+#include <algorithm>
+#include <array>
+#include <optional>
+#include <span>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+
+#include <spdlog/fmt/bundled/format.h>
+
+#include "NLOps.h"
+#include "ParameterMap.h"
+#include "ParameterValue.h"
+#include "StorageAttributes.h"
+
+#include "IRConstantColumn.h"
+#include "IRRowAlignment.h"
+#include "IRValueTypes.h"
+#include "PathHopArguments.h"
+#include "list/ListBuffer.h"
+#include "map/MapBuffer.h"
+#include "map/MapWriteCursor.h"
+#include "mlir/IR/Block.h"
+#include "mlir/IR/BuiltinAttributes.h"
+#include "mlir/IR/BuiltinTypes.h"
+#include "mlir/IR/Verifier.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/raw_ostream.h"
+
+#include "Procedure.h"
+#include "ProcedureContext.h"
+#include "ProcedureData.h"
+#include "ProcedureManager.h"
+#include "columns/ColumnConst.h"
+#include "columns/ColumnMask.h"
+#include "columns/ColumnOptVector.h"
+#include "columns/Functions.h"
+#include "list/ListView.h"
+#include "metadata/GraphMetadata.h"
+#include "metadata/LabelSet.h"
+#include "metadata/LabelSetHandle.h"
+#include "metadata/LabelSetMap.h"
+#include "metadata/PropertyNull.h"
+#include "metadata/PropertyType.h"
+#include "reader/GraphReader.h"
+#include "NumberOrder.h"
+#include "TypeUtils.h"
+#include "views/GraphView.h"
+#include "writers/MetadataBuilder.h"
+
+#include "NLExecutor.h"
+#include "NLSystemTranslator.h"
+
+#include "LocalMemory.h"
+#include "IRException.h"
+#include "BioAssert.h"
+
+using namespace db;
+
+namespace nl = mlir::nl;
+namespace storage = mlir::storage;
+
+namespace {
+
+// A chunk holding the single row a reduction collapsed the whole relation to, or a
+// computation over such rows and constants: like a constant, it holds one value for
+// every row of the step that reads it, whichever loop that step belongs to.
+bool yieldsReducedRowChunk(mlir::Value column) {
+    llvm::DenseMap<mlir::Value, bool> classified;
+    llvm::DenseMap<mlir::Value, bool> constants;
+    llvm::SmallVector<mlir::Value> worklist {column};
+
+    while (!worklist.empty()) {
+        const mlir::Value value = worklist.back();
+        if (classified.contains(value)) {
+            worklist.pop_back();
+            continue;
+        }
+
+        mlir::Operation* const definingOp = value.getDefiningOp();
+        const bool isReduction = definingOp && mlir::isa<nl::CountResult, nl::CountScanRows, nl::AggregateResult>(definingOp);
+        const bool dependsOnOperands = definingOp
+                                    && !isReduction
+                                    && definingOp->hasTrait<mlir::OpTrait::ConstantThroughOperands>();
+
+        if (!dependsOnOperands) {
+            classified[value] = isReduction;
+            worklist.pop_back();
+            continue;
+        }
+
+        bool operandsPending = false;
+        for (const mlir::Value operand : definingOp->getOperands()) {
+            if (!classified.contains(operand)) {
+                worklist.push_back(operand);
+                operandsPending = true;
+            }
+        }
+
+        if (operandsPending) {
+            continue;
+        }
+
+        bool readsAReducedRow = false;
+        bool everyOperandStandsForEveryRow = true;
+
+        for (const mlir::Value operand : definingOp->getOperands()) {
+            const bool operandIsReducedRow = classified.at(operand);
+            const bool operandStandsForEveryRow = operandIsReducedRow || yieldsConstantColumn(operand, constants);
+
+            readsAReducedRow = readsAReducedRow || operandIsReducedRow;
+            everyOperandStandsForEveryRow = everyOperandStandsForEveryRow && operandStandsForEveryRow;
+        }
+
+        classified[value] = readsAReducedRow && everyOperandStandsForEveryRow;
+        worklist.pop_back();
+    }
+
+    return classified.at(column);
+}
+
+using NLUnaryFunctionSelector = NLUnaryFunctionKernel (*)(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+
+const std::unordered_map<std::string_view, NLUnaryFunctionSelector> unaryFunctionSelectors = {
+    {"nl.labels",     &NLExecutor::selectLabels},
+    {"nl.edge_type",  &NLExecutor::selectEdgeType},
+    {"nl.keys",       &NLExecutor::selectKeys},
+    {"nl.properties", &NLExecutor::selectProperties},
+    {"nl.start_node", &NLExecutor::selectFunction<StartNodeFunction>},
+    {"nl.end_node",   &NLExecutor::selectFunction<EndNodeFunction>},
+    {"nl.to_integer", &NLExecutor::selectConversion<ToIntegerFunction>},
+    {"nl.to_float",   &NLExecutor::selectConversion<ToFloatFunction>},
+    {"nl.to_string",  &NLExecutor::selectConversion<ToStringFunction>},
+    {"nl.to_boolean", &NLExecutor::selectConversion<ToBoolFunction>},
+    {"nl.to_integer_or_null", &NLExecutor::selectOrNull<&NLExecutor::selectConversion<ToIntegerFunction>, TaggedToIntegerOrNullFunction>},
+    {"nl.to_float_or_null",   &NLExecutor::selectOrNull<&NLExecutor::selectConversion<ToFloatFunction>, TaggedToFloatOrNullFunction>},
+    {"nl.to_boolean_or_null", &NLExecutor::selectOrNull<&NLExecutor::selectConversion<ToBoolFunction>, TaggedToBooleanOrNullFunction>},
+    {"nl.to_string_or_null",  &NLExecutor::selectOrNull<&NLExecutor::selectConversion<ToStringFunction>, TaggedToStringOrNullFunction>},
+    {"nl.to_datetime", &NLExecutor::selectDateTimeConversion},
+    {"nl.to_duration", &NLExecutor::selectDurationConversion},
+
+    {"nl.datetime_year",        &NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Year>>},
+    {"nl.datetime_month",       &NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Month>>},
+    {"nl.datetime_day",         &NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Day>>},
+    {"nl.datetime_hour",        &NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Hour>>},
+    {"nl.datetime_minute",      &NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Minute>>},
+    {"nl.datetime_second",      &NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Second>>},
+    {"nl.datetime_millisecond", &NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Millisecond>>},
+    {"nl.datetime_microsecond", &NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Microsecond>>},
+
+    {"nl.duration_years",                  &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Years>>},
+    {"nl.duration_quarters",               &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Quarters>>},
+    {"nl.duration_months",                 &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Months>>},
+    {"nl.duration_weeks",                  &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Weeks>>},
+    {"nl.duration_days",                   &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Days>>},
+    {"nl.duration_hours",                  &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Hours>>},
+    {"nl.duration_minutes",                &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Minutes>>},
+    {"nl.duration_seconds",                &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Seconds>>},
+    {"nl.duration_milliseconds",           &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Milliseconds>>},
+    {"nl.duration_microseconds",           &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::Microseconds>>},
+    {"nl.duration_quarters_of_year",       &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::QuartersOfYear>>},
+    {"nl.duration_months_of_year",         &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MonthsOfYear>>},
+    {"nl.duration_months_of_quarter",      &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MonthsOfQuarter>>},
+    {"nl.duration_days_of_week",           &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::DaysOfWeek>>},
+    {"nl.duration_minutes_of_hour",        &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MinutesOfHour>>},
+    {"nl.duration_seconds_of_minute",      &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::SecondsOfMinute>>},
+    {"nl.duration_milliseconds_of_second", &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MillisecondsOfSecond>>},
+    {"nl.duration_microseconds_of_second", &NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MicrosecondsOfSecond>>},
+
+    {"nl.element_id", &NLExecutor::selectId},
+    {"nl.size",       &NLExecutor::selectSize},
+    {"nl.char_length", &NLExecutor::selectFunction<CharLengthFunction>},
+    {"nl.head",       &NLExecutor::selectFunction<ListHeadFunction>},
+    {"nl.last",       &NLExecutor::selectFunction<ListLastFunction>},
+    {"nl.tail",       &NLExecutor::selectFunction<ListTailFunction>},
+
+    {"nl.abs",      &NLExecutor::selectNumberFunction<AbsFunction>},
+    {"nl.negate",   &NLExecutor::selectNegateFunction},
+    {"nl.unary_plus", &NLExecutor::selectUnaryPlusFunction},
+    {"nl.sign",     &NLExecutor::selectNumberFunction<SignFunction>},
+    {"nl.ceil",     &NLExecutor::selectFloatFunction<FloatFunctionKind::Ceil>},
+    {"nl.floor",    &NLExecutor::selectFloatFunction<FloatFunctionKind::Floor>},
+    {"nl.round",    &NLExecutor::selectFloatFunction<FloatFunctionKind::Round>},
+    {"nl.sqrt",     &NLExecutor::selectFloatFunction<FloatFunctionKind::Sqrt>},
+    {"nl.exp",      &NLExecutor::selectFloatFunction<FloatFunctionKind::Exp>},
+    {"nl.log",      &NLExecutor::selectFloatFunction<FloatFunctionKind::Log>},
+    {"nl.log10",    &NLExecutor::selectFloatFunction<FloatFunctionKind::Log10>},
+    {"nl.sin",      &NLExecutor::selectFloatFunction<FloatFunctionKind::Sin>},
+    {"nl.cos",      &NLExecutor::selectFloatFunction<FloatFunctionKind::Cos>},
+    {"nl.tan",      &NLExecutor::selectFloatFunction<FloatFunctionKind::Tan>},
+    {"nl.cot",      &NLExecutor::selectFloatFunction<FloatFunctionKind::Cot>},
+    {"nl.asin",     &NLExecutor::selectFloatFunction<FloatFunctionKind::Asin>},
+    {"nl.acos",     &NLExecutor::selectFloatFunction<FloatFunctionKind::Acos>},
+    {"nl.atan",     &NLExecutor::selectFloatFunction<FloatFunctionKind::Atan>},
+    {"nl.degrees",  &NLExecutor::selectFloatFunction<FloatFunctionKind::Degrees>},
+    {"nl.radians",  &NLExecutor::selectFloatFunction<FloatFunctionKind::Radians>},
+    {"nl.haversin", &NLExecutor::selectFloatFunction<FloatFunctionKind::Haversin>},
+
+    {"nl.to_upper", &NLExecutor::selectFunction<ToUpperFunction>},
+    {"nl.to_lower", &NLExecutor::selectFunction<ToLowerFunction>},
+    {"nl.trim",     &NLExecutor::selectFunction<TrimFunction<TrimSide::Both>>},
+    {"nl.ltrim",    &NLExecutor::selectFunction<TrimFunction<TrimSide::Start>>},
+    {"nl.rtrim",    &NLExecutor::selectFunction<TrimFunction<TrimSide::End>>},
+    {"nl.reverse",  &NLExecutor::selectReverse},
+};
+
+template <template <UnicodeNormalForm> typename NormalFormFunction>
+NLUnaryFunctionSelector selectNormalFormFunction(storage::UnicodeNormalForm form) {
+    switch (form) {
+        case storage::UnicodeNormalForm::NFC:
+            return &NLExecutor::selectFunction<NormalFormFunction<UnicodeNormalForm::NFC>>;
+        break;
+        case storage::UnicodeNormalForm::NFD:
+            return &NLExecutor::selectFunction<NormalFormFunction<UnicodeNormalForm::NFD>>;
+        break;
+        case storage::UnicodeNormalForm::NFKC:
+            return &NLExecutor::selectFunction<NormalFormFunction<UnicodeNormalForm::NFKC>>;
+        break;
+        case storage::UnicodeNormalForm::NFKD:
+            return &NLExecutor::selectFunction<NormalFormFunction<UnicodeNormalForm::NFKD>>;
+        break;
+        default:
+            bioassert(false, "Unhandled Unicode normal form");
+            return nullptr;
+        break;
+    }
+}
+
+NLUnaryFunctionSelector lookupUnaryFunctionSelector(mlir::Operation& operation) {
+    if (nl::Normalize normalize = mlir::dyn_cast<nl::Normalize>(operation)) {
+        return selectNormalFormFunction<NormalizeFunction>(normalize.getForm());
+    } else if (nl::IsNormalized isNormalized = mlir::dyn_cast<nl::IsNormalized>(operation)) {
+        return selectNormalFormFunction<IsNormalizedFunction>(isNormalized.getForm());
+    }
+
+    const llvm::StringRef name = operation.getName().getStringRef();
+    const auto it = unaryFunctionSelectors.find(std::string_view(name.data(), name.size()));
+    return it == unaryFunctionSelectors.end() ? nullptr : it->second;
+}
+
+using NLBinaryFunctionSelector = NLBinaryFn (*)(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+
+const std::unordered_map<std::string_view, NLBinaryFunctionSelector> binaryFunctionSelectors = {
+    {"nl.cosine_similarity",  &NLExecutor::selectBinary<OP_FUNC_COSINE_SIMILARITY>},
+    {"nl.euclidean_distance", &NLExecutor::selectBinary<OP_FUNC_EUCLIDEAN_DISTANCE>},
+};
+
+NLBinaryFunctionSelector lookupBinaryFunctionSelector(mlir::Operation& operation) {
+    const llvm::StringRef name = operation.getName().getStringRef();
+    const auto it = binaryFunctionSelectors.find(std::string_view(name.data(), name.size()));
+    return it == binaryFunctionSelectors.end() ? nullptr : it->second;
+}
+
+// Pool-allocate a plain (never-null) chunk column of the given element type, reserving a
+// full chunk so execution stays allocation-free. Every such column - an ID chunk, or one a
+// procedure yielded - is a ColumnVector, so the element type is all that varies.
+template <typename T>
+Column* allocPlainChunkColumn(LocalMemory* memory, size_t chunkSize) {
+    ColumnVector<T>* column = memory->alloc<ColumnVector<T>>();
+    column->reserve(chunkSize);
+    return column;
+}
+
+template <typename T>
+Column* allocOptChunkColumn(LocalMemory* memory, size_t chunkSize) {
+    ColumnOptVector<T>* column = memory->alloc<ColumnOptVector<T>>();
+    column->reserve(chunkSize);
+    return column;
+}
+
+template <typename T>
+Column* allocProcedureChunkColumn(LocalMemory* memory, size_t chunkSize, bool nullable) {
+    if (nullable) {
+        return allocOptChunkColumn<T>(memory, chunkSize);
+    }
+
+    return allocPlainChunkColumn<T>(memory, chunkSize);
+}
+
+llvm::StringRef propertyTypeName(mlir::Value handle) {
+    nl::GetPropertyType handleOp = handle.getDefiningOp<nl::GetPropertyType>();
+    if (!handleOp) {
+        throw IRException("edge_property operand must come from nl.get_property_type");
+    }
+
+    return handleOp.getName();
+}
+
+// The with-null fetch handler for a property's value type, on the node side
+// when isNode is true and the edge side otherwise. Selecting it here keeps the
+// value-type dispatch with the rest of translation; the handler bodies live in
+// NLExecutor.
+NLHandlerFunction selectPropertyFetchHandler(bool isNode, ValueType valueType) {
+    // The handler is the runPropertyFetch instantiation for the node or edge ID
+    // type and the property's value type; ValueTypeDispatcher maps the runtime
+    // value type to that compile-time type, so the per-type fan-out lives in one
+    // shared place rather than a switch repeated across the lowering.
+    NLHandlerFunction handler = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        handler = isNode ? &NLExecutor::runPropertyFetch<NodeID, T>
+                         : &NLExecutor::runPropertyFetch<EdgeID, T>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return handler;
+}
+
+// Reverse of DBLowering's valueTypeToElementType: recover the storage value
+// type baked into a nullable value chunk's element type. A cross product result
+// keeps its input chunk's element type, so a crossed property column carries the
+// same !storage.nullable<...> the fetch produced, and this maps it back to allocate
+// the matching nullable value column and pick the broadcast.
+PathExplorationDir toPathExplorationDir(storage::PathDirection direction) {
+    switch (direction) {
+        case storage::PathDirection::Forward:
+            return PathExplorationDir::FORWARD;
+        break;
+
+        case storage::PathDirection::Backward:
+            return PathExplorationDir::BACKWARD;
+        break;
+
+        case storage::PathDirection::Both:
+            return PathExplorationDir::BOTH;
+        break;
+    }
+
+    throw IRException("Unknown path direction");
+}
+
+ValueType valueTypeFromElementType(mlir::Type elementType) {
+    // A null literal carries no type of its own, and a column has to have one to be
+    // laid out: it is carried as a null integer, which every reader sees as the
+    // absent value it is - the count that skips it, the key that groups on it
+    if (mlir::isa<mlir::NoneType>(elementType)) {
+        return ValueType::Int64;
+    }
+
+    const ValueType valueType = elementTypeToValueType(elementType);
+    if (valueType == ValueType::Invalid) {
+        throw IRException("Unsupported nullable value chunk element type");
+    }
+
+    return valueType;
+}
+
+template <SupportedType T>
+typename T::Primitive constantValueAs(mlir::Attribute value) {
+    if constexpr (std::same_as<T, types::Int64>) {
+        return mlir::cast<mlir::IntegerAttr>(value).getInt();
+    } else if constexpr (std::same_as<T, types::UInt64>) {
+        return mlir::cast<mlir::IntegerAttr>(value).getValue().getZExtValue();
+    } else if constexpr (std::same_as<T, types::Double>) {
+        return mlir::cast<mlir::FloatAttr>(value).getValueAsDouble();
+    } else if constexpr (std::same_as<T, types::Bool>) {
+        return CustomBool(mlir::cast<mlir::IntegerAttr>(value).getInt() != 0);
+    } else if constexpr (std::same_as<T, types::String>) {
+        return mlir::cast<mlir::StringAttr>(value).getValue();
+    } else if constexpr (std::same_as<T, types::Embedding>) {
+        const llvm::ArrayRef<float> floats = mlir::cast<mlir::DenseF32ArrayAttr>(value).asArrayRef();
+        return std::span<const float> {floats.data(), floats.size()};
+    } else {
+        throw IRException("Unsupported constant value type");
+    }
+}
+
+template <Number Target>
+bool resolveNumberLiteral(mlir::IntegerAttr integer,
+                          mlir::FloatAttr floating,
+                          NLScanByPropertyValueLoopData::Literal& value) {
+    Target number {};
+    const bool converts = floating ? convertNumberExactly(floating.getValueAsDouble(), number)
+                                   : convertNumberExactly(integer.getInt(), number);
+
+    if (converts) {
+        value = number;
+    }
+
+    return converts;
+}
+
+// Resolves a property-value scan's literal to the property's stored type. A number equals
+// a number of another type by value, so 32.0 finds an age of 32. Any other pairing - a
+// negative integer against UInt64, 32.5 against Int64, a string against a number - leaves
+// the scan unmatchable.
+bool resolvePropertyScanLiteral(ValueType valueType,
+                                mlir::TypedAttr literal,
+                                NLScanByPropertyValueLoopData::Literal& value) {
+    const mlir::IntegerAttr integer = mlir::dyn_cast<mlir::IntegerAttr>(literal);
+    const mlir::FloatAttr floating = mlir::dyn_cast<mlir::FloatAttr>(literal);
+    const mlir::StringAttr string = mlir::dyn_cast<mlir::StringAttr>(literal);
+    const bool isBoolLiteral = integer && integer.getType().isSignlessInteger(1);
+    const bool isIntegerLiteral = integer && !isBoolLiteral;
+    const bool isNumberLiteral = isIntegerLiteral || floating;
+
+    if (valueType == ValueType::Int64 && isNumberLiteral) {
+        return resolveNumberLiteral<types::Int64::Primitive>(integer, floating, value);
+    } else if (valueType == ValueType::UInt64 && isNumberLiteral) {
+        return resolveNumberLiteral<types::UInt64::Primitive>(integer, floating, value);
+    } else if (valueType == ValueType::Double && isNumberLiteral) {
+        return resolveNumberLiteral<types::Double::Primitive>(integer, floating, value);
+    } else if (valueType == ValueType::Bool && isBoolLiteral) {
+        value = CustomBool(integer.getInt() != 0);
+        return true;
+    } else if (valueType == ValueType::String && string) {
+        value = std::string(string.getValue());
+        return true;
+    }
+
+    return false;
+}
+
+// The runtime reduction the interpreter dispatches on, from the MLIR one the op
+// carries. The two enums are kept separate so the runtime (NLProgram / NLExecutor)
+// stays free of the MLIR dialect headers; this is the one place they meet.
+AggregateKind toRuntimeAggregateKind(storage::AggregateKind kind) {
+    switch (kind) {
+        case storage::AggregateKind::Sum:
+            return AggregateKind::Sum;
+        break;
+
+        case storage::AggregateKind::Min:
+            return AggregateKind::Min;
+        break;
+
+        case storage::AggregateKind::Max:
+            return AggregateKind::Max;
+        break;
+
+        case storage::AggregateKind::Avg:
+            return AggregateKind::Avg;
+        break;
+
+        case storage::AggregateKind::StDev:
+            return AggregateKind::StDev;
+        break;
+
+        case storage::AggregateKind::StDevP:
+            return AggregateKind::StDevP;
+        break;
+    }
+
+    throw IRException("Unhandled aggregate kind");
+}
+
+// The runtime grouped reduction the interpreter dispatches on, from the MLIR one
+// the op carries. Like toRuntimeAggregateKind, this is the one place the two enums
+// meet, keeping the runtime free of the MLIR dialect headers.
+GroupAggregateKind toRuntimeGroupAggregateKind(storage::GroupAggregateKind kind) {
+    switch (kind) {
+        case storage::GroupAggregateKind::Count:
+            return GroupAggregateKind::Count;
+        break;
+
+        case storage::GroupAggregateKind::Sum:
+            return GroupAggregateKind::Sum;
+        break;
+
+        case storage::GroupAggregateKind::Min:
+            return GroupAggregateKind::Min;
+        break;
+
+        case storage::GroupAggregateKind::Max:
+            return GroupAggregateKind::Max;
+        break;
+
+        case storage::GroupAggregateKind::Avg:
+            return GroupAggregateKind::Avg;
+        break;
+
+        case storage::GroupAggregateKind::CountDistinct:
+            return GroupAggregateKind::CountDistinct;
+        break;
+
+        case storage::GroupAggregateKind::SumDistinct:
+            return GroupAggregateKind::SumDistinct;
+        break;
+
+        case storage::GroupAggregateKind::AvgDistinct:
+            return GroupAggregateKind::AvgDistinct;
+        break;
+
+        case storage::GroupAggregateKind::CountRows:
+            return GroupAggregateKind::CountRows;
+        break;
+
+        case storage::GroupAggregateKind::StDev:
+            return GroupAggregateKind::StDev;
+        break;
+
+        case storage::GroupAggregateKind::StDevP:
+            return GroupAggregateKind::StDevP;
+        break;
+
+        case storage::GroupAggregateKind::StDevDistinct:
+            return GroupAggregateKind::StDevDistinct;
+        break;
+
+        case storage::GroupAggregateKind::StDevPDistinct:
+            return GroupAggregateKind::StDevPDistinct;
+        break;
+
+        case storage::GroupAggregateKind::First:
+            return GroupAggregateKind::First;
+        break;
+    }
+
+    throw IRException("Unhandled group aggregate kind");
+}
+
+// The value type wrapped by a nullable value chunk (!nl.chunk<!storage.nullable<T>>).
+// Every chunk carrying scalar values is such a chunk - an aggregate's input and result,
+// a property fetch, a homogeneous unwind - so a chunk that is not one (an ID chunk) is
+// rejected.
+ValueType nullableChunkValueType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const auto nullableType = mlir::dyn_cast<storage::NullableType>(chunk.getElementType());
+    if (!nullableType) {
+        throw IRException("Expected a nullable value chunk");
+    }
+
+    return valueTypeFromElementType(nullableType.getValueType());
+}
+
+// Whether a chunk holds a value that may be absent (!nl.chunk<!storage.nullable<T>>), as
+// opposed to a plain value column or a mask
+bool isNullableChunk(mlir::Type chunkType) {
+    const auto chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+
+    return chunk && mlir::isa<storage::NullableType>(chunk.getElementType());
+}
+
+// Whether a chunk carries the null literal, which has no value type of its own: a
+// !nl.chunk<!storage.nullable<none>>
+bool isUntypedNullChunk(mlir::Type chunkType) {
+    const auto chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    if (!chunk) {
+        return false;
+    }
+
+    const auto nullableType = mlir::dyn_cast<storage::NullableType>(chunk.getElementType());
+
+    return nullableType && mlir::isa<mlir::NoneType>(nullableType.getValueType());
+}
+
+ListPredicateKind listPredicateKind(storage::ListPredicateKind kind) {
+    switch (kind) {
+        case storage::ListPredicateKind::All:
+            return ListPredicateKind::All;
+        break;
+
+        case storage::ListPredicateKind::Any:
+            return ListPredicateKind::Any;
+        break;
+
+        case storage::ListPredicateKind::None:
+            return ListPredicateKind::None;
+        break;
+
+        case storage::ListPredicateKind::Single:
+            return ListPredicateKind::Single;
+        break;
+    }
+
+    return ListPredicateKind::All;
+}
+
+bool isNullableAny(mlir::Type elementType) {
+    const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType);
+
+    return nullableType && mlir::isa<storage::AnyType>(nullableType.getValueType());
+}
+
+bool isAnyChunk(mlir::Type chunkType) {
+    const mlir::Type elementType = mlir::cast<nl::ChunkType>(chunkType).getElementType();
+
+    return mlir::isa<storage::AnyType>(elementType) || isNullableAny(elementType);
+}
+
+bool isNullableList(mlir::Type elementType) {
+    const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType);
+
+    return nullableType && mlir::isa<storage::ListType>(nullableType.getValueType());
+}
+
+// The property value type a chunk writes, which is not quite the shape it holds: a mask
+// writes a Bool property, so it is recognised here and not in valueTypeFromElementType,
+// which answers what nullable value column a chunk needs.
+ValueType valueTypeFromChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        return valueTypeFromElementType(nullableType.getValueType());
+    }
+
+    if (mlir::isa<storage::BoolType>(elementType)) {
+        return ValueType::Bool;
+    }
+
+    return valueTypeFromElementType(elementType);
+}
+
+NLMergeDirection mergeDirectionFromValue(int64_t raw) {
+    const std::optional<storage::EdgeDirection> direction =
+        storage::symbolizeEdgeDirection(static_cast<uint64_t>(raw));
+
+    if (!direction) {
+        throw IRException("nl.merge carries an unknown edge direction");
+    }
+
+    switch (*direction) {
+        case storage::EdgeDirection::Undirected:
+            return NLMergeDirection::Undirected;
+        break;
+
+        case storage::EdgeDirection::Backward:
+            return NLMergeDirection::Backward;
+        break;
+
+        case storage::EdgeDirection::Forward:
+            return NLMergeDirection::Forward;
+        break;
+    }
+
+    bioassert(false, "Unhandled edge direction");
+    return NLMergeDirection::Forward;
+}
+
+void appendMergePropertySignature(const std::vector<NLMergeProperty>& properties,
+                                  std::string& signature) {
+    for (const NLMergeProperty& property : properties) {
+        const PropertyTypeID::Type id = property._propertyType._id.getValue();
+        const ValueType valueType = property._propertyType._valueType;
+
+        signature.append(reinterpret_cast<const char*>(&id), sizeof(id));
+        signature.append(reinterpret_cast<const char*>(&valueType), sizeof(valueType));
+    }
+}
+
+// What the pending log's keys for one chain-node spec start with: its label set and the
+// property it keys on, in order. Two specs writing the same pattern share the prefix, so
+// each binds what the other wrote; two that differ never collide.
+void appendMergeNodeSignature(const LabelSet& labels,
+                              const std::vector<NLMergeProperty>& properties,
+                              std::string& signature) {
+    signature.clear();
+
+    for (const LabelSet::IntegerType integer : labels.integers()) {
+        signature.append(reinterpret_cast<const char*>(&integer), sizeof(integer));
+    }
+
+    appendMergePropertySignature(properties, signature);
+}
+
+bool isConstantColumn(const Column* column) {
+    return column->getContainerKind() == ContainerKind::code<ColumnConst>();
+}
+
+template <size_t... Indices>
+consteval std::array<bool, InternalKind::Count + 1> collectNullHoldingInternalKinds(std::index_sequence<Indices...>) {
+    return {false,
+            (TypeUtils::is_optional_v<InternalKind::Types::TypeAt<Indices>>
+             || std::is_same_v<InternalKind::Types::TypeAt<Indices>, PropertyNull>)...};
+}
+
+constexpr std::array<bool, InternalKind::Count + 1> NULL_HOLDING_INTERNAL_KINDS =
+    collectNullHoldingInternalKinds(std::make_index_sequence<InternalKind::Count>());
+
+bool columnHoldsNulls(const Column* column) {
+    const InternalKind::Code internalKind = ColumnKind::extractInternalKind(column->getKind());
+    return NULL_HOLDING_INTERNAL_KINDS[internalKind];
+}
+
+// A drain wires its emit loop's variables into the accumulator's one output slot per
+// column, so an accumulator can serve exactly one nl.collect or nl.unwind_collect. A
+// second drain would rebind the first's outputs to its own, incompatible column types
+// (a per-group list cell against an unwound value), leaving the first to emit through
+// the other's columns. Generated IR names each accumulator from a single drain, so a
+// second one means malformed IR - the accumulate side rejects a second
+// nl.collect_update the same way.
+void throwIfAlreadyDrained(const NLCollectState* state) {
+    const std::vector<NLCollectState::ValueColumn>& valueColumns = state->valueColumns();
+    const bool isDrained = !valueColumns.empty() && valueColumns.front()._output;
+
+    if (isDrained) {
+        throw IRException("an nl.collect_buffer must be drained by a single nl.collect or nl.unwind_collect");
+    }
+}
+
+}
+
+NLTranslator::NLTranslator(NLProgram* program,
+                           LocalMemory* memory,
+                           const GraphView* view,
+                           MetadataBuilder* metadataBuilder,
+                           const ProcedureContext* procedureContext,
+                           const ParameterMap* parameters)
+    : _program(program),
+    _memory(memory),
+    _view(view),
+    _metadataBuilder(metadataBuilder),
+    _procedureContext(procedureContext),
+    _parameters(parameters),
+    _systemTranslator(std::make_unique<NLSystemTranslator>(program, memory, &_valueSlots))
+{
+}
+
+NLTranslator::~NLTranslator() {
+}
+
+void NLTranslator::translate(const mlir::func::FuncOp& function) {
+    // Check MLIR verifier on the function
+    if (mlir::failed(mlir::verify(function))) {
+        throw IRException("nl function failed MLIR verification");
+    }
+
+    mlir::Region& bodyRegion = function->getRegion(0);
+    if (!bodyRegion.hasOneBlock()) {
+        throw IRException("NLTranslator expects a function with a single block");
+    }
+
+    translateBlock(bodyRegion.front(), _program->getStmts());
+}
+
+template <typename ScanOp>
+void NLTranslator::bindScanEdgesByLabel(ScanOp scan, IteratorKind kind) {
+    IteratorConfig config {kind, {}, {}};
+    resolveLabelNames(scan.getLabels(), config._labels);
+
+    _iteratorConfigs[scan.getResult()] = config;
+}
+
+template <typename HopOp>
+void NLTranslator::bindGetEdgesByLabel(HopOp hop, IteratorKind kind) {
+    IteratorConfig config {kind, hop.getInputNodes(), {}};
+
+    const mlir::OperandRange carriedColumns = hop.getColumnsToFilter();
+    config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+
+    resolveLabelNames(hop.getLabels(), config._labels);
+
+    _iteratorConfigs[hop.getResult()] = config;
+}
+
+template <typename HopOp>
+void NLTranslator::bindGetEdgesByTypeAndLabel(HopOp hop, IteratorKind kind) {
+    IteratorConfig config {kind, hop.getInputNodes(), {}};
+
+    const mlir::OperandRange carriedColumns = hop.getColumnsToFilter();
+    config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+
+    resolveEdgeTypeNames(hop.getEdgeTypes(), config._edgeTypes);
+
+    resolveLabelNames(hop.getLabels(), config._labels);
+
+    _iteratorConfigs[hop.getResult()] = config;
+}
+
+void NLTranslator::translateBlock(mlir::Block& block, NLStmtContainer* body) {
+    for (mlir::Operation& operation : block) {
+        if (nl::ScanNodes scanNodes = mlir::dyn_cast<nl::ScanNodes>(operation)) {
+            _iteratorConfigs[scanNodes.getResult()] = IteratorConfig {IteratorKind::ScanNodes, {}, {}};
+        } else if (nl::ScanNodesByLabel scanNodesByLabel = mlir::dyn_cast<nl::ScanNodesByLabel>(operation)) {
+            IteratorConfig config {IteratorKind::ScanNodesByLabel, {}, {}};
+            resolveLabelNames(scanNodesByLabel.getLabels(), config._labels);
+            _iteratorConfigs[scanNodesByLabel.getResult()] = config;
+        } else if (nl::ConstScanNodes constScanNodes = mlir::dyn_cast<nl::ConstScanNodes>(operation)) {
+            IteratorConfig config {IteratorKind::ConstScanNodes, {}, {}};
+            config._nodeIDs = constScanNodes.getNodeIDs();
+            _iteratorConfigs[constScanNodes.getResult()] = config;
+        } else if (nl::ScanNodesByPropertyValue scanByValue = mlir::dyn_cast<nl::ScanNodesByPropertyValue>(operation)) {
+            IteratorConfig config {IteratorKind::ScanNodesByPropertyValue, {}, {}};
+            config._property = scanByValue.getProperty();
+            config._propertyValue = scanByValue.getValue();
+            if (const std::optional<mlir::ArrayAttr> labels = scanByValue.getLabels()) {
+                resolveLabelNames(*labels, config._labels);
+            }
+            _iteratorConfigs[scanByValue.getResult()] = config;
+        } else if (nl::ScanEdges scanEdges = mlir::dyn_cast<nl::ScanEdges>(operation)) {
+            _iteratorConfigs[scanEdges.getResult()] = IteratorConfig {IteratorKind::ScanEdges, {}, {}};
+        } else if (nl::ScanEdgesByType scanEdgesByType = mlir::dyn_cast<nl::ScanEdgesByType>(operation)) {
+            IteratorConfig config {IteratorKind::ScanEdgesByType, {}, {}};
+            resolveEdgeTypeNames(scanEdgesByType.getEdgeTypes(), config._edgeTypes);
+            _iteratorConfigs[scanEdgesByType.getResult()] = config;
+        } else if (nl::ScanOutEdgesByLabelSrc scanOutEdgesByLabelSrc = mlir::dyn_cast<nl::ScanOutEdgesByLabelSrc>(operation)) {
+            bindScanEdgesByLabel(scanOutEdgesByLabelSrc, IteratorKind::ScanEdgesBySourceLabel);
+        } else if (nl::ScanInEdgesByLabelSrc scanInEdgesByLabelSrc = mlir::dyn_cast<nl::ScanInEdgesByLabelSrc>(operation)) {
+            bindScanEdgesByLabel(scanInEdgesByLabelSrc, IteratorKind::ScanEdgesBySourceLabel);
+        } else if (nl::ScanInEdgesByLabelTgt scanInEdgesByLabelTgt = mlir::dyn_cast<nl::ScanInEdgesByLabelTgt>(operation)) {
+            bindScanEdgesByLabel(scanInEdgesByLabelTgt, IteratorKind::ScanEdgesByTargetLabel);
+        } else if (nl::ScanOutEdgesByLabelTgt scanOutEdgesByLabelTgt = mlir::dyn_cast<nl::ScanOutEdgesByLabelTgt>(operation)) {
+            bindScanEdgesByLabel(scanOutEdgesByLabelTgt, IteratorKind::ScanEdgesByTargetLabel);
+        } else if (nl::ScanOutEdgesByLabelSrcTgt scanOutEdgesByLabelSrcTgt = mlir::dyn_cast<nl::ScanOutEdgesByLabelSrcTgt>(operation)) {
+            IteratorConfig config {IteratorKind::ScanEdgesByEndpointLabelsFromSource, {}, {}};
+            resolveLabelNames(scanOutEdgesByLabelSrcTgt.getSrcLabels(), config._labels);
+            resolveLabelNames(scanOutEdgesByLabelSrcTgt.getTgtLabels(), config._otherEndLabels);
+            _iteratorConfigs[scanOutEdgesByLabelSrcTgt.getResult()] = config;
+        } else if (nl::ScanInEdgesByLabelSrcTgt scanInEdgesByLabelSrcTgt = mlir::dyn_cast<nl::ScanInEdgesByLabelSrcTgt>(operation)) {
+            IteratorConfig config {IteratorKind::ScanEdgesByEndpointLabelsFromTarget, {}, {}};
+            resolveLabelNames(scanInEdgesByLabelSrcTgt.getTgtLabels(), config._labels);
+            resolveLabelNames(scanInEdgesByLabelSrcTgt.getSrcLabels(), config._otherEndLabels);
+            _iteratorConfigs[scanInEdgesByLabelSrcTgt.getResult()] = config;
+        } else if (nl::GetOutEdges getOutEdges = mlir::dyn_cast<nl::GetOutEdges>(operation)) {
+            IteratorConfig config {IteratorKind::GetOutEdges, getOutEdges.getInputNodes(), {}};
+            const mlir::OperandRange carriedColumns = getOutEdges.getColumnsToFilter();
+            config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+            _iteratorConfigs[getOutEdges.getResult()] = config;
+        } else if (nl::GetInEdges getInEdges = mlir::dyn_cast<nl::GetInEdges>(operation)) {
+            IteratorConfig config {IteratorKind::GetInEdges, getInEdges.getInputNodes(), {}};
+            const mlir::OperandRange carriedColumns = getInEdges.getColumnsToFilter();
+            config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+            _iteratorConfigs[getInEdges.getResult()] = config;
+        } else if (nl::GetEdges getEdges = mlir::dyn_cast<nl::GetEdges>(operation)) {
+            IteratorConfig config {IteratorKind::GetEdges, getEdges.getInputNodes(), {}};
+            const mlir::OperandRange carriedColumns = getEdges.getColumnsToFilter();
+            config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+            _iteratorConfigs[getEdges.getResult()] = config;
+        } else if (nl::GetOutEdgesByType getOutEdgesByType = mlir::dyn_cast<nl::GetOutEdgesByType>(operation)) {
+            IteratorConfig config {IteratorKind::GetOutEdgesByType, getOutEdgesByType.getInputNodes(), {}};
+            const mlir::OperandRange carriedColumns = getOutEdgesByType.getColumnsToFilter();
+            config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+            resolveEdgeTypeNames(getOutEdgesByType.getEdgeTypes(), config._edgeTypes);
+            _iteratorConfigs[getOutEdgesByType.getResult()] = config;
+        } else if (nl::GetInEdgesByType getInEdgesByType = mlir::dyn_cast<nl::GetInEdgesByType>(operation)) {
+            IteratorConfig config {IteratorKind::GetInEdgesByType, getInEdgesByType.getInputNodes(), {}};
+            const mlir::OperandRange carriedColumns = getInEdgesByType.getColumnsToFilter();
+            config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+            resolveEdgeTypeNames(getInEdgesByType.getEdgeTypes(), config._edgeTypes);
+            _iteratorConfigs[getInEdgesByType.getResult()] = config;
+        } else if (nl::GetOutEdgesByLabel getOutEdgesByLabel = mlir::dyn_cast<nl::GetOutEdgesByLabel>(operation)) {
+            bindGetEdgesByLabel(getOutEdgesByLabel, IteratorKind::GetOutEdgesByLabel);
+        } else if (nl::GetInEdgesByLabel getInEdgesByLabel = mlir::dyn_cast<nl::GetInEdgesByLabel>(operation)) {
+            bindGetEdgesByLabel(getInEdgesByLabel, IteratorKind::GetInEdgesByLabel);
+        } else if (nl::GetOutEdgesByTypeAndLabel getOutEdgesByTypeAndLabel = mlir::dyn_cast<nl::GetOutEdgesByTypeAndLabel>(operation)) {
+            bindGetEdgesByTypeAndLabel(getOutEdgesByTypeAndLabel, IteratorKind::GetOutEdgesByTypeAndLabel);
+        } else if (nl::GetInEdgesByTypeAndLabel getInEdgesByTypeAndLabel = mlir::dyn_cast<nl::GetInEdgesByTypeAndLabel>(operation)) {
+            bindGetEdgesByTypeAndLabel(getInEdgesByTypeAndLabel, IteratorKind::GetInEdgesByTypeAndLabel);
+        } else if (nl::ExplorePaths explorePaths = mlir::dyn_cast<nl::ExplorePaths>(operation)) {
+            IteratorConfig config {IteratorKind::ExplorePaths, explorePaths.getInputNodes(), {}};
+            const mlir::OperandRange carriedColumns = explorePaths.getColumnsToFilter();
+            config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+            config._explorePaths = explorePaths;
+            config._minHops = explorePaths.getMinHops();
+            config._maxHops = explorePaths.getMaxHops().value_or(std::numeric_limits<uint64_t>::max());
+            const mlir::OperandRange hopImports = explorePaths.getHopImports();
+            config._hopImports.assign(hopImports.begin(), hopImports.end());
+            if (const std::optional<mlir::ArrayAttr> endLabels = explorePaths.getEndLabels()) {
+                resolveLabelNames(*endLabels, config._labels);
+            }
+            config._endColumn = explorePaths.getEndColumn();
+            config._endsOnSeed = explorePaths.getEndsOnSeed();
+            if (const mlir::Value endNodes = explorePaths.getEndNodes()) {
+                config._endNodeSet = nodeSetStateFor(endNodes);
+            }
+            config._distinctEnds = explorePaths.getDistinct();
+            _iteratorConfigs[explorePaths.getResult()] = config;
+        } else if (nl::Sort sort = mlir::dyn_cast<nl::Sort>(operation)) {
+            _iteratorConfigs[sort.getResult()] = IteratorConfig {IteratorKind::Sort, {}, {}, sortStateFor(sort.getState())};
+        } else if (nl::GroupAggregate groupAggregate = mlir::dyn_cast<nl::GroupAggregate>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::GroupAggregate;
+            config._groupAggregateState = groupAggregateStateFor(groupAggregate.getState());
+            _iteratorConfigs[groupAggregate.getResult()] = config;
+        } else if (nl::UnwindCollect unwind = mlir::dyn_cast<nl::UnwindCollect>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::UnwindCollect;
+            config._collectState = collectStateFor(unwind.getState());
+            _iteratorConfigs[unwind.getResult()] = config;
+        } else if (nl::Collect collect = mlir::dyn_cast<nl::Collect>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::Collect;
+            config._collectState = collectStateFor(collect.getState());
+            _iteratorConfigs[collect.getResult()] = config;
+        } else if (nl::ShortestPath shortestPath = mlir::dyn_cast<nl::ShortestPath>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::ShortestPath;
+            config._shortestPathState = shortestPathStateFor(shortestPath.getState());
+            _iteratorConfigs[shortestPath.getResult()] = config;
+        } else if (nl::UnwindConst unwindConst = mlir::dyn_cast<nl::UnwindConst>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::UnwindConst;
+            config._list = materializeListView(unwindConst.getElements());
+            _iteratorConfigs[unwindConst.getResult()] = config;
+        } else if (nl::LoadCSV loadCSV = mlir::dyn_cast<nl::LoadCSV>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::LoadCSV;
+            config._csvPath = loadCSV.getPath();
+            config._csvFields = loadCSV.getFieldsAttr();
+            config._csvHasHeaders = loadCSV.getWithHeaders();
+            config._csvSkipOnError = loadCSV.getSkipOnError();
+            _iteratorConfigs[loadCSV.getResult()] = config;
+        } else if (nl::VectorSearch vectorSearch = mlir::dyn_cast<nl::VectorSearch>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::VectorSearch;
+            config._indexName = vectorSearch.getIndexName();
+            config._neighbourCount = vectorSearch.getK();
+            config._queryVector = vectorSearch.getQueryVector();
+            _iteratorConfigs[vectorSearch.getResult()] = config;
+        } else if (nl::Unwind unwind = mlir::dyn_cast<nl::Unwind>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::Unwind;
+            config._source = unwind.getSource();
+
+            const mlir::OperandRange carriedColumns = unwind.getColumnsToFilter();
+            config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+
+            _iteratorConfigs[unwind.getResult()] = config;
+        } else if (nl::UnwindRange unwindRange = mlir::dyn_cast<nl::UnwindRange>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::UnwindRange;
+            config._rangeBounds = {unwindRange.getStart(),
+                                   unwindRange.getEnd(),
+                                   unwindRange.getStep(),
+                                   unwindRange.getFrom(),
+                                   unwindRange.getTo()};
+            config._rangeReversed = unwindRange.getReversed();
+
+            const mlir::OperandRange carriedColumns = unwindRange.getColumnsToFilter();
+            config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+
+            _iteratorConfigs[unwindRange.getResult()] = config;
+        } else if (nl::UnwindComputed unwindComputed = mlir::dyn_cast<nl::UnwindComputed>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::UnwindComputed;
+            config._unwindSource = &unwindComputed.getSource();
+
+            const mlir::OperandRange carriedColumns = unwindComputed.getColumnsToFilter();
+            config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+
+            _iteratorConfigs[unwindComputed.getResult()] = config;
+        } else if (nl::OptionalDrain optionalDrain = mlir::dyn_cast<nl::OptionalDrain>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::OptionalDrain;
+            config._optionalState = optionalStateFor(optionalDrain.getState());
+            _iteratorConfigs[optionalDrain.getResult()] = config;
+        } else if (nl::RowDrain rowDrain = mlir::dyn_cast<nl::RowDrain>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::RowDrain;
+            config._rowState = rowStateFor(rowDrain.getState());
+            _iteratorConfigs[rowDrain.getResult()] = config;
+        } else if (nl::ProcedureInit procedureInit = mlir::dyn_cast<nl::ProcedureInit>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::ProcedureInit;
+            config._procedureState = procedureStateFor(procedureInit.getState());
+
+            const mlir::OperandRange procedureInputs = procedureInit.getInputs();
+            config._procedureInputs.assign(procedureInputs.begin(), procedureInputs.end());
+
+            const mlir::OperandRange carriedColumns = procedureInit.getColumnsToFilter();
+            config._carriedColumns.assign(carriedColumns.begin(), carriedColumns.end());
+
+            _iteratorConfigs[procedureInit.getResult()] = config;
+        } else if (nl::For forLoop = mlir::dyn_cast<nl::For>(operation)) {
+            translateFor(forLoop, body);
+        } else if (mlir::isa<nl::GetPropertyType, nl::GetEdgeTypeSet>(operation)) {
+            // The handle carries only names; a fetch/hop resolves them on consumption
+        } else if (nl::Constant constant = mlir::dyn_cast<nl::Constant>(operation)) {
+            translateConstant(constant);
+        } else if (nl::CurrentDateTime currentDateTime = mlir::dyn_cast<nl::CurrentDateTime>(operation)) {
+            translateCurrentDateTime(currentDateTime);
+        } else if (nl::BroadcastConstant broadcast = mlir::dyn_cast<nl::BroadcastConstant>(operation)) {
+            translateBroadcastConstant(broadcast, body);
+        } else if (nl::RowConstant rowConstant = mlir::dyn_cast<nl::RowConstant>(operation)) {
+            translateRowConstant(rowConstant, body);
+        } else if (nl::Add add = mlir::dyn_cast<nl::Add>(operation)) {
+            translateBinaryOp<OP_ADD>(add, body);
+        } else if (nl::Concat concat = mlir::dyn_cast<nl::Concat>(operation)) {
+            translateBinaryOp<OP_CONCAT>(concat, body);
+        } else if (nl::ListIndex index = mlir::dyn_cast<nl::ListIndex>(operation)) {
+            translateListIndex(index, body);
+        } else if (nl::Sub sub = mlir::dyn_cast<nl::Sub>(operation)) {
+            translateBinaryOp<OP_SUB>(sub, body);
+        } else if (nl::Mul mul = mlir::dyn_cast<nl::Mul>(operation)) {
+            translateBinaryOp<OP_MUL>(mul, body);
+        } else if (nl::Div div = mlir::dyn_cast<nl::Div>(operation)) {
+            translateBinaryOp<OP_DIV>(div, body);
+        } else if (nl::Mod mod = mlir::dyn_cast<nl::Mod>(operation)) {
+            translateBinaryOp<OP_MOD>(mod, body);
+        } else if (nl::Pow pow = mlir::dyn_cast<nl::Pow>(operation)) {
+            translateBinaryOp<OP_POW>(pow, body);
+        } else if (nl::Eq eq = mlir::dyn_cast<nl::Eq>(operation)) {
+            translateBinaryOp<OP_EQUAL>(eq, body);
+        } else if (nl::Neq neq = mlir::dyn_cast<nl::Neq>(operation)) {
+            translateBinaryOp<OP_NOT_EQUAL>(neq, body);
+        } else if (nl::Gt gt = mlir::dyn_cast<nl::Gt>(operation)) {
+            translateBinaryOp<OP_GREATER_THAN>(gt, body);
+        } else if (nl::Lt lt = mlir::dyn_cast<nl::Lt>(operation)) {
+            translateBinaryOp<OP_LESS_THAN>(lt, body);
+        } else if (nl::Gte gte = mlir::dyn_cast<nl::Gte>(operation)) {
+            translateBinaryOp<OP_GREATER_THAN_OR_EQUAL>(gte, body);
+        } else if (nl::Lte lte = mlir::dyn_cast<nl::Lte>(operation)) {
+            translateBinaryOp<OP_LESS_THAN_OR_EQUAL>(lte, body);
+        } else if (nl::StartsWith startsWith = mlir::dyn_cast<nl::StartsWith>(operation)) {
+            translateBinaryOp<OP_STARTS_WITH>(startsWith, body);
+        } else if (nl::EndsWith endsWith = mlir::dyn_cast<nl::EndsWith>(operation)) {
+            translateBinaryOp<OP_ENDS_WITH>(endsWith, body);
+        } else if (nl::Contains containsOp = mlir::dyn_cast<nl::Contains>(operation)) {
+            translateBinaryOp<OP_CONTAINS>(containsOp, body);
+        } else if (nl::In inOp = mlir::dyn_cast<nl::In>(operation)) {
+            translateBinaryOp<OP_IN>(inOp, body);
+        } else if (nl::And andOp = mlir::dyn_cast<nl::And>(operation)) {
+            translateBinaryOp<OP_AND>(andOp, body);
+        } else if (nl::Or orOp = mlir::dyn_cast<nl::Or>(operation)) {
+            translateBinaryOp<OP_OR>(orOp, body);
+        } else if (nl::Xor xorOp = mlir::dyn_cast<nl::Xor>(operation)) {
+            translateBinaryOp<OP_XOR>(xorOp, body);
+        } else if (nl::Not notOp = mlir::dyn_cast<nl::Not>(operation)) {
+            translateNot(notOp, body);
+        } else if (nl::ToNullable toNullable = mlir::dyn_cast<nl::ToNullable>(operation)) {
+            translateToNullable(toNullable, body);
+        } else if (nl::Case caseOp = mlir::dyn_cast<nl::Case>(operation)) {
+            translateCase(caseOp, &NLExecutor::runCase, body);
+        } else if (nl::CaseMerge caseMerge = mlir::dyn_cast<nl::CaseMerge>(operation)) {
+            translateCase(caseMerge, &NLExecutor::runCaseMerge, body);
+        } else if (nl::IsNotTrue isNotTrue = mlir::dyn_cast<nl::IsNotTrue>(operation)) {
+            translateIsNotTrue(isNotTrue, body);
+        } else if (nl::MakeList makeList = mlir::dyn_cast<nl::MakeList>(operation)) {
+            translateMakeList(makeList, body);
+        } else if (nl::ListSlice listSlice = mlir::dyn_cast<nl::ListSlice>(operation)) {
+            translateListSlice(listSlice, body);
+        } else if (mlir::isa<nl::PercentileCont, nl::PercentileDisc>(operation)) {
+            translatePercentile(&operation, body);
+        } else if (nl::MakeMap makeMap = mlir::dyn_cast<nl::MakeMap>(operation)) {
+            translateMakeMap(makeMap, body);
+        } else if (nl::StaticMapKey mapKey = mlir::dyn_cast<nl::StaticMapKey>(operation)) {
+            translateStaticMapKey(mapKey, body);
+        } else if (nl::MapEntryValue entryValue = mlir::dyn_cast<nl::MapEntryValue>(operation)) {
+            translateMapEntryValue(entryValue, body);
+        } else if (nl::DynamicMapKey dynamicMapKey = mlir::dyn_cast<nl::DynamicMapKey>(operation)) {
+            translateDynamicMapKey(dynamicMapKey, body);
+        } else if (nl::Range range = mlir::dyn_cast<nl::Range>(operation)) {
+            translateRange(range, body);
+        } else if (nl::Substring substring = mlir::dyn_cast<nl::Substring>(operation)) {
+            translateSubstring(substring, body);
+        } else if (nl::Split split = mlir::dyn_cast<nl::Split>(operation)) {
+            translateSplit(split, body);
+        } else if (nl::Left left = mlir::dyn_cast<nl::Left>(operation)) {
+            translateStringEnd<LeftFunction>(left, body);
+        } else if (nl::Right right = mlir::dyn_cast<nl::Right>(operation)) {
+            translateStringEnd<RightFunction>(right, body);
+        } else if (nl::Replace replace = mlir::dyn_cast<nl::Replace>(operation)) {
+            translateReplace(replace, body);
+        } else if (nl::ListComprehension listComprehension = mlir::dyn_cast<nl::ListComprehension>(operation)) {
+            translateListComprehension(listComprehension, body);
+        } else if (nl::ListPredicate listPredicate = mlir::dyn_cast<nl::ListPredicate>(operation)) {
+            translateListPredicate(listPredicate, body);
+        } else if (nl::Reduce reduce = mlir::dyn_cast<nl::Reduce>(operation)) {
+            translateReduce(reduce, body);
+        } else if (lookupUnaryFunctionSelector(operation)) {
+            translateUnaryFunction(&operation, body);
+        } else if (lookupBinaryFunctionSelector(operation)) {
+            translateBinaryFunction(&operation, body);
+        } else if (nl::Filter filter = mlir::dyn_cast<nl::Filter>(operation)) {
+            translateFilter(filter, body);
+        } else if (nl::FetchNodes fetch = mlir::dyn_cast<nl::FetchNodes>(operation)) {
+            translateFetchNodes(fetch, body);
+        } else if (nl::GetNodeProperties getNodeProperties = mlir::dyn_cast<nl::GetNodeProperties>(operation)) {
+            translatePropertyFetch(getNodeProperties.getInputNodes(),
+                                   getNodeProperties.getPropertyType(),
+                                   getNodeProperties.getPending(),
+                                   getNodeProperties.getAllPending(),
+                                   getNodeProperties.getValues(),
+                                   /*isNode=*/true,
+                                   body);
+        } else if (nl::GetEdgeProperties getEdgeProperties = mlir::dyn_cast<nl::GetEdgeProperties>(operation)) {
+            translatePropertyFetch(getEdgeProperties.getInputEdges(),
+                                   getEdgeProperties.getPropertyType(),
+                                   getEdgeProperties.getPending(),
+                                   getEdgeProperties.getAllPending(),
+                                   getEdgeProperties.getValues(),
+                                   /*isNode=*/false,
+                                   body);
+        } else if (nl::ExpandPath expandPath = mlir::dyn_cast<nl::ExpandPath>(operation)) {
+            translateExpandPath(expandPath, body);
+        } else if (nl::MakePath makePath = mlir::dyn_cast<nl::MakePath>(operation)) {
+            translateMakePath(makePath, body);
+        } else if (nl::PathLength pathLength = mlir::dyn_cast<nl::PathLength>(operation)) {
+            translatePathLength(pathLength, body);
+        } else if (nl::PathElements pathElements = mlir::dyn_cast<nl::PathElements>(operation)) {
+            translatePathElements(pathElements, body);
+        } else if (nl::GetNodeLabelSet getNodeLabelSet = mlir::dyn_cast<nl::GetNodeLabelSet>(operation)) {
+            translateGetNodeLabelSet(getNodeLabelSet, body);
+        } else if (nl::GetEdgeTypes getEdgeTypes = mlir::dyn_cast<nl::GetEdgeTypes>(operation)) {
+            translateGetEdgeTypes(getEdgeTypes, body);
+        } else if (nl::CheckLabelConstraint checkLabelConstraint = mlir::dyn_cast<nl::CheckLabelConstraint>(operation)) {
+            translateCheckLabelConstraint(checkLabelConstraint, body);
+        } else if (nl::CheckEdgeTypeConstraint checkEdgeTypeConstraint = mlir::dyn_cast<nl::CheckEdgeTypeConstraint>(operation)) {
+            translateCheckEdgeTypeConstraint(checkEdgeTypeConstraint, body);
+        } else if (nl::EachRow eachRow = mlir::dyn_cast<nl::EachRow>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::EachRow;
+
+            const mlir::OperandRange columns = eachRow.getColumns();
+            config._eachRowColumns.assign(columns.begin(), columns.end());
+
+            _iteratorConfigs[eachRow.getResult()] = config;
+        } else if (nl::CrossProduct crossProduct = mlir::dyn_cast<nl::CrossProduct>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::CrossProduct;
+
+            const mlir::OperandRange outerColumns = crossProduct.getOuterColumns();
+            config._crossOuterColumns.assign(outerColumns.begin(), outerColumns.end());
+
+            const mlir::OperandRange innerColumns = crossProduct.getInnerColumns();
+            config._crossInnerColumns.assign(innerColumns.begin(), innerColumns.end());
+
+            _iteratorConfigs[crossProduct.getResult()] = config;
+        } else if (nl::Limit limit = mlir::dyn_cast<nl::Limit>(operation)) {
+            translateLimit(limit, body);
+        } else if (nl::LimitRemaining remaining = mlir::dyn_cast<nl::LimitRemaining>(operation)) {
+            translateLimitRemaining(remaining, body);
+        } else if (nl::LimitUpdate update = mlir::dyn_cast<nl::LimitUpdate>(operation)) {
+            translateLimitUpdate(update, body);
+        } else if (nl::LimitTruncate truncate = mlir::dyn_cast<nl::LimitTruncate>(operation)) {
+            translateLimitTruncate(truncate, body);
+        } else if (nl::Skip skip = mlir::dyn_cast<nl::Skip>(operation)) {
+            translateSkip(skip, body);
+        } else if (nl::SkipUpdate update = mlir::dyn_cast<nl::SkipUpdate>(operation)) {
+            translateSkipUpdate(update, body);
+        } else if (nl::SkipTruncate truncate = mlir::dyn_cast<nl::SkipTruncate>(operation)) {
+            translateSkipTruncate(truncate, body);
+        } else if (nl::SortBuffer sortBuffer = mlir::dyn_cast<nl::SortBuffer>(operation)) {
+            translateSortBuffer(sortBuffer, body);
+        } else if (nl::RowBuffer rowBuffer = mlir::dyn_cast<nl::RowBuffer>(operation)) {
+            translateRowBuffer(rowBuffer, body);
+        } else if (nl::RowCollect rowCollect = mlir::dyn_cast<nl::RowCollect>(operation)) {
+            translateRowCollect(rowCollect, body);
+        } else if (nl::SortCollect sortCollect = mlir::dyn_cast<nl::SortCollect>(operation)) {
+            translateSortCollect(sortCollect, body);
+        } else if (nl::HashJoinBuffer hashJoinBuffer = mlir::dyn_cast<nl::HashJoinBuffer>(operation)) {
+            translateHashJoinBuffer(hashJoinBuffer, body);
+        } else if (nl::HashJoinCollect hashJoinCollect = mlir::dyn_cast<nl::HashJoinCollect>(operation)) {
+            translateHashJoinCollect(hashJoinCollect, body);
+        } else if (nl::HashJoinProbe hashJoinProbe = mlir::dyn_cast<nl::HashJoinProbe>(operation)) {
+            IteratorConfig config;
+            config._kind = IteratorKind::HashJoinProbe;
+            config._hashJoinState = hashJoinProbe.getState();
+
+            const mlir::OperandRange probeColumns = hashJoinProbe.getColumns();
+            config._probeColumns.assign(probeColumns.begin(), probeColumns.end());
+
+            _iteratorConfigs[hashJoinProbe.getResult()] = config;
+        } else if (nl::Distinct distinct = mlir::dyn_cast<nl::Distinct>(operation)) {
+            translateDistinctState(distinct, body);
+        } else if (nl::DistinctFilter distinctFilter = mlir::dyn_cast<nl::DistinctFilter>(operation)) {
+            translateDistinctFilter(distinctFilter, body);
+        } else if (nl::Count count = mlir::dyn_cast<nl::Count>(operation)) {
+            translateCountState(count, body);
+        } else if (nl::CountUpdate countUpdate = mlir::dyn_cast<nl::CountUpdate>(operation)) {
+            translateCountUpdate(countUpdate, body);
+        } else if (nl::CountResult countResult = mlir::dyn_cast<nl::CountResult>(operation)) {
+            translateCountResult(countResult, body);
+        } else if (nl::CountScanRows countScanRows = mlir::dyn_cast<nl::CountScanRows>(operation)) {
+            translateCountScanRows(countScanRows, body);
+        } else if (nl::Aggregate aggregate = mlir::dyn_cast<nl::Aggregate>(operation)) {
+            translateAggregateState(aggregate, body);
+        } else if (nl::AggregateUpdate aggregateUpdate = mlir::dyn_cast<nl::AggregateUpdate>(operation)) {
+            translateAggregateUpdate(aggregateUpdate, body);
+        } else if (nl::AggregateResult aggregateResult = mlir::dyn_cast<nl::AggregateResult>(operation)) {
+            translateAggregateResult(aggregateResult, body);
+        } else if (nl::GroupAggregateBuffer groupBuffer = mlir::dyn_cast<nl::GroupAggregateBuffer>(operation)) {
+            translateGroupAggregateBuffer(groupBuffer, body);
+        } else if (nl::GroupAggregateUpdate groupUpdate = mlir::dyn_cast<nl::GroupAggregateUpdate>(operation)) {
+            translateGroupAggregateUpdate(groupUpdate, body);
+        } else if (nl::CollectBuffer collectBuffer = mlir::dyn_cast<nl::CollectBuffer>(operation)) {
+            translateCollectBuffer(collectBuffer, body);
+        } else if (nl::CollectUpdate collectUpdate = mlir::dyn_cast<nl::CollectUpdate>(operation)) {
+            translateCollectUpdate(collectUpdate, body);
+        } else if (nl::NodeSetBuffer nodeSetBuffer = mlir::dyn_cast<nl::NodeSetBuffer>(operation)) {
+            translateNodeSetBuffer(nodeSetBuffer, body);
+        } else if (nl::NodeSetCollect nodeSetCollect = mlir::dyn_cast<nl::NodeSetCollect>(operation)) {
+            translateNodeSetCollect(nodeSetCollect, body);
+        } else if (nl::ShortestPathBuffer shortestPathBuffer = mlir::dyn_cast<nl::ShortestPathBuffer>(operation)) {
+            translateShortestPathBuffer(shortestPathBuffer, body);
+        } else if (nl::ShortestPathUpdate shortestPathUpdate = mlir::dyn_cast<nl::ShortestPathUpdate>(operation)) {
+            translateShortestPathUpdate(shortestPathUpdate, body);
+        } else if (nl::OptionalBuffer optionalBuffer = mlir::dyn_cast<nl::OptionalBuffer>(operation)) {
+            translateOptionalBuffer(optionalBuffer, body);
+        } else if (nl::OptionalCollect optionalCollect = mlir::dyn_cast<nl::OptionalCollect>(operation)) {
+            translateOptionalCollect(optionalCollect, body);
+        } else if (nl::ExistsBuffer existsBuffer = mlir::dyn_cast<nl::ExistsBuffer>(operation)) {
+            translateExistsBuffer(existsBuffer, body);
+        } else if (nl::ExistsMark existsMark = mlir::dyn_cast<nl::ExistsMark>(operation)) {
+            translateExistsMark(existsMark, body);
+        } else if (nl::ExistsResult existsResult = mlir::dyn_cast<nl::ExistsResult>(operation)) {
+            translateExistsResult(existsResult, body);
+        } else if (nl::CountSubqueryBuffer countBuffer = mlir::dyn_cast<nl::CountSubqueryBuffer>(operation)) {
+            translateCountSubqueryBuffer(countBuffer, body);
+        } else if (nl::CountSubqueryTally countTally = mlir::dyn_cast<nl::CountSubqueryTally>(operation)) {
+            translateCountSubqueryTally(countTally, body);
+        } else if (nl::CountSubqueryResult countResult = mlir::dyn_cast<nl::CountSubqueryResult>(operation)) {
+            translateCountSubqueryResult(countResult, body);
+        } else if (nl::RowListsBuffer rowListsBuffer = mlir::dyn_cast<nl::RowListsBuffer>(operation)) {
+            translateRowListsBuffer(rowListsBuffer, body);
+        } else if (nl::RowListsCollect rowListsCollect = mlir::dyn_cast<nl::RowListsCollect>(operation)) {
+            translateRowListsCollect(rowListsCollect, body);
+        } else if (nl::RowListsResult rowListsResult = mlir::dyn_cast<nl::RowListsResult>(operation)) {
+            translateRowListsResult(rowListsResult, body);
+        } else if (nl::CreateNode createNode = mlir::dyn_cast<nl::CreateNode>(operation)) {
+            translateCreateNode(createNode, body);
+        } else if (nl::CreateEdge createEdge = mlir::dyn_cast<nl::CreateEdge>(operation)) {
+            translateCreateEdge(createEdge, body);
+        } else if (nl::Merge merge = mlir::dyn_cast<nl::Merge>(operation)) {
+            translateMerge(merge, body);
+        } else if (nl::SetNodeProperty setNodeProperty = mlir::dyn_cast<nl::SetNodeProperty>(operation)) {
+            translateSetNodeProperty(setNodeProperty, body);
+        } else if (nl::SetEdgeProperty setEdgeProperty = mlir::dyn_cast<nl::SetEdgeProperty>(operation)) {
+            translateSetEdgeProperty(setEdgeProperty, body);
+        } else if (nl::DeleteNode deleteNode = mlir::dyn_cast<nl::DeleteNode>(operation)) {
+            translateDeleteNode(deleteNode, body);
+        } else if (nl::DeleteEdge deleteEdge = mlir::dyn_cast<nl::DeleteEdge>(operation)) {
+            translateDeleteEdge(deleteEdge, body);
+        } else if (nl::Procedure procedureOp = mlir::dyn_cast<nl::Procedure>(operation)) {
+            translateProcedure(procedureOp, body);
+        } else if (nl::Output output = mlir::dyn_cast<nl::Output>(operation)) {
+            translateOutput(output, body);
+        } else if (mlir::isa<nl::Yield, nl::ComprehensionYield, nl::ReduceYield, nl::UnwindYield, mlir::func::ReturnOp>(operation)) {
+            // Structural terminators carry no behavior
+        } else if (!_systemTranslator->translate(operation, body)) {
+            throw IRException(fmt::format("NLTranslator cannot translate operation '{}'",
+                                          operation.getName().getStringRef().str()));
+        }
+    }
+}
+
+void NLTranslator::translateFor(nl::For forLoop, NLStmtContainer* body) {
+    // Fetch the iterator associated to this loop
+    const auto configIt = _iteratorConfigs.find(forLoop.getIterator());
+    if (configIt == _iteratorConfigs.end()) {
+        throw IRException("nl.for iterator must be produced by an nl source operation");
+    }
+
+    const IteratorConfig& config = configIt->second;
+    mlir::Block& loopBody = forLoop->getRegion(0).front();
+
+    // A loop that names a limit handle stops once that counter is spent; the
+    // handle was produced by an nl.limit translated earlier, so its counter is
+    // already mapped.
+    NLLimitState* limit = limitStateFor(forLoop.getLimit());
+
+    // Translate the loop differently depending on the kind of iterator associated
+    if (config._kind == IteratorKind::ScanNodes) {
+        translateScanLoop(loopBody, limit, body);
+    } else if (config._kind == IteratorKind::ScanNodesByLabel) {
+        translateScanByLabelLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::ConstScanNodes) {
+        translateConstScanLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::ScanNodesByPropertyValue) {
+        translateScanByPropertyValueLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::ScanEdges) {
+        translateScanEdgesLoop(loopBody, limit, body);
+    } else if (config._kind == IteratorKind::ScanEdgesByType) {
+        translateScanEdgesByTypeLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::ScanEdgesBySourceLabel) {
+        translateScanEdgesByLabelLoop(config, loopBody, limit, body, &NLExecutor::runScanEdgesBySourceLabelLoop);
+    } else if (config._kind == IteratorKind::ScanEdgesByTargetLabel) {
+        translateScanEdgesByLabelLoop(config, loopBody, limit, body, &NLExecutor::runScanEdgesByTargetLabelLoop);
+    } else if (config._kind == IteratorKind::ScanEdgesByEndpointLabelsFromSource) {
+        translateScanEdgesByEndpointLabelsLoop(config, loopBody, limit, body, &NLExecutor::runScanEdgesByEndpointLabelsFromSourceLoop);
+    } else if (config._kind == IteratorKind::ScanEdgesByEndpointLabelsFromTarget) {
+        translateScanEdgesByEndpointLabelsLoop(config, loopBody, limit, body, &NLExecutor::runScanEdgesByEndpointLabelsFromTargetLoop);
+    } else if (config._kind == IteratorKind::Sort) {
+        translateSortLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::GroupAggregate) {
+        translateGroupAggregateLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::UnwindCollect) {
+        // A collect drain emit loop is never limit-bounded: every row must be folded
+        // before the first element is emitted.
+        translateUnwindCollectLoop(config, loopBody, body);
+    } else if (config._kind == IteratorKind::Collect) {
+        translateCollectLoop(config, loopBody, body);
+    } else if (config._kind == IteratorKind::ShortestPath) {
+        translateShortestPathLoop(config, loopBody, body);
+    } else if (config._kind == IteratorKind::UnwindConst) {
+        // A const unwind is a plain source, so - like a scan - a downstream LIMIT can
+        // bound its loop through the ordinary early-exit.
+        translateUnwindConstLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::LoadCSV) {
+        // A CSV load is a plain source too, so a downstream LIMIT can bound its loop
+        // through the ordinary early-exit - the file is then read only as far as the
+        // budget reaches.
+        translateLoadCSVLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::VectorSearch) {
+        // A vector search is a plain source too, so a downstream LIMIT can bound its
+        // loop through the ordinary early-exit.
+        translateVectorSearchLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::Unwind) {
+        // An unwind expands the rows it is given rather than accumulating them, so - like
+        // a hop - a downstream LIMIT can bound its loop through the ordinary early-exit.
+        translateUnwindLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::UnwindRange) {
+        translateUnwindRangeLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::UnwindComputed) {
+        translateUnwindComputedLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::OptionalDrain) {
+        translateOptionalDrainLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::RowDrain) {
+        translateRowLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::ProcedureInit) {
+        translateProcedureInitLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::CrossProduct) {
+        // A product expands the rows it is given rather than accumulating them, so -
+        // like a hop - a downstream LIMIT can bound its loop through the ordinary
+        // early-exit, and a step lays out only the prefix the budget can emit.
+        translateCrossProductLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::HashJoinProbe) {
+        // A probe expands the rows it is given the way a product does, so a downstream
+        // LIMIT bounds its loop through the same early-exit.
+        translateHashJoinProbeLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::EachRow) {
+        translateEachRowLoop(config, loopBody, limit, body);
+    } else if (config._kind == IteratorKind::ExplorePaths) {
+        translateExplorePathsLoop(config, loopBody, limit, body);
+    } else {
+        translateEdgeLoop(config, loopBody, limit, body);
+    }
+}
+
+void NLTranslator::translateScanLoop(mlir::Block& loopBody, NLLimitState* limit, NLStmtContainer* body) {
+    // For::verify guarantees one block argument per iterator chunk, and a
+    // node scan iterator has exactly one chunk of node IDs
+    ColumnNodeIDs* nodeIDs = static_cast<ColumnNodeIDs*>(allocColumn(loopBody.getArgument(0)));
+
+    NLScanLoopData* loopData = _program->allocFunctionData<NLScanLoopData>(nodeIDs);
+    loopData->setLimit(limit);
+
+    body->emplaceStmt(&NLExecutor::runScanNodesLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateScanByLabelLoop(const IteratorConfig& config,
+                                            mlir::Block& loopBody,
+                                            NLLimitState* limit,
+                                            NLStmtContainer* body) {
+    // A label scan binds the same single node ID chunk as a plain scan.
+    const mlir::Value nodeChunk = loopBody.getArgument(0);
+    ColumnNodeIDs* nodeIDs = static_cast<ColumnNodeIDs*>(allocColumn(nodeChunk));
+
+    // An unmatchable scan emits nothing rather than dropping the absent name and
+    // matching a weaker set.
+    LabelSet labelset;
+    const bool matchable = resolveLabelSet(config._labels, labelset);
+
+    NLScanByLabelLoopData* loopData = _program->allocFunctionData<NLScanByLabelLoopData>(nodeIDs, labelset, matchable);
+    loopData->setLimit(limit);
+
+    body->emplaceStmt(&NLExecutor::runScanNodesByLabelLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateConstScanLoop(const IteratorConfig& config,
+                                          mlir::Block& loopBody,
+                                          NLLimitState* limit,
+                                          NLStmtContainer* body) {
+    // A const scan binds the same single node ID chunk as a plain scan.
+    const mlir::Value nodeChunk = loopBody.getArgument(0);
+    ColumnNodeIDs* nodeIDs = static_cast<ColumnNodeIDs*>(allocColumn(nodeChunk));
+
+    NLConstScanLoopData* loopData = _program->allocFunctionData<NLConstScanLoopData>(nodeIDs);
+    loopData->setLimit(limit);
+
+    const GraphReader reader = _view->read();
+
+    loopData->reserveNodeIDs(config._nodeIDs.size());
+    for (const int64_t nodeID : config._nodeIDs) {
+        const NodeID candidate(static_cast<uint64_t>(nodeID));
+        if (reader.graphHasNode(candidate)) {
+            loopData->addNodeID(candidate);
+        }
+    }
+
+    body->emplaceStmt(&NLExecutor::runConstScanNodesLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateScanByPropertyValueLoop(const IteratorConfig& config,
+                                                    mlir::Block& loopBody,
+                                                    NLLimitState* limit,
+                                                    NLStmtContainer* body) {
+    const mlir::Value nodeChunk = loopBody.getArgument(0);
+    ColumnNodeIDs* nodeIDs = static_cast<ColumnNodeIDs*>(allocColumn(nodeChunk));
+
+    LabelSet labelset;
+    const bool byLabel = !config._labels.empty();
+    const bool labelsResolved = !byLabel || resolveLabelSet(config._labels, labelset);
+
+    const llvm::StringRef property = config._property;
+    const std::optional<PropertyType> propertyType = findPropertyType(property);
+
+    PropertyTypeID propertyTypeID;
+    ValueType valueType = ValueType::Invalid;
+    NLScanByPropertyValueLoopData::Literal literal;
+    bool matchable = false;
+
+    if (labelsResolved && propertyType) {
+        propertyTypeID = propertyType->_id;
+        valueType = propertyType->_valueType;
+        matchable = resolvePropertyScanLiteral(valueType, config._propertyValue, literal);
+    }
+
+    NLScanByPropertyValueLoopData* loopData = _program->allocFunctionData<NLScanByPropertyValueLoopData>(nodeIDs,
+                                                                                                         propertyTypeID,
+                                                                                                         valueType,
+                                                                                                         literal,
+                                                                                                         labelset,
+                                                                                                         byLabel,
+                                                                                                         matchable);
+    loopData->setLimit(limit);
+
+    body->emplaceStmt(&NLExecutor::runScanNodesByPropertyValueLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+bool NLTranslator::resolveLabelSet(llvm::ArrayRef<llvm::StringRef> labels, LabelSet& labelset) const {
+    for (const llvm::StringRef label : labels) {
+        const std::optional<LabelID> id = findLabel(label);
+        if (!id) {
+            return false;
+        }
+
+        labelset.set(*id);
+    }
+
+    return true;
+}
+
+void NLTranslator::resolveLabelNames(mlir::ArrayAttr labels, llvm::SmallVectorImpl<llvm::StringRef>& names) const {
+    resolveSchemaNames(labels, LABEL_NOUNS, names);
+}
+
+void NLTranslator::resolveEdgeTypeNames(mlir::ArrayAttr edgeTypes, llvm::SmallVectorImpl<llvm::StringRef>& names) const {
+    resolveSchemaNames(edgeTypes, EDGE_TYPE_NOUNS, names);
+}
+
+// A by-type hop carries the nl.get_edge_type_set handle, not the names: they sit on the
+// handle op, resolved once above the loops, and a hop reads them back through its operand
+void NLTranslator::resolveEdgeTypeNames(mlir::Value handle, llvm::SmallVectorImpl<llvm::StringRef>& names) const {
+    nl::GetEdgeTypeSet handleOp = handle.getDefiningOp<nl::GetEdgeTypeSet>();
+    if (!handleOp) {
+        throw IRException("edge_types operand must come from nl.get_edge_type_set");
+    }
+
+    resolveEdgeTypeNames(handleOp.getNames(), names);
+}
+
+llvm::StringRef NLTranslator::resolveEdgeTypeName(mlir::Attribute edgeType) const {
+    if (const mlir::StringAttr name = mlir::dyn_cast<mlir::StringAttr>(edgeType)) {
+        return name.getValue();
+    }
+
+    const mlir::storage::ParameterAttr parameter = mlir::cast<mlir::storage::ParameterAttr>(edgeType);
+    const llvm::StringRef name = parameter.getName();
+    const ParameterValue& value = lookupParameter(name);
+
+    if (value.isNull()) {
+        throw IRException(fmt::format("Parameter ${} is null: an edge is written with one edge type, a String", name));
+    }
+
+    const ValueType type = value.getType();
+    if (type != ValueType::String) {
+        throw IRException(fmt::format("Parameter ${} has type {}: an edge is written with one edge type, a String",
+                                      name,
+                                      ValueTypeName::value(type)));
+    }
+
+    return boundSchemaName(name, EDGE_TYPE_NOUNS, value.getString());
+}
+
+void NLTranslator::resolveSchemaNames(mlir::ArrayAttr refs,
+                                      const SchemaNameNouns& nouns,
+                                      llvm::SmallVectorImpl<llvm::StringRef>& names) const {
+    for (const mlir::Attribute ref : refs) {
+        if (const mlir::StringAttr name = mlir::dyn_cast<mlir::StringAttr>(ref)) {
+            names.push_back(name.getValue());
+        } else {
+            bindParameterSchemaNames(mlir::cast<mlir::storage::ParameterAttr>(ref), nouns, names);
+        }
+    }
+}
+
+void NLTranslator::bindParameterSchemaNames(mlir::storage::ParameterAttr parameter,
+                                            const SchemaNameNouns& nouns,
+                                            llvm::SmallVectorImpl<llvm::StringRef>& names) const {
+    const llvm::StringRef name = parameter.getName();
+    const ParameterValue& value = lookupParameter(name);
+
+    if (value.isNull()) {
+        throw IRException(fmt::format("Parameter ${} is null: {} is a String or a list of Strings", name, nouns._withArticle));
+    }
+
+    const ValueType type = value.getType();
+    if (type == ValueType::String) {
+        names.push_back(boundSchemaName(name, nouns, value.getString()));
+    } else if (type == ValueType::List) {
+        const ParameterValue::List& elements = value.getList();
+        if (elements.empty()) {
+            throw IRException(fmt::format("Parameter ${} holds no {}", name, nouns._noun));
+        }
+
+        for (size_t index = 0; index < elements.size(); index++) {
+            const ParameterValue& element = elements[index];
+            const bool isString = !element.isNull() && element.getType() == ValueType::String;
+            if (!isString) {
+                throw IRException(fmt::format("Element {} of parameter ${} has type {}: {} is a String",
+                                              index,
+                                              name,
+                                              element.getTypeName(),
+                                              nouns._withArticle));
+            }
+
+            names.push_back(boundSchemaName(name, nouns, element.getString()));
+        }
+    } else {
+        throw IRException(fmt::format("Parameter ${} has type {}: {} is a String or a list of Strings",
+                                      name,
+                                      ValueTypeName::value(type),
+                                      nouns._withArticle));
+    }
+}
+
+const ParameterValue& NLTranslator::lookupParameter(llvm::StringRef name) const {
+    const ParameterValue* value = _parameters ? _parameters->get(name) : nullptr;
+    if (!value) {
+        throw IRException(fmt::format("Parameter ${} is not defined", name));
+    }
+
+    return *value;
+}
+
+llvm::StringRef NLTranslator::boundSchemaName(llvm::StringRef parameterName,
+                                              const SchemaNameNouns& nouns,
+                                              const std::string& name) const {
+    if (name.empty()) {
+        throw IRException(fmt::format("Parameter ${} holds an empty {} name", parameterName, nouns._noun));
+    }
+
+    return name;
+}
+
+// What this change knows a label by: the graph's schema, plus the names a CREATE earlier in
+// the program introduced, which live in the change's own schema and nowhere else until the
+// commit. The edge type sibling of this is findEdgeType.
+std::optional<LabelID> NLTranslator::findLabel(llvm::StringRef name) const {
+    const std::optional<LabelID> labelID = _view->metadata().labels().get(name);
+    if (labelID || !_metadataBuilder) {
+        return labelID;
+    }
+
+    return _metadataBuilder->findLabel(name);
+}
+
+void NLTranslator::translateUnwindConstLoop(const IteratorConfig& config,
+                                            mlir::Block& loopBody,
+                                            NLLimitState* limit,
+                                            NLStmtContainer* body) {
+    // An unwind_const binds a single value chunk: the loop emits one element per row.
+    const mlir::Value valueChunk = loopBody.getArgument(0);
+    const mlir::Type elementType = mlir::cast<nl::ChunkType>(valueChunk.getType()).getElementType();
+
+    // The chunk element type is the homogeneity verdict: a !storage.any chunk is the
+    // type-erased column of tagged scalars; a nullable value chunk is a homogeneous
+    // column of that one value type, the shape every other value-chunk consumer reads.
+    const bool heterogeneous = llvm::isa<storage::AnyType>(elementType);
+
+    Column* output {nullptr};
+    ValueType valueType {ValueType::Invalid};
+
+    if (heterogeneous) {
+        output = allocListElementColumn();
+    } else {
+        valueType = nullableChunkValueType(valueChunk.getType());
+        output = allocOptColumnForValueType(valueType);
+    }
+
+    _valueSlots[valueChunk] = output;
+
+    NLUnwindConstLoopData* loopData = _program->allocFunctionData<NLUnwindConstLoopData>(output,
+                                                                                        config._list,
+                                                                                        heterogeneous,
+                                                                                        valueType);
+    loopData->setLimit(limit);
+
+    body->emplaceStmt(&NLExecutor::runUnwindConstLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateLoadCSVLoop(const IteratorConfig& config,
+                                        mlir::Block& loopBody,
+                                        NLLimitState* limit,
+                                        NLStmtContainer* body) {
+    // A CSV load binds one string chunk per field it produces. The parser fills a
+    // row of field columns, so the chunks are gathered into one - the chunk a downstream
+    // op reads is the very column the parser wrote.
+    ColumnStringTable* const row = _memory->alloc<ColumnStringTable>();
+
+    for (const mlir::Value fieldChunk : loopBody.getArguments()) {
+        Column* const field = allocColumn(fieldChunk);
+        row->addFieldColumn(static_cast<ColumnStringTable::StringColumn*>(field));
+    }
+
+    const std::string_view path {config._csvPath.data(), config._csvPath.size()};
+
+    NLLoadCSVLoopData* loopData = _program->allocFunctionData<NLLoadCSVLoopData>(row,
+                                                                                &_program->allocStepBuffers()->stringBuffer(),
+                                                                                path,
+                                                                                config._csvHasHeaders,
+                                                                                config._csvSkipOnError);
+    loopData->setLimit(limit);
+
+    for (const mlir::Attribute field : config._csvFields) {
+        if (const auto header = mlir::dyn_cast<mlir::StringAttr>(field)) {
+            const llvm::StringRef name = header.getValue();
+            loopData->addField({._header = std::string_view {name.data(), name.size()},
+                                ._byHeader = true});
+        } else {
+            const auto index = mlir::cast<mlir::IntegerAttr>(field);
+            loopData->addField({._index = index.getValue().getZExtValue()});
+        }
+    }
+
+    body->emplaceStmt(&NLExecutor::runLoadCSVLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateVectorSearchLoop(const IteratorConfig& config,
+                                             mlir::Block& loopBody,
+                                             NLLimitState* limit,
+                                             NLStmtContainer* body) {
+    // A vector search binds two chunks: the neighbour nodes and the distances they scored.
+    const mlir::Value idChunk = loopBody.getArgument(0);
+    const mlir::Value scoreChunk = loopBody.getArgument(1);
+
+    ColumnNodeIDs* const ids = static_cast<ColumnNodeIDs*>(allocColumn(idChunk));
+    Column* const scores = allocColumn(scoreChunk);
+
+    const std::string_view indexName {config._indexName.data(), config._indexName.size()};
+    const std::span<const float> queryVector {config._queryVector.data(), config._queryVector.size()};
+
+    NLVectorSearchLoopData* loopData = _program->allocFunctionData<NLVectorSearchLoopData>(ids,
+                                                                                          scores,
+                                                                                          indexName,
+                                                                                          config._neighbourCount,
+                                                                                          queryVector);
+    loopData->setLimit(limit);
+
+    body->emplaceStmt(&NLExecutor::runVectorSearchLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+NLUnwindElementEmitFunction NLTranslator::selectListUnwindEmit(mlir::Type chunkType, bool sourceIsNullable) {
+    const mlir::Type elementType = mlir::cast<nl::ChunkType>(chunkType).getElementType();
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        return NLExecutor::selectListUnwindValueEmit(sourceIsNullable,
+                                                     valueTypeFromElementType(nullableType.getValueType()));
+    } else if (mlir::isa<storage::NodeIDType>(elementType)) {
+        return NLExecutor::selectListUnwindNodeEmit(sourceIsNullable);
+    } else if (mlir::isa<storage::EdgeIDType>(elementType)) {
+        return NLExecutor::selectListUnwindEdgeEmit(sourceIsNullable);
+    }
+
+    return NLExecutor::selectListUnwindElementEmit(sourceIsNullable);
+}
+
+// A column whose cells hold more than the element - a list, or a tagged scalar that may
+// itself be a list - drains through its own emit. A scalar column already holds one
+// element per cell, so its element column is the source's own rows gathered by the step:
+// a carried column like the rest, and no drain here.
+void NLTranslator::selectElementDrain(mlir::Type sourceElement,
+                                      mlir::Type elementChunkType,
+                                      NLUnwindElementCountFunction& elementCount,
+                                      NLUnwindElementEmitFunction& elementEmit) {
+    const auto sourceNullable = mlir::dyn_cast<storage::NullableType>(sourceElement);
+    const bool drainsNullableList = sourceNullable && llvm::isa<storage::ListType>(sourceNullable.getValueType());
+
+    elementEmit = nullptr;
+
+    if (llvm::isa<storage::ListType>(sourceElement) || drainsNullableList) {
+        elementCount = NLExecutor::selectListUnwindElementCount(drainsNullableList);
+        elementEmit = selectListUnwindEmit(elementChunkType, drainsNullableList);
+    } else if (llvm::isa<storage::AnyType>(sourceElement)) {
+        elementCount = NLExecutor::selectTaggedUnwindElementCount();
+        elementEmit = NLExecutor::selectTaggedUnwindElementEmit();
+    } else if (isNullableAny(sourceElement)) {
+        elementCount = NLExecutor::selectOptTaggedUnwindElementCount();
+        elementEmit = NLExecutor::selectOptTaggedUnwindElementEmit();
+    } else if (sourceNullable) {
+        elementCount = NLExecutor::selectOptUnwindElementCount(valueTypeFromElementType(sourceNullable.getValueType()));
+    } else {
+        elementCount = NLExecutor::selectValueUnwindElementCount();
+    }
+}
+
+NLCellAbsentFunction NLTranslator::selectCellAbsent(mlir::Type sourceElement) {
+    if (llvm::isa<storage::AnyType>(sourceElement)) {
+        return NLExecutor::selectTaggedCellAbsent(/*nullable=*/false);
+    } else if (isNullableAny(sourceElement)) {
+        return NLExecutor::selectTaggedCellAbsent(/*nullable=*/true);
+    } else if (isNullableList(sourceElement)) {
+        return NLExecutor::selectListCellAbsent();
+    }
+
+    const auto sourceNullable = mlir::dyn_cast<storage::NullableType>(sourceElement);
+    if (!sourceNullable) {
+        return NLExecutor::selectPresentCell();
+    }
+
+    return NLExecutor::selectValueCellAbsent(valueTypeFromElementType(sourceNullable.getValueType()));
+}
+
+template <typename LoopData>
+void NLTranslator::bindCarriedColumns(llvm::ArrayRef<mlir::Value> carriedColumns,
+                                      mlir::Block& loopBody,
+                                      size_t firstCarriedArgument,
+                                      LoopData* loopData) {
+    for (size_t carriedIndex = 0; carriedIndex < carriedColumns.size(); carriedIndex++) {
+        const mlir::Value carriedValue = carriedColumns[carriedIndex];
+
+        const unsigned argumentIndex = static_cast<unsigned>(firstCarriedArgument + carriedIndex);
+        Column* carriedOutput = allocColumn(loopBody.getArgument(argumentIndex));
+
+        const NLCarriedColumn carriedColumn(getColumn(carriedValue),
+                                            carriedOutput,
+                                            selectGatherForChunkType(carriedValue.getType()));
+        loopData->addCarriedColumn(carriedColumn);
+    }
+}
+
+void NLTranslator::throwIfCarriedNotRowAligned(const IteratorConfig& config) {
+    for (const mlir::Value carriedValue : config._carriedColumns) {
+        if (!rowAlignedWith(carriedValue, config._inputNodes)) {
+            throw IRException("Carried column is not row-aligned with the input chunk");
+        }
+    }
+}
+
+void NLTranslator::translateUnwindLoop(const IteratorConfig& config,
+                                       mlir::Block& loopBody,
+                                       NLLimitState* limit,
+                                       NLStmtContainer* body) {
+    const mlir::Value sourceValue = config._source;
+    const Column* source = getColumn(sourceValue);
+
+    const nl::ChunkType sourceChunk = mlir::cast<nl::ChunkType>(sourceValue.getType());
+    const mlir::Type sourceElement = sourceChunk.getElementType();
+
+    // An unwind binds the elements first, then one variable per carried column.
+    const mlir::Value elementValue = loopBody.getArgument(0);
+
+    NLUnwindElementCountFunction elementCount = nullptr;
+    NLUnwindElementEmitFunction elementEmit = nullptr;
+    selectElementDrain(sourceElement, elementValue.getType(), elementCount, elementEmit);
+
+    const bool readsTheElements = !elementValue.use_empty();
+    if (!readsTheElements) {
+        elementEmit = nullptr;
+    }
+
+    Column* const elementOutput = elementEmit ? allocColumn(elementValue) : nullptr;
+
+    NLUnwindLoopData* loopData = _program->allocFunctionData<NLUnwindLoopData>(source,
+                                                                               elementCount,
+                                                                               elementEmit,
+                                                                               elementOutput);
+    loopData->setLimit(limit);
+
+    const size_t chunkSize = _program->getChunkSize();
+    loopData->getRows()->reserve(chunkSize);
+    loopData->getPositions()->reserve(chunkSize);
+
+    if (readsTheElements && !elementEmit) {
+        const NLCarriedColumn elementColumn(source,
+                                            allocColumn(elementValue),
+                                            selectGatherForChunkType(sourceChunk));
+        loopData->addCarriedColumn(elementColumn);
+    }
+
+    bindCarriedColumns(config._carriedColumns, loopBody, 1, loopData);
+
+    body->emplaceStmt(&NLExecutor::runUnwindLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateUnwindComputedLoop(const IteratorConfig& config,
+                                               mlir::Block& loopBody,
+                                               NLLimitState* limit,
+                                               NLStmtContainer* body) {
+    const llvm::ArrayRef<mlir::Value> carriedValues = config._carriedColumns;
+    NLUnwindComputedLoopData* loopData = _program->allocFunctionData<NLUnwindComputedLoopData>(getColumn(carriedValues.front()));
+    loopData->setLimit(limit);
+
+    const size_t chunkSize = _program->getChunkSize();
+    loopData->getRunRows()->reserve(chunkSize);
+    loopData->getRows()->reserve(chunkSize);
+    loopData->getPositions()->reserve(chunkSize);
+
+    mlir::Block& sourceBlock = config._unwindSource->front();
+    for (size_t carriedIndex = 0; carriedIndex < carriedValues.size(); carriedIndex++) {
+        const mlir::Value argument = sourceBlock.getArgument(static_cast<unsigned>(carriedIndex));
+        if (argument.use_empty()) {
+            continue;
+        }
+
+        const NLCarriedColumn sourceArgument(getColumn(carriedValues[carriedIndex]),
+                                             allocColumn(argument),
+                                             selectGatherForChunkType(argument.getType()));
+        loopData->addSourceArgument(sourceArgument);
+    }
+
+    translateBlock(sourceBlock, loopData->getSourceStmts());
+
+    // The op's verifier guarantees the terminator, so a region without one here means
+    // unverified IR.
+    nl::UnwindYield yield = mlir::dyn_cast<nl::UnwindYield>(sourceBlock.back());
+    if (!yield) {
+        throw IRException("The source region of an nl.unwind_computed does not end with an nl.unwind_yield");
+    }
+
+    const mlir::Value sourceValue = yield.getSource();
+    const Column* source = getColumn(sourceValue);
+    const nl::ChunkType sourceChunk = mlir::cast<nl::ChunkType>(sourceValue.getType());
+
+    const mlir::Value elementValue = loopBody.getArgument(0);
+
+    NLUnwindElementCountFunction elementCount = nullptr;
+    NLUnwindElementEmitFunction elementEmit = nullptr;
+    selectElementDrain(sourceChunk.getElementType(), elementValue.getType(), elementCount, elementEmit);
+
+    const bool readsTheElements = !elementValue.use_empty();
+    if (!readsTheElements) {
+        elementEmit = nullptr;
+    }
+
+    Column* const elementOutput = elementEmit ? allocColumn(elementValue) : nullptr;
+
+    if (readsTheElements && !elementEmit) {
+        const NLCarriedColumn elementCell(source, allocColumn(elementValue), selectGatherForChunkType(sourceChunk));
+        loopData->setSource(source, elementCount, elementEmit, elementOutput, &elementCell);
+    } else {
+        loopData->setSource(source, elementCount, elementEmit, elementOutput, nullptr);
+    }
+
+    bindCarriedColumns(carriedValues, loopBody, 1, loopData);
+
+    body->emplaceStmt(&NLExecutor::runUnwindComputedLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateUnwindRangeLoop(const IteratorConfig& config,
+                                            mlir::Block& loopBody,
+                                            NLLimitState* limit,
+                                            NLStmtContainer* body) {
+    const llvm::SmallVector<mlir::Value, 5>& bounds = config._rangeBounds;
+
+    const NLRangeWindowBounds window {
+        ._from = rangeBound(bounds[3]),
+        ._to = rangeBound(bounds[4]),
+        ._reversed = config._rangeReversed,
+    };
+
+    NLUnwindRangeLoopData* loopData = _program->allocFunctionData<NLUnwindRangeLoopData>(rangeBound(bounds[0]),
+                                                                                         rangeBound(bounds[1]),
+                                                                                         rangeBound(bounds[2]),
+                                                                                         window,
+                                                                                         allocColumnIfUsed(loopBody.getArgument(0)));
+    loopData->setLimit(limit);
+    loopData->getRows()->reserve(_program->getChunkSize());
+
+    bindCarriedColumns(config._carriedColumns, loopBody, 1, loopData);
+
+    body->emplaceStmt(&NLExecutor::runUnwindRangeLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+// The bytes the values of a literal list's elements occupy, tag bytes excluded - what
+// ListBuffer::reserveList sizes the region from. Each element stores the same value object
+// the write below hands it, so the two walks must recognise the same attribute kinds in the
+// same order.
+size_t NLTranslator::listValueBytes(mlir::ArrayAttr elements) {
+    size_t valueBytes = 0;
+
+    for (const mlir::Attribute element : elements) {
+        // BoolAttr is an i1 IntegerAttr, so it must be tested before IntegerAttr; an
+        // i64 literal falls through to the integer case.
+        if (mlir::isa<mlir::BoolAttr>(element)) {
+            valueBytes += sizeof(types::Bool::Primitive);
+        } else if (mlir::isa<mlir::IntegerAttr>(element)) {
+            valueBytes += sizeof(types::Int64::Primitive);
+        } else if (mlir::isa<mlir::FloatAttr>(element)) {
+            valueBytes += sizeof(types::Double::Primitive);
+        } else if (mlir::isa<mlir::StringAttr>(element)) {
+            valueBytes += sizeof(types::String::Primitive);
+        } else if (mlir::isa<mlir::DenseF32ArrayAttr>(element)) {
+            valueBytes += sizeof(types::Embedding::Primitive);
+        } else if (mlir::isa<mlir::UnitAttr>(element)) {
+            valueBytes += sizeof(PropertyNull);
+        } else if (mlir::isa<mlir::ArrayAttr>(element)) {
+            // A nested list is one element of this one, storing the child's view
+            valueBytes += sizeof(ListView);
+        } else if (mlir::isa<mlir::DictionaryAttr>(element)) {
+            valueBytes += sizeof(MapView);
+        } else {
+            throw IRException("Unsupported literal attribute in a constant list");
+        }
+    }
+
+    return valueBytes;
+}
+
+// The bytes the values of a literal map's entries occupy, key and tag bytes excluded - what
+// MapBuffer::reserveMap sizes the region from. Each entry stores the same value object the
+// write below hands it, so the two walks must recognise the same attribute kinds in the same
+// order.
+size_t NLTranslator::mapValueBytes(mlir::DictionaryAttr entries) {
+    size_t valueBytes = 0;
+
+    for (const mlir::NamedAttribute entry : entries) {
+        const mlir::Attribute value = entry.getValue();
+
+        // BoolAttr is an i1 IntegerAttr, so it must be tested before IntegerAttr; an
+        // i64 literal falls through to the integer case.
+        if (mlir::isa<mlir::BoolAttr>(value)) {
+            valueBytes += sizeof(types::Bool::Primitive);
+        } else if (mlir::isa<mlir::IntegerAttr>(value)) {
+            valueBytes += sizeof(types::Int64::Primitive);
+        } else if (mlir::isa<mlir::FloatAttr>(value)) {
+            valueBytes += sizeof(types::Double::Primitive);
+        } else if (mlir::isa<mlir::StringAttr>(value)) {
+            valueBytes += sizeof(types::String::Primitive);
+        } else if (mlir::isa<mlir::DenseF32ArrayAttr>(value)) {
+            valueBytes += sizeof(types::Embedding::Primitive);
+        } else if (mlir::isa<mlir::ArrayAttr>(value)) {
+            valueBytes += sizeof(ListView);
+        } else if (mlir::isa<mlir::DictionaryAttr>(value)) {
+            // A nested map is one entry of this one, storing the child's view
+            valueBytes += sizeof(MapView);
+        } else if (mlir::isa<mlir::UnitAttr>(value)) {
+            valueBytes += sizeof(PropertyNull);
+        } else {
+            throw IRException("Unsupported literal attribute in a constant map");
+        }
+    }
+
+    return valueBytes;
+}
+
+std::string_view NLTranslator::ownedCharacters(llvm::StringRef text) {
+    return _memory->stringBuffer().insert(text);
+}
+
+types::Embedding::Primitive NLTranslator::ownedFloats(llvm::ArrayRef<float> embedding) {
+    return _memory->embeddingBuffer().insert(std::span<const float> {embedding.data(), embedding.size()});
+}
+
+MapView NLTranslator::materializeMapView(mlir::DictionaryAttr entries) {
+    // The region is reserved and committed up front, so the entries are written straight
+    // into their final place - no staging container between the attributes and the buffer.
+    // A later reservation lands after this region rather than inside it, which is what lets
+    // a nested map be materialized part-way through filling its parent.
+    MapWriteCursor cursor = _memory->mapBuffer().reserveMap(entries.size(),
+                                                            mapValueBytes(entries));
+
+    for (const mlir::NamedAttribute entry : entries) {
+        const mlir::StringAttr name = entry.getName();
+        const mlir::Attribute value = entry.getValue();
+
+        cursor.writeKey(ownedCharacters(name.getValue()));
+
+        if (const auto boolAttr = mlir::dyn_cast<mlir::BoolAttr>(value)) {
+            cursor.writeValue(MapBufferTypeTag::Bool, types::Bool::Primitive(boolAttr.getValue()));
+        } else if (const auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(value)) {
+            cursor.writeValue(MapBufferTypeTag::Int,
+                              static_cast<types::Int64::Primitive>(intAttr.getInt()));
+        } else if (const auto floatAttr = mlir::dyn_cast<mlir::FloatAttr>(value)) {
+            cursor.writeValue(MapBufferTypeTag::Double,
+                              static_cast<types::Double::Primitive>(floatAttr.getValueAsDouble()));
+        } else if (const auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(value)) {
+            cursor.writeValue(MapBufferTypeTag::String, ownedCharacters(stringAttr.getValue()));
+        } else if (const auto embeddingAttr = mlir::dyn_cast<mlir::DenseF32ArrayAttr>(value)) {
+            cursor.writeValue(MapBufferTypeTag::Embedding, ownedFloats(embeddingAttr.asArrayRef()));
+        } else if (const auto nestedList = mlir::dyn_cast<mlir::ArrayAttr>(value)) {
+            cursor.writeValue(MapBufferTypeTag::ListView, materializeListView(nestedList));
+        } else if (const auto nestedMap = mlir::dyn_cast<mlir::DictionaryAttr>(value)) {
+            cursor.writeValue(MapBufferTypeTag::MapView, materializeMapView(nestedMap));
+        } else if (mlir::isa<mlir::UnitAttr>(value)) {
+            cursor.writeValue(MapBufferTypeTag::Null, PropertyNull {});
+        } else {
+            throw IRException("Unsupported literal attribute in a constant map");
+        }
+    }
+
+    return cursor.getView();
+}
+
+ListView NLTranslator::materializeListView(mlir::ArrayAttr elements) {
+    // The region is reserved and committed up front, so the elements are written straight
+    // into their final place - no staging container between the attributes and the buffer.
+    // A later reservation lands after this region rather than inside it, which is what lets
+    // a nested list be materialized part-way through filling its parent.
+    ListWriteCursor cursor = _memory->listBuffer().reserveList(elements.size(),
+                                                              listValueBytes(elements));
+
+    for (const mlir::Attribute element : elements) {
+        if (const auto boolAttr = mlir::dyn_cast<mlir::BoolAttr>(element)) {
+            cursor.writeValue(ListBufferTypeTag::Bool, types::Bool::Primitive(boolAttr.getValue()));
+        } else if (const auto intAttr = mlir::dyn_cast<mlir::IntegerAttr>(element)) {
+            cursor.writeValue(ListBufferTypeTag::Int,
+                              static_cast<types::Int64::Primitive>(intAttr.getInt()));
+        } else if (const auto floatAttr = mlir::dyn_cast<mlir::FloatAttr>(element)) {
+            cursor.writeValue(ListBufferTypeTag::Double,
+                              static_cast<types::Double::Primitive>(floatAttr.getValueAsDouble()));
+        } else if (const auto stringAttr = mlir::dyn_cast<mlir::StringAttr>(element)) {
+            cursor.writeValue(ListBufferTypeTag::String, ownedCharacters(stringAttr.getValue()));
+        } else if (const auto embeddingAttr = mlir::dyn_cast<mlir::DenseF32ArrayAttr>(element)) {
+            cursor.writeValue(ListBufferTypeTag::Embedding, ownedFloats(embeddingAttr.asArrayRef()));
+        } else if (mlir::isa<mlir::UnitAttr>(element)) {
+            cursor.writeValue(ListBufferTypeTag::Null, PropertyNull {});
+        } else if (const auto nestedAttr = mlir::dyn_cast<mlir::ArrayAttr>(element)) {
+            cursor.writeValue(ListBufferTypeTag::ListView, materializeListView(nestedAttr));
+        } else if (const auto nestedMap = mlir::dyn_cast<mlir::DictionaryAttr>(element)) {
+            cursor.writeValue(ListBufferTypeTag::MapView, materializeMapView(nestedMap));
+        } else {
+            throw IRException("Unsupported literal attribute in a constant list");
+        }
+    }
+
+    return cursor.getView();
+}
+
+void NLTranslator::translateScanEdgesLoop(mlir::Block& loopBody, NLLimitState* limit, NLStmtContainer* body) {
+    // For::verify guarantees one block argument per iterator chunk, and an edge
+    // scan iterator has exactly four chunks in the order getEdgeIteratorType
+    // establishes: sources, edge IDs, edge type IDs, targets.
+    ColumnNodeIDs* sources = static_cast<ColumnNodeIDs*>(allocColumn(loopBody.getArgument(0)));
+    ColumnEdgeIDs* edgeIDs = static_cast<ColumnEdgeIDs*>(allocColumn(loopBody.getArgument(1)));
+    ColumnEdgeTypes* edgeTypes = static_cast<ColumnEdgeTypes*>(allocColumn(loopBody.getArgument(2)));
+    ColumnNodeIDs* targets = static_cast<ColumnNodeIDs*>(allocColumn(loopBody.getArgument(3)));
+
+    NLScanEdgesLoopData* loopData = _program->allocFunctionData<NLScanEdgesLoopData>(sources,
+                                                                                     edgeIDs,
+                                                                                     edgeTypes,
+                                                                                     targets);
+    loopData->setLimit(limit);
+
+    body->addStmt(NLFunctionDescriptor {&NLExecutor::runScanEdgesLoop, loopData});
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateScanEdgesByTypeLoop(const IteratorConfig& config,
+                                                mlir::Block& loopBody,
+                                                NLLimitState* limit,
+                                                NLStmtContainer* body) {
+    ColumnNodeIDs* sources = static_cast<ColumnNodeIDs*>(allocColumn(loopBody.getArgument(0)));
+    ColumnEdgeIDs* edgeIDs = static_cast<ColumnEdgeIDs*>(allocColumn(loopBody.getArgument(1)));
+    ColumnEdgeTypes* edgeTypes = static_cast<ColumnEdgeTypes*>(allocColumn(loopBody.getArgument(2)));
+    ColumnNodeIDs* targets = static_cast<ColumnNodeIDs*>(allocColumn(loopBody.getArgument(3)));
+
+    // Resolve the edge type names against the schema, exactly as translateEdgeLoop
+    // does for a by-type hop.
+    llvm::SmallVector<EdgeTypeID, 4> requestedTypes;
+    resolveEdgeTypes(config._edgeTypes, requestedTypes);
+
+    NLScanEdgesByTypeLoopData* loopData =
+        _program->allocFunctionData<NLScanEdgesByTypeLoopData>(sources,
+                                                               edgeIDs,
+                                                               edgeTypes,
+                                                               targets,
+                                                               requestedTypes);
+    loopData->setLimit(limit);
+
+    body->addStmt(NLFunctionDescriptor {&NLExecutor::runScanEdgesByTypeLoop, loopData});
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateScanEdgesByLabelLoop(const IteratorConfig& config,
+                                                 mlir::Block& loopBody,
+                                                 NLLimitState* limit,
+                                                 NLStmtContainer* body,
+                                                 NLHandlerFunction executor) {
+    ColumnNodeIDs* sources = static_cast<ColumnNodeIDs*>(allocColumn(loopBody.getArgument(0)));
+    ColumnEdgeIDs* edgeIDs = static_cast<ColumnEdgeIDs*>(allocColumn(loopBody.getArgument(1)));
+    ColumnEdgeTypes* edgeTypes = static_cast<ColumnEdgeTypes*>(allocColumn(loopBody.getArgument(2)));
+    ColumnNodeIDs* targets = static_cast<ColumnNodeIDs*>(allocColumn(loopBody.getArgument(3)));
+
+    // An unmatchable scan emits nothing rather than dropping the absent name and
+    // matching a weaker set, exactly as translateScanByLabelLoop does.
+    LabelSet labelset;
+    const bool matchable = resolveLabelSet(config._labels, labelset);
+
+    NLScanEdgesByLabelLoopData* loopData =
+        _program->allocFunctionData<NLScanEdgesByLabelLoopData>(sources,
+                                                                edgeIDs,
+                                                                edgeTypes,
+                                                                targets,
+                                                                labelset,
+                                                                matchable);
+    loopData->setLimit(limit);
+
+    body->addStmt(NLFunctionDescriptor {executor, loopData});
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateScanEdgesByEndpointLabelsLoop(const IteratorConfig& config,
+                                                          mlir::Block& loopBody,
+                                                          NLLimitState* limit,
+                                                          NLStmtContainer* body,
+                                                          NLHandlerFunction executor) {
+    ColumnNodeIDs* sources = static_cast<ColumnNodeIDs*>(allocColumn(loopBody.getArgument(0)));
+    ColumnEdgeIDs* edgeIDs = static_cast<ColumnEdgeIDs*>(allocColumn(loopBody.getArgument(1)));
+    ColumnEdgeTypes* edgeTypes = static_cast<ColumnEdgeTypes*>(allocColumn(loopBody.getArgument(2)));
+    ColumnNodeIDs* targets = static_cast<ColumnNodeIDs*>(allocColumn(loopBody.getArgument(3)));
+
+    LabelSet indexedLabelSet;
+    const bool indexedMatchable = resolveLabelSet(config._labels, indexedLabelSet);
+
+    LabelSet otherEndLabelSet;
+    const bool otherEndMatchable = resolveLabelSet(config._otherEndLabels, otherEndLabelSet);
+
+    NLScanEdgesByEndpointLabelsLoopData* loopData =
+        _program->allocFunctionData<NLScanEdgesByEndpointLabelsLoopData>(sources,
+                                                                         edgeIDs,
+                                                                         edgeTypes,
+                                                                         targets,
+                                                                         indexedLabelSet,
+                                                                         otherEndLabelSet,
+                                                                         indexedMatchable && otherEndMatchable);
+    loopData->setLimit(limit);
+
+    body->addStmt(NLFunctionDescriptor {executor, loopData});
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+std::optional<PropertyType> NLTranslator::findPropertyType(llvm::StringRef name) const {
+    const std::string_view propertyName(name.data(), name.size());
+
+    const std::optional<PropertyType> propertyType = _view->metadata().propTypes().get(propertyName);
+    if (propertyType || !_metadataBuilder) {
+        return propertyType;
+    }
+
+    return _metadataBuilder->findPropertyType(propertyName);
+}
+
+std::optional<EdgeTypeID> NLTranslator::findEdgeType(llvm::StringRef name) const {
+    const std::optional<EdgeTypeID> edgeTypeID = _view->metadata().edgeTypes().get(name);
+    if (edgeTypeID || !_metadataBuilder) {
+        return edgeTypeID;
+    }
+
+    return _metadataBuilder->findEdgeType(name);
+}
+
+void NLTranslator::resolveEdgeTypes(llvm::ArrayRef<llvm::StringRef> names,
+                                    llvm::SmallVectorImpl<EdgeTypeID>& resolved) const {
+    for (const llvm::StringRef name : names) {
+        const std::optional<EdgeTypeID> edgeTypeID = findEdgeType(name);
+        if (edgeTypeID) {
+            resolved.push_back(*edgeTypeID);
+        }
+    }
+}
+
+void NLTranslator::resolveEdgeTypes(mlir::ArrayAttr names,
+                                    llvm::SmallVectorImpl<EdgeTypeID>& resolved) const {
+    llvm::SmallVector<llvm::StringRef, 4> nameRefs;
+    resolveEdgeTypeNames(names, nameRefs);
+
+    resolveEdgeTypes(nameRefs, resolved);
+}
+
+void NLTranslator::translateEdgeLoop(const IteratorConfig& config,
+                                     mlir::Block& loopBody,
+                                     NLLimitState* limit,
+                                     NLStmtContainer* body) {
+    // The four fixed chunks of an edge iterator step, in the block-argument
+    // order established by getEdgeIteratorType: sources, edge IDs, edge type
+    // IDs, targets.
+    ColumnNodeIDs* sources = static_cast<ColumnNodeIDs*>(allocColumnIfUsed(loopBody.getArgument(0)));
+    ColumnEdgeIDs* edgeIDs = static_cast<ColumnEdgeIDs*>(allocColumnIfUsed(loopBody.getArgument(1)));
+    ColumnEdgeTypes* edgeTypes = static_cast<ColumnEdgeTypes*>(allocColumnIfUsed(loopBody.getArgument(2)));
+    ColumnNodeIDs* targets = static_cast<ColumnNodeIDs*>(allocColumnIfUsed(loopBody.getArgument(3)));
+
+    // Allocate for edge IDs even if they aren't read if we have to check tombstones
+    if (!edgeIDs && (_view->hasDeletedEdges() || _view->followsChangeDeletions())) {
+        edgeIDs = _memory->alloc<ColumnEdgeIDs>();
+        edgeIDs->reserve(_program->getChunkSize());
+    }
+
+    const ColumnNodeIDs* inputNodeIDs = static_cast<const ColumnNodeIDs*>(getColumn(config._inputNodes));
+
+    const bool byType = config._kind == IteratorKind::GetOutEdgesByType
+                        || config._kind == IteratorKind::GetInEdgesByType;
+
+    const bool byLabel = config._kind == IteratorKind::GetOutEdgesByLabel
+                         || config._kind == IteratorKind::GetInEdgesByLabel;
+
+    const bool byTypeAndLabel = config._kind == IteratorKind::GetOutEdgesByTypeAndLabel
+                                || config._kind == IteratorKind::GetInEdgesByTypeAndLabel;
+
+    // A by-type hop carries the resolved edge type in an NLEdgeByTypeLoopData and a
+    // by-label one its label set in an NLEdgeByLabelLoopData; a plain hop uses the
+    // base NLEdgeLoopData. The shared driver below (reserve, carried columns, body)
+    // works through the base pointer whichever it is.
+    NLEdgeLoopData* loopData = nullptr;
+    if (byType) {
+        // Resolve the edge type names against the schema, exactly as
+        // translateScanByLabelLoop resolves its labels.
+        llvm::SmallVector<EdgeTypeID, 4> requestedTypes;
+        resolveEdgeTypes(config._edgeTypes, requestedTypes);
+
+        loopData = _program->allocFunctionData<NLEdgeByTypeLoopData>(inputNodeIDs,
+                                                                     sources,
+                                                                     edgeIDs,
+                                                                     edgeTypes,
+                                                                     targets,
+                                                                     requestedTypes);
+    } else if (byLabel) {
+        // An unmatchable hop emits nothing rather than dropping the absent name and
+        // matching a weaker set, exactly as translateScanByLabelLoop does.
+        LabelSet labelset;
+        const bool matchable = resolveLabelSet(config._labels, labelset);
+
+        loopData = _program->allocFunctionData<NLEdgeByLabelLoopData>(inputNodeIDs,
+                                                                      sources,
+                                                                      edgeIDs,
+                                                                      edgeTypes,
+                                                                      targets,
+                                                                      labelset,
+                                                                      matchable);
+    } else if (byTypeAndLabel) {
+        llvm::SmallVector<EdgeTypeID, 4> requestedTypes;
+        resolveEdgeTypes(config._edgeTypes, requestedTypes);
+
+        LabelSet labelset;
+        const bool labelsMatchable = resolveLabelSet(config._labels, labelset);
+
+        loopData = _program->allocFunctionData<NLEdgeByTypeAndLabelLoopData>(inputNodeIDs,
+                                                                             sources,
+                                                                             edgeIDs,
+                                                                             edgeTypes,
+                                                                             targets,
+                                                                             requestedTypes,
+                                                                             labelset,
+                                                                             labelsMatchable);
+    } else {
+        loopData = _program->allocFunctionData<NLEdgeLoopData>(inputNodeIDs,
+                                                               sources,
+                                                               edgeIDs,
+                                                               edgeTypes,
+                                                               targets);
+    }
+    loopData->setLimit(limit);
+
+    // Reserve scratch indices column
+    loopData->getIndices()->reserve(_program->getChunkSize());
+
+    throwIfCarriedNotRowAligned(config);
+    bindCarriedColumns(config._carriedColumns, loopBody, 4, loopData);
+
+    NLHandlerFunction handler = nullptr;
+    if (config._kind == IteratorKind::GetOutEdges) {
+        handler = &NLExecutor::runGetOutEdgesLoop;
+    } else if (config._kind == IteratorKind::GetInEdges) {
+        handler = &NLExecutor::runGetInEdgesLoop;
+    } else if (config._kind == IteratorKind::GetEdges) {
+        handler = &NLExecutor::runGetEdgesLoop;
+    } else if (config._kind == IteratorKind::GetOutEdgesByType) {
+        handler = &NLExecutor::runGetOutEdgesByTypeLoop;
+    } else if (config._kind == IteratorKind::GetInEdgesByType) {
+        handler = &NLExecutor::runGetInEdgesByTypeLoop;
+    } else if (config._kind == IteratorKind::GetOutEdgesByLabel) {
+        handler = &NLExecutor::runGetOutEdgesByLabelLoop;
+    } else if (config._kind == IteratorKind::GetInEdgesByLabel) {
+        handler = &NLExecutor::runGetInEdgesByLabelLoop;
+    } else if (config._kind == IteratorKind::GetOutEdgesByTypeAndLabel) {
+        handler = &NLExecutor::runGetOutEdgesByTypeAndLabelLoop;
+    } else {
+        handler = &NLExecutor::runGetInEdgesByTypeAndLabelLoop;
+    }
+    body->emplaceStmt(handler, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+bool NLTranslator::isPendingValue(mlir::Value value, bool isNode) const {
+    const llvm::DenseSet<mlir::Value>& pendingValues = isNode ? _pendingNodeValues : _pendingEdgeValues;
+
+    return pendingValues.contains(value);
+}
+
+void NLTranslator::translateExplorePathsLoop(const IteratorConfig& config,
+                                             mlir::Block& loopBody,
+                                             NLLimitState* limit,
+                                             NLStmtContainer* body) {
+    // The three fixed chunks of an exploration step, in the block-argument order
+    // established by getPathIteratorType: seeds, ends, paths
+    ColumnNodeIDs* sources = static_cast<ColumnNodeIDs*>(allocColumnIfUsed(loopBody.getArgument(0)));
+    ColumnNodeIDs* targets = static_cast<ColumnNodeIDs*>(allocColumnIfUsed(loopBody.getArgument(1)));
+    ColumnVector<PathRef>* paths = static_cast<ColumnVector<PathRef>*>(allocColumnIfUsed(loopBody.getArgument(2)));
+
+    const ColumnNodeIDs* inputNodeIDs = static_cast<const ColumnNodeIDs*>(getColumn(config._inputNodes));
+
+    NLExplorePathsLoopData* loopData = _program->allocFunctionData<NLExplorePathsLoopData>(inputNodeIDs,
+                                                                                         sources,
+                                                                                         targets,
+                                                                                         paths,
+                                                                                         &_memory->pathTrie(),
+                                                                                         config._minHops,
+                                                                                         config._maxHops);
+    loopData->setLimit(limit);
+    loopData->getIndices()->reserve(_program->getChunkSize());
+
+    // The end labels resolve as a label scan's do: a name absent from the schema is carried
+    // by no node, so no path can end on one and the loop is marked unmatchable
+    if (!config._labels.empty()) {
+        LabelSet endLabels;
+        const bool endMatchable = resolveLabelSet(config._labels, endLabels);
+        loopData->setEndLabels(endLabels, endMatchable);
+    }
+
+    throwIfCarriedNotRowAligned(config);
+    bindCarriedColumns(config._carriedColumns, loopBody, 3, loopData);
+
+    // The bound end is the carried column's input, row-aligned with the seeds; a walk
+    // ending where it began targets the seeds themselves
+    if (config._endColumn) {
+        const mlir::Value endValue = config._carriedColumns[*config._endColumn];
+        loopData->setEndNodes(static_cast<const ColumnNodeIDs*>(getColumn(endValue)));
+    } else if (config._endsOnSeed) {
+        loopData->setEndNodes(static_cast<const ColumnNodeIDs*>(getColumn(config._inputNodes)));
+    } else if (config._endNodeSet) {
+        loopData->setEndNodeSet(config._endNodeSet);
+    }
+
+    if (config._distinctEnds) {
+        loopData->setDistinctEnds();
+    }
+
+    nl::ExplorePaths explorePaths = config._explorePaths;
+    const size_t stepCount = explorePaths.getStepCount();
+    for (size_t step = 0; step < stepCount; step++) {
+        translateExploreStep(explorePaths, step, config._hopImports, loopData);
+    }
+
+    body->emplaceStmt(&NLExecutor::runExplorePathsLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateExploreStep(nl::ExplorePaths explorePaths,
+                                        size_t step,
+                                        llvm::ArrayRef<mlir::Value> hopImports,
+                                        NLExplorePathsLoopData* loopData) {
+    // The types are resolved as translateEdgeLoop resolves a by-type hop's: a name absent
+    // from the schema drops out of the set, and a set left empty that way marks the step
+    // unmatchable
+    llvm::SmallVector<llvm::StringRef, 4> edgeTypeNamesOfStep;
+    if (const mlir::Value handle = explorePaths.getStepEdgeTypes(step)) {
+        resolveEdgeTypeNames(handle, edgeTypeNamesOfStep);
+    }
+
+    const bool filtersByType = !edgeTypeNamesOfStep.empty();
+    llvm::SmallVector<EdgeTypeID, 4> edgeTypes;
+    bool matchable = true;
+    if (filtersByType) {
+        resolveEdgeTypes(edgeTypeNamesOfStep, edgeTypes);
+        matchable = !edgeTypes.empty();
+    }
+
+    const PathExplorationDir direction = toPathExplorationDir(explorePaths.getStepDirection(step));
+    NLExploreStep* exploreStep = loopData->addStep(direction, filtersByType, edgeTypes, matchable);
+
+    if (const std::optional<mlir::ArrayAttr> stepLabels = explorePaths.getHopLabels()) {
+        const mlir::ArrayAttr labelsOfStep = mlir::cast<mlir::ArrayAttr>((*stepLabels)[step]);
+
+        llvm::SmallVector<llvm::StringRef, 4> names;
+        resolveLabelNames(labelsOfStep, names);
+
+        if (!names.empty()) {
+            LabelSet hopLabels;
+            const bool hopLabelsMatchable = resolveLabelSet(names, hopLabels);
+            exploreStep->setHopLabels(hopLabels, hopLabelsMatchable);
+        }
+    }
+
+    mlir::Region& hop = explorePaths.getHops()[step];
+    if (hop.empty()) {
+        return;
+    }
+
+    mlir::Block& hopBlock = hop.front();
+    const size_t chunkSize = _program->getChunkSize();
+
+    // The hop's own source, edge and end are always filled; the nodes and edges the
+    // repetition took before it only when the predicate reads them
+    const size_t hopArguments = mlir::hopWalkArgumentCount(step);
+    for (size_t argumentIndex = 0; argumentIndex < hopArguments; argumentIndex++) {
+        const mlir::BlockArgument argument = hopBlock.getArgument(static_cast<unsigned>(argumentIndex));
+        const bool ofTheHop = argumentIndex >= mlir::hopSourceArgument(step);
+        const bool isEdge = argumentIndex % 2 == 1;
+
+        if (!ofTheHop && argument.use_empty()) {
+            if (isEdge) {
+                exploreStep->addHopEdge(nullptr);
+            } else {
+                exploreStep->addHopNode(nullptr);
+            }
+
+            continue;
+        }
+
+        if (isEdge) {
+            ColumnEdgeIDs* edges = _memory->alloc<ColumnEdgeIDs>();
+            edges->reserve(chunkSize);
+            _valueSlots[argument] = edges;
+            exploreStep->addHopEdge(edges);
+        } else {
+            ColumnNodeIDs* nodes = _memory->alloc<ColumnNodeIDs>();
+            nodes->reserve(chunkSize);
+            _valueSlots[argument] = nodes;
+            exploreStep->addHopNode(nodes);
+        }
+    }
+
+    for (size_t importIndex = 0; importIndex < hopImports.size(); importIndex++) {
+        const mlir::BlockArgument importArgument = hopBlock.getArgument(static_cast<unsigned>(hopArguments + importIndex));
+        if (importArgument.use_empty()) {
+            continue;
+        }
+
+        const mlir::Value importValue = hopImports[importIndex];
+        const Column* importColumn = getColumn(importValue);
+
+        Column* importChunk = nullptr;
+        NLGatherFunction gather = nullptr;
+        if (isConstantColumn(importColumn)) {
+            importChunk = _memory->allocSame(importColumn);
+            gather = NLExecutor::selectConstGatherFunction();
+        } else {
+            importChunk = allocColumnForChunkType(importArgument.getType());
+            gather = selectGatherForChunkType(importValue.getType());
+        }
+        _valueSlots[importArgument] = importChunk;
+
+        exploreStep->addHopImport(NLHopImport {importColumn, importChunk, gather});
+    }
+
+    translateBlock(hopBlock, exploreStep->getHopStmts());
+
+    nl::Yield yield = mlir::cast<nl::Yield>(hopBlock.getTerminator());
+    const mlir::Value mask = yield.getColumns().front();
+    const auto maskChunk = mlir::cast<nl::ChunkType>(mask.getType());
+    const bool maskNullable = mlir::isa<storage::NullableType>(maskChunk.getElementType());
+    const bool maskIsUntypedNull = isUntypedNullChunk(mask.getType());
+
+    exploreStep->setHopFilter(getColumn(mask),
+                              NLExecutor::selectMaskSurvivorFunction(maskNullable,
+                                                                     maskIsUntypedNull,
+                                                                     isAnyChunk(mask.getType())));
+}
+
+void NLTranslator::translateExpandPath(nl::ExpandPath expand, NLStmtContainer* body) {
+    const ColumnVector<PathRef>* paths = static_cast<const ColumnVector<PathRef>*>(getColumn(expand.getPaths()));
+    const ColumnNodeIDs* seeds = nullptr;
+    if (const mlir::Value seedsValue = expand.getSrcids()) {
+        seeds = static_cast<const ColumnNodeIDs*>(getColumn(seedsValue));
+    }
+
+    ColumnVector<ListView>* output = static_cast<ColumnVector<ListView>*>(allocListColumn());
+    _valueSlots[expand.getResult()] = output;
+
+    PathExpansionKind kind = PathExpansionKind::Edges;
+    switch (expand.getKind()) {
+        case storage::PathExpansionKind::Edges:
+            kind = PathExpansionKind::Edges;
+        break;
+
+        case storage::PathExpansionKind::Sources:
+            kind = PathExpansionKind::Sources;
+        break;
+
+        case storage::PathExpansionKind::Ends:
+            kind = PathExpansionKind::Ends;
+        break;
+
+        case storage::PathExpansionKind::Nodes:
+            kind = PathExpansionKind::Nodes;
+        break;
+    }
+
+    const PathHopStride hops {._offset = expand.getStep().value_or(0), ._stride = expand.getSteps().value_or(1)};
+
+    NLExpandPathData* data = _program->allocFunctionData<NLExpandPathData>(paths,
+                                                                           seeds,
+                                                                           output,
+                                                                           kind,
+                                                                           expand.getReversed(),
+                                                                           hops,
+                                                                           &_memory->pathTrie(),
+                                                                           &_program->allocStepBuffers()->listBuffer());
+    body->emplaceStmt(&NLExecutor::runExpandPath, data);
+}
+
+void NLTranslator::translatePathLength(nl::PathLength length, NLStmtContainer* body) {
+    const ColumnVector<PathRef>* paths = static_cast<const ColumnVector<PathRef>*>(getColumn(length.getPaths()));
+
+    ColumnVector<uint64_t>* output = allocCountColumn();
+    _valueSlots[length.getResult()] = output;
+
+    NLPathLengthData* data = _program->allocFunctionData<NLPathLengthData>(paths, output, &_memory->pathTrie());
+    body->emplaceStmt(&NLExecutor::runPathLength, data);
+}
+
+void NLTranslator::translatePathElements(nl::PathElements elements, NLStmtContainer* body) {
+    const Column* paths = getColumn(elements.getPath());
+
+    PathElementsKind kind = PathElementsKind::Nodes;
+    Column* output = nullptr;
+    switch (elements.getKind()) {
+        case storage::PathElementsKind::Nodes:
+            kind = PathElementsKind::Nodes;
+            output = allocOptListColumn();
+        break;
+
+        case storage::PathElementsKind::Relationships:
+            kind = PathElementsKind::Relationships;
+            output = allocOptListColumn();
+        break;
+
+        case storage::PathElementsKind::Length:
+            kind = PathElementsKind::Length;
+            output = allocOptColumnForValueType(ValueType::UInt64);
+        break;
+    }
+
+    _valueSlots[elements.getResult()] = output;
+
+    NLPathElementsData* data = _program->allocFunctionData<NLPathElementsData>(paths,
+                                                                               output,
+                                                                               kind,
+                                                                               &_program->allocStepBuffers()->listBuffer());
+    body->emplaceStmt(&NLExecutor::runPathElements, data);
+}
+
+void NLTranslator::translateMakePath(nl::MakePath makePath, NLStmtContainer* body) {
+    ColumnVector<EntityList>* output = static_cast<ColumnVector<EntityList>*>(allocEntityListColumn());
+    _valueSlots[makePath.getResult()] = output;
+
+    NLMakePathData* data = _program->allocFunctionData<NLMakePathData>(output, &_memory->pathTrie());
+
+    llvm::SmallVector<bool> reversedPaths(makePath.getEntities().size(), false);
+    if (const std::optional<mlir::ArrayAttr> reversed = makePath.getReversedPaths()) {
+        for (const mlir::Attribute entry : *reversed) {
+            reversedPaths[mlir::cast<mlir::IntegerAttr>(entry).getInt()] = true;
+        }
+    }
+
+    size_t entityIndex = 0;
+    for (const mlir::Value entityValue : makePath.getEntities()) {
+        NLPathEntity entity;
+        entity._column = getColumn(entityValue);
+        entity._reversed = reversedPaths[entityIndex];
+        entityIndex++;
+
+        switch (getChunkKind(entityValue.getType())) {
+            case NLChunkKind::NodeID:
+                entity._kind = NLPathEntity::Kind::Node;
+            break;
+
+            case NLChunkKind::EdgeID:
+                entity._kind = NLPathEntity::Kind::Edge;
+            break;
+
+            case NLChunkKind::PathRef:
+                entity._kind = NLPathEntity::Kind::Path;
+            break;
+
+            default:
+                throw IRException("nl.make_path runs through nodes, edges and paths alone");
+            break;
+        }
+
+        data->addEntity(entity);
+    }
+
+    body->emplaceStmt(&NLExecutor::runMakePath, data);
+}
+
+void NLTranslator::translatePropertyFetch(mlir::Value inputValue,
+                                          mlir::Value propertyTypeValue,
+                                          mlir::Value pendingValue,
+                                          bool allPending,
+                                          mlir::Value resultValue,
+                                          bool isNode,
+                                          NLStmtContainer* body) {
+    // The property name lives on the nl.get_property_type that produced the handle
+    nl::GetPropertyType handleOp = propertyTypeValue.getDefiningOp<nl::GetPropertyType>();
+    if (!handleOp) {
+        throw IRException("property_type operand must come from nl.get_property_type");
+    }
+
+    const llvm::StringRef name = handleOp.getName();
+
+    // Resolve the name against the schema once, here, so execution works from a
+    // PropertyTypeID and value type and never sees the name again. A CREATE earlier in the
+    // program may have introduced the name, which puts it in the change's own schema and
+    // nowhere else until the commit
+    const std::optional<PropertyType> propertyType = findPropertyType(name);
+    if (!propertyType) {
+        throw IRException("Unknown property '" + name.str() + "'");
+    }
+
+    const ValueType valueType = propertyType->_valueType;
+
+    const Column* input = getColumn(inputValue);
+    Column* output = allocOptColumnForValueType(valueType);
+    _valueSlots[resultValue] = output;
+
+    NLPropertyFetchData* fetchData = _program->allocFunctionData<NLPropertyFetchData>(input,
+                                                                                      output,
+                                                                                      propertyType->_id);
+    fetchData->setPending(getMaskColumn(pendingValue));
+    fetchData->setAllPending(allPending || isPendingValue(inputValue, isNode));
+
+    const NLHandlerFunction handler = selectPropertyFetchHandler(isNode, valueType);
+    body->emplaceStmt(handler, fetchData);
+}
+
+void NLTranslator::translateGetNodeLabelSet(nl::GetNodeLabelSet op, NLStmtContainer* body) {
+    const mlir::TypedValue<::mlir::nl::ChunkType> nodes = op.getInputNodes();
+    const Column* nodeCol = getColumn(nodes);
+    const ColumnNodeIDs* input = static_cast<const ColumnNodeIDs*>(nodeCol);
+
+    ColumnLabelSetIDs* output = _memory->alloc<ColumnLabelSetIDs>();
+    output->reserve(_program->getChunkSize());
+    _valueSlots[op.getLabelSetIds()] = output;
+
+    NLGetNodeLabelSetData* data = _program->allocFunctionData<NLGetNodeLabelSetData>(input, output);
+    body->emplaceStmt(&NLExecutor::runGetNodeLabelSet, data);
+}
+
+void NLTranslator::translateGetEdgeTypes(nl::GetEdgeTypes op, NLStmtContainer* body) {
+    const mlir::TypedValue<::mlir::nl::ChunkType> edges = op.getInputEdges();
+    const Column* edgeCol = getColumn(edges);
+    const ColumnEdgeIDs* input = static_cast<const ColumnEdgeIDs*>(edgeCol);
+
+    ColumnEdgeTypes* output = _memory->alloc<ColumnEdgeTypes>();
+    output->reserve(_program->getChunkSize());
+    _valueSlots[op.getEdgeTypeIds()] = output;
+
+    NLGetEdgeTypesData* data = _program->allocFunctionData<NLGetEdgeTypesData>(input, output);
+    body->emplaceStmt(&NLExecutor::runGetEdgeTypes, data);
+}
+
+void NLTranslator::translateCheckLabelConstraint(nl::CheckLabelConstraint op, NLStmtContainer* body) {
+    const mlir::TypedValue<::mlir::nl::ChunkType> lbls = op.getLabelsetIds();
+    const Column* lblsCol = getColumn(lbls);
+    const ColumnLabelSetIDs* input = static_cast<const ColumnLabelSetIDs*>(lblsCol);
+
+    const bool nullable = isNullableChunk(op.getResult().getType());
+    Column* output = allocCheckMask(nullable);
+    _valueSlots[op.getResult()] = output;
+
+    NLCheckLabelConstraintData* data = _program->allocFunctionData<NLCheckLabelConstraintData>(input, output);
+
+    // Each alternative is a conjunction, so one label no node has ever carried makes that
+    // alternative match nothing, where dropping the missing label would test a weaker
+    // constraint than the query wrote.
+    llvm::SmallVector<LabelSet, 4> constraints;
+    for (const mlir::Attribute alternative : op.getAlternatives()) {
+        llvm::SmallVector<llvm::StringRef> labels;
+        resolveLabelNames(mlir::cast<mlir::ArrayAttr>(alternative), labels);
+
+        LabelSet constraint;
+        if (resolveLabelSet(labels, constraint)) {
+            constraints.push_back(constraint);
+        }
+    }
+
+    if (!constraints.empty()) {
+        collectMatchingLabelSets(constraints, data);
+    }
+
+    if (nullable) {
+        body->emplaceStmt(&NLExecutor::runCheckLabelConstraint<ColumnOptMask>, data);
+    } else {
+        body->emplaceStmt(&NLExecutor::runCheckLabelConstraint<ColumnMask>, data);
+    }
+}
+
+Column* NLTranslator::allocCheckMask(bool nullable) {
+    const size_t chunkSize = _program->getChunkSize();
+
+    if (nullable) {
+        ColumnOptMask* mask = _memory->alloc<ColumnOptMask>();
+        mask->reserve(chunkSize);
+        return mask;
+    }
+
+    ColumnMask* mask = _memory->alloc<ColumnMask>();
+    mask->reserve(chunkSize);
+
+    return mask;
+}
+
+void NLTranslator::collectMatchingLabelSets(std::span<const LabelSet> constraints, NLCheckLabelConstraintData* data) const {
+    const auto collectMatching = [constraints, data](LabelSetID id, const LabelSet& labelset) {
+        const bool matches = std::any_of(constraints.begin(), constraints.end(), [&labelset](const LabelSet& constraint) {
+            return labelset.hasAtLeastLabels(constraint);
+        });
+
+        if (matches) {
+            data->addMatchingID(id);
+        }
+    };
+
+    if (_metadataBuilder) {
+        _metadataBuilder->forEachLabelSet(collectMatching);
+    } else {
+        for (const LabelSetMap::Pair& pair : _view->metadata().labelsets()) {
+            collectMatching(pair._id, *pair._value);
+        }
+    }
+}
+
+void NLTranslator::translateCheckEdgeTypeConstraint(nl::CheckEdgeTypeConstraint op, NLStmtContainer* body) {
+    const mlir::TypedValue<::mlir::nl::ChunkType> etypes = op.getEdgeTypeIds();
+    const Column* etypesCol = getColumn(etypes);
+    const ColumnEdgeTypes* input = static_cast<const ColumnEdgeTypes*>(etypesCol);
+
+    const bool nullable = isNullableChunk(op.getResult().getType());
+    Column* output = allocCheckMask(nullable);
+    _valueSlots[op.getResult()] = output;
+
+    NLCheckEdgeTypeConstraintData* data = _program->allocFunctionData<NLCheckEdgeTypeConstraintData>(input, output);
+
+    llvm::SmallVector<EdgeTypeID, 4> matchingTypes;
+    resolveEdgeTypes(op.getEdgeTypes(), matchingTypes);
+
+    for (const EdgeTypeID edgeTypeID : matchingTypes) {
+        data->addMatchingID(edgeTypeID);
+    }
+
+    if (nullable) {
+        body->emplaceStmt(&NLExecutor::runCheckEdgeTypeConstraint<ColumnOptMask>, data);
+    } else {
+        body->emplaceStmt(&NLExecutor::runCheckEdgeTypeConstraint<ColumnMask>, data);
+    }
+}
+
+void NLTranslator::translateCreateNode(nl::CreateNode createNode, NLStmtContainer* body) {
+    if (!_metadataBuilder) {
+        throw IRException("Cannot perform CREATE outside of a write transaction.");
+    }
+
+    llvm::SmallVector<llvm::StringRef, 4> names;
+    resolveLabelNames(createNode.getLabels(), names);
+
+    LabelSet labelset;
+    for (const llvm::StringRef labelName : names) {
+        const LabelID labelID = _metadataBuilder->getOrCreateLabel(labelName);
+        labelset.set(labelID);
+    }
+    bioassert(not labelset.empty(), "Node must have at least one label.");
+
+    const LabelSetHandle labelsetHandle = _metadataBuilder->getOrCreateLabelSet(labelset);
+
+    ColumnNodeIDs* result = _memory->alloc<ColumnNodeIDs>();
+    _valueSlots[createNode.getResult()] = result;
+    _pendingNodeValues.insert(createNode.getResult());
+
+    NLCreateNodeData* data = _program->allocFunctionData<NLCreateNodeData>(labelsetHandle, result);
+
+    const mlir::OperandRange propValues = createNode.getPropValues();
+    const mlir::ArrayAttr propNames = createNode.getPropNames();
+
+    for (size_t propIndex = 0; propIndex < propNames.size(); propIndex++) {
+        const llvm::StringRef propName = mlir::cast<mlir::StringAttr>(propNames[propIndex]).getValue();
+        const mlir::Value propValue = propValues[propIndex];
+        const ValueType valueType = valueTypeFromChunkType(propValue.getType());
+
+        const PropertyType propType = _metadataBuilder->getOrCreatePropertyType(propName, valueType);
+        const Column* propColumn = getColumn(propValue);
+
+        data->addProperty({._propertyTypeID=propType._id, ._values=propColumn});
+    }
+
+    if (const mlir::Value cardinality = createNode.getCardinality()) {
+        data->setCardinality(getColumn(cardinality));
+    }
+
+    body->emplaceStmt(&NLExecutor::runCreateNode, data);
+}
+
+void NLTranslator::translateCreateEdge(nl::CreateEdge createEdge, NLStmtContainer* body) {
+    if (!_metadataBuilder) {
+        throw IRException("Cannot perform CREATE outside of a write transaction.");
+    }
+
+    const llvm::StringRef edgeTypeName = resolveEdgeTypeName(createEdge.getEdgeType());
+    const EdgeTypeID edgeTypeID = _metadataBuilder->getOrCreateEdgeType(edgeTypeName);
+
+    const mlir::Value srcValue = createEdge.getSrcIds();
+    const mlir::Value tgtValue = createEdge.getTgtIds();
+    const bool srcIsPending = createEdge.getSrcAllPending() || isPendingValue(srcValue, /*isNode=*/true);
+    const bool tgtIsPending = createEdge.getTgtAllPending() || isPendingValue(tgtValue, /*isNode=*/true);
+
+    const ColumnNodeIDs* srcColumn = static_cast<const ColumnNodeIDs*>(getColumn(srcValue));
+    const ColumnNodeIDs* tgtColumn = static_cast<const ColumnNodeIDs*>(getColumn(tgtValue));
+
+    ColumnEdgeIDs* result = _memory->alloc<ColumnEdgeIDs>();
+    _valueSlots[createEdge.getResult()] = result;
+    _pendingEdgeValues.insert(createEdge.getResult());
+
+    NLCreateEdgeData* data = _program->allocFunctionData<NLCreateEdgeData>(
+        edgeTypeID,
+        srcColumn,
+        srcIsPending,
+        tgtColumn,
+        tgtIsPending,
+        result);
+
+    data->setSrcPendingMask(getMaskColumn(createEdge.getSrcPending()));
+    data->setTgtPendingMask(getMaskColumn(createEdge.getTgtPending()));
+
+    const mlir::OperandRange propValues = createEdge.getPropValues();
+    const mlir::ArrayAttr propNames = createEdge.getPropNames();
+
+    for (size_t propIndex = 0; propIndex < propNames.size(); propIndex++) {
+        const llvm::StringRef propName = mlir::cast<mlir::StringAttr>(propNames[propIndex]).getValue();
+        const mlir::Value propValue = propValues[propIndex];
+        const ValueType valueType = valueTypeFromChunkType(propValue.getType());
+
+        const PropertyType propType = _metadataBuilder->getOrCreatePropertyType(propName, valueType);
+        const Column* propColumn = getColumn(propValue);
+
+        data->addProperty({._propertyTypeID=propType._id, ._values=propColumn});
+    }
+
+    body->emplaceStmt(&NLExecutor::runCreateEdge, data);
+}
+
+void NLTranslator::translateMerge(nl::Merge merge, NLStmtContainer* body) {
+    if (!_metadataBuilder) {
+        throw IRException("Cannot perform MERGE outside of a write transaction.");
+    }
+
+    const mlir::ArrayAttr nodeLabels = merge.getNodeLabels();
+    const mlir::ArrayAttr nodePropNames = merge.getNodePropNames();
+    const mlir::ArrayAttr edgeTypes = merge.getEdgeTypes();
+    const mlir::ArrayAttr edgePropNames = merge.getEdgePropNames();
+    const llvm::ArrayRef<int64_t> directions = merge.getEdgeDirections();
+
+    const mlir::OperandRange boundNodes = merge.getBoundNodes();
+    const mlir::OperandRange boundPending = merge.getBoundPending();
+    const mlir::OperandRange nodePropValues = merge.getNodePropValues();
+    const mlir::OperandRange edgePropValues = merge.getEdgePropValues();
+    const mlir::OperandRange carriedColumns = merge.getCarriedColumns();
+    const mlir::ResultRange results = merge.getResults();
+
+    ColumnMask* created = _memory->alloc<ColumnMask>();
+    created->reserve(_program->getChunkSize());
+
+    NLMergeData* data = _program->allocFunctionData<NLMergeData>(_program->getMergePendingEdges(), created);
+
+    const size_t nodeCount = nodeLabels.size();
+    const size_t hopCount = nodeCount - 1;
+
+    // A bound node has no result pair of its own: its rows come back through the carry set
+    size_t resultIndex = 0;
+    size_t boundIndex = 0;
+    size_t nodeValueIndex = 0;
+    for (size_t nodeIndex = 0; nodeIndex < nodeCount; nodeIndex++) {
+        const mlir::ArrayAttr labels = mlir::cast<mlir::ArrayAttr>(nodeLabels[nodeIndex]);
+        const mlir::ArrayAttr propNames = mlir::cast<mlir::ArrayAttr>(nodePropNames[nodeIndex]);
+
+        NLMergeData::Node node;
+
+        if (labels.empty()) {
+            node._boundColumn = static_cast<const ColumnNodeIDs*>(getColumn(boundNodes[boundIndex]));
+            boundIndex++;
+        } else {
+            translateMergeNodeSpec(labels, propNames, nodePropValues.slice(nodeValueIndex, propNames.size()), node);
+
+            node._output = static_cast<ColumnNodeIDs*>(allocColumn(results[resultIndex]));
+            node._outputPending = static_cast<ColumnMask*>(allocColumn(results[resultIndex + 1]));
+            resultIndex += 2;
+        }
+
+        nodeValueIndex += propNames.size();
+
+        data->addNode(node);
+    }
+
+    // Only a bound node whose column a merge produced carries a mask, so each one names
+    // the chain node it belongs to rather than leaving a hole in a per-node group
+    const llvm::ArrayRef<int64_t> pendingNodes = merge.getPendingNodes();
+    std::vector<NLMergeData::Node>& nodes = data->nodes();
+    for (size_t index = 0; index < pendingNodes.size(); index++) {
+        nodes[pendingNodes[index]]._boundPending = getMaskColumn(boundPending[index]);
+    }
+
+    size_t edgeValueIndex = 0;
+    for (size_t hopIndex = 0; hopIndex < hopCount; hopIndex++) {
+        const llvm::StringRef edgeTypeName = resolveEdgeTypeName(edgeTypes[hopIndex]);
+        const mlir::ArrayAttr propNames = mlir::cast<mlir::ArrayAttr>(edgePropNames[hopIndex]);
+
+        NLMergeData::Hop hop;
+        hop._writeEdgeType = _metadataBuilder->getOrCreateEdgeType(edgeTypeName);
+        hop._direction = mergeDirectionFromValue(directions[hopIndex]);
+
+        // A type the graph's schema does not have is on no committed edge, so the match
+        // reads the graph only when the name resolves there. It is created above all the
+        // same, since a written hop needs it.
+        const std::optional<EdgeTypeID> matchEdgeType = _view->metadata().edgeTypes().get(edgeTypeName);
+        if (matchEdgeType) {
+            hop._matchEdgeType = *matchEdgeType;
+        }
+
+        bool matchable = matchEdgeType.has_value();
+        for (size_t propIndex = 0; propIndex < propNames.size(); propIndex++) {
+            const llvm::StringRef propName = mlir::cast<mlir::StringAttr>(propNames[propIndex]).getValue();
+            const mlir::Value propValue = edgePropValues[edgeValueIndex + propIndex];
+
+            translateMergeProperty(propName, propValue, hop._properties, hop._scanProperties, matchable);
+        }
+
+        // A property the graph does not have is on no committed edge either, so the hop
+        // reads no candidate rather than reading one it cannot key
+        if (!matchable) {
+            hop._matchEdgeType = EdgeTypeID();
+            hop._scanProperties.clear();
+        }
+
+        edgeValueIndex += propNames.size();
+
+        collectWrittenMergeProperties(hop._properties, hop._writtenProperties);
+
+        hop._scanSources = _memory->alloc<ColumnNodeIDs>();
+        hop._scanEdges = _memory->alloc<ColumnEdgeIDs>();
+
+        hop._output = static_cast<ColumnEdgeIDs*>(allocColumn(results[resultIndex]));
+        hop._outputPending = static_cast<ColumnMask*>(allocColumn(results[resultIndex + 1]));
+        resultIndex += 2;
+
+        data->addHop(hop);
+    }
+
+    _valueSlots[results[resultIndex]] = created;
+    resultIndex++;
+
+    for (size_t index = 0; index < carriedColumns.size(); index++) {
+        const mlir::Value input = carriedColumns[index];
+
+        data->addCarriedColumn({getColumn(input),
+                                allocColumn(results[resultIndex + index]),
+                                selectGatherForChunkType(input.getType())});
+    }
+
+    // Every row the op runs over is a row of its inputs, so any of them holding rows of
+    // its own gives their count. A pattern reading only constants runs over one row.
+    for (const mlir::Value input : merge->getOperands()) {
+        const Column* column = getColumn(input);
+        if (!isConstantColumn(column)) {
+            data->setRowCarrier(column);
+            break;
+        }
+    }
+
+    body->emplaceStmt(&NLExecutor::runMerge, data);
+}
+
+void NLTranslator::translateMergeNodeSpec(mlir::ArrayAttr labels,
+                                          mlir::ArrayAttr propNames,
+                                          mlir::OperandRange propValues,
+                                          NLMergeData::Node& node) {
+    // The labels the node is written with, created where the schema lacks them, and the
+    // same set resolved against the graph for the match. A name the graph does not have
+    // is on no committed node, so the conjunction matches nothing there - the way
+    // nl.scan_nodes_by_label treats it - and only what this query wrote can match.
+    LabelSet writeLabels;
+    LabelSet matchLabels;
+    bool matchable = true;
+
+    llvm::SmallVector<llvm::StringRef, 4> names;
+    resolveLabelNames(labels, names);
+
+    const LabelMap& graphLabels = _view->metadata().labels();
+    for (const llvm::StringRef labelName : names) {
+        writeLabels.set(_metadataBuilder->getOrCreateLabel(labelName));
+
+        const std::optional<LabelID> graphLabel = graphLabels.get(labelName);
+        if (graphLabel) {
+            matchLabels.set(*graphLabel);
+        } else {
+            matchable = false;
+        }
+    }
+
+    node._labelSetHandle = _metadataBuilder->getOrCreateLabelSet(writeLabels);
+
+    std::vector<NLMergeScanProperty> scanProperties;
+    for (size_t propIndex = 0; propIndex < propNames.size(); propIndex++) {
+        const llvm::StringRef propName = mlir::cast<mlir::StringAttr>(propNames[propIndex]).getValue();
+
+        translateMergeProperty(propName, propValues[propIndex], node._properties, scanProperties, matchable);
+    }
+
+    if (!matchable) {
+        scanProperties.clear();
+    }
+
+    std::string signature;
+    appendMergeNodeSignature(writeLabels, node._properties, signature);
+
+    // Every chain node of the same signature looks its candidates up in one index, so
+    // the label set is scanned once however many times the query merges the pattern
+    node._index = _program->findMergeNodeIndex(signature);
+    if (node._index) {
+        return;
+    }
+
+    ColumnNodeIDs* scanNodes = _memory->alloc<ColumnNodeIDs>();
+    node._index = _program->addMergeNodeIndex(signature, matchLabels, writeLabels, matchable, scanNodes);
+    for (const NLMergeScanProperty& scanProperty : scanProperties) {
+        node._index->addScanProperty(scanProperty);
+    }
+
+    NLMergeScanProperties writtenProperties;
+    collectWrittenMergeProperties(node._properties, writtenProperties);
+    for (const NLMergeScanProperty& writtenProperty : writtenProperties) {
+        node._index->addWrittenProperty(writtenProperty);
+    }
+}
+
+void NLTranslator::collectWrittenMergeProperties(const std::vector<NLMergeProperty>& properties,
+                                                 NLMergeScanProperties& writtenProperties) {
+    for (const NLMergeProperty& property : properties) {
+        const ValueType valueType = property._propertyType._valueType;
+
+        writtenProperties.push_back({._propertyType=property._propertyType,
+                                     ._values=allocOptColumnForValueType(valueType),
+                                     ._keyAppend=NLExecutor::selectOptKeyAppendFunction(valueType)});
+    }
+}
+
+void NLTranslator::translateMergeProperty(llvm::StringRef propName,
+                                          mlir::Value propValue,
+                                          std::vector<NLMergeProperty>& properties,
+                                          std::vector<NLMergeScanProperty>& scanProperties,
+                                          bool& matchable) {
+    const ValueType valueType = valueTypeFromChunkType(propValue.getType());
+    const Column* column = getColumn(propValue);
+
+    // Created where the schema lacks it, since a written pattern carries the property.
+    // Both sides of the key serialize in its registered type: the analyzer lets an
+    // integer constrain a double-typed property, and 5 keys like the 5.0 the graph side
+    // reads back only once converted to it.
+    const PropertyType writeType = _metadataBuilder->getOrCreatePropertyType(propName, valueType);
+    properties.push_back({._propertyType=writeType,
+                          ._values=column,
+                          ._keyAppend=selectMergeKeyAppend(propValue.getType(),
+                                                           column,
+                                                           writeType._valueType)});
+
+    // The graph's own property, which is what a candidate's value is read back through.
+    // Absent means no committed entity carries it, so nothing there can match.
+    const std::optional<PropertyType> graphType = _view->metadata().propTypes().get(propName);
+    if (!graphType) {
+        matchable = false;
+        return;
+    }
+
+    scanProperties.push_back({._propertyType=*graphType,
+                              ._values=allocOptColumnForValueType(graphType->_valueType),
+                              ._keyAppend=NLExecutor::selectOptKeyAppendFunction(graphType->_valueType)});
+}
+
+PropertyType NLTranslator::setPropertyType(llvm::StringRef propName,
+                                           mlir::Type valueChunkType,
+                                           bool writesNull) const {
+    const bool writesListElements = isAnyChunk(valueChunkType);
+
+    if (!writesNull && !writesListElements) {
+        const ValueType valueType = valueTypeFromChunkType(valueChunkType);
+
+        return _metadataBuilder->getOrCreatePropertyType(propName, valueType);
+    }
+
+    const std::optional<PropertyType> existing = findPropertyType(propName);
+    if (!existing) {
+        bioassert(!writesListElements, "List elements written to property '{}', which the graph does not hold", propName.str());
+        return PropertyType {};
+    }
+
+    return *existing;
+}
+
+void NLTranslator::translateSetNodeProperty(nl::SetNodeProperty setNodeProperty, NLStmtContainer* body) {
+    if (!_metadataBuilder) {
+        throw IRException("Cannot perform SET or REMOVE outside of a write transaction.");
+    }
+
+    const llvm::StringRef propName = setNodeProperty.getProperty();
+    const mlir::Value inputValue = setNodeProperty.getInputNodes();
+    const mlir::Value propValue = setNodeProperty.getValue();
+    const mlir::Type valueChunkType = propValue.getType();
+    const bool writesNull = isUntypedNullChunk(valueChunkType);
+
+    const PropertyType propType = setPropertyType(propName, valueChunkType, writesNull);
+    if (!propType.isValid()) {
+        return;
+    }
+
+    const ColumnNodeIDs* inputColumn = static_cast<const ColumnNodeIDs*>(getColumn(inputValue));
+    const Column* valueColumn = getColumn(propValue);
+
+    NLSetNodePropertyData* data = _program->allocFunctionData<NLSetNodePropertyData>(
+        propType._id,
+        inputColumn,
+        valueColumn);
+
+    if (writesNull) {
+        data->setNullValueType(propType._valueType);
+    } else if (isAnyChunk(valueChunkType)) {
+        data->setListElementValueType(propType._valueType);
+    }
+
+    data->setPending(getMaskColumn(setNodeProperty.getPending()));
+    data->setAllPending(setNodeProperty.getAllPending() || isPendingValue(inputValue, /*isNode=*/true));
+    data->setRows(getMaskColumn(setNodeProperty.getRows()));
+
+    body->emplaceStmt(&NLExecutor::runSetNodeProperty, data);
+}
+
+void NLTranslator::translateSetEdgeProperty(nl::SetEdgeProperty setEdgeProperty, NLStmtContainer* body) {
+    if (!_metadataBuilder) {
+        throw IRException("Cannot perform SET outside of a write transaction.");
+    }
+
+    const llvm::StringRef propName = setEdgeProperty.getProperty();
+    const mlir::Value inputValue = setEdgeProperty.getInputEdges();
+    const mlir::Value propValue = setEdgeProperty.getValue();
+    const mlir::Type valueChunkType = propValue.getType();
+    const bool writesNull = isUntypedNullChunk(valueChunkType);
+
+    const PropertyType propType = setPropertyType(propName, valueChunkType, writesNull);
+    if (!propType.isValid()) {
+        return;
+    }
+
+    const ColumnEdgeIDs* inputColumn = static_cast<const ColumnEdgeIDs*>(getColumn(inputValue));
+    const Column* valueColumn = getColumn(propValue);
+
+    NLSetEdgePropertyData* data = _program->allocFunctionData<NLSetEdgePropertyData>(
+        propType._id,
+        inputColumn,
+        valueColumn);
+
+    if (writesNull) {
+        data->setNullValueType(propType._valueType);
+    } else if (isAnyChunk(valueChunkType)) {
+        data->setListElementValueType(propType._valueType);
+    }
+
+    data->setPending(getMaskColumn(setEdgeProperty.getPending()));
+    data->setAllPending(setEdgeProperty.getAllPending() || isPendingValue(inputValue, /*isNode=*/false));
+    data->setRows(getMaskColumn(setEdgeProperty.getRows()));
+
+    body->emplaceStmt(&NLExecutor::runSetEdgeProperty, data);
+}
+
+void NLTranslator::translateDeleteNode(nl::DeleteNode deleteNode, NLStmtContainer* body) {
+    if (!_metadataBuilder) {
+        throw IRException("Cannot perform DELETE outside of a write transaction.");
+    }
+
+    const mlir::Value inputValue = deleteNode.getInputNodes();
+    const ColumnNodeIDs* inputColumn = static_cast<const ColumnNodeIDs*>(getColumn(inputValue));
+
+    NLDeleteNodeData* data = _program->allocFunctionData<NLDeleteNodeData>(
+        inputColumn,
+        deleteNode.getDetach(),
+        _memory->alloc<ColumnNodeIDs>());
+
+    data->setPending(getMaskColumn(deleteNode.getPending()));
+    data->setAllPending(deleteNode.getAllPending() || isPendingValue(inputValue, /*isNode=*/true));
+
+    body->emplaceStmt(&NLExecutor::runDeleteNode, data);
+}
+
+void NLTranslator::translateDeleteEdge(nl::DeleteEdge deleteEdge, NLStmtContainer* body) {
+    if (!_metadataBuilder) {
+        throw IRException("Cannot perform DELETE outside of a write transaction.");
+    }
+
+    const mlir::Value inputValue = deleteEdge.getInputEdges();
+    const ColumnEdgeIDs* inputColumn = static_cast<const ColumnEdgeIDs*>(getColumn(inputValue));
+
+    NLDeleteEdgeData* data = _program->allocFunctionData<NLDeleteEdgeData>(
+        inputColumn,
+        _memory->alloc<ColumnEdgeIDs>());
+
+    data->setPending(getMaskColumn(deleteEdge.getPending()));
+    data->setAllPending(deleteEdge.getAllPending() || isPendingValue(inputValue, /*isNode=*/false));
+
+    body->emplaceStmt(&NLExecutor::runDeleteEdge, data);
+}
+
+void NLTranslator::translateConstant(nl::Constant constant) {
+    const mlir::TypedValue<mlir::nl::ChunkType> res = constant.getResult();
+    const auto chunkType = mlir::cast<nl::ChunkType>(res.getType());
+    const mlir::Type elementType = chunkType.getElementType();
+
+    // A list literal is carried as the array of its elements. It is written into the
+    // query-scoped list buffer once, here, and the column holds a view over that run: one
+    // list for every row, as a scalar constant holds one value. The views outlive
+    // translation, so the chunk needs no per-step fill.
+    if (llvm::isa<storage::ListType>(elementType)) {
+        const auto elements = mlir::cast<mlir::ArrayAttr>(constant.getValue());
+
+        ColumnConst<ListView>* lists = _memory->alloc<ColumnConst<ListView>>();
+        lists->set(materializeListView(elements));
+
+        _valueSlots[res] = lists;
+        return;
+    }
+
+    if (llvm::isa<storage::MapType>(elementType)) {
+        const auto entries = mlir::cast<mlir::DictionaryAttr>(constant.getValue());
+
+        ColumnConst<MapView>* map = _memory->alloc<ColumnConst<MapView>>();
+        map->set(materializeMapView(entries));
+
+        _valueSlots[res] = map;
+        return;
+    }
+
+    const mlir::Attribute value = constant.getValue();
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        if (mlir::isa<mlir::NoneType>(nullableType.getValueType())) {
+            _valueSlots[res] = _memory->alloc<ColumnConst<PropertyNull>>();
+            return;
+        }
+    }
+
+    const ValueType valueType = valueTypeFromElementType(elementType);
+
+    Column* column = nullptr;
+    const auto materialize = [&]<SupportedType T>() {
+        auto* typed = _memory->alloc<ColumnConst<typename T::Primitive>>();
+
+        if constexpr (std::same_as<T, types::String>) {
+            typed->set(ownedCharacters(mlir::cast<mlir::StringAttr>(value).getValue()));
+        } else if constexpr (std::same_as<T, types::Embedding>) {
+            typed->set(ownedFloats(mlir::cast<mlir::DenseF32ArrayAttr>(value).asArrayRef()));
+        } else {
+            typed->set(constantValueAs<T>(value));
+        }
+
+        column = typed;
+    };
+    ValueTypeDispatcher(valueType).execute(materialize);
+    bioassert(column, "Failed to allocate column.");
+
+    _valueSlots[res] = column;
+}
+
+void NLTranslator::translateCurrentDateTime(nl::CurrentDateTime currentDateTime) {
+    if (!_queryInstant.has_value()) {
+        _queryInstant = DateTime::now();
+    }
+
+    ColumnConst<types::DateTime::Primitive>* instant
+        = _memory->alloc<ColumnConst<types::DateTime::Primitive>>();
+    instant->set(*_queryInstant);
+
+    _valueSlots[currentDateTime.getResult()] = instant;
+}
+
+void NLTranslator::translateBroadcastConstant(nl::BroadcastConstant broadcast, NLStmtContainer* body) {
+    const Column* value = getColumn(broadcast.getValue());
+
+    // Absent when no relation drives the projection, which is then the single row the
+    // constant is, so there is no chunk to read a row count from
+    const mlir::Value cardinalityChunk = broadcast.getCardinality();
+    const Column* cardinality = cardinalityChunk ? getColumn(cardinalityChunk) : nullptr;
+
+    const mlir::Value result = broadcast.getResult();
+    const mlir::Type resultType = result.getType();
+
+    Column* output = allocColumnForChunkType(resultType);
+    _valueSlots[result] = output;
+
+    // The untyped null constant is a ColumnConst<PropertyNull>, which holds no value to
+    // repeat: its rows are absent values rather than copies of one. A list or a map rides
+    // its own container chunk rather than a nullable value one, so its fill repeats the one
+    // view the constant holds instead of dispatching on a value type.
+    const mlir::Type resultElement = mlir::cast<nl::ChunkType>(resultType).getElementType();
+    const bool isUntypedNull = isUntypedNullChunk(broadcast.getValue().getType());
+    const bool isList = llvm::isa<storage::ListType>(resultElement);
+    const bool isMap = llvm::isa<storage::MapType>(resultElement);
+
+    NLBroadcastConstantFunction fill = nullptr;
+    if (isUntypedNull) {
+        fill = NLExecutor::selectNullConstantBroadcast();
+    } else if (isList) {
+        fill = NLExecutor::selectConstantListBroadcast();
+    } else if (isMap) {
+        fill = NLExecutor::selectConstantMapBroadcast();
+    } else if (mlir::isa<storage::MapElementType>(resultElement)) {
+        fill = NLExecutor::selectConstantMapEntryBroadcast();
+    } else if (isNullableAny(resultElement)) {
+        fill = NLExecutor::selectOptListElementBroadcast(value);
+    } else {
+        fill = NLExecutor::selectConstantBroadcast(nullableChunkValueType(resultType), value);
+    }
+
+    NLBroadcastConstantData* data = _program->allocFunctionData<NLBroadcastConstantData>(value, cardinality, output, fill);
+    body->emplaceStmt(&NLExecutor::runBroadcastConstant, data);
+}
+
+void NLTranslator::translateRowConstant(nl::RowConstant rowConstant, NLStmtContainer* body) {
+    const Column* row = getColumn(rowConstant.getRow());
+
+    Column* result = nullptr;
+    const NLUnaryFn read = NLExecutor::selectRowConstant(row, _memory, result);
+    _valueSlots[rowConstant.getResult()] = result;
+
+    NLUnaryData* data = _program->allocFunctionData<NLUnaryData>(row, result, read);
+    body->emplaceStmt(&NLExecutor::runUnary, data);
+}
+
+template <ColumnOperator Op, typename OpType>
+void NLTranslator::translateBinaryOp(OpType op, NLStmtContainer* body) {
+    const Column* lhs = getColumn(op.getLhs());
+    const Column* rhs = getColumn(op.getRhs());
+
+    // An i1 chunk is a mask where a comparison produced it, and membership only has
+    // kernels over a boolean value column
+    if constexpr (Op == OP_IN) {
+        if (lhs->getKind() == ColumnMask::staticKind()) {
+            Column* nullableLhs = nullptr;
+            const NLUnaryFn toNullable = NLExecutor::selectMaskToNullable(_memory, nullableLhs);
+
+            NLUnaryData* toNullableData = _program->allocFunctionData<NLUnaryData>(lhs, nullableLhs, toNullable);
+            body->emplaceStmt(&NLExecutor::runUnary, toNullableData);
+
+            lhs = nullableLhs;
+        }
+    }
+
+    Column* result = nullptr;
+    const NLBinaryFn fn = NLExecutor::selectBinary<Op>(lhs, rhs, _memory, result);
+    bindKernelResult(op.getResult(), result);
+
+    NLBinaryData* data = _program->allocFunctionData<NLBinaryData>(lhs, rhs, result, fn, _program->allocStepBuffers());
+    body->emplaceStmt(&NLExecutor::runBinary, data);
+}
+
+void NLTranslator::translateListIndex(nl::ListIndex index, NLStmtContainer* body) {
+    const Column* lhs = getColumn(index.getLhs());
+    const Column* rhs = getColumn(index.getRhs());
+
+    const auto resultChunk = mlir::cast<nl::ChunkType>(index.getResult().getType());
+    const mlir::Type resultElement = resultChunk.getElementType();
+    const bool readsAnEntity = mlir::isa<storage::NodeIDType, storage::EdgeIDType>(resultElement);
+
+    Column* result = nullptr;
+    NLBinaryFn fn = nullptr;
+
+    if (readsAnEntity) {
+        fn = NLExecutor::selectEntityListIndex(chunkKindFromElementType(resultElement),
+                                               lhs,
+                                               rhs,
+                                               _memory,
+                                               result);
+    } else {
+        const auto nullableType = mlir::cast<storage::NullableType>(resultElement);
+        const mlir::Type elementType = nullableType.getValueType();
+        const bool readsATaggedCell = mlir::isa<storage::AnyType>(elementType);
+
+        if (readsATaggedCell) {
+            fn = NLExecutor::selectBinary<OP_INDEX>(lhs, rhs, _memory, result);
+        } else {
+            fn = NLExecutor::selectValueListIndex(valueTypeFromElementType(elementType), lhs, rhs, _memory, result);
+        }
+    }
+
+    bindKernelResult(index.getResult(), result);
+
+    NLBinaryData* data = _program->allocFunctionData<NLBinaryData>(lhs, rhs, result, fn, _program->allocStepBuffers());
+    body->emplaceStmt(&NLExecutor::runBinary, data);
+}
+
+void NLTranslator::translateNot(nl::Not notOp, NLStmtContainer* body) {
+    const Column* operand = getColumn(notOp.getOperand());
+
+    Column* result = nullptr;
+    const NLUnaryFn fn = NLExecutor::selectNot(operand, _memory, result);
+    bindKernelResult(notOp.getResult(), result);
+
+    NLUnaryData* data = _program->allocFunctionData<NLUnaryData>(operand, result, fn);
+    body->emplaceStmt(&NLExecutor::runUnary, data);
+}
+
+void NLTranslator::translateToNullable(nl::ToNullable toNullable, NLStmtContainer* body) {
+    const mlir::Value operandValue = toNullable.getOperand();
+    const Column* operand = getColumn(operandValue);
+
+    const auto resultChunk = mlir::cast<nl::ChunkType>(toNullable.getResult().getType());
+    const auto nullableType = mlir::cast<storage::NullableType>(resultChunk.getElementType());
+
+    // The null literal's chunk names no value type of its own, so there is no value to read
+    // through: the result is one absent value per row, in the type it does name - what a
+    // UNION branch spelling a column's value null hands the sink.
+    if (isUntypedNullChunk(operandValue.getType())) {
+        Column* const nulls = allocColumnForChunkType(resultChunk);
+        _valueSlots[toNullable.getResult()] = nulls;
+
+        NLFillNullData* fillData = _program->allocFunctionData<NLFillNullData>(operand,
+                                                                               nulls,
+                                                                               selectFillNullForChunkType(resultChunk));
+        body->emplaceStmt(&NLExecutor::runFillNull, fillData);
+        return;
+    }
+
+    const ValueType valueType = valueTypeFromElementType(nullableType.getValueType());
+
+    // An entity column carries its null in the ID rather than in an optional, so it is
+    // read row by row for validity instead of copied straight across
+    const auto operandChunk = mlir::cast<nl::ChunkType>(operandValue.getType());
+    const mlir::Type operandElement = operandChunk.getElementType();
+    const bool readsAnEntity = mlir::isa<storage::NodeIDType, storage::EdgeIDType, storage::PathRefType>(operandElement);
+    const bool readsAPath = mlir::isa<storage::EntityListType>(operandElement);
+    const bool readsAMask = isMaskElementType(operandElement);
+
+    Column* result = nullptr;
+    NLUnaryFn fn = nullptr;
+    if (readsAnEntity) {
+        fn = NLExecutor::selectEntityToNullable(chunkKindFromElementType(operandElement), _memory, result);
+    } else if (readsAPath) {
+        fn = NLExecutor::selectPathToNullable(_memory, result);
+    } else if (readsAMask) {
+        fn = NLExecutor::selectMaskToNullable(_memory, result);
+    } else {
+        fn = NLExecutor::selectToNullable(valueType, operand, _memory, result);
+    }
+    bindKernelResult(toNullable.getResult(), result);
+
+    NLUnaryData* data = _program->allocFunctionData<NLUnaryData>(operand, result, fn);
+    body->emplaceStmt(&NLExecutor::runUnary, data);
+}
+
+NLListItemReadFunction NLTranslator::selectListItemRead(mlir::Type chunkType) {
+    const mlir::Type elementType = mlir::cast<nl::ChunkType>(chunkType).getElementType();
+
+    if (mlir::isa<storage::NodeIDType>(elementType)) {
+        return NLExecutor::selectNodeListItemRead();
+    } else if (mlir::isa<storage::EdgeIDType>(elementType)) {
+        return NLExecutor::selectEdgeListItemRead();
+    } else if (mlir::isa<storage::ListType>(elementType)) {
+        return NLExecutor::selectNestedListItemRead();
+    } else if (mlir::isa<storage::MapType>(elementType)) {
+        return NLExecutor::selectNestedMapListItemRead();
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectTaggedListItemRead(/*nullable=*/false);
+    } else if (isNullableList(elementType)) {
+        return NLExecutor::selectOptNestedListItemRead();
+    } else if (isNullableAny(elementType)) {
+        return NLExecutor::selectTaggedListItemRead(/*nullable=*/true);
+    }
+
+    const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType);
+    if (!nullableType) {
+        throw IRException("nl.make_list requires a nullable value chunk for a scalar element column");
+    }
+
+    const mlir::Type valueElement = nullableType.getValueType();
+    return NLExecutor::selectValueListItemRead(valueTypeFromElementType(valueElement));
+}
+
+void NLTranslator::translateMakeList(nl::MakeList makeList, NLStmtContainer* body) {
+    const mlir::Value resultValue = makeList.getResult();
+
+    Column* const result = allocColumnForChunkType(resultValue.getType());
+    _valueSlots[resultValue] = result;
+
+    NLMakeListData* data = _program->allocFunctionData<NLMakeListData>(result, _program->allocStepBuffers());
+
+    for (const mlir::Value elementChunk : makeList.getElements()) {
+        data->addElement(NLMakeListData::Element {
+            ._column = getColumn(elementChunk),
+            ._read = selectListItemRead(elementChunk.getType()),
+        });
+    }
+
+    body->emplaceStmt(&NLExecutor::runMakeList, data);
+}
+
+NLMapValueReadFunction NLTranslator::selectMapValueRead(mlir::Type chunkType) {
+    const mlir::Type elementType = mlir::cast<nl::ChunkType>(chunkType).getElementType();
+
+    if (mlir::isa<storage::NodeIDType>(elementType)) {
+        return NLExecutor::selectNodeMapValueRead();
+    } else if (mlir::isa<storage::EdgeIDType>(elementType)) {
+        return NLExecutor::selectEdgeMapValueRead();
+    } else if (mlir::isa<storage::MapType>(elementType)) {
+        return NLExecutor::selectNestedMapValueRead();
+    } else if (mlir::isa<storage::ListType>(elementType)) {
+        return NLExecutor::selectNestedListMapValueRead();
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectTaggedMapValueRead(/*nullable=*/false);
+    } else if (isNullableList(elementType)) {
+        return NLExecutor::selectOptNestedListMapValueRead();
+    } else if (isNullableAny(elementType)) {
+        return NLExecutor::selectTaggedMapValueRead(/*nullable=*/true);
+    }
+
+    const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType);
+    if (!nullableType) {
+        throw IRException("nl.make_map requires a nullable value chunk for a scalar value column");
+    }
+
+    const mlir::Type valueElement = nullableType.getValueType();
+    return NLExecutor::selectValueMapValueRead(valueTypeFromElementType(valueElement));
+}
+
+void NLTranslator::translateMakeMap(nl::MakeMap makeMap, NLStmtContainer* body) {
+    const mlir::Value resultValue = makeMap.getResult();
+
+    Column* const result = allocColumnForChunkType(resultValue.getType());
+    _valueSlots[resultValue] = result;
+
+    NLMakeMapData* data = _program->allocFunctionData<NLMakeMapData>(result, _program->allocStepBuffers());
+
+    const mlir::ArrayAttr keys = makeMap.getKeys();
+    for (const auto& [key, valueChunk] : llvm::zip_equal(keys, makeMap.getValues())) {
+        const llvm::StringRef keyName = mlir::cast<mlir::StringAttr>(key).getValue();
+
+        data->addEntry(NLMakeMapData::Entry {
+            ._key = ownedCharacters(keyName),
+            ._column = getColumn(valueChunk),
+            ._read = selectMapValueRead(valueChunk.getType()),
+        });
+    }
+
+    body->emplaceStmt(&NLExecutor::runMakeMap, data);
+}
+
+void NLTranslator::translateStaticMapKey(nl::StaticMapKey mapKey, NLStmtContainer* body) {
+    const mlir::Value resultValue = mapKey.getResult();
+
+    const Column* input = getColumn(mapKey.getMap());
+    Column* const result = yieldsConstantColumn(resultValue) ? allocConstMapEntryColumn()
+                                                             : allocMapEntryColumn();
+    _valueSlots[resultValue] = result;
+
+    const std::string_view key = ownedCharacters(mapKey.getKey());
+
+    // The single null entry every row missing the key points at. It is the same on every
+    // row and every chunk, so it is written into the query's map buffer once, here.
+    MapWriteCursor absentCursor = _memory->mapBuffer().reserveMap(1, sizeof(PropertyNull));
+    absentCursor.writeKey(key);
+    const MapEntryView absent = absentCursor.writeValue(MapBufferTypeTag::Null, PropertyNull {});
+
+    NLStaticMapKeyData* data = _program->allocFunctionData<NLStaticMapKeyData>(input,
+                                                                   result,
+                                                                   NLExecutor::selectKeyedRead(input),
+                                                                   key,
+                                                                   absent,
+                                                                   _program->allocStepBuffers());
+
+    body->emplaceStmt(&NLExecutor::runStaticMapKey, data);
+}
+
+void NLTranslator::translateMapEntryValue(nl::MapEntryValue entryValue, NLStmtContainer* body) {
+    const mlir::Value resultValue = entryValue.getResult();
+
+    const Column* input = getColumn(entryValue.getEntries());
+
+    Column* result = nullptr;
+    if (yieldsConstantColumn(resultValue)) {
+        result = _memory->alloc<ColumnConst<ListElementView>>();
+    } else {
+        result = _memory->alloc<ColumnVector<ListElementView>>();
+    }
+    _valueSlots[resultValue] = result;
+
+    NLMapEntryValueData* data = _program->allocFunctionData<NLMapEntryValueData>(input,
+                                                                                 result,
+                                                                                 _program->allocStepBuffers());
+
+    body->emplaceStmt(&NLExecutor::runMapEntryValue, data);
+}
+
+void NLTranslator::translateDynamicMapKey(nl::DynamicMapKey mapKey, NLStmtContainer* body) {
+    const mlir::Value resultValue = mapKey.getResult();
+
+    const Column* input = getColumn(mapKey.getMap());
+    const Column* key = getColumn(mapKey.getKey());
+
+    Column* const result = yieldsConstantColumn(resultValue) ? allocConstMapEntryColumn()
+                                                             : allocMapEntryColumn();
+    _valueSlots[resultValue] = result;
+
+    // A row holding no key has no key to name its null entry by, so one keyless entry
+    // serves every such row and is written into the query's map buffer once, here. The
+    // entry for a key the map does not hold carries that key, so the executor writes it.
+    MapWriteCursor keylessCursor = _memory->mapBuffer().reserveMap(1, sizeof(PropertyNull));
+    keylessCursor.writeKey(std::string_view {});
+    const MapEntryView keyless = keylessCursor.writeValue(MapBufferTypeTag::Null, PropertyNull {});
+
+    NLDynamicMapKeyData* data = _program->allocFunctionData<NLDynamicMapKeyData>(input,
+                                                                                 result,
+                                                                                 NLExecutor::selectKeyedRead(input),
+                                                                                 key,
+                                                                                 NLExecutor::selectStringRead(key),
+                                                                                 keyless,
+                                                                                 _program->allocStepBuffers());
+
+    body->emplaceStmt(&NLExecutor::runDynamicMapKey, data);
+}
+
+NLRangeBoundReadFunction NLTranslator::selectRangeBoundRead(mlir::Type chunkType) {
+    const mlir::Type elementType = mlir::cast<nl::ChunkType>(chunkType).getElementType();
+
+    const storage::NullableType nullableType = mlir::dyn_cast<storage::NullableType>(elementType);
+    if (!nullableType) {
+        throw IRException("nl.range requires a nullable integer chunk for each bound");
+    }
+
+    return NLExecutor::selectRangeBoundRead(valueTypeFromElementType(nullableType.getValueType()));
+}
+
+NLRangeBound NLTranslator::rangeBound(mlir::Value chunk) {
+    if (!chunk) {
+        return NLRangeBound {};
+    }
+
+    return NLRangeBound {
+        ._column = getColumn(chunk),
+        ._read = selectRangeBoundRead(chunk.getType()),
+    };
+}
+
+void NLTranslator::translateListSlice(nl::ListSlice slice, NLStmtContainer* body) {
+    const mlir::Value resultValue = slice.getResult();
+
+    Column* const result = allocColumnForChunkType(resultValue.getType());
+    _valueSlots[resultValue] = result;
+
+    const Column* const list = getColumn(slice.getList());
+
+    NLListSliceData* data = _program->allocFunctionData<NLListSliceData>(list,
+                                                                         NLExecutor::selectListRead(list),
+                                                                         rangeBound(slice.getFrom()),
+                                                                         rangeBound(slice.getTo()),
+                                                                         result);
+
+    body->emplaceStmt(&NLExecutor::runListSlice, data);
+}
+
+void NLTranslator::translatePercentile(mlir::Operation* operation, NLStmtContainer* body) {
+    const mlir::Value resultValue = operation->getResult(0);
+    const mlir::Value percentileValue = operation->getOperand(1);
+
+    Column* const result = allocColumnForChunkType(resultValue.getType());
+    _valueSlots[resultValue] = result;
+
+    const Column* const list = getColumn(operation->getOperand(0));
+    const Column* const percentile = getColumn(percentileValue);
+
+    NLPercentileData* data = _program->allocFunctionData<NLPercentileData>(list,
+                                                                           NLExecutor::selectListRead(list),
+                                                                           percentile,
+                                                                           NLExecutor::selectPercentileRead(nullableChunkValueType(percentileValue.getType())),
+                                                                           result);
+
+    if (mlir::isa<nl::PercentileCont>(operation)) {
+        body->emplaceStmt(&NLExecutor::runPercentileCont, data);
+        return;
+    }
+
+    const mlir::Type resultElement = mlir::cast<nl::ChunkType>(resultValue.getType()).getElementType();
+    const auto nullable = mlir::dyn_cast<storage::NullableType>(resultElement);
+
+    if (!nullable) {
+        body->emplaceStmt(&NLExecutor::runPercentileDisc<ListElementView>, data);
+        return;
+    }
+
+    switch (valueTypeFromElementType(nullable.getValueType())) {
+        case ValueType::Int64:
+            body->emplaceStmt(&NLExecutor::runPercentileDisc<std::optional<types::Int64::Primitive>>, data);
+        break;
+
+        case ValueType::UInt64:
+            body->emplaceStmt(&NLExecutor::runPercentileDisc<std::optional<types::UInt64::Primitive>>, data);
+        break;
+
+        case ValueType::Double:
+            body->emplaceStmt(&NLExecutor::runPercentileDisc<std::optional<types::Double::Primitive>>, data);
+        break;
+
+        default:
+            throw IRException("nl.percentile_disc answers a number or a tagged cell");
+        break;
+    }
+}
+
+void NLTranslator::translateRange(nl::Range range, NLStmtContainer* body) {
+    const mlir::Value resultValue = range.getResult();
+
+    Column* const result = allocColumnForChunkType(resultValue.getType());
+    _valueSlots[resultValue] = result;
+
+    NLRangeData* data = _program->allocFunctionData<NLRangeData>(result,
+                                                                 _program->allocStepBuffers(),
+                                                                 rangeBound(range.getStart()),
+                                                                 rangeBound(range.getEnd()),
+                                                                 rangeBound(range.getStep()));
+
+    body->emplaceStmt(&NLExecutor::runRange, data);
+}
+
+void NLTranslator::translateSubstring(nl::Substring substring, NLStmtContainer* body) {
+    const mlir::Value resultValue = substring.getResult();
+    const mlir::Type resultType = resultValue.getType();
+
+    Column* const result = allocColumnForChunkType(resultType);
+    _valueSlots[resultValue] = result;
+
+    const Column* const string = getColumn(substring.getString());
+    const Column* const start = getColumn(substring.getStart());
+
+    NLSubstringData::IntegerArgument length;
+    if (const mlir::Value lengthValue = substring.getLength()) {
+        length._column = getColumn(lengthValue);
+        length._read = NLExecutor::selectIntegerArgumentRead(length._column);
+    }
+
+    const NLSubstringData::StringArgument stringArgument {string, NLExecutor::selectStringArgumentRead(string)};
+    const NLSubstringData::IntegerArgument startArgument {start, NLExecutor::selectIntegerArgumentRead(start)};
+
+    NLSubstringData* data = _program->allocFunctionData<NLSubstringData>(result, stringArgument, startArgument, length);
+
+    const mlir::Type resultElement = mlir::cast<nl::ChunkType>(resultType).getElementType();
+    const bool resultNullable = mlir::isa<storage::NullableType>(resultElement);
+
+    if (resultNullable) {
+        body->emplaceStmt(&NLExecutor::runSubstring<std::optional<types::String::Primitive>>, data);
+    } else {
+        body->emplaceStmt(&NLExecutor::runSubstring<types::String::Primitive>, data);
+    }
+}
+
+void NLTranslator::translateSplit(nl::Split split, NLStmtContainer* body) {
+    const mlir::Value resultValue = split.getResult();
+    const mlir::Type resultType = resultValue.getType();
+
+    const mlir::Type resultElement = mlir::cast<nl::ChunkType>(resultType).getElementType();
+    const bool resultNullable = mlir::isa<storage::NullableType>(resultElement);
+
+    Column* const result = allocColumnForChunkType(resultType);
+    _valueSlots[resultValue] = result;
+
+    const Column* const string = getColumn(split.getString());
+    const Column* const delimiter = getColumn(split.getDelimiter());
+
+    const NLSplitData::StringArgument stringArgument {string, NLExecutor::selectStringArgumentRead(string)};
+    const NLSplitData::StringArgument delimiterArgument {delimiter, NLExecutor::selectStringArgumentRead(delimiter)};
+
+    NLSplitData* data = _program->allocFunctionData<NLSplitData>(result, _program->allocStepBuffers(), stringArgument, delimiterArgument);
+
+    if (resultNullable) {
+        body->emplaceStmt(&NLExecutor::runSplit<std::optional<ListView>>, data);
+    } else {
+        body->emplaceStmt(&NLExecutor::runSplit<ListView>, data);
+    }
+}
+
+template <typename Function, typename StringEndOp>
+void NLTranslator::translateStringEnd(StringEndOp stringEnd, NLStmtContainer* body) {
+    const mlir::Value resultValue = stringEnd.getResult();
+    const mlir::Type resultType = resultValue.getType();
+
+    Column* const result = allocColumnForChunkType(resultType);
+    _valueSlots[resultValue] = result;
+
+    const Column* const string = getColumn(stringEnd.getString());
+    const Column* const length = getColumn(stringEnd.getLength());
+
+    const NLStringEndData::StringArgument stringArgument {string, NLExecutor::selectStringArgumentRead(string)};
+    const NLStringEndData::IntegerArgument lengthArgument {length, NLExecutor::selectIntegerArgumentRead(length)};
+
+    NLStringEndData* data = _program->allocFunctionData<NLStringEndData>(result, stringArgument, lengthArgument);
+
+    if (isNullableChunk(resultType)) {
+        body->emplaceStmt(&NLExecutor::runStringEnd<Function, std::optional<types::String::Primitive>>, data);
+    } else {
+        body->emplaceStmt(&NLExecutor::runStringEnd<Function, types::String::Primitive>, data);
+    }
+}
+
+void NLTranslator::translateReplace(nl::Replace replace, NLStmtContainer* body) {
+    const mlir::Value resultValue = replace.getResult();
+    const mlir::Type resultType = resultValue.getType();
+
+    Column* const result = allocColumnForChunkType(resultType);
+    _valueSlots[resultValue] = result;
+
+    const Column* const string = getColumn(replace.getString());
+    const Column* const search = getColumn(replace.getSearch());
+    const Column* const replacement = getColumn(replace.getReplacement());
+
+    const NLReplaceData::StringArgument stringArgument {string, NLExecutor::selectStringArgumentRead(string)};
+    const NLReplaceData::StringArgument searchArgument {search, NLExecutor::selectStringArgumentRead(search)};
+    const NLReplaceData::StringArgument replacementArgument {replacement, NLExecutor::selectStringArgumentRead(replacement)};
+
+    NLReplaceData* data = _program->allocFunctionData<NLReplaceData>(result,
+                                                                     _program->allocStepBuffers(),
+                                                                     stringArgument,
+                                                                     searchArgument,
+                                                                     replacementArgument);
+
+    if (isNullableChunk(resultType)) {
+        body->emplaceStmt(&NLExecutor::runReplace<std::optional<types::String::Primitive>>, data);
+    } else {
+        body->emplaceStmt(&NLExecutor::runReplace<types::String::Primitive>, data);
+    }
+}
+
+template <typename Data, typename Op, typename... Extra>
+Data* NLTranslator::allocElementData(Op op, Extra... extra) {
+    const mlir::Value sourceValue = op.getSource();
+    const mlir::Type sourceElement = mlir::cast<nl::ChunkType>(sourceValue.getType()).getElementType();
+
+    mlir::Block& bodyBlock = op.getBody().front();
+    const mlir::Value elementValue = bodyBlock.getArgument(0);
+    const mlir::Value rowTagValue = bodyBlock.getArgument(1);
+
+    NLUnwindElementCountFunction elementCount = nullptr;
+    NLUnwindElementEmitFunction elementEmit = nullptr;
+    selectElementDrain(sourceElement, elementValue.getType(), elementCount, elementEmit);
+
+    Column* const elementOutput = elementEmit ? allocColumn(elementValue) : nullptr;
+
+    const mlir::Value resultValue = op.getResult();
+    Column* const result = allocColumnForChunkType(resultValue.getType());
+    _valueSlots[resultValue] = result;
+
+    ColumnVector<uint64_t>* const rowTags =
+        static_cast<ColumnVector<uint64_t>*>(allocColumn(rowTagValue));
+
+    return _program->allocFunctionData<Data>(getColumn(sourceValue),
+                                             elementCount,
+                                             elementEmit,
+                                             selectCellAbsent(sourceElement),
+                                             elementOutput,
+                                             rowTags,
+                                             result,
+                                             extra...);
+}
+
+template <typename Op>
+mlir::Value NLTranslator::translateElementBody(Op op, NLElementBodyData* data) {
+    const mlir::Value sourceValue = op.getSource();
+    const Column* source = data->getSource();
+
+    // The body binds the element, then the row tag, then one chunk per carried column -
+    // the block argument order of the op's region.
+    mlir::Block& bodyBlock = op.getBody().front();
+    const mlir::Value elementValue = bodyBlock.getArgument(0);
+
+    const size_t chunkSize = _program->getChunkSize();
+    data->getRows()->reserve(chunkSize);
+    data->getPositions()->reserve(chunkSize);
+    data->getRowTags()->reserve(chunkSize);
+
+    if (!data->getElementEmitFunc()) {
+        const NLCarriedColumn elementColumn(source,
+                                            allocColumn(elementValue),
+                                            selectGatherForChunkType(sourceValue.getType()));
+        data->addCarriedColumn(elementColumn);
+    }
+
+    const mlir::OperandRange carriedColumns = op.getColumnsToFilter();
+    for (size_t carriedIndex = 0; carriedIndex < carriedColumns.size(); carriedIndex++) {
+        const mlir::Value carriedValue = carriedColumns[carriedIndex];
+        const mlir::Value bodyChunk = bodyBlock.getArgument(static_cast<unsigned>(2 + carriedIndex));
+
+        const NLCarriedColumn carriedColumn(getColumn(carriedValue),
+                                            allocColumn(bodyChunk),
+                                            selectGatherForChunkType(bodyChunk.getType()));
+        data->addCarriedColumn(carriedColumn);
+    }
+
+    translateBlock(bodyBlock, data->getStmts());
+
+    // The op's verifier guarantees the terminator, so a body without one here means
+    // unverified IR.
+    nl::ComprehensionYield yield = mlir::dyn_cast<nl::ComprehensionYield>(bodyBlock.back());
+    if (!yield) {
+        throw IRException("The body of an op over the elements of a list does not end with an nl.comprehension_yield");
+    }
+
+    const mlir::Value valueValue = yield.getValue();
+    data->setYield(getColumn(yield.getRowTags()), getColumn(valueValue));
+
+    return valueValue;
+}
+
+void NLTranslator::translateListComprehension(nl::ListComprehension comprehension, NLStmtContainer* body) {
+    NLListComprehensionData* data = allocElementData<NLListComprehensionData>(comprehension, _program->allocStepBuffers());
+
+    const mlir::Value valueValue = translateElementBody(comprehension, data);
+    data->setValueRead(selectListItemRead(valueValue.getType()));
+
+    body->emplaceStmt(&NLExecutor::runListComprehension, data);
+}
+
+void NLTranslator::translateListPredicate(nl::ListPredicate predicate, NLStmtContainer* body) {
+    NLListPredicateData* data = allocElementData<NLListPredicateData>(predicate, listPredicateKind(predicate.getKind()));
+
+    const mlir::Value valueValue = translateElementBody(predicate, data);
+
+    const mlir::Type valueType = valueValue.getType();
+    const bool nullable = mlir::isa<storage::NullableType>(mlir::cast<nl::ChunkType>(valueType).getElementType());
+    data->setTruthRead(NLExecutor::selectTruthRead(nullable, isUntypedNullChunk(valueType), isAnyChunk(valueType)));
+
+    body->emplaceStmt(&NLExecutor::runListPredicate, data);
+}
+
+void NLTranslator::translateReduce(nl::Reduce reduce, NLStmtContainer* body) {
+    const mlir::Value sourceValue = reduce.getSource();
+    const mlir::Type sourceElement = mlir::cast<nl::ChunkType>(sourceValue.getType()).getElementType();
+    const Column* source = getColumn(sourceValue);
+
+    // The body binds the element, then the accumulator, then one chunk per carried column
+    mlir::Block& bodyBlock = reduce.getBody().front();
+    const mlir::Value elementValue = bodyBlock.getArgument(0);
+    const mlir::Value accumulatorValue = bodyBlock.getArgument(1);
+
+    NLUnwindElementCountFunction elementCount = nullptr;
+    NLUnwindElementEmitFunction elementEmit = nullptr;
+    selectElementDrain(sourceElement, elementValue.getType(), elementCount, elementEmit);
+
+    Column* const elementOutput = elementEmit ? allocColumn(elementValue) : nullptr;
+
+    const mlir::Value resultValue = reduce.getResult();
+    const mlir::Type resultType = resultValue.getType();
+    Column* const result = allocColumnForChunkType(resultType);
+    _valueSlots[resultValue] = result;
+
+    const mlir::Value initialValue = reduce.getInitialValue();
+    const Column* initial = getColumn(initialValue);
+
+    NLReduceData* data = _program->allocFunctionData<NLReduceData>(source,
+                                                                   elementCount,
+                                                                   elementEmit,
+                                                                   selectCellAbsent(sourceElement),
+                                                                   elementOutput,
+                                                                   initial,
+                                                                   result,
+                                                                   _program->allocStepBuffers());
+
+    const size_t chunkSize = _program->getChunkSize();
+    data->getRows()->reserve(chunkSize);
+    data->getPositions()->reserve(chunkSize);
+
+    if (!elementEmit) {
+        const NLCarriedColumn elementColumn(source,
+                                            allocColumn(elementValue),
+                                            selectGatherForChunkType(sourceValue.getType()));
+        data->addCarriedColumn(elementColumn);
+    }
+
+    const NLCarriedColumn accumulatorColumn(result,
+                                            allocColumn(accumulatorValue),
+                                            selectGatherForChunkType(resultType));
+    data->addCarriedColumn(accumulatorColumn);
+
+    const mlir::OperandRange carriedColumns = reduce.getColumnsToFilter();
+    for (size_t carriedIndex = 0; carriedIndex < carriedColumns.size(); carriedIndex++) {
+        const mlir::Value bodyChunk = bodyBlock.getArgument(static_cast<unsigned>(2 + carriedIndex));
+
+        const NLCarriedColumn carriedColumn(getColumn(carriedColumns[carriedIndex]),
+                                            allocColumn(bodyChunk),
+                                            selectGatherForChunkType(bodyChunk.getType()));
+        data->addCarriedColumn(carriedColumn);
+    }
+
+    translateBlock(bodyBlock, data->getStmts());
+
+    const mlir::Value yieldedValue = mlir::cast<nl::ReduceYield>(bodyBlock.back()).getValue();
+    const Column* yielded = getColumn(yieldedValue);
+    data->setValue(yielded);
+
+    const bool accumulatesTaggedCells = isAnyChunk(resultType);
+
+    data->setReset(selectCaseResetForChunkType(resultType));
+    data->setWrites(selectCellWriteForChunkType(resultType, initial, initialValue.getType()),
+                    selectCellWriteForChunkType(resultType, yielded, yieldedValue.getType()));
+
+    const NLReownRowsFunction reownRows = accumulatesTaggedCells ? nullptr
+                                                                 : NLExecutor::selectReownRowsFunction(result);
+    data->setReowns(NLExecutor::selectReownFunction(result), reownRows);
+
+    body->emplaceStmt(&NLExecutor::runReduce, data);
+}
+
+template <typename CaseOp>
+void NLTranslator::translateCase(CaseOp caseOp, NLHandlerFunction run, NLStmtContainer* body) {
+    const mlir::Value resultValue = caseOp.getResult();
+    const mlir::Type resultChunkType = resultValue.getType();
+
+    Column* const result = allocColumnForChunkType(resultChunkType);
+    _valueSlots[resultValue] = result;
+
+    const mlir::OperandRange conditions = caseOp.getConditions();
+    const mlir::OperandRange values = caseOp.getValues();
+
+    // The first condition holds one row per row this step writes
+    NLCaseData* data = _program->allocFunctionData<NLCaseData>(getColumn(conditions.front()),
+                                                               result,
+                                                               selectCaseResetForChunkType(resultChunkType),
+                                                               _program->allocStepBuffers());
+
+    for (size_t branchIndex = 0; branchIndex < conditions.size(); branchIndex++) {
+        const mlir::Type conditionType = conditions[branchIndex].getType();
+        const mlir::Type valueChunkType = values[branchIndex].getType();
+
+        NLCaseData::Branch branch;
+        branch._condition = getColumn(conditions[branchIndex]);
+        branch._value = getColumn(values[branchIndex]);
+        branch._test = NLExecutor::selectCaseTest(branch._condition,
+                                                  isNullableChunk(conditionType),
+                                                  isUntypedNullChunk(conditionType));
+        branch._write = selectCellWriteForChunkType(resultChunkType, branch._value, valueChunkType);
+
+        data->addBranch(branch);
+    }
+
+    const mlir::Value defaultValue = caseOp.getDefaultValue();
+    if (defaultValue) {
+        const mlir::Type defaultType = defaultValue.getType();
+        const Column* const defaultColumn = getColumn(defaultValue);
+
+        data->setDefault(defaultColumn,
+                         selectCellWriteForChunkType(resultChunkType, defaultColumn, defaultType));
+    }
+
+    body->emplaceStmt(run, data);
+}
+
+void NLTranslator::translateIsNotTrue(nl::IsNotTrue isNotTrue, NLStmtContainer* body) {
+    const mlir::Value operandValue = isNotTrue.getOperand();
+    const Column* operand = getColumn(operandValue);
+
+    Column* result = nullptr;
+    const NLUnaryFn fn = NLExecutor::selectIsNotTrue(operand,
+                                                     isUntypedNullChunk(operandValue.getType()),
+                                                     _memory,
+                                                     result);
+
+    bindKernelResult(isNotTrue.getResult(), result);
+
+    NLUnaryData* data = _program->allocFunctionData<NLUnaryData>(operand, result, fn);
+    body->emplaceStmt(&NLExecutor::runUnary, data);
+}
+
+NLCaseResetFn NLTranslator::selectCaseResetForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isEntityIDElement(elementType)) {
+        return NLExecutor::selectEntityCaseReset(chunkKindFromElementType(elementType));
+    } else if (isAnyChunk(chunkType)) {
+        return NLExecutor::selectTaggedCellReset();
+    }
+
+    return NLExecutor::selectCaseReset(nullableChunkValueType(chunkType));
+}
+
+NLCellWrite NLTranslator::selectCellWriteForChunkType(mlir::Type resultChunkType,
+                                                      const Column* value,
+                                                      mlir::Type valueChunkType) {
+    if (!isAnyChunk(resultChunkType)) {
+        return NLCellWrite {._write = selectCaseWriteForChunkType(resultChunkType, value, valueChunkType)};
+    } else if (isUntypedNullChunk(valueChunkType)) {
+        return NLCellWrite {._write = NLExecutor::selectNullCellWrite()};
+    }
+
+    return NLCellWrite {._taggedRead = selectListItemRead(valueChunkType)};
+}
+
+NLCaseWriteFn NLTranslator::selectCaseWriteForChunkType(mlir::Type resultChunkType,
+                                                        const Column* value,
+                                                        mlir::Type valueChunkType) {
+    const auto resultChunk = mlir::cast<nl::ChunkType>(resultChunkType);
+    const mlir::Type resultElement = resultChunk.getElementType();
+
+    if (isEntityIDElement(resultElement)) {
+        return NLExecutor::selectEntityCaseWrite(chunkKindFromElementType(resultElement),
+                                                 isUntypedNullChunk(valueChunkType));
+    }
+
+    return NLExecutor::selectCaseWrite(nullableChunkValueType(resultChunkType),
+                                       value,
+                                       isNullableChunk(valueChunkType),
+                                       isUntypedNullChunk(valueChunkType));
+}
+
+void NLTranslator::translateUnaryFunction(mlir::Operation* op, NLStmtContainer* body) {
+    const NLUnaryFunctionSelector select = lookupUnaryFunctionSelector(*op);
+    bioassert(select, "translateUnaryFunction called on a non-function op");
+
+    const mlir::Value inputValue = op->getOperand(0);
+    const Column* input = getColumn(inputValue);
+
+    const auto inputChunk = mlir::cast<nl::ChunkType>(inputValue.getType());
+    const bool inputNullable = mlir::isa<storage::NullableType>(inputChunk.getElementType());
+
+    Column* result = nullptr;
+    const NLUnaryFunctionKernel kernel = select(input, inputNullable, _memory, result);
+    bindKernelResult(op->getResult(0), result);
+
+    NLUnaryFunctionData* data = _program->allocFunctionData<NLUnaryFunctionData>(input, result, kernel, _program->allocStepBuffers());
+    body->emplaceStmt(&NLExecutor::runUnaryFunction, data);
+}
+
+void NLTranslator::translateBinaryFunction(mlir::Operation* op, NLStmtContainer* body) {
+    const NLBinaryFunctionSelector select = lookupBinaryFunctionSelector(*op);
+    bioassert(select, "translateBinaryFunction called on a non-function op");
+
+    const Column* lhs = getColumn(op->getOperand(0));
+    const Column* rhs = getColumn(op->getOperand(1));
+
+    Column* result = nullptr;
+    const NLBinaryFn fn = select(lhs, rhs, _memory, result);
+    bindKernelResult(op->getResult(0), result);
+
+    NLBinaryData* data = _program->allocFunctionData<NLBinaryData>(lhs, rhs, result, fn, _program->allocStepBuffers());
+    body->emplaceStmt(&NLExecutor::runBinary, data);
+}
+
+void NLTranslator::translateFilter(nl::Filter filter, NLStmtContainer* body) {
+    const mlir::Value maskValue = filter.getMask();
+    const Column* mask = getColumn(maskValue);
+
+    const mlir::Type maskType = maskValue.getType();
+    const auto maskChunk = mlir::cast<nl::ChunkType>(maskType);
+    const bool maskNullable = mlir::isa<storage::NullableType>(maskChunk.getElementType());
+    const bool maskIsUntypedNull = isUntypedNullChunk(maskType);
+    const bool maskHoldsTaggedCells = isAnyChunk(maskType);
+    const NLMaskSurvivorFunction filterFunction =
+        NLExecutor::selectMaskSurvivorFunction(maskNullable, maskIsUntypedNull, maskHoldsTaggedCells);
+
+    NLFilterData* data = _program->allocFunctionData<NLFilterData>(mask, filterFunction);
+
+    // Reserve to avoid execution time allocations
+    data->getIndices()->reserve(_program->getChunkSize());
+
+    // New column for each result output, same types
+    const mlir::OperandRange columns = filter.getColumns();
+    const mlir::ResultRange results = filter.getResults();
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        const mlir::Value colVal = columns[columnIndex];
+        const mlir::Type colType = colVal.getType();
+
+        const Column* input = getColumn(colVal);
+        Column* output = allocColumnForChunkType(colType);
+        _valueSlots[results[columnIndex]] = output;
+
+        const NLGatherFunction gatherType = selectGatherForChunkType(colType);
+
+        const NLFilterData::FilterColumn column {input, output, gatherType};
+
+        data->addColumn(column);
+    }
+
+    body->emplaceStmt(&NLExecutor::runFilter, data);
+}
+
+void NLTranslator::translateFetchNodes(nl::FetchNodes fetch, NLStmtContainer* body) {
+    const mlir::Value idsValue = fetch.getIds();
+    const Column* ids = getColumn(idsValue);
+
+    const mlir::Value nodesValue = fetch.getNodes();
+    ColumnNodeIDs* nodes = static_cast<ColumnNodeIDs*>(allocColumnForChunkType(nodesValue.getType()));
+    _valueSlots[nodesValue] = nodes;
+
+    const NLFetchNodesFunction fetchFunction = selectFetchForChunkType(idsValue.getType());
+    NLFetchNodesData* data = _program->allocFunctionData<NLFetchNodesData>(ids, fetchFunction, nodes);
+
+    data->getIndices()->reserve(_program->getChunkSize());
+    nodes->reserve(_program->getChunkSize());
+
+    const mlir::OperandRange columns = fetch.getColumnsToFilter();
+    const mlir::ResultRange results = fetch.getCarried();
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        const mlir::Type columnType = columns[columnIndex].getType();
+
+        const Column* input = getColumn(columns[columnIndex]);
+        Column* output = allocColumnForChunkType(columnType);
+        _valueSlots[results[columnIndex]] = output;
+
+        data->addColumn(NLFilterData::FilterColumn {input, output, selectGatherForChunkType(columnType)});
+    }
+
+    body->emplaceStmt(&NLExecutor::runFetchNodes, data);
+}
+
+void NLTranslator::translateOutput(nl::Output output, NLStmtContainer* body) {
+    // The optional limit handle is a separate operand, so read just the columns;
+    // including it in this list would treat the handle as a chunk.
+    const mlir::OperandRange columns = output.getColumns();
+    if (columns.empty()) {
+        throw IRException("nl.output requires at least one column");
+    }
+
+    // Output is either the per-step sink inside an nl.for body, or - for an
+    // aggregate like COUNT that collapses to one row - a one-shot emit at function
+    // scope. Either way its per-row columns must be bound in the output's own block,
+    // which the per-column check below enforces: a loop variable of this loop, or a
+    // chunk materialized in this block (a property fetch, or nl.count_result at
+    // function scope). Two chunks cross that scope: a constant, and the single row a
+    // reduction collapsed to. Any other chunk from an outer or sibling loop fails the
+    // check.
+    mlir::Block* outputBlock = output->getBlock();
+
+    // A constant broadcasts to any step, since reading it ignores the row. A reduced
+    // row is one row and nothing here spreads it over more, so it crosses only into a
+    // step that is that single row.
+    const bool singleRowStep = stepKeepsASingleRow(outputBlock);
+
+    NLOutputData* outputData = _program->allocFunctionData<NLOutputData>();
+
+    outputData->setLimit(limitStateFor(output.getLimit()));
+    outputData->setSkip(skipStateFor(output.getSkip()));
+
+    if (const mlir::Value cardinality = output.getCardinality()) {
+        outputData->setCardinality(getColumn(cardinality));
+    }
+
+    for (const mlir::Value column : columns) {
+        const auto columnArgument = mlir::dyn_cast<mlir::BlockArgument>(column);
+        const bool isInnermostLoopVariable = columnArgument && columnArgument.getOwner() == outputBlock;
+
+        // A property fetch result is not a loop variable but an op result
+        // produced in this same loop body; it is equally available to output.
+        mlir::Operation* definingOp = column.getDefiningOp();
+        const bool isProducedInThisBlock = definingOp && definingOp->getBlock() == outputBlock;
+
+        const bool isConstant = yieldsConstantColumn(column);
+        const bool isReducedRow = singleRowStep && yieldsReducedRowChunk(column);
+
+        if (!isInnermostLoopVariable && !isProducedInThisBlock && !isConstant && !isReducedRow) {
+            throw IRException("nl.output columns must be a loop variable of the enclosing "
+                              "nl.for, produced in this block, a constant, or a reduced row");
+        }
+
+        const bool carriesRows = !isConstant && !isReducedRow;
+        const auto chunk = mlir::cast<nl::ChunkType>(column.getType());
+        if (mlir::isa<storage::PathRefType>(chunk.getElementType())) {
+            const ColumnVector<PathRef>* paths = static_cast<const ColumnVector<PathRef>*>(getColumn(column));
+            ColumnVector<ListView>* lists = static_cast<ColumnVector<ListView>*>(allocListColumn());
+            outputData->addExpandedPathColumn(paths, lists, carriesRows);
+            outputData->setTrie(&_memory->pathTrie());
+        } else {
+            outputData->addOutputColumn(getColumn(column), carriesRows);
+        }
+    }
+
+    _program->setOutputData(outputData);
+
+    // The names label the result, not one emission of it, so they go on the program
+    // rather than the per-step output data the limit and skip handles sit on.
+    if (const mlir::ArrayAttr columnNames = output.getColumnNamesAttr()) {
+        llvm::SmallVector<std::string_view> names;
+        for (const mlir::Attribute name : columnNames) {
+            const llvm::StringRef nameText = mlir::cast<mlir::StringAttr>(name).getValue();
+            names.emplace_back(nameText.data(), nameText.size());
+        }
+
+        _program->setColumnNames(names);
+    }
+
+    body->emplaceStmt(&NLExecutor::runOutput, outputData);
+}
+
+bool NLTranslator::stepKeepsASingleRow(mlir::Block* block) const {
+    // A cross product pairs what the loop bound with every row of another factor, so the
+    // block holds that product rather than the one row the loop stands for.
+    const bool crossesAnotherFactor = !block->getOps<nl::CrossProduct>().empty();
+    if (crossesAnotherFactor) {
+        return false;
+    }
+
+    nl::For forLoop = mlir::dyn_cast<nl::For>(block->getParentOp());
+    if (!forLoop) {
+        return true;
+    }
+
+    const auto configIt = _iteratorConfigs.find(forLoop.getIterator());
+    if (configIt == _iteratorConfigs.end()) {
+        return false;
+    }
+
+    const IteratorConfig& config = configIt->second;
+    const bool drainsACollect = config._kind == IteratorKind::Collect;
+
+    return drainsACollect && config._collectState->keyColumns().empty();
+}
+
+void NLTranslator::translateLimit(nl::Limit limit, NLStmtContainer* body) {
+    // Allocate the runtime counter and map the handle to it, so the loops, the
+    // update and the output that name the handle all find the same counter.
+    NLLimitState* state = _program->allocLimitState();
+    _limitStates[limit.getState()] = state;
+
+    // The reset runs each time the block holding this nl.limit runs: once at
+    // function scope for a top-level LIMIT, per enclosing step for a nested one.
+    const size_t count = limit.getCount();
+    NLLimitInitData* initData = _program->allocFunctionData<NLLimitInitData>(state, count);
+
+    body->emplaceStmt(&NLExecutor::runLimitInit, initData);
+}
+
+void NLTranslator::translateLimitRemaining(nl::LimitRemaining remaining, NLStmtContainer* body) {
+    NLLimitState* state = _program->allocLimitState();
+    _limitStates[remaining.getState()] = state;
+
+    const NLLimitState* source = limitStateFor(remaining.getSource());
+    NLLimitRemainingData* remainingData = _program->allocFunctionData<NLLimitRemainingData>(state, source);
+
+    body->emplaceStmt(&NLExecutor::runLimitRemaining, remainingData);
+}
+
+void NLTranslator::translateLimitUpdate(nl::LimitUpdate update, NLStmtContainer* body) {
+    // The handle is a required operand, so limitStateFor returns its counter or
+    // throws if it was not produced by an nl.limit.
+    NLLimitState* state = limitStateFor(update.getState());
+
+    const Column* representative = getColumn(update.getRows());
+    NLLimitUpdateData* updateData = _program->allocFunctionData<NLLimitUpdateData>(state, representative);
+
+    body->emplaceStmt(&NLExecutor::runLimitUpdate, updateData);
+}
+
+void NLTranslator::translateLimitTruncate(nl::LimitTruncate truncate, NLStmtContainer* body) {
+    // The handle is a required operand, so limitStateFor returns its counter or
+    // throws if it was not produced by an nl.limit.
+    NLLimitState* state = limitStateFor(truncate.getState());
+
+    NLLimitTruncateData* data = _program->allocFunctionData<NLLimitTruncateData>(state);
+
+    // One fresh output column per input, walked in step with the results the
+    // downstream consumers are mapped to.
+    const mlir::OperandRange columns = truncate.getColumns();
+    const mlir::ResultRange results = truncate.getResults();
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        addTruncateColumn(columns[columnIndex], results[columnIndex], data);
+    }
+
+    body->emplaceStmt(&NLExecutor::runLimitTruncate, data);
+}
+
+void NLTranslator::addTruncateColumn(mlir::Value inputValue,
+                                     mlir::Value resultValue,
+                                     NLLimitTruncateData* data) {
+    const Column* input = getColumn(inputValue);
+
+    const auto chunkType = mlir::cast<nl::ChunkType>(inputValue.getType());
+    const mlir::Type elementType = chunkType.getElementType();
+
+    // The output keeps the input's element type; only the row count is cut. The
+    // copy is a block-repeat with factor 1 (each input row once, stopping at
+    // emitThisStep), so it reuses the block-repeat broadcast families the cross
+    // product uses - by value type for a nullable value chunk, by chunk kind for
+    // an ID chunk, on uint64 for a count chunk.
+    Column* output = nullptr;
+    NLBroadcastFunction copyPrefix = nullptr;
+
+    if (isConstantColumn(input)) {
+        output = _memory->allocSame(input);
+        copyPrefix = NLExecutor::selectConstBlockRepeatFunction();
+    } else if (isNullableList(elementType)) {
+        output = allocOptListColumn();
+        copyPrefix = NLExecutor::selectOptListBlockRepeatFunction();
+    } else if (isNullableAny(elementType)) {
+        output = allocOptListElementColumn();
+        copyPrefix = NLExecutor::selectOptListElementBlockRepeatFunction();
+    } else if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const ValueType valueType = valueTypeFromElementType(nullableType.getValueType());
+        output = allocOptColumnForValueType(valueType);
+        copyPrefix = NLExecutor::selectOptBlockRepeatFunction(valueType);
+    } else if (isMaskElementType(elementType)) {
+        output = allocMaskColumn();
+        copyPrefix = NLExecutor::selectMaskBlockRepeat();
+    } else if (isPlainValueElementType(elementType)) {
+        const ValueType valueType = valueTypeFromElementType(elementType);
+        output = allocPlainColumn(valueType);
+        copyPrefix = NLExecutor::selectPlainBlockRepeatFunction(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        output = allocListElementColumn();
+        copyPrefix = NLExecutor::selectListElementBlockRepeatFunction();
+    } else if (mlir::isa<storage::MapElementType>(elementType)) {
+        output = allocMapEntryColumn();
+        copyPrefix = NLExecutor::selectMapEntryBlockRepeatFunction();
+    } else {
+        const NLChunkKind kind = getChunkKind(chunkType);
+        output = allocColumnForKind(kind);
+        copyPrefix = NLExecutor::selectBlockRepeatFunction(kind);
+    }
+
+    _valueSlots[resultValue] = output;
+
+    const NLCrossColumn truncateColumn(input, output, copyPrefix);
+    data->addColumn(truncateColumn);
+}
+
+NLLimitState* NLTranslator::limitStateFor(mlir::Value handle) const {
+    if (!handle) {
+        return nullptr;
+    }
+
+    const auto stateIt = _limitStates.find(handle);
+    if (stateIt == _limitStates.end()) {
+        throw IRException("limit handle must be produced by an nl.limit");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateSkip(nl::Skip skip, NLStmtContainer* body) {
+    // Allocate the runtime counter and map the handle to it, so the update and the
+    // truncate that name the handle both find the same counter.
+    NLSkipState* state = _program->allocSkipState();
+    _skipStates[skip.getState()] = state;
+
+    // The reset runs each time the block holding this nl.skip runs: once at
+    // function scope for a top-level SKIP.
+    const size_t count = skip.getCount();
+    NLSkipInitData* initData = _program->allocFunctionData<NLSkipInitData>(state, count);
+
+    body->emplaceStmt(&NLExecutor::runSkipInit, initData);
+}
+
+void NLTranslator::translateSkipUpdate(nl::SkipUpdate update, NLStmtContainer* body) {
+    // The handle is a required operand, so skipStateFor returns its counter or
+    // throws if it was not produced by an nl.skip.
+    NLSkipState* state = skipStateFor(update.getState());
+
+    const Column* representative = getColumn(update.getRows());
+    NLSkipUpdateData* updateData = _program->allocFunctionData<NLSkipUpdateData>(state, representative);
+
+    body->emplaceStmt(&NLExecutor::runSkipUpdate, updateData);
+}
+
+void NLTranslator::translateSkipTruncate(nl::SkipTruncate truncate, NLStmtContainer* body) {
+    // The handle is a required operand, so skipStateFor returns its counter or
+    // throws if it was not produced by an nl.skip.
+    NLSkipState* state = skipStateFor(truncate.getState());
+
+    NLSkipTruncateData* data = _program->allocFunctionData<NLSkipTruncateData>(state);
+
+    // One fresh output column per input, walked in step with the results the
+    // downstream consumers are mapped to.
+    const mlir::OperandRange columns = truncate.getColumns();
+    const mlir::ResultRange results = truncate.getResults();
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        addSkipColumn(columns[columnIndex], results[columnIndex], data);
+    }
+
+    body->emplaceStmt(&NLExecutor::runSkipTruncate, data);
+}
+
+void NLTranslator::addSkipColumn(mlir::Value inputValue,
+                                 mlir::Value resultValue,
+                                 NLSkipTruncateData* data) {
+    const Column* input = getColumn(inputValue);
+
+    const auto chunkType = mlir::cast<nl::ChunkType>(inputValue.getType());
+    const mlir::Type elementType = chunkType.getElementType();
+
+    // The output keeps the input's element type; only the dropped prefix is
+    // removed. The copy is a range copy of the surviving suffix to the front of a
+    // fresh chunk, so it uses the copy families - by value type for a nullable
+    // value chunk, by chunk kind for an ID chunk, on uint64 for a count chunk.
+    Column* output = nullptr;
+    NLCopyFunction copySuffix = nullptr;
+
+    if (isConstantColumn(input)) {
+        output = _memory->allocSame(input);
+        copySuffix = NLExecutor::selectConstCopyFunction();
+    } else if (isNullableList(elementType)) {
+        output = allocOptListColumn();
+        copySuffix = NLExecutor::selectOptListCopyFunction();
+    } else if (isNullableAny(elementType)) {
+        output = allocOptListElementColumn();
+        copySuffix = NLExecutor::selectOptListElementCopyFunction();
+    } else if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+        if (isIDElement(wrappedType)) {
+            const NLChunkKind kind = chunkKindFromElementType(wrappedType);
+
+            output = allocOptIDColumn(kind);
+            copySuffix = NLExecutor::selectOptCopyFunction(kind);
+        } else {
+            const ValueType valueType = valueTypeFromElementType(wrappedType);
+            output = allocOptColumnForValueType(valueType);
+            copySuffix = NLExecutor::selectOptCopyFunction(valueType);
+        }
+    } else if (isMaskElementType(elementType)) {
+        output = allocMaskColumn();
+        copySuffix = NLExecutor::selectMaskCopy();
+    } else if (isPlainValueElementType(elementType)) {
+        const ValueType valueType = valueTypeFromElementType(elementType);
+        output = allocPlainColumn(valueType);
+        copySuffix = NLExecutor::selectPlainCopyFunction(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        output = allocListElementColumn();
+        copySuffix = NLExecutor::selectListElementCopyFunction();
+    } else if (mlir::isa<storage::MapElementType>(elementType)) {
+        output = allocMapEntryColumn();
+        copySuffix = NLExecutor::selectMapEntryCopyFunction();
+    } else {
+        const NLChunkKind kind = getChunkKind(chunkType);
+        output = allocColumnForKind(kind);
+        copySuffix = NLExecutor::selectCopyFunction(kind);
+    }
+
+    _valueSlots[resultValue] = output;
+
+    const NLSkipColumn skipColumn(input, output, copySuffix);
+    data->addColumn(skipColumn);
+}
+
+NLSkipState* NLTranslator::skipStateFor(mlir::Value handle) const {
+    if (!handle) {
+        return nullptr;
+    }
+
+    const auto stateIt = _skipStates.find(handle);
+    if (stateIt == _skipStates.end()) {
+        throw IRException("skip handle must be produced by an nl.skip");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateSortBuffer(nl::SortBuffer buffer, NLStmtContainer* body) {
+    // Allocate the runtime accumulator and map the handle to it, so the collect
+    // and the emit loop that name the handle share the same buffers. The buffer
+    // columns themselves are allocated by the collect, which knows their types.
+    NLSortState* state = _program->allocSortState();
+    _sortStates[buffer.getState()] = state;
+
+    // A fused ORDER BY ... LIMIT carries the bound as the top-K count, so the
+    // accumulator keeps only the best k rows. Absent, it keeps every row.
+    if (const std::optional<uint64_t> topK = buffer.getTopK()) {
+        state->setTopK(*topK);
+    }
+
+    // The reset empties the buffers each time the block holding this nl.sort_buffer
+    // runs: once at function scope for a top-level ORDER BY.
+    NLSortResetData* resetData = _program->allocFunctionData<NLSortResetData>(state);
+    body->emplaceStmt(&NLExecutor::runSortReset, resetData);
+}
+
+void NLTranslator::translateSortCollect(nl::SortCollect collect, NLStmtContainer* body) {
+    const mlir::Value collectState = collect.getState();
+    NLSortState* state = sortStateFor(collectState);
+
+    // The sort spec lives on the nl.sort_buffer that produced the handle.
+    nl::SortBuffer buffer = collectState.getDefiningOp<nl::SortBuffer>();
+    if (!buffer) {
+        throw IRException("sort_collect state must come from nl.sort_buffer");
+    }
+
+    // The buffers are allocated once, by the single collect feeding a buffer.
+    // Generated IR has exactly one collect per accumulator; a second would append
+    // to the same buffers and double the rows, so it is rejected here.
+    if (!state->buffers().empty()) {
+        throw IRException("an nl.sort_buffer must be fed by a single nl.sort_collect");
+    }
+
+    NLSortCollectData* data = _program->allocFunctionData<NLSortCollectData>(state);
+
+    // One growing buffer per collected column, row-aligned. The buffer keeps the
+    // column's element type; the append copies a chunk's rows onto its tail. A
+    // bounded accumulator also gets a compaction scratch column and the gather
+    // that fills it, so the trim can drop all but the best k rows.
+    const bool bounded = state->isBounded();
+    const mlir::OperandRange columns = collect.getColumns();
+    for (const mlir::Value column : columns) {
+        Column* bufferColumn = allocColumnForChunkType(column.getType());
+
+        Column* tempColumn = bounded ? allocColumnForChunkType(column.getType()) : nullptr;
+        const NLGatherFunction gather = bounded ? selectGatherForChunkType(column.getType()) : nullptr;
+        state->addColumnBuffer(bufferColumn, tempColumn, gather);
+
+        const mlir::Type columnType = column.getType();
+        const NLOwnedAppendFunction appendOwned = NLExecutor::selectOwnedAppendFunction(bufferColumn);
+        const NLAppendFunction append = appendOwned ? nullptr : selectAppendForChunkType(columnType);
+
+        data->addAppend(NLSortCollectData::Append {getColumn(column),
+                                                   bufferColumn,
+                                                   append,
+                                                   appendOwned});
+    }
+
+    // Build the comparators from the spec, most significant key first. Each key
+    // indexes a collected column, so the index must be in range, and the column's
+    // element type must have an order (an embedding key is rejected by the
+    // selector). The buffer column is the one the comparator reads at run time.
+    const llvm::ArrayRef<int64_t> keyColumns = buffer.getKeyColumns();
+    const llvm::ArrayRef<bool> keyAscending = buffer.getKeyAscending();
+    for (size_t keyIndex = 0; keyIndex < keyColumns.size(); keyIndex++) {
+        const int64_t keyColumn = keyColumns[keyIndex];
+        const bool inRange = keyColumn >= 0 && static_cast<size_t>(keyColumn) < columns.size();
+        if (!inRange) {
+            throw IRException("sort key column index is out of range");
+        }
+
+        const mlir::Type keyType = columns[static_cast<size_t>(keyColumn)].getType();
+        const NLSortState::Key key {state->buffer(static_cast<size_t>(keyColumn)),
+                                    keyAscending[keyIndex],
+                                    selectCompareForChunkType(keyType)};
+        state->addKey(key);
+    }
+
+    body->emplaceStmt(&NLExecutor::runSortCollect, data);
+}
+
+void NLTranslator::translateSortLoop(const IteratorConfig& config,
+                                     mlir::Block& loopBody,
+                                     NLLimitState* limit,
+                                     NLStmtContainer* body) {
+    NLSortState* state = config._sortState;
+    if (!state) {
+        throw IRException("nl.sort iterator must carry a sort accumulator");
+    }
+
+    // For::verify binds one loop variable per iterator chunk, and the sort
+    // iterator's chunk types are the collected column types, so the loop must
+    // take exactly one variable per buffer.
+    const size_t bufferCount = state->buffers().size();
+    if (loopBody.getNumArguments() != bufferCount) {
+        throw IRException("nl.sort loop must bind one variable per collected column");
+    }
+
+    NLSortLoopData* loopData = _program->allocFunctionData<NLSortLoopData>(state);
+    loopData->setLimit(limit);
+
+    // Reserve the permutation-slice scratch so the per-step gather stays
+    // allocation-free, the same as the edge loop's indices column.
+    loopData->getIndices()->reserve(_program->getChunkSize());
+
+    // Each loop variable is filled from its buffer by gathering the rows the
+    // current emit step covers, in permutation order. The buffer is the read
+    // side, the loop variable the write side - the NLCarriedColumn (input,
+    // output, gather) shape the edge loops already use.
+    for (size_t columnIndex = 0; columnIndex < bufferCount; columnIndex++) {
+        const mlir::Value loopVariable = loopBody.getArgument(static_cast<unsigned>(columnIndex));
+
+        Column* output = allocColumnForChunkType(loopVariable.getType());
+        _valueSlots[loopVariable] = output;
+
+        const NLCarriedColumn column(state->buffer(columnIndex),
+                                     output,
+                                     selectGatherForChunkType(loopVariable.getType()));
+        loopData->addColumn(column);
+    }
+
+    body->emplaceStmt(&NLExecutor::runSortLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateRowBuffer(nl::RowBuffer buffer, NLStmtContainer* body) {
+    NLRowState* state = _program->allocRowState();
+    _rowStates[buffer.getState()] = state;
+
+    NLRowResetData* resetData = _program->allocFunctionData<NLRowResetData>(state);
+    body->emplaceStmt(&NLExecutor::runRowReset, resetData);
+}
+
+void NLTranslator::translateRowCollect(nl::RowCollect collect, NLStmtContainer* body) {
+    NLRowState* state = rowStateFor(collect.getState());
+    const mlir::OperandRange columns = collect.getColumns();
+
+    if (state->buffers().empty()) {
+        for (const mlir::Value column : columns) {
+            state->addBuffer(allocColumnForChunkType(column.getType()));
+        }
+    } else if (state->buffers().size() != columns.size()) {
+        throw IRException("every nl.row_collect of an accumulator must append the same number of columns");
+    }
+
+    NLRowCollectData* data = _program->allocFunctionData<NLRowCollectData>(state);
+
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        const mlir::Value column = columns[columnIndex];
+        const mlir::Type columnType = column.getType();
+
+        Column* bufferColumn = state->buffer(columnIndex);
+
+        const NLOwnedAppendFunction appendOwned = NLExecutor::selectOwnedAppendFunction(bufferColumn);
+        const NLAppendFunction append = appendOwned ? nullptr : selectAppendForChunkType(columnType);
+
+        data->addAppend(NLSortCollectData::Append {getColumn(column),
+                                                   bufferColumn,
+                                                   append,
+                                                   appendOwned});
+    }
+
+    body->emplaceStmt(&NLExecutor::runRowCollect, data);
+}
+
+void NLTranslator::translateRowLoop(const IteratorConfig& config,
+                                    mlir::Block& loopBody,
+                                    NLLimitState* limit,
+                                    NLStmtContainer* body) {
+    NLRowState* state = config._rowState;
+
+    const size_t bufferCount = state->buffers().size();
+    if (loopBody.getNumArguments() != bufferCount) {
+        throw IRException("nl.row_drain loop must bind one variable per collected column");
+    }
+
+    NLRowLoopData* loopData = _program->allocFunctionData<NLRowLoopData>(state);
+    loopData->setLimit(limit);
+    loopData->getIndices()->reserve(_program->getChunkSize());
+
+    for (size_t columnIndex = 0; columnIndex < bufferCount; columnIndex++) {
+        const mlir::Value loopVariable = loopBody.getArgument(static_cast<unsigned>(columnIndex));
+
+        Column* output = allocColumnForChunkType(loopVariable.getType());
+        _valueSlots[loopVariable] = output;
+
+        const NLCarriedColumn column(state->buffer(columnIndex),
+                                     output,
+                                     selectGatherForChunkType(loopVariable.getType()));
+        loopData->addColumn(column);
+    }
+
+    body->emplaceStmt(&NLExecutor::runRowLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+NLRowState* NLTranslator::rowStateFor(mlir::Value handle) const {
+    const auto stateIt = _rowStates.find(handle);
+    if (stateIt == _rowStates.end()) {
+        throw IRException("row handle must be produced by an nl.row_buffer");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateOptionalBuffer(nl::OptionalBuffer buffer, NLStmtContainer* body) {
+    NLOptionalState* state = _program->allocOptionalState();
+    _optionalStates[buffer.getState()] = state;
+
+    // This step's own chunks: the drain rebuilds the rows the pattern missed out of them,
+    // and their row count is how many matched flags the reset clears.
+    for (const mlir::Value column : buffer.getInputColumns()) {
+        state->addInputColumn(getColumn(column));
+    }
+
+    ColumnVector<uint64_t>* tag = static_cast<ColumnVector<uint64_t>*>(allocColumn(buffer.getTag()));
+
+    NLOptionalResetData* resetData = _program->allocFunctionData<NLOptionalResetData>(state, tag);
+    body->emplaceStmt(&NLExecutor::runOptionalReset, resetData);
+}
+
+void NLTranslator::translateOptionalCollect(nl::OptionalCollect collect, NLStmtContainer* body) {
+    NLOptionalState* state = optionalStateFor(collect.getState());
+
+    // The buffers are allocated once, by the single collect feeding an accumulator.
+    // Generated IR has exactly one collect per accumulator; a second would append to the
+    // same buffers and double the rows, so it is rejected here as a sort's is.
+    if (!state->buffers().empty()) {
+        throw IRException("an nl.optional_buffer must be fed by a single nl.optional_collect");
+    }
+
+    NLOptionalCollectData* data = _program->allocFunctionData<NLOptionalCollectData>(state);
+
+    if (const mlir::Value tag = collect.getTag()) {
+        data->setTag(static_cast<const ColumnVector<uint64_t>*>(getColumn(tag)));
+    }
+
+    // One growing buffer per column the pattern contributes, row-aligned. The buffer keeps
+    // the column's element type; the append copies a chunk's rows onto its tail.
+    for (const mlir::Value column : collect.getColumns()) {
+        Column* bufferColumn = allocColumnForChunkType(column.getType());
+        state->addMatchedBuffer(bufferColumn);
+
+        const NLOwnedAppendFunction appendOwned = NLExecutor::selectOwnedAppendFunction(bufferColumn);
+        const NLAppendFunction append = appendOwned ? nullptr : selectAppendForChunkType(column.getType());
+
+        data->addAppend(NLSortCollectData::Append {getColumn(column),
+                                                   bufferColumn,
+                                                   append,
+                                                   appendOwned});
+    }
+
+    body->emplaceStmt(&NLExecutor::runOptionalCollect, data);
+}
+
+void NLTranslator::translateOptionalDrainLoop(const IteratorConfig& config,
+                                              mlir::Block& loopBody,
+                                              NLLimitState* limit,
+                                              NLStmtContainer* body) {
+    NLOptionalState* state = config._optionalState;
+    if (!state) {
+        throw IRException("nl.optional_drain iterator must carry an optional accumulator");
+    }
+
+    // For::verify binds one loop variable per iterator chunk, and the drain iterator's
+    // chunk types are the collected column types, so the loop must take one per buffer.
+    const size_t bufferCount = state->buffers().size();
+    if (loopBody.getNumArguments() != bufferCount) {
+        throw IRException("nl.optional_drain loop must bind one variable per collected column");
+    }
+
+    NLOptionalDrainLoopData* loopData = _program->allocFunctionData<NLOptionalDrainLoopData>(state);
+    loopData->setLimit(limit);
+
+    // Reserve the row-slice scratch so the per-step gather stays allocation-free, the same
+    // as the edge loop's indices column.
+    loopData->getIndices()->reserve(_program->getChunkSize());
+
+    // The columns the pattern joined onto come first, in the order it yielded them back,
+    // so the first inputColumns().size() of them are the ones a missed row is rebuilt from.
+    const std::vector<const Column*>& inputColumns = state->inputColumns();
+
+    for (size_t columnIndex = 0; columnIndex < bufferCount; columnIndex++) {
+        const mlir::Value loopVariable = loopBody.getArgument(static_cast<unsigned>(columnIndex));
+        const mlir::Type chunkType = loopVariable.getType();
+
+        Column* output = allocColumnForChunkType(chunkType);
+        _valueSlots[loopVariable] = output;
+
+        const bool joinedOnto = columnIndex < inputColumns.size();
+
+        NLOptionalDrainLoopData::DrainColumn column;
+        column._buffer = state->buffers()[columnIndex];
+        column._input = joinedOnto ? inputColumns[columnIndex] : nullptr;
+        column._output = output;
+        column._gather = selectGatherForChunkType(chunkType);
+        column._fillNull = joinedOnto ? nullptr : selectFillNullForChunkType(chunkType);
+
+        loopData->addColumn(column);
+    }
+
+    body->emplaceStmt(&NLExecutor::runOptionalDrainLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateExistsBuffer(nl::ExistsBuffer buffer, NLStmtContainer* body) {
+    NLExistsState* state = _program->allocExistsState();
+    _existsStates[buffer.getState()] = state;
+
+    translateSubqueryExpressionReset(state, buffer.getInputColumns(), buffer.getTag(), body);
+}
+
+void NLTranslator::translateExistsMark(nl::ExistsMark mark, NLStmtContainer* body) {
+    NLExistsState* state = existsStateFor(mark.getState());
+
+    NLExistsMarkData* data = _program->allocFunctionData<NLExistsMarkData>(state);
+
+    if (const mlir::Value tag = mark.getTag()) {
+        data->setTag(static_cast<const ColumnVector<uint64_t>*>(getColumn(tag)));
+    }
+
+    for (const mlir::Value column : mark.getColumns()) {
+        data->addColumn(getColumn(column));
+    }
+
+    body->emplaceStmt(&NLExecutor::runExistsMark, data);
+}
+
+void NLTranslator::translateExistsResult(nl::ExistsResult result, NLStmtContainer* body) {
+    NLExistsState* state = existsStateFor(result.getState());
+
+    ColumnMask* answer = static_cast<ColumnMask*>(allocColumn(result.getResult()));
+
+    NLExistsResultData* data = _program->allocFunctionData<NLExistsResultData>(state, answer);
+    body->emplaceStmt(&NLExecutor::runExistsResult, data);
+}
+
+NLExistsState* NLTranslator::existsStateFor(mlir::Value handle) const {
+    const auto stateIt = _existsStates.find(handle);
+    if (stateIt == _existsStates.end()) {
+        throw IRException("exists handle must be produced by an nl.exists_buffer");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateCountSubqueryBuffer(nl::CountSubqueryBuffer buffer, NLStmtContainer* body) {
+    NLCountSubqueryState* state = _program->allocCountSubqueryState();
+    _countSubqueryStates[buffer.getState()] = state;
+
+    translateSubqueryExpressionReset(state, buffer.getInputColumns(), buffer.getTag(), body);
+}
+
+void NLTranslator::translateSubqueryExpressionReset(NLSubqueryExpressionState* state,
+                                                    mlir::OperandRange inputColumns,
+                                                    mlir::Value tag,
+                                                    NLStmtContainer* body) {
+    // This step's own chunks: their row count is how many answers the reset clears, and how
+    // many the result lays out.
+    for (const mlir::Value column : inputColumns) {
+        state->addInputColumn(getColumn(column));
+    }
+
+    ColumnVector<uint64_t>* tagColumn = static_cast<ColumnVector<uint64_t>*>(allocColumn(tag));
+
+    NLSubqueryExpressionResetData* resetData = _program->allocFunctionData<NLSubqueryExpressionResetData>(state, tagColumn);
+    body->emplaceStmt(&NLExecutor::runSubqueryExpressionReset, resetData);
+}
+
+void NLTranslator::translateCountSubqueryTally(nl::CountSubqueryTally tally, NLStmtContainer* body) {
+    NLCountSubqueryState* state = countSubqueryStateFor(tally.getState());
+
+    const ColumnVector<uint64_t>* tag = nullptr;
+    if (const mlir::Value tagValue = tally.getTag()) {
+        tag = static_cast<const ColumnVector<uint64_t>*>(getColumn(tagValue));
+    }
+
+    const Column* rows = nullptr;
+    if (const mlir::Value rowsValue = tally.getRows()) {
+        rows = getColumn(rowsValue);
+    }
+
+    NLCountSubqueryTallyData* data = _program->allocFunctionData<NLCountSubqueryTallyData>(state, tag, rows);
+    body->emplaceStmt(&NLExecutor::runCountSubqueryTally, data);
+}
+
+void NLTranslator::translateCountSubqueryResult(nl::CountSubqueryResult result, NLStmtContainer* body) {
+    NLCountSubqueryState* state = countSubqueryStateFor(result.getState());
+
+    ColumnVector<uint64_t>* counts = static_cast<ColumnVector<uint64_t>*>(allocColumn(result.getResult()));
+
+    NLCountSubqueryResultData* data = _program->allocFunctionData<NLCountSubqueryResultData>(state, counts);
+    body->emplaceStmt(&NLExecutor::runCountSubqueryResult, data);
+}
+
+NLCountSubqueryState* NLTranslator::countSubqueryStateFor(mlir::Value handle) const {
+    const auto stateIt = _countSubqueryStates.find(handle);
+    if (stateIt == _countSubqueryStates.end()) {
+        throw IRException("count subquery handle must be produced by an nl.count_subquery_buffer");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateRowListsBuffer(nl::RowListsBuffer buffer, NLStmtContainer* body) {
+    NLRowListsState* state = _program->allocRowListsState();
+    _rowListsStates[buffer.getState()] = state;
+
+    const mlir::Value cardinality = buffer.getCardinality();
+    const Column* const rows = cardinality ? getColumn(cardinality) : nullptr;
+
+    ColumnVector<uint64_t>* tag = static_cast<ColumnVector<uint64_t>*>(allocColumn(buffer.getTag()));
+
+    NLRowListsResetData* resetData =
+        _program->allocFunctionData<NLRowListsResetData>(state, rows, tag);
+    body->emplaceStmt(&NLExecutor::runRowListsReset, resetData);
+}
+
+void NLTranslator::translateRowListsCollect(nl::RowListsCollect collect, NLStmtContainer* body) {
+    NLRowListsState* state = rowListsStateFor(collect.getState());
+
+    const mlir::Value value = collect.getValue();
+    const mlir::Value tag = collect.getTag();
+
+    const ColumnVector<uint64_t>* tagColumn = nullptr;
+    if (tag) {
+        tagColumn = static_cast<const ColumnVector<uint64_t>*>(getColumn(tag));
+    }
+
+    NLRowListsCollectData* data =
+        _program->allocFunctionData<NLRowListsCollectData>(state,
+                                                           tagColumn,
+                                                           getColumn(value),
+                                                           selectListItemRead(value.getType()),
+                                                           _program->allocStepBuffers());
+    body->emplaceStmt(&NLExecutor::runRowListsCollect, data);
+}
+
+void NLTranslator::translateRowListsResult(nl::RowListsResult result, NLStmtContainer* body) {
+    NLRowListsState* state = rowListsStateFor(result.getState());
+
+    const mlir::Value resultValue = result.getResult();
+    Column* const lists = allocColumnForChunkType(resultValue.getType());
+    _valueSlots[resultValue] = lists;
+
+    NLRowListsResultData* data =
+        _program->allocFunctionData<NLRowListsResultData>(state,
+                                                          static_cast<ColumnVector<ListView>*>(lists),
+                                                          _program->allocStepBuffers());
+    body->emplaceStmt(&NLExecutor::runRowListsResult, data);
+}
+
+NLRowListsState* NLTranslator::rowListsStateFor(mlir::Value handle) const {
+    const auto stateIt = _rowListsStates.find(handle);
+    if (stateIt == _rowListsStates.end()) {
+        throw IRException("row lists handle must be produced by an nl.row_lists_buffer");
+    }
+
+    return stateIt->second;
+}
+
+NLOptionalState* NLTranslator::optionalStateFor(mlir::Value handle) const {
+    const auto stateIt = _optionalStates.find(handle);
+    if (stateIt == _optionalStates.end()) {
+        throw IRException("optional handle must be produced by an nl.optional_buffer");
+    }
+
+    return stateIt->second;
+}
+
+NLSortState* NLTranslator::sortStateFor(mlir::Value handle) const {
+    const auto stateIt = _sortStates.find(handle);
+    if (stateIt == _sortStates.end()) {
+        throw IRException("sort handle must be produced by an nl.sort_buffer");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateHashJoinBuffer(nl::HashJoinBuffer buffer, NLStmtContainer* body) {
+    // Allocate the runtime build side and map the handle to it, so the collect and the
+    // probe that name the handle share the same buffers and index. The buffer columns
+    // themselves are allocated by the collect, which knows their types.
+    NLHashJoinState* state = _program->allocHashJoinState();
+    _hashJoinStates[buffer.getState()] = state;
+
+    // The reset empties the buffers and the index each time the block holding this
+    // nl.hash_join_buffer runs: once at function scope for a top-level join.
+    NLHashJoinResetData* resetData = _program->allocFunctionData<NLHashJoinResetData>(state);
+    body->emplaceStmt(&NLExecutor::runHashJoinReset, resetData);
+}
+
+void NLTranslator::translateHashJoinCollect(nl::HashJoinCollect collect, NLStmtContainer* body) {
+    const mlir::Value collectState = collect.getState();
+    NLHashJoinState* state = hashJoinStateFor(collectState);
+
+    // The buffers are allocated once, by the single collect feeding a build side.
+    // Generated IR has exactly one collect per build side; a second would append to the
+    // same buffers and index the same rows twice, so it is rejected here.
+    if (!state->buffers().empty()) {
+        throw IRException("an nl.hash_join_buffer must be fed by a single nl.hash_join_collect");
+    }
+
+    const mlir::OperandRange columns = collect.getColumns();
+    const uint64_t buildKey = hashJoinBufferOf(collectState).getBuildKey();
+    if (buildKey >= columns.size()) {
+        throw IRException("hash join build key column index is out of range");
+    }
+
+    NLHashJoinCollectData* data = _program->allocFunctionData<NLHashJoinCollectData>(state);
+
+    // One growing buffer per build column, row-aligned. The buffer keeps the column's
+    // element type; the append copies a chunk's rows onto its tail, exactly as a sort
+    // accumulates them. The types are recorded beside them for the probe, which declares
+    // these columns among its own results and is checked against what was allocated here.
+    llvm::SmallVector<mlir::Type, 4>& buildTypes = _hashJoinBuildTypes[collectState];
+
+    for (const mlir::Value column : columns) {
+        const mlir::Type chunkType = column.getType();
+        buildTypes.push_back(chunkType);
+
+        Column* bufferColumn = allocColumnForChunkType(chunkType);
+        state->addColumnBuffer(bufferColumn);
+
+        const NLOwnedAppendFunction appendOwned = NLExecutor::selectOwnedAppendFunction(bufferColumn);
+        const NLAppendFunction append = appendOwned ? nullptr : selectAppendForChunkType(chunkType);
+
+        data->addAppend(NLSortCollectData::Append {getColumn(column),
+                                                   bufferColumn,
+                                                   append,
+                                                   appendOwned});
+    }
+
+    // The key is one of those columns, read a second time to chain each row under its
+    // hash; the match gate keeps a row no probe key can match - a null, a NaN - out of
+    // the index.
+    const mlir::Value keyColumn = columns[buildKey];
+    data->setKeyColumns(getColumn(keyColumn),
+                        state->buffer(buildKey),
+                        selectJoinKeyFunctionsForChunkType(keyColumn.getType()),
+                        selectKeyMatchableForChunkType(keyColumn.getType()));
+    data->getHashScratch()->reserve(_program->getChunkSize());
+
+    body->emplaceStmt(&NLExecutor::runHashJoinCollect, data);
+}
+
+void NLTranslator::translateHashJoinProbeLoop(const IteratorConfig& config,
+                                              mlir::Block& loopBody,
+                                              NLLimitState* limit,
+                                              NLStmtContainer* body) {
+    const mlir::Value probeState = config._hashJoinState;
+    NLHashJoinState* state = hashJoinStateFor(probeState);
+
+    const std::span<const mlir::Value> columns = config._probeColumns;
+
+    // The build buffers are allocated by the collect, which the lowering places in the
+    // build loop ahead of this probe, so by here they say how many columns the build side
+    // contributes - and the loop binds one variable per probe column, then one per build
+    // column, the order the iterator lays its chunks out in.
+    const size_t buildCount = state->buffers().size();
+    if (loopBody.getNumArguments() != columns.size() + buildCount) {
+        throw IRException("nl.hash_join_probe emits one column per probe column and per build column");
+    }
+
+    nl::HashJoinBuffer buffer = hashJoinBufferOf(probeState);
+    const uint64_t probeKey = buffer.getProbeKey();
+    const uint64_t buildKey = buffer.getBuildKey();
+    if (probeKey >= columns.size()) {
+        throw IRException("hash join probe key column index is out of range");
+    }
+
+    NLHashJoinProbeLoopData* data = _program->allocFunctionData<NLHashJoinProbeLoopData>(state);
+    data->setLimit(limit);
+
+    // Reserve the matched-pair scratches so a step that pairs no more than a chunk's worth
+    // of rows stays allocation-free, the same as the edge and sort loops' indices.
+    data->getProbeIndices()->reserve(_program->getChunkSize());
+    data->getBuildIndices()->reserve(_program->getChunkSize());
+    data->getHashScratch()->reserve(_program->getChunkSize());
+
+    // A probe column is read from this step's chunk and repeated once per match; a build
+    // column is read back from its buffer at the matched row. Both are the gather the
+    // edge and sort loops use, over the pair of index scratches the probe fills.
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        const mlir::Value column = columns[columnIndex];
+
+        Column* output = allocColumnForChunkType(column.getType());
+        _valueSlots[loopBody.getArgument(static_cast<unsigned>(columnIndex))] = output;
+
+        data->addProbeColumn(NLCarriedColumn(getColumn(column),
+                                             output,
+                                             selectGatherForChunkType(column.getType())));
+    }
+
+    // A build chunk is gathered out of the buffer the collect allocated, so the type the
+    // iterator declares has to be the type that buffer holds: reading a column of one
+    // element type as another would take its rows apart at the wrong width.
+    const llvm::SmallVector<mlir::Type, 4>& buildTypes = _hashJoinBuildTypes[probeState];
+    for (size_t columnIndex = 0; columnIndex < buildCount; columnIndex++) {
+        const mlir::Value bound = loopBody.getArgument(static_cast<unsigned>(columns.size() + columnIndex));
+        const mlir::Type bufferType = buildTypes[columnIndex];
+
+        if (bound.getType() != bufferType) {
+            throw IRException("nl.hash_join_probe must declare each build chunk as the chunk type the nl.hash_join_collect appended");
+        }
+
+        Column* output = allocColumnForChunkType(bufferType);
+        _valueSlots[bound] = output;
+
+        data->addBuildColumn(NLCarriedColumn(state->buffer(columnIndex),
+                                             output,
+                                             selectGatherForChunkType(bufferType)));
+    }
+
+    // The probe key is read against the build key buffer through the handlers of one
+    // chunk type, so the two sides must have collected and probed chunks of that type.
+    if (buildKey >= buildTypes.size()) {
+        throw IRException("hash join build key column index is out of range");
+    }
+
+    const mlir::Value keyColumn = columns[probeKey];
+    if (keyColumn.getType() != buildTypes[buildKey]) {
+        throw IRException("nl.hash_join_probe must read its key from a chunk of the type the build key was collected as");
+    }
+
+    data->setKeyColumns(getColumn(keyColumn),
+                        state->buffer(buildKey),
+                        selectJoinKeyFunctionsForChunkType(keyColumn.getType()),
+                        selectKeyMatchableForChunkType(keyColumn.getType()));
+
+    body->emplaceStmt(&NLExecutor::runHashJoinProbeLoop, data);
+
+    translateBlock(loopBody, data->getStmts());
+}
+
+NLHashJoinState* NLTranslator::hashJoinStateFor(mlir::Value handle) const {
+    const auto stateIt = _hashJoinStates.find(handle);
+    if (stateIt == _hashJoinStates.end()) {
+        throw IRException("hash join handle must be produced by an nl.hash_join_buffer");
+    }
+
+    return stateIt->second;
+}
+
+nl::HashJoinBuffer NLTranslator::hashJoinBufferOf(mlir::Value handle) {
+    nl::HashJoinBuffer buffer = handle.getDefiningOp<nl::HashJoinBuffer>();
+    if (!buffer) {
+        throw IRException("hash join handle must be produced by an nl.hash_join_buffer");
+    }
+
+    return buffer;
+}
+
+void NLTranslator::translateDistinctState(nl::Distinct distinct, NLStmtContainer* body) {
+    // Allocate the runtime seen-set and map the handle to it, so the filter that
+    // names the handle finds the same set.
+    NLDistinctState* state = _program->allocDistinctState();
+    _distinctStates[distinct.getState()] = state;
+
+    // The reset empties the set each time the block holding this nl.distinct runs:
+    // once at function scope for a top-level / mid-query DISTINCT.
+    NLDistinctResetData* resetData = _program->allocFunctionData<NLDistinctResetData>(state);
+    body->emplaceStmt(&NLExecutor::runDistinctReset, resetData);
+}
+
+void NLTranslator::translateDistinctFilter(nl::DistinctFilter filter, NLStmtContainer* body) {
+    // The handle is a required operand, so distinctStateFor returns its set or
+    // throws if it was not produced by an nl.distinct.
+    NLDistinctState* state = distinctStateFor(filter.getState());
+
+    NLDistinctFilterData* data = _program->allocFunctionData<NLDistinctFilterData>(state);
+
+    // Reserve the surviving-indices scratch so the per-step gather stays
+    // allocation-free, the same as the edge and sort loops' indices column.
+    data->getIndices()->reserve(_program->getChunkSize());
+
+    // One fresh output column per input, walked in step with the results the
+    // downstream consumers are mapped to.
+    const mlir::OperandRange columns = filter.getColumns();
+    const mlir::ResultRange results = filter.getResults();
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        addDistinctColumn(columns[columnIndex], results[columnIndex], data);
+    }
+
+    body->emplaceStmt(&NLExecutor::runDistinctFilter, data);
+}
+
+void NLTranslator::addDistinctColumn(mlir::Value inputValue,
+                                     mlir::Value resultValue,
+                                     NLDistinctFilterData* data) {
+    const Column* input = getColumn(inputValue);
+
+    // The output keeps the input's element type; only duplicate rows are removed.
+    // The key-append serializes one of its rows into the shared row key, and the
+    // gather copies the survivors into the fresh output - the same gather family
+    // the edge and sort loops use, selected by chunk type.
+    Column* output = allocColumnForChunkType(inputValue.getType());
+    _valueSlots[resultValue] = output;
+
+    const NLDistinctFilterData::FilterColumn column {input,
+                                                     output,
+                                                     selectKeyAppendForChunkType(inputValue.getType()),
+                                                     selectGatherForChunkType(inputValue.getType())};
+    data->addColumn(column);
+}
+
+NLDistinctState* NLTranslator::distinctStateFor(mlir::Value handle) const {
+    const auto stateIt = _distinctStates.find(handle);
+    if (stateIt == _distinctStates.end()) {
+        throw IRException("distinct handle must be produced by an nl.distinct");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateCountState(nl::Count count, NLStmtContainer* body) {
+    // Allocate the runtime tally and map the handle to it, so the update and the
+    // emit loop that name the handle share the same counter.
+    NLCountState* state = _program->allocCountState();
+    _countStates[count.getState()] = state;
+
+    // The reset zeroes the tally each time the block holding this nl.count runs:
+    // once at function scope for a top-level / mid-query COUNT.
+    NLCountResetData* resetData = _program->allocFunctionData<NLCountResetData>(state);
+    body->emplaceStmt(&NLExecutor::runCountReset, resetData);
+}
+
+void NLTranslator::translateCountUpdate(nl::CountUpdate update, NLStmtContainer* body) {
+    // The handle is a required operand, so countStateFor returns its tally or
+    // throws if it was not produced by an nl.count.
+    NLCountState* state = countStateFor(update.getState());
+
+    // Measure the chunk's non-null rows the way its type demands: all rows for an
+    // ID chunk, the present values for a nullable value chunk. count(*) reads no value,
+    // so it charges every row whatever the chunk holds.
+    const mlir::Value rows = update.getRows();
+    const Column* input = getColumn(rows);
+    const NLCountFunction count = update.getAllRows() ? &NLExecutor::countAllRows
+                                                      : selectCountForChunkType(rows.getType());
+
+    NLCountUpdateData* data = _program->allocFunctionData<NLCountUpdateData>(state, input, count);
+    body->emplaceStmt(&NLExecutor::runCountUpdate, data);
+}
+
+void NLTranslator::translateCountResult(nl::CountResult result, NLStmtContainer* body) {
+    // The handle is a required operand, so countStateFor returns its tally or
+    // throws if it was not produced by an nl.count.
+    NLCountState* state = countStateFor(result.getState());
+
+    // The result is the unsigned i64 count chunk (!nl.chunk<ui64>) runCountResult
+    // fills with the single tally row.
+    ColumnVector<uint64_t>* output = allocCountColumn();
+    _valueSlots[result.getResult()] = output;
+
+    NLCountResultData* data = _program->allocFunctionData<NLCountResultData>(state, output);
+    body->emplaceStmt(&NLExecutor::runCountResult, data);
+}
+
+void NLTranslator::translateCountScanRows(nl::CountScanRows countScanRows, NLStmtContainer* body) {
+    // The result is the unsigned i64 count chunk (!nl.chunk<ui64>) runCountScanRows fills
+    // with the single product row - the chunk an nl.count_result emits after its loop.
+    ColumnVector<uint64_t>* output = allocCountColumn();
+    _valueSlots[countScanRows.getResult()] = output;
+
+    const mlir::ArrayAttr scans = countScanRows.getLabels();
+
+    NLCountScanRowsData* data = _program->allocFunctionData<NLCountScanRowsData>(output);
+    data->reserveLabelSets(scans.size());
+
+    for (const mlir::Attribute scan : scans) {
+        llvm::SmallVector<llvm::StringRef, 4> labels;
+        resolveLabelNames(mlir::cast<mlir::ArrayAttr>(scan), labels);
+
+        LabelSet labelset;
+        if (!resolveLabelSet(labels, labelset)) {
+            data->markUnmatchable();
+        }
+
+        data->addLabelSet(labelset);
+    }
+
+    // A property the schema never had is held by no node, so the tally over its holders
+    // is 0 - the same unsatisfiable conjunction an absent label leaves.
+    if (const std::optional<llvm::StringRef> property = countScanRows.getProperty()) {
+        const std::optional<PropertyType> propertyType = _view->metadata().propTypes().get(std::string_view(property->data(), property->size()));
+        if (propertyType) {
+            data->setProperty(propertyType->_id, countScanRows.getPropertyScan().value_or(0));
+        } else {
+            data->markUnmatchable();
+        }
+    }
+
+    body->emplaceStmt(&NLExecutor::runCountScanRows, data);
+}
+
+NLCountState* NLTranslator::countStateFor(mlir::Value handle) const {
+    const auto stateIt = _countStates.find(handle);
+    if (stateIt == _countStates.end()) {
+        throw IRException("count handle must be produced by an nl.count");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateAggregateState(nl::Aggregate aggregate, NLStmtContainer* body) {
+    // Allocate the runtime accumulator and map the handle to it, so the update and
+    // the emit that name the handle share the same accumulator.
+    NLAggregateState* state = _program->allocAggregateState();
+    _aggregateStates[aggregate.getState()] = state;
+
+    // The state handle's element type is the accumulator's value type (f64 for an
+    // avg, the input type otherwise), baked during lowering. Allocate the single-row
+    // nullable value column the reduction folds into, and the reset that
+    // re-initializes it each time the block holding this nl.aggregate runs (once at
+    // function scope for a top-level aggregate): a present zero for sum/avg, null for
+    // min/max.
+    const auto stateType = mlir::cast<nl::AggregateStateType>(aggregate.getState().getType());
+    const mlir::Type accumulatorElement = stateType.getElementType();
+    const AggregateKind kind = toRuntimeAggregateKind(aggregate.getKind());
+
+    // A min/max over type-erased cells keeps the winning cell, which names no value type
+    Column* accumulator = nullptr;
+    NLAggregateResetFunction reset = nullptr;
+    if (mlir::isa<storage::AnyType>(accumulatorElement)) {
+        accumulator = allocOptListElementColumn();
+        reset = NLExecutor::selectTaggedAggregateReset();
+    } else {
+        const ValueType accumulatorType = valueTypeFromElementType(accumulatorElement);
+        accumulator = allocSingleRowOptColumnForValueType(accumulatorType);
+        reset = NLExecutor::selectAggregateReset(kind, accumulatorType);
+    }
+
+    state->setAccumulator(accumulator);
+
+    NLAggregateResetData* resetData = _program->allocFunctionData<NLAggregateResetData>(state, reset);
+    body->emplaceStmt(&NLExecutor::runAggregateReset, resetData);
+}
+
+void NLTranslator::translateAggregateUpdate(nl::AggregateUpdate update, NLStmtContainer* body) {
+    // The handle is a required operand, so aggregateStateFor returns its accumulator
+    // or throws if it was not produced by an nl.aggregate.
+    NLAggregateState* state = aggregateStateFor(update.getState());
+
+    // Fold the chunk's non-null values the way its kind and chunk type demand. The
+    // input value type may differ from the accumulator's (an avg of i64 folds into
+    // an f64 accumulator), so the handler is selected from the input here.
+    const mlir::Value rows = update.getRows();
+    const Column* input = getColumn(rows);
+    const AggregateKind kind = toRuntimeAggregateKind(update.getKind());
+    const NLAggregateUpdateFunction fold = selectAggregateUpdateForChunkType(kind, rows.getType());
+
+    NLAggregateUpdateData* data = _program->allocFunctionData<NLAggregateUpdateData>(state, input, fold);
+    body->emplaceStmt(&NLExecutor::runAggregateUpdate, data);
+}
+
+void NLTranslator::translateAggregateResult(nl::AggregateResult result, NLStmtContainer* body) {
+    // The handle is a required operand, so aggregateStateFor returns its accumulator
+    // or throws if it was not produced by an nl.aggregate.
+    NLAggregateState* state = aggregateStateFor(result.getState());
+
+    // The result is a single-row nullable value chunk runAggregateResult fills with
+    // the reduced value. Allocate its ColumnOptVector on the result value type and
+    // map the op result to it.
+    const mlir::Value resultChunk = result.getResult();
+    const AggregateKind kind = toRuntimeAggregateKind(result.getKind());
+    const mlir::Type resultElement = mlir::cast<nl::ChunkType>(resultChunk.getType()).getElementType();
+
+    Column* output = nullptr;
+    NLAggregateResultFunction emit = nullptr;
+    if (isNullableAny(resultElement)) {
+        output = allocOptListElementColumn();
+        emit = NLExecutor::selectTaggedAggregateResult();
+    } else {
+        const ValueType resultType = nullableChunkValueType(resultChunk.getType());
+        output = allocOptColumnForValueType(resultType);
+        emit = NLExecutor::selectAggregateResult(kind, resultType);
+    }
+
+    _valueSlots[resultChunk] = output;
+
+    NLAggregateResultData* data = _program->allocFunctionData<NLAggregateResultData>(state, output, emit);
+    body->emplaceStmt(&NLExecutor::runAggregateResult, data);
+}
+
+NLAggregateState* NLTranslator::aggregateStateFor(mlir::Value handle) const {
+    const auto stateIt = _aggregateStates.find(handle);
+    if (stateIt == _aggregateStates.end()) {
+        throw IRException("aggregate handle must be produced by an nl.aggregate");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateGroupAggregateBuffer(nl::GroupAggregateBuffer buffer, NLStmtContainer* body) {
+    // Allocate the runtime accumulator and map the handle to it, so the update and
+    // the emit loop that name the handle share the same group table and per-group
+    // state. The key buffers and accumulators themselves are allocated by the
+    // update, which knows their types - the grouped sibling of translateSortBuffer.
+    NLGroupAggregateState* state = _program->allocGroupAggregateState();
+    _groupAggregateStates[buffer.getState()] = state;
+
+    // The reset empties the group table and per-group state each time the block
+    // holding this nl.group_aggregate_buffer runs: once at function scope for a
+    // top-level grouped RETURN.
+    NLGroupAggregateResetData* resetData = _program->allocFunctionData<NLGroupAggregateResetData>(state);
+    body->addStmt(NLFunctionDescriptor {&NLExecutor::runGroupAggregateReset, resetData});
+}
+
+void NLTranslator::buildGroupAggregate(mlir::storage::GroupAggregateKind mlirKind,
+                                       mlir::Value column,
+                                       NLGroupAggregateState::Aggregate& aggregate) {
+    const GroupAggregateKind kind = toRuntimeGroupAggregateKind(mlirKind);
+    const mlir::Type chunkType = column.getType();
+
+    aggregate._input = getColumn(column);
+
+    // A switch (not an if/else) over every kind so a new one is a compile error
+    // here rather than silently taking the value-reduction path.
+    switch (kind) {
+        case GroupAggregateKind::Count: {
+            // count tallies rows, so it keeps no reduced value (a null
+            // accumulator, only the per-group tally). count(*) over an ID chunk
+            // charges every row; count(x) over a nullable value chunk charges
+            // only the present values.
+            aggregate._accumulator = nullptr;
+            aggregate._grow = NLExecutor::selectGroupAggregateGrow(kind, ValueType::Int64);
+            aggregate._emit = NLExecutor::selectGroupAggregateEmit(kind, ValueType::Int64);
+
+            const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+            const mlir::Type countElementType = chunk.getElementType();
+            const auto nullable = mlir::dyn_cast<storage::NullableType>(countElementType);
+            if (isNullableList(countElementType)) {
+                aggregate._fold = NLExecutor::selectGroupCountOptListFold();
+            } else if (isNullableAny(countElementType)) {
+                aggregate._fold = NLExecutor::selectGroupCountOptListElementFold();
+            } else if (nullable) {
+                const ValueType valueType = valueTypeFromElementType(nullable.getValueType());
+                aggregate._fold = NLExecutor::selectGroupAggregateFold(kind, valueType);
+            } else if (mlir::isa<storage::AnyType>(countElementType)) {
+                aggregate._fold = NLExecutor::selectGroupCountListElementFold();
+            } else if (llvm::isa<storage::ListType>(countElementType)) {
+                // No row of a list chunk is null, so a group's tally is its whole row
+                // count, as it is for count(*).
+                aggregate._fold = NLExecutor::selectGroupCountAllFold();
+            } else if (isEntityIDElement(countElementType)) {
+                // An invalid ID is the null an OPTIONAL MATCH leaves, so a group charges
+                // its valid rows alone.
+                const NLChunkKind countKind = chunkKindFromElementType(countElementType);
+                aggregate._fold = NLExecutor::selectGroupCountValidIDFold(countKind);
+            } else if (mlir::isa<storage::EntityListType>(countElementType)) {
+                aggregate._fold = NLExecutor::selectGroupCountPresentPathFold();
+            } else {
+                // Every other non-nullable chunk holds no null to skip - a column a CALL
+                // yielded - so every row of the group is charged.
+                aggregate._fold = NLExecutor::selectGroupCountAllFold();
+            }
+        }
+        break;
+
+        case GroupAggregateKind::CountRows: {
+            // count(*) charges every row of the group and reads no value, so the
+            // chunk it is anchored on needs no type dispatch at all
+            aggregate._accumulator = nullptr;
+            aggregate._grow = NLExecutor::selectGroupAggregateGrow(kind, ValueType::Int64);
+            aggregate._emit = NLExecutor::selectGroupAggregateEmit(kind, ValueType::Int64);
+            aggregate._fold = NLExecutor::selectGroupCountAllFold();
+        }
+        break;
+
+        case GroupAggregateKind::CountDistinct: {
+            // count(DISTINCT x) keeps the same per-group tally as count, charged
+            // once per distinct value instead of once per row, so it shares count's
+            // grow and emit and differs only in the fold. count(DISTINCT n) over an
+            // ID chunk keys on the ID; count(DISTINCT x) over a nullable value chunk
+            // keys on the value and skips the nulls.
+            aggregate._accumulator = nullptr;
+            aggregate._grow = NLExecutor::selectGroupAggregateGrow(kind, ValueType::Int64);
+            aggregate._emit = NLExecutor::selectGroupAggregateEmit(kind, ValueType::Int64);
+
+            const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+            const mlir::Type distinctElementType = chunk.getElementType();
+            const auto nullable = mlir::dyn_cast<storage::NullableType>(distinctElementType);
+            if (isNullableList(distinctElementType)) {
+                aggregate._fold = NLExecutor::selectGroupCountDistinctOptListFold();
+            } else if (isNullableAny(distinctElementType)) {
+                aggregate._fold = NLExecutor::selectGroupCountDistinctOptListElementFold();
+            } else if (nullable) {
+                const ValueType valueType = valueTypeFromElementType(nullable.getValueType());
+                aggregate._fold = NLExecutor::selectGroupAggregateFold(kind, valueType);
+            } else if (mlir::isa<storage::AnyType>(distinctElementType)) {
+                aggregate._fold = NLExecutor::selectGroupCountDistinctListElementFold();
+            } else {
+                aggregate._fold = NLExecutor::selectGroupCountDistinctChunkFold(getChunkKind(chunkType));
+            }
+        }
+        break;
+
+        case GroupAggregateKind::Sum:
+        case GroupAggregateKind::SumDistinct:
+        case GroupAggregateKind::Min:
+        case GroupAggregateKind::Max:
+        case GroupAggregateKind::Avg:
+        case GroupAggregateKind::AvgDistinct:
+        case GroupAggregateKind::StDev:
+        case GroupAggregateKind::StDevP:
+        case GroupAggregateKind::StDevDistinct:
+        case GroupAggregateKind::StDevPDistinct:
+        case GroupAggregateKind::First: {
+            // sum/min/max/avg/stdev/first reduce the values themselves, so the input must be
+            // a nullable value chunk; avg and stdev accumulate as f64, the rest in the input's
+            // own type. nullableChunkValueType rejects an ID chunk here. The distinct
+            // kinds keep the shape of the kind they mirror and differ only in the
+            // fold, which charges each of a group's values once.
+            //
+            // A type-erased input carries a type per cell, so sum and avg reduce it by tag
+            // into the f64 its mixed numeric tags land on, and min/max/first keep the cell.
+            const mlir::Type reducedElement = mlir::cast<nl::ChunkType>(chunkType).getElementType();
+            const bool reducesNullableTaggedCells = isNullableAny(reducedElement);
+            const bool reducesTaggedCells = mlir::isa<storage::AnyType>(reducedElement)
+                                         || reducesNullableTaggedCells;
+
+            const bool keepsAValue = (kind == GroupAggregateKind::Min)
+                                  || (kind == GroupAggregateKind::Max)
+                                  || (kind == GroupAggregateKind::First);
+            const bool keepsTaggedCells = reducesTaggedCells && keepsAValue;
+            const bool averages = (kind == GroupAggregateKind::Avg) || (kind == GroupAggregateKind::AvgDistinct);
+            const bool deviates = (kind == GroupAggregateKind::StDev)
+                               || (kind == GroupAggregateKind::StDevP)
+                               || (kind == GroupAggregateKind::StDevDistinct)
+                               || (kind == GroupAggregateKind::StDevPDistinct);
+            const bool accumulatesAsDouble = (reducesTaggedCells && !keepsAValue) || averages || deviates;
+
+            const ValueType inputType = reducesTaggedCells ? ValueType::Double
+                                                           : nullableChunkValueType(chunkType);
+            const ValueType accumulatorType = accumulatesAsDouble ? ValueType::Double : inputType;
+
+            if (keepsTaggedCells) {
+                aggregate._accumulator = allocOptListElementColumn();
+                aggregate._grow = NLExecutor::selectTaggedGroupAggregateGrow();
+                aggregate._emit = NLExecutor::selectTaggedGroupAggregateEmit();
+            } else {
+                aggregate._accumulator = allocOptColumnForValueType(accumulatorType);
+                aggregate._grow = NLExecutor::selectGroupAggregateGrow(kind, accumulatorType);
+                aggregate._emit = NLExecutor::selectGroupAggregateEmit(kind, accumulatorType);
+            }
+
+            if (reducesNullableTaggedCells) {
+                aggregate._fold = NLExecutor::selectOptTaggedGroupAggregateFold(kind);
+            } else if (reducesTaggedCells) {
+                aggregate._fold = NLExecutor::selectTaggedGroupAggregateFold(kind);
+            } else {
+                aggregate._fold = NLExecutor::selectGroupAggregateFold(kind, inputType);
+            }
+
+            if (keepsAValue) {
+                aggregate._reown = NLExecutor::selectReownFunction(aggregate._accumulator);
+            }
+        }
+        break;
+    }
+}
+
+void NLTranslator::translateGroupAggregateUpdate(nl::GroupAggregateUpdate update, NLStmtContainer* body) {
+    const mlir::Value updateState = update.getState();
+    NLGroupAggregateState* state = groupAggregateStateFor(updateState);
+
+    // The keyCount / aggregate-kind spec lives on the nl.group_aggregate_buffer that
+    // produced the handle.
+    nl::GroupAggregateBuffer buffer = updateState.getDefiningOp<nl::GroupAggregateBuffer>();
+    if (!buffer) {
+        throw IRException("group_aggregate_update state must come from nl.group_aggregate_buffer");
+    }
+
+    // The key buffers and accumulators are allocated once, by the single update
+    // feeding an accumulator. Generated IR has exactly one update per accumulator; a
+    // second would fold the same rows twice, so it is rejected here.
+    if (!state->keyColumns().empty() || !state->aggregates().empty()) {
+        throw IRException("an nl.group_aggregate_buffer must be fed by a single nl.group_aggregate_update");
+    }
+
+    const mlir::OperandRange columns = update.getColumns();
+    const size_t keyCount = buffer.getKeyCount();
+    const llvm::ArrayRef<int64_t> kinds = buffer.getKinds();
+
+    // The collected columns are the grouping keys followed by the aggregate inputs,
+    // one per aggregate; the two counts must partition them exactly.
+    if (columns.size() != keyCount + kinds.size()) {
+        throw IRException("group_aggregate collects one column per grouping key and aggregate");
+    }
+
+    NLGroupAggregateUpdateData* data = _program->allocFunctionData<NLGroupAggregateUpdateData>(state);
+
+    // One growing key buffer per grouping key, holding its distinct value per group.
+    // The buffer keeps the key column's element type; the key-append serializes a row
+    // into the group key (the DISTINCT serializer), the gather-append grows the
+    // buffer with each new group's key values, and the range copy slices it at emit.
+    for (size_t keyIndex = 0; keyIndex < keyCount; keyIndex++) {
+        const mlir::Value column = columns[keyIndex];
+
+        NLGroupAggregateState::KeyColumn key;
+        key._input = getColumn(column);
+        key._buffer = allocColumnForChunkType(column.getType());
+        key._keyAppend = selectKeyAppendForChunkType(column.getType());
+        key._gatherAppend = selectGroupKeyGatherForChunkType(column.getType());
+        key._emitCopy = selectCopyForChunkType(column.getType());
+
+        state->addKeyColumn(key);
+    }
+
+    // One per-group accumulator per aggregate, with the grow/fold/emit handlers baked
+    // from the kind and the input value type.
+    for (size_t aggregateIndex = 0; aggregateIndex < kinds.size(); aggregateIndex++) {
+        const auto kind = static_cast<storage::GroupAggregateKind>(kinds[aggregateIndex]);
+
+        NLGroupAggregateState::Aggregate aggregate;
+        buildGroupAggregate(kind, columns[keyCount + aggregateIndex], aggregate);
+
+        state->addAggregate(aggregate);
+    }
+
+    body->addStmt(NLFunctionDescriptor {&NLExecutor::runGroupAggregateUpdate, data});
+}
+
+void NLTranslator::translateGroupAggregateLoop(const IteratorConfig& config,
+                                               mlir::Block& loopBody,
+                                               NLLimitState* limit,
+                                               NLStmtContainer* body) {
+    NLGroupAggregateState* state = config._groupAggregateState;
+    if (!state) {
+        throw IRException("nl.group_aggregate iterator must carry a group accumulator");
+    }
+
+    // For::verify binds one loop variable per iterator chunk, and the group
+    // iterator's chunks are the grouping-key columns followed by the aggregate
+    // results, so the loop must take exactly one variable per output column.
+    const size_t keyCount = state->keyColumns().size();
+    const size_t aggregateCount = state->aggregates().size();
+    if (loopBody.getNumArguments() != keyCount + aggregateCount) {
+        throw IRException("nl.group_aggregate loop must bind one variable per output column");
+    }
+
+    NLGroupAggregateLoopData* loopData = _program->allocFunctionData<NLGroupAggregateLoopData>(state);
+    loopData->setLimit(limit);
+
+    // Each loop variable is the emit output of one column: the first keyCount are the
+    // grouping keys (filled by slicing their key buffers), the rest the aggregate
+    // results (filled from the per-group state). Wire each into its column's slot on
+    // the shared state, so runGroupAggregateLoop fills the loop variables directly.
+    for (size_t keyIndex = 0; keyIndex < keyCount; keyIndex++) {
+        const mlir::Value loopVariable = loopBody.getArgument(static_cast<unsigned>(keyIndex));
+
+        Column* output = allocColumnForResultChunkType(loopVariable.getType());
+        _valueSlots[loopVariable] = output;
+        state->keyColumns()[keyIndex]._output = output;
+    }
+
+    for (size_t aggregateIndex = 0; aggregateIndex < aggregateCount; aggregateIndex++) {
+        const mlir::Value loopVariable = loopBody.getArgument(static_cast<unsigned>(keyCount + aggregateIndex));
+
+        Column* output = allocColumnForResultChunkType(loopVariable.getType());
+        _valueSlots[loopVariable] = output;
+        state->aggregates()[aggregateIndex]._output = output;
+    }
+
+    body->addStmt(NLFunctionDescriptor {&NLExecutor::runGroupAggregateLoop, loopData});
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+NLGroupAggregateState* NLTranslator::groupAggregateStateFor(mlir::Value handle) const {
+    const auto stateIt = _groupAggregateStates.find(handle);
+    if (stateIt == _groupAggregateStates.end()) {
+        throw IRException("group aggregate handle must be produced by an nl.group_aggregate_buffer");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateCollectBuffer(nl::CollectBuffer buffer, NLStmtContainer* body) {
+    // Allocate the runtime accumulator and map the handle to it, so the update (and
+    // later the drain) that name the handle share the same group table and per-group
+    // lists. The key buffers and the value buffer are allocated by the update, which
+    // knows their types - the collect sibling of translateGroupAggregateBuffer.
+    NLCollectState* state = _program->allocCollectState();
+    _collectStates[buffer.getState()] = state;
+
+    // The reset empties the group table and per-group lists each time the block
+    // holding this nl.collect_buffer runs: once at function scope for a top-level
+    // collect.
+    NLCollectResetData* resetData = _program->allocFunctionData<NLCollectResetData>(state);
+    body->emplaceStmt(&NLExecutor::runCollectReset, resetData);
+}
+
+void NLTranslator::translateCollectUpdate(nl::CollectUpdate update, NLStmtContainer* body) {
+    const mlir::Value updateState = update.getState();
+    NLCollectState* state = collectStateFor(updateState);
+
+    // The keyCount lives on the nl.collect_buffer that produced the handle.
+    nl::CollectBuffer buffer = updateState.getDefiningOp<nl::CollectBuffer>();
+    if (!buffer) {
+        throw IRException("collect_update state must come from nl.collect_buffer");
+    }
+
+    // The key buffers and the value buffers are allocated once, by the single update
+    // feeding an accumulator. Generated IR has exactly one update per accumulator; a
+    // second would append the same rows twice, so it is rejected here.
+    if (!state->keyColumns().empty() || !state->valueColumns().empty()) {
+        throw IRException("an nl.collect_buffer must be fed by a single nl.collect_update");
+    }
+
+    const mlir::OperandRange columns = update.getColumns();
+    const size_t keyCount = buffer.getKeyCount();
+    const llvm::ArrayRef<int64_t> kinds = buffer.getKinds().value_or(llvm::ArrayRef<int64_t> {});
+
+    // The collected columns are the grouping keys, the value columns, then one input per
+    // aggregate reduced over the same groups: what the keys and the aggregates leave is
+    // what the collect gathers, and it gathers at least one. Bound keyCount by the column
+    // count before summing, as nl.collect_update's verifier does.
+    const size_t columnCount = columns.size();
+    if (keyCount >= columnCount || columnCount - keyCount <= kinds.size()) {
+        throw IRException("collect collects at least one value column after the grouping keys, then one column per aggregate");
+    }
+
+    const size_t valueCount = columnCount - keyCount - kinds.size();
+
+    const llvm::ArrayRef<int64_t> distinctValues = buffer.getDistinctValues().value_or(llvm::ArrayRef<int64_t> {});
+
+    NLCollectUpdateData* data = _program->allocFunctionData<NLCollectUpdateData>(state);
+
+    // One growing key buffer per grouping key, holding its distinct value per group -
+    // the same setup as translateGroupAggregateUpdate's keys.
+    for (size_t keyIndex = 0; keyIndex < keyCount; keyIndex++) {
+        const mlir::Value column = columns[keyIndex];
+
+        NLCollectState::KeyColumn key;
+        key._input = getColumn(column);
+        key._buffer = allocColumnForChunkType(column.getType());
+        key._keyAppend = selectKeyAppendForChunkType(column.getType());
+        key._gatherAppend = selectGroupKeyGatherForChunkType(column.getType());
+        key._emitCopy = selectCopyForChunkType(column.getType());
+        key._gather = selectGatherForChunkType(column.getType());
+
+        state->addKeyColumn(key);
+    }
+
+    // Each collected column is either a nullable value chunk (a property fetch), whose
+    // present values accumulate in a flat buffer of the same primitive with nulls
+    // dropped to match Cypher collect, or an entity chunk, whose every row carries an
+    // ID. The fold (append) and the drain emit handlers are baked from that type here,
+    // so whichever drain the query uses reads a ready handler off the state.
+    for (size_t valueIndex = 0; valueIndex < valueCount; valueIndex++) {
+        const mlir::Value column = columns[keyCount + valueIndex];
+        const mlir::Type element = mlir::cast<nl::ChunkType>(column.getType()).getElementType();
+
+        const bool isDistinct = llvm::is_contained(distinctValues, static_cast<int64_t>(valueIndex));
+
+        NLCollectState::ValueColumn value;
+        value._input = getColumn(column);
+
+        if (isNullableList(element)) {
+            NLCollectFoldFunction fold = nullptr;
+            NLCollectListEmitFunction listEmit = nullptr;
+            NLExecutor::selectCollectOptListHandlers(isDistinct, fold, listEmit);
+
+            value._buffer = allocListColumn();
+            value._fold = fold;
+            value._listEmit = listEmit;
+        } else if (isNullableAny(element)) {
+            NLCollectFoldFunction fold = nullptr;
+            NLCollectListEmitFunction listEmit = nullptr;
+            NLExecutor::selectCollectOptTaggedHandlers(isDistinct, fold, listEmit);
+
+            value._buffer = allocListElementColumn();
+            value._fold = fold;
+            value._listEmit = listEmit;
+        } else if (const auto nullableElement = mlir::dyn_cast<storage::NullableType>(element);
+                   nullableElement && isIDElement(nullableElement.getValueType())) {
+            const NLChunkKind kind = chunkKindFromElementType(nullableElement.getValueType());
+
+            NLCollectFoldFunction fold = nullptr;
+            NLCollectListEmitFunction listEmit = nullptr;
+            NLExecutor::selectCollectOptEntityHandlers(kind, isDistinct, fold, listEmit);
+
+            value._buffer = allocColumnForKind(kind);
+            value._fold = fold;
+            value._listEmit = listEmit;
+        } else if (mlir::isa<storage::NullableType>(element)) {
+            const ValueType valueType = nullableChunkValueType(column.getType());
+
+            value._buffer = allocValueColumnForValueType(valueType);
+            value._fold = isDistinct ? NLExecutor::selectCollectDistinctFold(valueType)
+                                     : NLExecutor::selectCollectFold(valueType);
+            value._unwindCollectEmit = NLExecutor::selectUnwindCollectValueEmit(valueType);
+            value._listEmit = NLExecutor::selectCollectListEmit(valueType);
+        } else if (mlir::isa<storage::ListType>(element)) {
+            NLCollectFoldFunction fold = nullptr;
+            NLCollectListEmitFunction listEmit = nullptr;
+            NLExecutor::selectCollectListHandlers(isDistinct, fold, listEmit);
+
+            value._buffer = allocListColumn();
+            value._fold = fold;
+            value._listEmit = listEmit;
+        } else if (mlir::isa<storage::AnyType>(element)) {
+            NLCollectFoldFunction fold = nullptr;
+            NLCollectListEmitFunction listEmit = nullptr;
+            NLExecutor::selectCollectTaggedHandlers(isDistinct, fold, listEmit);
+
+            value._buffer = allocListElementColumn();
+            value._fold = fold;
+            value._listEmit = listEmit;
+        } else {
+            const NLChunkKind kind = getChunkKind(column.getType());
+
+            NLCollectFoldFunction fold = nullptr;
+            NLCollectListEmitFunction listEmit = nullptr;
+            NLExecutor::selectCollectEntityHandlers(kind, isDistinct, fold, listEmit);
+
+            value._buffer = allocColumnForKind(kind);
+            value._fold = fold;
+            value._listEmit = listEmit;
+        }
+
+        state->addValueColumn(value);
+    }
+
+    // The reductions taken beside the list read the same groups, so their accumulators
+    // live on this state and are wired exactly as a grouped aggregation's are.
+    for (size_t aggregateIndex = 0; aggregateIndex < kinds.size(); aggregateIndex++) {
+        const storage::GroupAggregateKind aggregateKind = static_cast<storage::GroupAggregateKind>(kinds[aggregateIndex]);
+
+        NLGroupAggregateState::Aggregate aggregate;
+        buildGroupAggregate(aggregateKind, columns[keyCount + valueCount + aggregateIndex], aggregate);
+
+        state->addAggregate(aggregate);
+    }
+
+    body->emplaceStmt(&NLExecutor::runCollectUpdate, data);
+}
+
+NLCollectState* NLTranslator::collectStateFor(mlir::Value handle) const {
+    const auto stateIt = _collectStates.find(handle);
+    if (stateIt == _collectStates.end()) {
+        throw IRException("collect handle must be produced by an nl.collect_buffer");
+    }
+
+    return stateIt->second;
+}
+
+PropertyType NLTranslator::resolveShortestPathWeight(mlir::Value stateHandle) const {
+    nl::ShortestPath drain;
+    for (mlir::Operation* user : stateHandle.getUsers()) {
+        if (nl::ShortestPath found = mlir::dyn_cast<nl::ShortestPath>(user)) {
+            drain = found;
+            break;
+        }
+    }
+
+    if (!drain) {
+        throw IRException("nl.shortest_path_buffer must feed an nl.shortest_path drain");
+    }
+
+    const llvm::StringRef name = propertyTypeName(drain.getEdgeProperty());
+    const std::optional<PropertyType> weight = _view->metadata().propTypes().get(name);
+    if (!weight) {
+        throw IRException("Unknown property '" + name.str() + "'");
+    }
+
+    return *weight;
+}
+
+NLShortestPathState* NLTranslator::allocShortestPathStateFor(const PropertyType& weight) {
+    switch (weight._valueType) {
+        case ValueType::Double:
+            return _program->allocShortestPathState<types::Double>(weight._valueType, weight._id);
+        break;
+
+        case ValueType::Int64:
+            return _program->allocShortestPathState<types::Int64>(weight._valueType, weight._id);
+        break;
+
+        case ValueType::UInt64:
+            return _program->allocShortestPathState<types::UInt64>(weight._valueType, weight._id);
+        break;
+
+        default:
+            throw IRException("SHORTESTPATH weight must be an Int64, UInt64 or Double property");
+        break;
+    }
+}
+
+void NLTranslator::translateNodeSetBuffer(nl::NodeSetBuffer buffer, NLStmtContainer* body) {
+    NLNodeSetState* state = _program->allocNodeSetState();
+    _nodeSetStates[buffer.getState()] = state;
+
+    // The reset empties the set each time the block holding this nl.node_set_buffer runs
+    NLNodeSetResetData* resetData = _program->allocFunctionData<NLNodeSetResetData>(state);
+    body->emplaceStmt(&NLExecutor::runNodeSetReset, resetData);
+}
+
+void NLTranslator::translateNodeSetCollect(nl::NodeSetCollect collect, NLStmtContainer* body) {
+    NLNodeSetState* state = nodeSetStateFor(collect.getState());
+
+    const ColumnNodeIDs* nodes = static_cast<const ColumnNodeIDs*>(getColumn(collect.getNodes()));
+
+    NLNodeSetCollectData* data = _program->allocFunctionData<NLNodeSetCollectData>(state, nodes);
+    body->emplaceStmt(&NLExecutor::runNodeSetCollect, data);
+}
+
+NLNodeSetState* NLTranslator::nodeSetStateFor(mlir::Value handle) const {
+    const auto stateIt = _nodeSetStates.find(handle);
+    if (stateIt == _nodeSetStates.end()) {
+        throw IRException("node set handle must be produced by an nl.node_set_buffer");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateShortestPathBuffer(nl::ShortestPathBuffer buffer, NLStmtContainer* body) {
+    // Resolve the weight before the accumulator is built, so it is typed by the weight and the
+    // updates can seed the frontier directly. The weight type is chosen once, here.
+    const PropertyType weight = resolveShortestPathWeight(buffer.getState());
+    NLShortestPathState* state = allocShortestPathStateFor(weight);
+    _shortestPathStates[buffer.getState()] = state;
+
+    // The reset empties the accumulator each time the block holding this
+    // nl.shortest_path_buffer runs: once at function scope.
+    NLShortestPathResetData* resetData = _program->allocFunctionData<NLShortestPathResetData>(state);
+    body->emplaceStmt(&NLExecutor::runShortestPathReset, resetData);
+}
+
+void NLTranslator::translateShortestPathUpdate(nl::ShortestPathUpdate update, NLStmtContainer* body) {
+    NLShortestPathState* state = shortestPathStateFor(update.getState());
+
+    const ColumnNodeIDs* nodes = static_cast<const ColumnNodeIDs*>(getColumn(update.getNodes()));
+
+    NLShortestPathUpdateData* data = _program->allocFunctionData<NLShortestPathUpdateData>(state, nodes, update.getTarget());
+    body->emplaceStmt(&NLExecutor::runShortestPathUpdate, data);
+}
+
+NLShortestPathState* NLTranslator::shortestPathStateFor(mlir::Value handle) const {
+    const auto stateIt = _shortestPathStates.find(handle);
+    if (stateIt == _shortestPathStates.end()) {
+        throw IRException("shortest path handle must be produced by an nl.shortest_path_buffer");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::translateShortestPathLoop(const IteratorConfig& config,
+                                             mlir::Block& loopBody,
+                                             NLStmtContainer* body) {
+    NLShortestPathState* state = config._shortestPathState;
+    if (!state) {
+        throw IRException("nl.shortest_path iterator must carry a shortest-path accumulator");
+    }
+
+    if (loopBody.getNumArguments() != 2) {
+        throw IRException("nl.shortest_path loop must bind a distance and a path variable");
+    }
+
+    NLShortestPathLoopData* loopData = _program->allocFunctionData<NLShortestPathLoopData>(state);
+
+    const mlir::Value distanceVariable = loopBody.getArgument(0);
+    const mlir::Value pathVariable = loopBody.getArgument(1);
+
+    Column* distanceOutput = allocColumnForChunkType(distanceVariable.getType());
+    _valueSlots[distanceVariable] = distanceOutput;
+    loopData->setDistanceOutput(distanceOutput);
+
+    ColumnVector<Path>* pathOutput = static_cast<ColumnVector<Path>*>(allocColumnForChunkType(pathVariable.getType()));
+    _valueSlots[pathVariable] = pathOutput;
+    loopData->setPathOutput(pathOutput);
+
+    ColumnNodeIDs* expansionInput = _memory->alloc<ColumnNodeIDs>();
+    ColumnEdgeIDs* expandedEdges = _memory->alloc<ColumnEdgeIDs>();
+    ColumnNodeIDs* expandedTargets = _memory->alloc<ColumnNodeIDs>();
+    Column* weightValues = allocOptColumnForValueType(state->getValueType());
+    loopData->setExpansionScratch(expansionInput, expandedEdges, expandedTargets, weightValues);
+
+    body->emplaceStmt(&NLExecutor::runShortestPathLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateUnwindCollectLoop(const IteratorConfig& config,
+                                       mlir::Block& loopBody,
+                                       NLStmtContainer* body) {
+    NLCollectState* state = config._collectState;
+    if (!state) {
+        throw IRException("nl.unwind_collect iterator must carry a collect accumulator");
+    }
+
+    throwIfAlreadyDrained(state);
+
+    // Only a value collect bakes an unwind emit handler; an entity collect leaves it
+    // unset, so its list can be returned but not yet unwound element by element.
+    NLCollectState::ValueColumn& unwound = state->unwoundColumn();
+    if (!unwound._unwindCollectEmit) {
+        throw IRException("unwinding a collected entity list is not supported");
+    }
+
+    // For::verify binds one loop variable per iterator chunk; the unwind iterator's
+    // chunks are the grouping keys then the element value, so the loop takes one
+    // variable per grouping key plus one for the value.
+    const size_t keyCount = state->keyColumns().size();
+    if (loopBody.getNumArguments() != keyCount + 1) {
+        throw IRException("nl.unwind_collect loop must bind one variable per grouping key plus the element");
+    }
+
+    NLUnwindCollectLoopData* loopData = _program->allocFunctionData<NLUnwindCollectLoopData>(state);
+    loopData->getGroupIndices()->reserve(_program->getChunkSize());
+    loopData->getPositions()->reserve(_program->getChunkSize());
+
+    // The first keyCount loop variables are the grouping keys (filled by gathering
+    // their key buffers, one row per emitted element); wire each into its key column's
+    // output slot on the shared state.
+    for (size_t keyIndex = 0; keyIndex < keyCount; keyIndex++) {
+        const mlir::Value loopVariable = loopBody.getArgument(static_cast<unsigned>(keyIndex));
+
+        Column* output = allocColumnForResultChunkType(loopVariable.getType());
+        _valueSlots[loopVariable] = output;
+        state->keyColumns()[keyIndex]._output = output;
+    }
+
+    // The last loop variable is the unwound element value (a nullable value chunk).
+    const mlir::Value valueVariable = loopBody.getArgument(static_cast<unsigned>(keyCount));
+    Column* valueOutput = allocColumnForResultChunkType(valueVariable.getType());
+    _valueSlots[valueVariable] = valueOutput;
+    unwound._output = valueOutput;
+
+    body->emplaceStmt(&NLExecutor::runUnwindCollectLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateCollectLoop(const IteratorConfig& config,
+                                        mlir::Block& loopBody,
+                                        NLStmtContainer* body) {
+    NLCollectState* state = config._collectState;
+    if (!state) {
+        throw IRException("nl.collect iterator must carry a collect accumulator");
+    }
+
+    throwIfAlreadyDrained(state);
+
+    // The collect iterator's chunks are the grouping keys, one list cell per collected
+    // column, then one per aggregate reduced over the same groups.
+    const size_t keyCount = state->keyColumns().size();
+    std::vector<NLCollectState::ValueColumn>& valueColumns = state->valueColumns();
+    std::vector<NLGroupAggregateState::Aggregate>& aggregates = state->aggregates();
+    if (loopBody.getNumArguments() != keyCount + valueColumns.size() + aggregates.size()) {
+        throw IRException("nl.collect loop must bind one variable per grouping key, one per list, and one per aggregate");
+    }
+
+    NLCollectLoopData* loopData = _program->allocFunctionData<NLCollectLoopData>(state);
+
+    // The first keyCount loop variables are the grouping keys (filled by slicing their
+    // key buffers, one row per group); wire each into its key column's output slot.
+    for (size_t keyIndex = 0; keyIndex < keyCount; keyIndex++) {
+        const mlir::Value loopVariable = loopBody.getArgument(static_cast<unsigned>(keyIndex));
+
+        Column* output = allocColumnForResultChunkType(loopVariable.getType());
+        _valueSlots[loopVariable] = output;
+        state->keyColumns()[keyIndex]._output = output;
+    }
+
+    // Then one per-group list cell per collected column (a ColumnVector<ListView>).
+    for (size_t valueIndex = 0; valueIndex < valueColumns.size(); valueIndex++) {
+        const mlir::Value listVariable = loopBody.getArgument(static_cast<unsigned>(keyCount + valueIndex));
+
+        Column* listOutput = allocColumnForResultChunkType(listVariable.getType());
+        _valueSlots[listVariable] = listOutput;
+        valueColumns[valueIndex]._output = listOutput;
+    }
+
+    // The remaining variables take the reductions, one per aggregate, filled from the
+    // same group window the lists are sliced over.
+    for (size_t aggregateIndex = 0; aggregateIndex < aggregates.size(); aggregateIndex++) {
+        const unsigned argumentIndex = static_cast<unsigned>(keyCount + valueColumns.size() + aggregateIndex);
+        const mlir::Value loopVariable = loopBody.getArgument(argumentIndex);
+
+        Column* output = allocColumnForResultChunkType(loopVariable.getType());
+        _valueSlots[loopVariable] = output;
+        aggregates[aggregateIndex]._output = output;
+    }
+
+    body->emplaceStmt(&NLExecutor::runCollectLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+// A plain (non-nullable) value column of the collected type's primitive: collect
+// drops nulls, so only present values land here. It grows as values are appended
+// across steps, so no initial reserve is needed.
+Column* NLTranslator::allocValueColumnForValueType(ValueType valueType) {
+    switch (valueType) {
+        case ValueType::Int64:
+            return _memory->alloc<ColumnVector<types::Int64::Primitive>>();
+        break;
+
+        case ValueType::UInt64:
+            return _memory->alloc<ColumnVector<types::UInt64::Primitive>>();
+        break;
+
+        case ValueType::Double:
+            return _memory->alloc<ColumnVector<types::Double::Primitive>>();
+        break;
+
+        case ValueType::Bool:
+            return _memory->alloc<ColumnVector<types::Bool::Primitive>>();
+        break;
+
+        case ValueType::String:
+            return _memory->alloc<ColumnVector<types::String::Primitive>>();
+        break;
+
+        case ValueType::List:
+            return allocListColumn();
+        break;
+
+        case ValueType::DateTime:
+            return _memory->alloc<ColumnVector<types::DateTime::Primitive>>();
+        break;
+
+        case ValueType::Duration:
+            return _memory->alloc<ColumnVector<types::Duration::Primitive>>();
+        break;
+
+        default:
+            throw IRException("collect does not support this value type");
+        break;
+    }
+
+    return nullptr;
+}
+
+void NLTranslator::translateProcedure(nl::Procedure procedureOp, NLStmtContainer* body) {
+    const llvm::StringRef name = procedureOp.getName();
+
+    if (!_procedureContext) {
+        throw IRException(fmt::format("nl.procedure of '{}' requires a procedure context, but the "
+                                      "translator was created without one",
+                                      name.str()));
+    }
+
+    const ProcedureManager* procedures = _procedureContext->getProcedures();
+    if (!procedures) {
+        throw IRException("The procedure context carries no procedure registry to resolve "
+                          "nl.procedure against");
+    }
+
+    // A procedure fills at most a chunk's worth of rows per call, reading that budget
+    // off the context: a zero budget leaves a drive loop asking an exhausted-looking
+    // procedure for rows forever, so reject the unset context here rather than hang.
+    if (_procedureContext->getChunkSize() == 0) {
+        throw IRException("The procedure context carries no chunk size, so a procedure would be "
+                          "asked for chunks of no rows");
+    }
+
+    const Procedure* procedure = procedures->getProcedure(std::string_view(name.data(), name.size()));
+    if (!procedure) {
+        throw IRException(fmt::format("Procedure '{}' does not exist", name.str()));
+    }
+
+    // A procedure keeps its own state - iterators, tallies - in the data its alloc
+    // callback produces, and every callback runs through the execute entry point, so
+    // a procedure missing either cannot be called at all.
+    const Procedure::AllocCallback alloc = procedure->getAllocCallback();
+    if (!alloc || !procedure->getExecCallback()) {
+        throw IRException(fmt::format("Procedure '{}' has no alloc or execute callback", name.str()));
+    }
+
+    // The slots the procedure reads its arguments from and writes its return values
+    // into. Every declared value gets a slot, so a return value this call does not
+    // yield stays null and the procedure skips it.
+    ProcedureData* procedureData = alloc();
+    procedureData->resizeInputColumns(procedure->argumentTypes().size());
+    procedureData->resizeReturnColumns(procedure->returnValues().size());
+
+    // The runtime call owns that data from here on - its dealloc callback releases it
+    // - and is mapped to the handle, so every op that names the handle drives the same
+    // procedure.
+    NLProcedureState* state = _program->allocProcedureState(procedure, procedureData, _procedureContext);
+    _procedureStates[procedureOp.getState()] = state;
+
+    // Resolve each yielded name to the procedure's own return value index once here,
+    // so the ops that bind columns work off indices rather than names.
+    for (const mlir::Attribute yield : procedureOp.getYields()) {
+        const llvm::StringRef yieldName = mlir::cast<mlir::StringAttr>(yield).getValue();
+
+        state->addYieldIndex(procedure->getReturnValueIndex(std::string_view(yieldName.data(), yieldName.size())));
+    }
+}
+
+void NLTranslator::bindProcedureInputs(NLProcedureState* state, mlir::ValueRange inputs) {
+    // Operand i is argument i, so each argument chunk lands in the slot the procedure
+    // reads that argument from. The chunks are the enclosing loop's variables, refilled
+    // in place each step, so binding them once here holds for every step. A call that
+    // stopped short of the trailing optional arguments leaves their slots at the null
+    // the alloc sized them to, which is how the procedure reads an omitted one.
+    const Procedure* procedure = state->getProcedure();
+    const size_t argumentCount = procedure->argumentTypes().size();
+    const size_t requiredCount = procedure->getRequiredArgumentCount();
+    const bool tooFewArguments = inputs.size() < requiredCount;
+    const bool tooManyArguments = inputs.size() > argumentCount;
+    if (tooFewArguments || tooManyArguments) {
+        throw IRException(fmt::format("A procedure call passes {} arguments, but the procedure "
+                                      "declares {}, {} of them required",
+                                      inputs.size(),
+                                      argumentCount,
+                                      requiredCount));
+    }
+
+    ProcedureData* procedureData = state->getData();
+    for (size_t inputIndex = 0; inputIndex < inputs.size(); inputIndex++) {
+        procedureData->setInputColumn(inputIndex, getColumn(inputs[inputIndex]));
+    }
+}
+
+void NLTranslator::addProcedureCarriedColumns(const IteratorConfig& config,
+                                              mlir::Block& loopBody,
+                                              size_t yieldCount,
+                                              NLProcedureLoopData* loopData) {
+    const llvm::SmallVector<mlir::Value, 4>& carriedColumns = config._carriedColumns;
+    const Procedure* procedure = loopData->getState()->getProcedure();
+
+    // A call binding no return value has no row count for a carried row to be replicated
+    // against, so nothing can ride through it - it is driven for what it does, not for
+    // rows. The db verifier settles this, so reaching it here means hand-written nl IR.
+    if (!carriedColumns.empty() && yieldCount == 0) {
+        throw IRException(fmt::format("nl.procedure_init carries columns past '{}', which binds no "
+                                      "return value, so they could not be aligned with anything",
+                                      procedure->getFullName()));
+    }
+
+    // Only a procedure that declares it reports the input row behind each row it emits
+    // can be carried past: that report is what the carried columns are rebuilt from.
+    // Lowering settles this at plan time, so reaching it here means hand-written nl IR.
+    if (!carriedColumns.empty() && !procedure->hasIndices()) {
+        throw IRException(fmt::format("nl.procedure_init carries columns past '{}', but the "
+                                      "procedure does not report the input row of the rows it emits",
+                                      procedure->getFullName()));
+    }
+
+    for (size_t carriedIndex = 0; carriedIndex < carriedColumns.size(); carriedIndex++) {
+        const mlir::Value carried = carriedColumns[carriedIndex];
+
+        // A carried chunk comes back as a loop variable after the yields, and is
+        // rebuilt into it each step - the call may repeat or drop its rows, so it
+        // cannot be passed through in place.
+        const auto loopVariableIndex = static_cast<unsigned>(yieldCount + carriedIndex);
+        const mlir::Value loopVariable = loopBody.getArgument(loopVariableIndex);
+
+        Column* output = allocColumnForChunkType(loopVariable.getType());
+        _valueSlots[loopVariable] = output;
+
+        const NLCarriedColumn column(getColumn(carried),
+                                     output,
+                                     selectGatherForChunkType(loopVariable.getType()));
+        loopData->addCarriedColumn(column);
+    }
+
+    if (carriedColumns.empty()) {
+        return;
+    }
+
+    // The procedure reports the input row behind each row it emits only when something
+    // is carried past the call; hand it the map the loop gathers those columns through,
+    // reserving a chunk so the reporting stays allocation-free.
+    ColumnIndices* indices = loopData->getIndices();
+    indices->reserve(_program->getChunkSize());
+
+    ProcedureData* data = loopData->getState()->getData();
+    IndexedProcedureData* indexedData = dynamic_cast<IndexedProcedureData*>(data);
+
+    bioassert(indexedData,
+              "Procedure '{}' is expected to have indices but has no indices data",
+              procedure->getFullName());
+
+    indexedData->setIndices(indices);
+}
+
+void NLTranslator::translateProcedureInitLoop(const IteratorConfig& config,
+                                              mlir::Block& loopBody,
+                                              NLLimitState* limit,
+                                              NLStmtContainer* body) {
+    NLProcedureState* state = config._procedureState;
+    if (!state) {
+        throw IRException("nl.procedure_init iterator must carry a procedure call");
+    }
+
+    bindProcedureInputs(state, config._procedureInputs);
+
+    // For::verify binds one loop variable per iterator chunk, and a drive iterator's
+    // chunks are the yielded return values followed by the carried ones. The yields are
+    // the columns the procedure fills, so those loop variables are its result columns -
+    // each step rewrites them in place, with no gather and no copy.
+    const size_t yieldCount = state->yieldIndices().size();
+    const size_t carriedCount = config._carriedColumns.size();
+    if (loopBody.getNumArguments() != yieldCount + carriedCount) {
+        throw IRException(fmt::format("An nl.procedure_init loop binds {} variables, but its call "
+                                      "yields {} return values and carries {} columns",
+                                      loopBody.getNumArguments(),
+                                      yieldCount,
+                                      carriedCount));
+    }
+
+    bindProcedureResults(state, loopBody.getArguments().take_front(yieldCount));
+
+    NLProcedureLoopData* loopData = _program->allocFunctionData<NLProcedureLoopData>(state);
+    loopData->setLimit(limit);
+
+    // The carried columns come back as the trailing loop variables, rebuilt each step
+    // from the input rows the procedure reports.
+    addProcedureCarriedColumns(config, loopBody, yieldCount, loopData);
+
+    body->emplaceStmt(&NLExecutor::runProcedureInitLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+NLProcedureState* NLTranslator::procedureStateFor(mlir::Value handle) const {
+    const auto stateIt = _procedureStates.find(handle);
+    if (stateIt == _procedureStates.end()) {
+        throw IRException("procedure handle must be produced by an nl.procedure");
+    }
+
+    return stateIt->second;
+}
+
+void NLTranslator::bindProcedureResults(NLProcedureState* state, mlir::ValueRange chunks) {
+    // One op binds the call's result columns - the drive loop - so a second one would
+    // allocate a rival set of columns the procedure no longer writes into.
+    if (!state->resultColumns().empty()) {
+        throw IRException("A procedure call binds its result chunks once, but a second operation "
+                          "names the same handle");
+    }
+
+    const std::vector<size_t>& yieldIndices = state->yieldIndices();
+    if (chunks.size() != yieldIndices.size()) {
+        throw IRException(fmt::format("A procedure call produces {} chunks, but its nl.procedure "
+                                      "yields {} return values",
+                                      chunks.size(),
+                                      yieldIndices.size()));
+    }
+
+    const Procedure* procedure = state->getProcedure();
+    ProcedureData* procedureData = state->getData();
+
+    for (size_t yieldIndex = 0; yieldIndex < yieldIndices.size(); yieldIndex++) {
+        const size_t returnIndex = yieldIndices[yieldIndex];
+        Column* column = allocColumnForProcedureType(procedure->returnValues()[returnIndex]);
+
+        // The procedure writes through the slot its own declaration order names; the
+        // engine reads the same column through the chunk value, and the ordered list
+        // on the call sizes each step's rows.
+        procedureData->setReturnColumn(returnIndex, column);
+        state->addResultColumn(column);
+        _valueSlots[chunks[yieldIndex]] = column;
+    }
+}
+
+Column* NLTranslator::allocColumnForProcedureType(const NamedProcedureType& returnValue) {
+    const size_t chunkSize = _program->getChunkSize();
+    const bool nullable = returnValue._nullable;
+
+    // The column type each declared return type is written through, matching the
+    // pipeline engine's allocReturnValues: the procedure static_casts its return
+    // column to exactly this type, so the two must not drift.
+    switch (returnValue._type) {
+        case ProcedureType::NODE:
+            return allocProcedureChunkColumn<NodeID>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::EDGE:
+            return allocProcedureChunkColumn<EdgeID>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::LABEL_ID:
+            return allocProcedureChunkColumn<LabelID>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::EDGE_TYPE_ID:
+            return allocProcedureChunkColumn<EdgeTypeID>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::PROPERTY_TYPE_ID:
+            return allocProcedureChunkColumn<PropertyTypeID>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::VALUE_TYPE:
+            return allocProcedureChunkColumn<ValueType>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::UINT_64:
+            return allocProcedureChunkColumn<types::UInt64::Primitive>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::INT64:
+            return allocProcedureChunkColumn<types::Int64::Primitive>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::DOUBLE:
+            return allocProcedureChunkColumn<types::Double::Primitive>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::BOOL:
+            return allocProcedureChunkColumn<types::Bool::Primitive>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::STRING_VIEW:
+            return allocProcedureChunkColumn<types::String::Primitive>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::LIST:
+            return allocProcedureChunkColumn<ListView>(_memory, chunkSize, nullable);
+        break;
+
+        case ProcedureType::MAP:
+            throw IRException("Unsupported procedure return type: MAP");
+        break;
+
+        case ProcedureType::INVALID:
+        case ProcedureType::_SIZE:
+            throw IRException("Invalid procedure return type");
+        break;
+    }
+
+    throw IRException("Unhandled procedure return type");
+}
+
+// An ID chunk allocates an ID column on its kind; a !storage.nullable<...> chunk
+// allocates a ColumnOptVector on its value type; a ui64 count chunk a
+// ColumnVector<uint64_t>. Mirrors addCrossColumn's split.
+Column* NLTranslator::allocColumnForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isNullableList(elementType)) {
+        return allocOptListColumn();
+    } else if (isNullableAny(elementType)) {
+        return allocOptListElementColumn();
+    }
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+
+        if (isIDElement(wrappedType)) {
+            return allocOptIDColumn(chunkKindFromElementType(wrappedType));
+        }
+
+        const ValueType valueType = valueTypeFromElementType(wrappedType);
+        return allocOptColumnForValueType(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return allocListElementColumn();
+    } else if (mlir::isa<storage::MapElementType>(elementType)) {
+        return allocMapEntryColumn();
+    } else if (isMaskElementType(elementType)) {
+        return allocMaskColumn();
+    }
+
+    if (isPlainValueElementType(elementType)) {
+        return allocPlainColumn(valueTypeFromElementType(elementType));
+    }
+
+    return allocColumnForKind(chunkKindFromElementType(elementType));
+}
+
+NLAppendFunction NLTranslator::selectAppendForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isNullableList(elementType)) {
+        return NLExecutor::selectOptListAppendFunction();
+    } else if (isNullableAny(elementType)) {
+        return NLExecutor::selectOptListElementAppendFunction();
+    }
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+
+        if (isIDElement(wrappedType)) {
+            return NLExecutor::selectOptAppendFunction(chunkKindFromElementType(wrappedType));
+        }
+
+        const ValueType valueType = valueTypeFromElementType(wrappedType);
+        return NLExecutor::selectOptAppendFunction(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectListElementAppendFunction();
+    } else if (mlir::isa<storage::MapElementType>(elementType)) {
+        return NLExecutor::selectMapEntryAppendFunction();
+    } else if (isMaskElementType(elementType)) {
+        return NLExecutor::selectMaskAppend();
+    }
+
+    if (isPlainValueElementType(elementType)) {
+        return NLExecutor::selectPlainAppendFunction(valueTypeFromElementType(elementType));
+    }
+
+    return NLExecutor::selectAppendFunction(chunkKindFromElementType(elementType));
+}
+
+NLGatherFunction NLTranslator::selectGatherForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isNullableList(elementType)) {
+        return NLExecutor::selectOptListGatherFunction();
+    } else if (isNullableAny(elementType)) {
+        return NLExecutor::selectOptListElementGatherFunction();
+    }
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+
+        if (isIDElement(wrappedType)) {
+            return NLExecutor::selectOptGatherFunction(chunkKindFromElementType(wrappedType));
+        }
+
+        const ValueType valueType = valueTypeFromElementType(wrappedType);
+        return NLExecutor::selectOptGatherFunction(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectListElementGatherFunction();
+    } else if (mlir::isa<storage::MapElementType>(elementType)) {
+        return NLExecutor::selectMapEntryGatherFunction();
+    } else if (isMaskElementType(elementType)) {
+        return NLExecutor::selectMaskGather();
+    }
+
+    if (isPlainValueElementType(elementType)) {
+        return NLExecutor::selectPlainGatherFunction(valueTypeFromElementType(elementType));
+    }
+
+    return NLExecutor::selectGatherFunction(chunkKindFromElementType(elementType));
+}
+
+NLFetchNodesFunction NLTranslator::selectFetchForChunkType(mlir::Type chunkType) {
+    const mlir::Type elementType = mlir::cast<nl::ChunkType>(chunkType).getElementType();
+    const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType);
+
+    const bool nullable = static_cast<bool>(nullableType);
+    const mlir::Type cellType = nullable ? nullableType.getValueType() : elementType;
+
+    if (mlir::isa<storage::NodeIDType>(cellType)) {
+        return NLExecutor::selectNodeFetchFunction(nullable);
+    } else if (mlir::isa<storage::AnyType>(cellType)) {
+        return NLExecutor::selectTaggedFetchFunction(nullable);
+    }
+
+    return NLExecutor::selectIntegerFetchFunction(valueTypeFromElementType(cellType), nullable);
+}
+
+NLFillNullFunction NLTranslator::selectFillNullForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isNullableList(elementType)) {
+        return NLExecutor::selectOptListFillNull();
+    } else if (isNullableAny(elementType)) {
+        return NLExecutor::selectOptListElementFillNull();
+    }
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+
+        if (isIDElement(wrappedType)) {
+            return NLExecutor::selectOptFillNullFunction(chunkKindFromElementType(wrappedType));
+        }
+
+        const ValueType valueType = valueTypeFromElementType(wrappedType);
+        return NLExecutor::selectOptFillNullFunction(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectListElementFillNull();
+    } else if (isMaskElementType(elementType)) {
+        return NLExecutor::selectMaskFillNull();
+    }
+
+    if (isPlainValueElementType(elementType)) {
+        return NLExecutor::selectPlainFillNullFunction(valueTypeFromElementType(elementType));
+    }
+
+    return NLExecutor::selectFillNullFunction(chunkKindFromElementType(elementType));
+}
+
+NLCompareFunction NLTranslator::selectCompareForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isNullableList(elementType)) {
+        return NLExecutor::selectOptListCompareFunction();
+    } else if (isNullableAny(elementType)) {
+        return NLExecutor::selectOptListElementCompareFunction();
+    }
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+
+        if (isIDElement(wrappedType)) {
+            return NLExecutor::selectOptCompareFunction(chunkKindFromElementType(wrappedType));
+        }
+
+        const ValueType valueType = valueTypeFromElementType(wrappedType);
+        return NLExecutor::selectOptCompareFunction(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectListElementCompareFunction();
+    } else if (isMaskElementType(elementType)) {
+        return NLExecutor::selectMaskCompare();
+    }
+
+    if (isPlainValueElementType(elementType)) {
+        return NLExecutor::selectPlainCompareFunction(valueTypeFromElementType(elementType));
+    }
+
+    if (llvm::isa<storage::ListType>(elementType)) {
+        return NLExecutor::selectListCompareFunction();
+    }
+
+    return NLExecutor::selectCompareFunction(chunkKindFromElementType(elementType));
+}
+
+const ColumnMask* NLTranslator::getMaskColumn(mlir::Value chunkValue) const {
+    if (!chunkValue) {
+        return nullptr;
+    }
+
+    return static_cast<const ColumnMask*>(getColumn(chunkValue));
+}
+
+NLKeyAppendFunction NLTranslator::selectMergeKeyAppend(mlir::Type chunkType,
+                                                      const Column* column,
+                                                      ValueType keyType) {
+    if (isUntypedNullChunk(chunkType)) {
+        return NLExecutor::selectNullMergeKeyAppendFunction();
+    }
+
+    if (isConstantColumn(column)) {
+        return NLExecutor::selectConstMergeKeyAppendFunction(valueTypeFromChunkType(chunkType), keyType);
+    }
+
+    const mlir::Type elementType = mlir::cast<nl::ChunkType>(chunkType).getElementType();
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const ValueType nullableValueType = valueTypeFromElementType(nullableType.getValueType());
+        return NLExecutor::selectOptMergeKeyAppendFunction(nullableValueType, keyType);
+    } else if (isMaskElementType(elementType)) {
+        return NLExecutor::selectMaskMergeKeyAppend(keyType);
+    }
+
+    return NLExecutor::selectPlainMergeKeyAppendFunction(chunkKindFromElementType(elementType), keyType);
+}
+
+NLKeyAppendFunction NLTranslator::selectKeyAppendForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isNullableList(elementType)) {
+        return NLExecutor::selectOptListKeyAppendFunction();
+    } else if (isNullableAny(elementType)) {
+        return NLExecutor::selectOptListElementKeyAppendFunction();
+    }
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+
+        if (isIDElement(wrappedType)) {
+            return NLExecutor::selectOptKeyAppendFunction(chunkKindFromElementType(wrappedType));
+        }
+
+        const ValueType valueType = valueTypeFromElementType(wrappedType);
+        return NLExecutor::selectOptKeyAppendFunction(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectListElementKeyAppendFunction();
+    } else if (isMaskElementType(elementType)) {
+        return NLExecutor::selectMaskKeyAppend();
+    }
+
+    if (isPlainValueElementType(elementType)) {
+        return NLExecutor::selectPlainKeyAppendFunction(valueTypeFromElementType(elementType));
+    }
+
+    return NLExecutor::selectKeyAppendFunction(chunkKindFromElementType(elementType));
+}
+
+// The join's sibling of selectKeyAppendForChunkType: a key is hashed and compared where it
+// lives rather than serialized. An embedding is a key here, since `=` between two embedding
+// columns compares the vectors, though it has no byte identity a DISTINCT can group by.
+NLJoinKeyFunctions NLTranslator::selectJoinKeyFunctionsForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        return NLExecutor::selectOptJoinKeyFunctions(valueTypeFromElementType(nullableType.getValueType()));
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectListElementJoinKeyFunctions();
+    } else if (isPlainValueElementType(elementType)) {
+        return NLExecutor::selectPlainJoinKeyFunctions(valueTypeFromElementType(elementType));
+    }
+
+    return NLExecutor::selectJoinKeyFunctions(chunkKindFromElementType(elementType));
+}
+
+// The gating sibling of selectKeyAppendForChunkType: a nullable value chunk reads its
+// present flag and a type-erased cell its tag, a double chunk of either shape also
+// rejects a NaN, and every other chunk holds a matchable key in every row.
+NLKeyIsMatchableFunction NLTranslator::selectKeyMatchableForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        return NLExecutor::selectOptKeyMatchableFunction(valueTypeFromElementType(nullableType.getValueType()));
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectListElementKeyMatchableFunction();
+    } else if (isPlainValueElementType(elementType)) {
+        return NLExecutor::selectPlainKeyMatchableFunction(valueTypeFromElementType(elementType));
+    }
+
+    return NLExecutor::everyKeyMatchable();
+}
+
+// The value-reduction sibling of selectCountForChunkType: a type-erased column of tagged
+// cells is folded cell by cell, every other one through the value type it shares.
+NLAggregateUpdateFunction NLTranslator::selectAggregateUpdateForChunkType(AggregateKind kind,
+                                                                         mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isNullableAny(elementType)) {
+        return NLExecutor::selectOptTaggedAggregateUpdate(kind);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectTaggedAggregateUpdate(kind);
+    }
+
+    return NLExecutor::selectAggregateUpdate(kind, nullableChunkValueType(chunkType));
+}
+
+NLCountFunction NLTranslator::selectCountForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isNullableList(elementType)) {
+        return NLExecutor::selectOptListCountFunction();
+    } else if (isNullableAny(elementType)) {
+        return NLExecutor::selectOptListElementCountFunction();
+    }
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+
+        if (isIDElement(wrappedType)) {
+            return NLExecutor::selectOptCountFunction(chunkKindFromElementType(wrappedType));
+        }
+
+        const ValueType valueType = valueTypeFromElementType(wrappedType);
+        return NLExecutor::selectOptCountFunction(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectListElementCountFunction();
+    }
+
+    // An entity an OPTIONAL MATCH did not match is an invalid ID and a path it did not match
+    // is empty, so those chunks count their other rows; every other plain chunk holds no
+    // null and counts them all, whether or not it is one chunkKindFromElementType has a
+    // kind for.
+    if (isEntityIDElement(elementType)) {
+        return NLExecutor::selectIDCountFunction(chunkKindFromElementType(elementType));
+    } else if (mlir::isa<storage::EntityListType>(elementType)) {
+        return NLExecutor::selectPathCountFunction();
+    }
+
+    return &NLExecutor::countAllRows;
+}
+
+NLGroupKeyGatherFunction NLTranslator::selectGroupKeyGatherForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isNullableList(elementType)) {
+        return NLExecutor::selectOptListGroupKeyGatherFunction();
+    } else if (isNullableAny(elementType)) {
+        return NLExecutor::selectOptListElementGroupKeyGatherFunction();
+    }
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+
+        if (isIDElement(wrappedType)) {
+            return NLExecutor::selectOptGroupKeyGather(chunkKindFromElementType(wrappedType));
+        }
+
+        const ValueType valueType = valueTypeFromElementType(wrappedType);
+        return NLExecutor::selectOptGroupKeyGather(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectListElementGroupKeyGatherFunction();
+    } else if (isMaskElementType(elementType)) {
+        return NLExecutor::selectMaskGroupKeyGather();
+    }
+
+    if (isPlainValueElementType(elementType)) {
+        return NLExecutor::selectPlainGroupKeyGather(valueTypeFromElementType(elementType));
+    }
+
+    return NLExecutor::selectGroupKeyGather(chunkKindFromElementType(elementType));
+}
+
+NLCopyFunction NLTranslator::selectCopyForChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isNullableList(elementType)) {
+        return NLExecutor::selectOptListCopyFunction();
+    } else if (isNullableAny(elementType)) {
+        return NLExecutor::selectOptListElementCopyFunction();
+    }
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+
+        if (isIDElement(wrappedType)) {
+            return NLExecutor::selectOptCopyFunction(chunkKindFromElementType(wrappedType));
+        }
+
+        const ValueType valueType = valueTypeFromElementType(wrappedType);
+        return NLExecutor::selectOptCopyFunction(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return NLExecutor::selectListElementCopyFunction();
+    } else if (mlir::isa<storage::MapElementType>(elementType)) {
+        return NLExecutor::selectMapEntryCopyFunction();
+    } else if (isMaskElementType(elementType)) {
+        return NLExecutor::selectMaskCopy();
+    }
+
+    if (isPlainValueElementType(elementType)) {
+        return NLExecutor::selectPlainCopyFunction(valueTypeFromElementType(elementType));
+    }
+
+    return NLExecutor::selectCopyFunction(chunkKindFromElementType(elementType));
+}
+
+// An ID chunk (a grouping key) allocates an ID column on its kind; a
+// !storage.nullable<...> chunk (a key or a sum/min/max/avg result) a
+// ColumnOptVector on its value type; a ui64 chunk (a count result) a
+// ColumnVector<uint64_t> directly, as nl.count_result's output is allocated.
+Column* NLTranslator::allocColumnForResultChunkType(mlir::Type chunkType) {
+    const auto chunk = mlir::cast<nl::ChunkType>(chunkType);
+    const mlir::Type elementType = chunk.getElementType();
+
+    if (isNullableList(elementType)) {
+        return allocOptListColumn();
+    } else if (isNullableAny(elementType)) {
+        return allocOptListElementColumn();
+    }
+
+    if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+
+        if (isIDElement(wrappedType)) {
+            return allocOptIDColumn(chunkKindFromElementType(wrappedType));
+        }
+
+        const ValueType valueType = valueTypeFromElementType(wrappedType);
+        return allocOptColumnForValueType(valueType);
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        return allocListElementColumn();
+    } else if (mlir::isa<storage::MapElementType>(elementType)) {
+        return allocMapEntryColumn();
+    }
+
+    if (isPlainValueElementType(elementType)) {
+        return allocPlainColumn(valueTypeFromElementType(elementType));
+    }
+
+    return allocColumnForKind(chunkKindFromElementType(elementType));
+}
+
+void NLTranslator::translateEachRowLoop(const IteratorConfig& config,
+                                        mlir::Block& loopBody,
+                                        NLLimitState* limit,
+                                        NLStmtContainer* body) {
+    const std::span<const mlir::Value> columns = config._eachRowColumns;
+
+    // The row count is read from the first column, so a walk over no column cannot be
+    // sized. DBLowering never emits it, but the nl IR may come from elsewhere.
+    if (columns.empty()) {
+        throw IRException("nl.each_row needs at least one column");
+    }
+
+    if (loopBody.getNumArguments() != columns.size()) {
+        throw IRException("nl.each_row loop must bind one variable per column");
+    }
+
+    NLEachRowLoopData* loopData = _program->allocFunctionData<NLEachRowLoopData>();
+    loopData->setLimit(limit);
+    loopData->getIndices()->resize(1);
+
+    // Each loop variable is a one-row chunk of its column's own kind, filled by the gather
+    // an edge hop uses over a one-row index column.
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        const mlir::Value loopVariable = loopBody.getArgument(static_cast<unsigned>(columnIndex));
+        const mlir::Type chunkType = loopVariable.getType();
+
+        Column* output = allocColumnForChunkType(chunkType);
+        _valueSlots[loopVariable] = output;
+
+        loopData->addColumn(NLCarriedColumn {getColumn(columns[columnIndex]),
+                                             output,
+                                             selectGatherForChunkType(chunkType)});
+    }
+
+    body->emplaceStmt(&NLExecutor::runEachRowLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::translateCrossProductLoop(const IteratorConfig& config,
+                                             mlir::Block& loopBody,
+                                             NLLimitState* limit,
+                                             NLStmtContainer* body) {
+    const std::span<const mlir::Value> outerColumns = config._crossOuterColumns;
+    const std::span<const mlir::Value> innerColumns = config._crossInnerColumns;
+
+    // At run time the loop takes N from the first outer column and M from the first
+    // inner column, so a side with no column cannot be sized. Reject that here:
+    // DBLowering never emits it, but the nl IR may come from elsewhere.
+    if (outerColumns.empty() || innerColumns.empty()) {
+        throw IRException("nl.cross_product needs at least one column on each side");
+    }
+
+    NLCrossProductLoopData* loopData = _program->allocFunctionData<NLCrossProductLoopData>();
+    loopData->setLimit(limit);
+
+    // The loop binds one variable per crossed column - the outer columns followed by
+    // the inner, the order inferReturnTypes lays the iterator's chunks out - so walk
+    // the block arguments in step.
+    unsigned argumentIndex = 0;
+
+    for (const mlir::Value column : outerColumns) {
+        addCrossColumn(column, loopBody.getArgument(argumentIndex), /*isOuter=*/true, loopData);
+        argumentIndex++;
+    }
+
+    for (const mlir::Value column : innerColumns) {
+        addCrossColumn(column, loopBody.getArgument(argumentIndex), /*isOuter=*/false, loopData);
+        argumentIndex++;
+    }
+
+    body->emplaceStmt(&NLExecutor::runCrossProductLoop, loopData);
+
+    translateBlock(loopBody, loopData->getStmts());
+}
+
+void NLTranslator::allocBroadcastColumn(mlir::Value inputValue,
+                                        bool isOuter,
+                                        Column*& output,
+                                        NLBroadcastFunction& broadcast) {
+    const Column* input = getColumn(inputValue);
+
+    const auto chunkType = mlir::cast<nl::ChunkType>(inputValue.getType());
+    const mlir::Type elementType = chunkType.getElementType();
+
+    // The output keeps the input's element type, only the row count changes. A
+    // nullable value chunk allocates a ColumnOptVector and broadcasts on its
+    // value type; a !storage.any chunk allocates a column of tagged scalars, which
+    // carry their own type; an ID chunk allocates on its chunk kind.
+
+    // A constant column holds one value standing for every row, so repeating it block-wise
+    // and tiling it give the same column: the one broadcast serves both sides.
+    if (isConstantColumn(input)) {
+        output = _memory->allocSame(input);
+        broadcast = NLExecutor::selectConstBlockRepeatFunction();
+    } else if (isNullableList(elementType)) {
+        output = allocOptListColumn();
+        broadcast = isOuter ? NLExecutor::selectOptListBlockRepeatFunction()
+                            : NLExecutor::selectOptListTileFunction();
+    } else if (isNullableAny(elementType)) {
+        output = allocOptListElementColumn();
+        broadcast = isOuter ? NLExecutor::selectOptListElementBlockRepeatFunction()
+                            : NLExecutor::selectOptListElementTileFunction();
+    } else if (const auto nullableType = mlir::dyn_cast<storage::NullableType>(elementType)) {
+        const mlir::Type wrappedType = nullableType.getValueType();
+        if (isIDElement(wrappedType)) {
+            const NLChunkKind kind = chunkKindFromElementType(wrappedType);
+            output = allocOptIDColumn(kind);
+            broadcast = isOuter ? NLExecutor::selectOptBlockRepeatFunction(kind)
+                                : NLExecutor::selectOptTileFunction(kind);
+        } else {
+            const ValueType valueType = valueTypeFromElementType(wrappedType);
+            output = allocOptColumnForValueType(valueType);
+            broadcast = isOuter ? NLExecutor::selectOptBlockRepeatFunction(valueType)
+                                : NLExecutor::selectOptTileFunction(valueType);
+        }
+    } else if (isMaskElementType(elementType)) {
+        output = allocMaskColumn();
+        broadcast = isOuter ? NLExecutor::selectMaskBlockRepeat() : NLExecutor::selectMaskTile();
+    } else if (mlir::isa<storage::AnyType>(elementType)) {
+        output = allocListElementColumn();
+        broadcast = isOuter ? NLExecutor::selectListElementBlockRepeatFunction()
+                            : NLExecutor::selectListElementTileFunction();
+    } else if (mlir::isa<storage::MapElementType>(elementType)) {
+        output = allocMapEntryColumn();
+        broadcast = isOuter ? NLExecutor::selectMapEntryBlockRepeatFunction()
+                            : NLExecutor::selectMapEntryTileFunction();
+    } else if (isPlainValueElementType(elementType)) {
+        const ValueType valueType = valueTypeFromElementType(elementType);
+        output = allocPlainColumn(valueType);
+        broadcast = isOuter ? NLExecutor::selectPlainBlockRepeatFunction(valueType)
+                            : NLExecutor::selectPlainTileFunction(valueType);
+    } else {
+        const NLChunkKind kind = getChunkKind(chunkType);
+        output = allocColumnForKind(kind);
+        broadcast = isOuter ? NLExecutor::selectBlockRepeatFunction(kind)
+                            : NLExecutor::selectTileFunction(kind);
+    }
+}
+
+void NLTranslator::addCrossColumn(mlir::Value inputValue,
+                                  mlir::Value resultValue,
+                                  bool isOuter,
+                                  NLCrossProductLoopData* data) {
+    const Column* input = getColumn(inputValue);
+
+    Column* output = nullptr;
+    NLBroadcastFunction broadcast = nullptr;
+    allocBroadcastColumn(inputValue, isOuter, output, broadcast);
+
+    _valueSlots[resultValue] = output;
+
+    const NLCrossColumn crossColumn(input, output, broadcast);
+    if (isOuter) {
+        data->addOuterColumn(crossColumn);
+    } else {
+        data->addInnerColumn(crossColumn);
+    }
+}
+
+Column* NLTranslator::allocColumn(mlir::Value chunkValue) {
+    Column* column = allocColumnForChunkType(chunkValue.getType());
+    _valueSlots[chunkValue] = column;
+    return column;
+}
+
+Column* NLTranslator::allocColumnIfUsed(mlir::Value chunkValue) {
+    if (chunkValue.use_empty()) {
+        return nullptr;
+    }
+
+    return allocColumn(chunkValue);
+}
+
+void NLTranslator::bindKernelResult(mlir::Value resultValue, Column* result) {
+    bioassert(result, "The kernel allocated no result column");
+
+    const mlir::Type resultType = resultValue.getType();
+    const bool declaredNullable = isNullableChunk(resultType);
+
+    if (declaredNullable != columnHoldsNulls(result)) {
+        std::string declaredType;
+        llvm::raw_string_ostream stream(declaredType);
+        resultType.print(stream);
+
+        const llvm::StringRef opName = resultValue.getDefiningOp()->getName().getStringRef();
+        throw IRException(fmt::format("{} declares a {} result, but its kernel writes a {}",
+                                      std::string_view(opName.data(), opName.size()),
+                                      declaredType,
+                                      result->getTypeName()));
+    }
+
+    _valueSlots[resultValue] = result;
+}
+
+// Pool-allocate a chunk column of the right concrete type from the external
+// arena, reserving a full chunk so execution stays allocation-free
+Column* NLTranslator::allocColumnForKind(NLChunkKind kind) {
+    const size_t chunkSize = _program->getChunkSize();
+
+    Column* column = nullptr;
+    dispatchChunkKind(kind, [&]<typename ElementType>() {
+        column = allocPlainChunkColumn<ElementType>(_memory, chunkSize);
+    });
+
+    return column;
+}
+
+// Pool-allocate a nullable value column (ColumnOptVector) of the right primitive
+// for a property's value type, reserving a full chunk so execution stays
+// allocation-free. The value type was baked into the chunk during lowering and
+// re-resolved from the schema here.
+Column* NLTranslator::allocOptColumnForValueType(ValueType valueType) {
+    // Per-step loop columns reserve a full chunk so execution stays
+    // allocation-free.
+    return allocOptColumn(valueType, _program->getChunkSize());
+}
+
+Column* NLTranslator::allocSingleRowOptColumnForValueType(ValueType valueType) {
+    // The aggregate accumulator only ever holds one row (reset assign(1, ...),
+    // update rewrites .front()), so reserve a single element rather than a chunk
+    // it would never fill.
+    return allocOptColumn(valueType, 1);
+}
+
+// A plain value element type: a 64-bit number carried without a nullable wrapper. A
+// tally is one (a ui64 that is never null) and so is an expression over it (a signed
+// i64, or an f64 once a double takes part). A width-1 integer is a mask, not one of
+// these, and an ID or list element is its own family.
+bool NLTranslator::isMaskElementType(mlir::Type elementType) {
+    return mlir::isa<storage::BoolType>(elementType);
+}
+
+Column* NLTranslator::allocMaskColumn() {
+    ColumnMask* column = _memory->alloc<ColumnMask>();
+    column->reserve(_program->getChunkSize());
+
+    return column;
+}
+
+bool NLTranslator::isEntityIDElement(mlir::Type elementType) {
+    return mlir::isa<storage::NodeIDType>(elementType) || mlir::isa<storage::EdgeIDType>(elementType);
+}
+
+// An element type carried as an identifier rather than as a property value: the entity
+// IDs isEntityIDElement names, the schema IDs and the value-type code. No ValueType
+// names any of them, so a nullable chunk over one is selected on its chunk kind.
+bool NLTranslator::isIDElement(mlir::Type elementType) {
+    return mlir::isa<storage::NodeIDType,
+                     storage::EdgeIDType,
+                     storage::EdgeTypeIDType,
+                     storage::LabelIDType,
+                     storage::PropertyTypeIDType,
+                     storage::ValueTypeType>(elementType);
+}
+
+// The nullable ID column a chunk of this kind is read through. Its plain sibling is
+// allocColumnForKind, which the same kinds reach when the chunk is not nullable.
+Column* NLTranslator::allocOptIDColumn(NLChunkKind kind) {
+    const size_t chunkSize = _program->getChunkSize();
+
+    switch (kind) {
+        case NLChunkKind::NodeID:
+            return allocOptChunkColumn<NodeID>(_memory, chunkSize);
+        break;
+
+        case NLChunkKind::EdgeID:
+            return allocOptChunkColumn<EdgeID>(_memory, chunkSize);
+        break;
+
+        case NLChunkKind::EdgeTypeID:
+            return allocOptChunkColumn<EdgeTypeID>(_memory, chunkSize);
+        break;
+
+        case NLChunkKind::LabelID:
+            return allocOptChunkColumn<LabelID>(_memory, chunkSize);
+        break;
+
+        case NLChunkKind::PropertyTypeID:
+            return allocOptChunkColumn<PropertyTypeID>(_memory, chunkSize);
+        break;
+
+        case NLChunkKind::ValueTypeCode:
+            return allocOptChunkColumn<ValueType>(_memory, chunkSize);
+        break;
+
+        default:
+            throw IRException("A nullable chunk of this element type is not an ID column");
+        break;
+    }
+}
+
+bool NLTranslator::isPlainValueElementType(mlir::Type elementType) {
+    if (mlir::isa<mlir::Float64Type>(elementType)) {
+        return true;
+    }
+
+    const auto intType = mlir::dyn_cast<mlir::IntegerType>(elementType);
+
+    return intType && intType.getWidth() == 64;
+}
+
+Column* NLTranslator::allocPlainColumn(ValueType valueType) {
+    const size_t chunkSize = _program->getChunkSize();
+
+    switch (valueType) {
+        case ValueType::Int64: {
+            ColumnVector<types::Int64::Primitive>* column = _memory->alloc<ColumnVector<types::Int64::Primitive>>();
+            column->reserve(chunkSize);
+            return column;
+        }
+        break;
+
+        case ValueType::UInt64:
+            return allocCountColumn();
+        break;
+
+        case ValueType::Double: {
+            ColumnVector<types::Double::Primitive>* column = _memory->alloc<ColumnVector<types::Double::Primitive>>();
+            column->reserve(chunkSize);
+            return column;
+        }
+        break;
+
+        default:
+            throw IRException("a plain value column must be numeric");
+        break;
+    }
+}
+
+ColumnVector<uint64_t>* NLTranslator::allocCountColumn() {
+    ColumnVector<uint64_t>* column = _memory->alloc<ColumnVector<uint64_t>>();
+    column->reserve(_program->getChunkSize());
+
+    return column;
+}
+
+Column* NLTranslator::allocListColumn() {
+    ColumnVector<ListView>* column = _memory->alloc<ColumnVector<ListView>>();
+    column->reserve(_program->getChunkSize());
+
+    return column;
+}
+
+Column* NLTranslator::allocOptListColumn() {
+    ColumnOptVector<ListView>* column = _memory->alloc<ColumnOptVector<ListView>>();
+    column->reserve(_program->getChunkSize());
+
+    return column;
+}
+
+Column* NLTranslator::allocEntityListColumn() {
+    ColumnVector<EntityList>* column = _memory->alloc<ColumnVector<EntityList>>();
+    column->reserve(_program->getChunkSize());
+
+    return column;
+}
+
+Column* NLTranslator::allocListElementColumn() {
+    ColumnVector<ListElementView>* column = _memory->alloc<ColumnVector<ListElementView>>();
+    column->reserve(_program->getChunkSize());
+
+    return column;
+}
+
+Column* NLTranslator::allocConstMapEntryColumn() {
+    return _memory->alloc<ColumnConst<MapEntryView>>();
+}
+
+Column* NLTranslator::allocMapEntryColumn() {
+    ColumnVector<MapEntryView>* column = _memory->alloc<ColumnVector<MapEntryView>>();
+    column->reserve(_program->getChunkSize());
+
+    return column;
+}
+
+Column* NLTranslator::allocOptListElementColumn() {
+    ColumnOptVector<ListElementView>* column = _memory->alloc<ColumnOptVector<ListElementView>>();
+    column->reserve(_program->getChunkSize());
+
+    return column;
+}
+
+Column* NLTranslator::allocOptColumn(ValueType valueType, size_t reserveSize) {
+    // Allocate a ColumnOptVector for the value type's primitive, reserving
+    // reserveSize optionals up front; ValueTypeDispatcher maps the runtime value
+    // type to that compile-time primitive.
+    Column* column = nullptr;
+    const auto allocate = [&]<SupportedType T>() {
+        ColumnOptVector<typename T::Primitive>* typed = _memory->alloc<ColumnOptVector<typename T::Primitive>>();
+        typed->reserve(reserveSize);
+        column = typed;
+    };
+    ValueTypeDispatcher(valueType).execute(allocate);
+
+    return column;
+}
+
+Column* NLTranslator::getColumn(mlir::Value chunkValue) const {
+    // Get allocated column for a given MLIR Value
+    const auto slotIt = _valueSlots.find(chunkValue);
+    if (slotIt == _valueSlots.end()) {
+        throw IRException("Chunk value must be a loop variable of an enclosing nl.for");
+    }
+
+    return slotIt->second;
+}
+
+NLChunkKind NLTranslator::getChunkKind(mlir::Type chunkType) {
+    const auto chunk = mlir::dyn_cast<nl::ChunkType>(chunkType);
+    if (!chunk) {
+        throw IRException("Expected an !nl.chunk type");
+    }
+
+    return chunkKindFromElementType(chunk.getElementType());
+}
+
+NLChunkKind NLTranslator::chunkKindFromElementType(mlir::Type elementType) {
+    // The ID chunks a scan or a hop binds, then the element types a CALL's yielded
+    // columns carry - so a yielded column is crossed and carried like any other. The
+    // integer widths are read the way a nullable value chunk's are: unsigned for a ui64,
+    // one bit for a bool.
+    if (mlir::isa<storage::NodeIDType>(elementType)) {
+        return NLChunkKind::NodeID;
+    } else if (mlir::isa<storage::EdgeIDType>(elementType)) {
+        return NLChunkKind::EdgeID;
+    } else if (mlir::isa<storage::EdgeTypeIDType>(elementType)) {
+        return NLChunkKind::EdgeTypeID;
+    } else if (mlir::isa<storage::LabelIDType>(elementType)) {
+        return NLChunkKind::LabelID;
+    } else if (mlir::isa<storage::PropertyTypeIDType>(elementType)) {
+        return NLChunkKind::PropertyTypeID;
+    } else if (mlir::isa<storage::ValueTypeType>(elementType)) {
+        return NLChunkKind::ValueTypeCode;
+    } else if (mlir::isa<storage::StringType>(elementType)) {
+        return NLChunkKind::String;
+    } else if (mlir::isa<storage::ListType>(elementType)) {
+        return NLChunkKind::List;
+    } else if (mlir::isa<storage::MapType>(elementType)) {
+        return NLChunkKind::Map;
+    } else if (mlir::isa<storage::PathType>(elementType)) {
+        return NLChunkKind::Path;
+    } else if (mlir::isa<storage::DateTimeType>(elementType)) {
+        return NLChunkKind::DateTime;
+    } else if (mlir::isa<storage::DurationType>(elementType)) {
+        return NLChunkKind::Duration;
+    } else if (mlir::isa<storage::PathRefType>(elementType)) {
+        return NLChunkKind::PathRef;
+    } else if (mlir::isa<storage::EntityListType>(elementType)) {
+        return NLChunkKind::EntityList;
+    } else if (mlir::isa<storage::BoolType>(elementType)) {
+        return NLChunkKind::Bool;
+    } else if (mlir::isa<mlir::Float64Type>(elementType)) {
+        return NLChunkKind::Double;
+    } else if (const auto intType = mlir::dyn_cast<mlir::IntegerType>(elementType)) {
+        if (intType.getWidth() == 1) {
+            return NLChunkKind::Bool;
+        } else if (intType.isUnsigned()) {
+            return NLChunkKind::UInt64;
+        }
+
+        return NLChunkKind::Int64;
+    }
+
+    throw IRException("Unsupported chunk element type");
+}

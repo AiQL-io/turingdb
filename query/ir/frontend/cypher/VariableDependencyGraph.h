@@ -1,6 +1,7 @@
 #pragma once
 
 #include <deque>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -12,8 +13,12 @@
 namespace db {
 
 class CypherAST;
+class DiagnosticsManager;
 class EntityPattern;
 class PatternElement;
+class Stmt;
+class UnwindStmt;
+class VarDecl;
 
 /**
  * @brief Graph representation of the dependencies among variables, generated from
@@ -34,20 +39,44 @@ class PatternElement;
 class VariableDependencyGraph {
 public:
     using Cycle = std::vector<VariableDependency*>;
-    using EdgeIdentityMap = std::unordered_map<std::string, std::vector<VariableDependency*>>;
+    using EdgeIdentityMap = std::unordered_map<const VarDecl*, std::vector<VariableDependency*>>;
+    using UnwindSourceMap = std::unordered_map<const VariableDependency*, const UnwindStmt*>;
+    using BoundVars = std::vector<VariableDependency*>;
 
     VariableDependencyGraph();
     ~VariableDependencyGraph();
 
-    void buildFromAST(const CypherAST* ast);
+    VariableDependencyGraph(VariableDependencyGraph&& other);
+    VariableDependencyGraph& operator=(VariableDependencyGraph&& other);
+
+    /// Inserts the variables of one query part, keeping the ones @ref
+    /// registerBoundVariable already declared so a pattern naming one depends on it
+    void build(std::span<Stmt* const> stmts);
+
+    /// Declares a variable a preceding WITH bound, whose column the code generator holds:
+    /// a pattern naming it is a join onto that column, not a scan, so it enters isolated
+    VariableDependency* registerBoundVariable(std::string_view name, const VarDecl* decl);
+
+    /// Drops every variable and edge, so the graph can be rebuilt for the next query part
+    void clear();
+
+    /// Held for the source locations it resolves, so a rejection names the span of the
+    /// query it came from
+    void setDiagnosticsManager(const DiagnosticsManager* diagnostics);
 
     /// Given a pattern (e.g. (n)-[e]->(m)), inserts all vars into the dependency graph
     void registerPatternElement(const PatternElement* ptn);
+
+    /// Given an UNWIND (e.g. UNWIND [1, 2, 3] AS x), inserts its variable into the
+    /// dependency graph
+    void registerUnwindStmt(const UnwindStmt* stmt);
 
     /// Iteration order has no semantic meaning
     const auto& vars() const { return _vars; }
     const auto& edges() const { return _edges; }
     const EdgeIdentityMap& edgeIdentities() const { return _edgeIdentities; }
+    const UnwindSourceMap& unwindSources() const { return _unwindSources; }
+    const BoundVars& boundVars() const { return _boundVars; }
 
     bool empty() const { return _vars.empty() && _edges.empty(); }
 
@@ -65,12 +94,27 @@ private:
     // Tracks how many times a variable has been anonimised
     std::unordered_map<VariableDependency*, int> _anonymised;
 
-    // Maps each Cypher edge variable name to all anonymous VDG variables created for it
+    // Maps each Cypher edge variable to all anonymous VDG variables created for it
     EdgeIdentityMap _edgeIdentities;
 
+    // Maps each UNWIND variable to the statement whose list it is bound to
+    UnwindSourceMap _unwindSources;
+
+    // The variables a preceding WITH bound, in the order that WITH projects them
+    BoundVars _boundVars;
+
+    const DiagnosticsManager* _diagnostics {nullptr};
+
+    [[noreturn]] void throwError(std::string_view msg, const void* obj = nullptr) const;
+
     VariableDependency* getOrCreateVariable(const EntityPattern* entity);
-    VariableDependency* newVariable(const EntityPattern* entity);
+    VariableDependency* newVariable(const VarDecl* decl);
     VariableDependency* newVariable(std::string_view name);
+
+    /// Under a name no Cypher identifier can be, so a user alias never resolves to it
+    VariableDependency* newAnonymousVariable(const VarDecl* decl);
+
+    VariableDependency* findVariable(const VarDecl* decl);
 
     void getNextAnonymisation(VariableDependency* v, std::string& buf);
 
@@ -91,14 +135,16 @@ private:
      * not connected
      */
     VariableDependency* subdivideWithMerge(VariableDependency* s, VariableDependency* t);
+    static DependencyEdge* findOutgoingMerge(VariableDependency* var);
 
     void subdivideWithMergeOutImpl(VariableDependency* s, VariableDependency* mid, VariableDependency* t, DependencyEdge* e);
     void subdivideWithMergeIncImpl(VariableDependency* s, VariableDependency* mid, VariableDependency* t, DependencyEdge* e);
 
     /**
-    * @brief Get the cycle basis of this graph.
-    */
-    void computeCycleBasis(std::vector<Cycle>& cycles);
+     * @brief Finds one cycle of the graph's non-meta edges, in the order its variables
+     * run around it. Returns false when those edges form a forest.
+     */
+    bool findCycle(Cycle& cycle);
 
     /**
      * @brief Removes a non-meta cycle by detaching the cycle and replacing the critical

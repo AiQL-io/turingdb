@@ -22,7 +22,7 @@ public:
 private:
     Expr* _lhs {nullptr};
     Expr* _rhs {nullptr};
-    BinaryOperator _operator {BinaryOperator::Or};
+    BinaryOperator _operator {BinaryOperator::Equal};
 
     BinaryExpr(BinaryOperator op,
                Expr* lhs,

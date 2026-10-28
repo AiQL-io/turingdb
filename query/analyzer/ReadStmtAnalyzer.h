@@ -1,5 +1,6 @@
 #pragma once
 
+#include "decl/EvaluatedType.h"
 #include "views/GraphView.h"
 
 namespace db {
@@ -8,6 +9,7 @@ class CypherAST;
 class ExprAnalyzer;
 class DeclContext;
 class VarDecl;
+class Symbol;
 class Stmt;
 class MatchStmt;
 class YieldClause;
@@ -21,10 +23,15 @@ class PatternElement;
 class NodePattern;
 class EdgePattern;
 class FunctionInvocation;
+class FunctionSignature;
 class LoadCSVStmt;
 class ShortestPathStmt;
 class GraphMetadata;
 class UnwindStmt;
+class YieldItems;
+class Expr;
+class EdgePatternData;
+class DeclContext;
 
 class ReadStmtAnalyzer {
 public:
@@ -49,12 +56,12 @@ public:
     void analyze(OrderBy* orderBySt);
     void analyze(Skip* skipSt);
     void analyze(Limit* limitSt);
-    void analyze(const ShortestPathStmt* spSt);
-    void analyze(const UnwindStmt* unwind);
+    void analyze(ShortestPathStmt* spSt);
+    void analyze(UnwindStmt* unwind);
 
     // Pattern
     void analyze(const Pattern* pattern);
-    void analyze(const PatternElement* element);
+    void analyze(PatternElement* element);
     void analyze(NodePattern* node);
     void analyze(EdgePattern* edge);
 
@@ -64,6 +71,43 @@ private:
     DeclContext* _ctxt {nullptr};
     ExprAnalyzer* _exprAnalyzer {nullptr};
     const GraphMetadata& _graphMetadata;
+
+    void yieldEveryReturnValue(const FunctionSignature& signature, YieldClause* yield);
+
+    // The property map of an edge pattern, each entry an equality predicate on @param decl:
+    // a constraint on the matched edge, or - for a hop of the quantified pattern @param
+    // walk - one more predicate every repetition must pass
+    void analyzeEdgeProperties(EdgePattern* edgePattern,
+                               VarDecl* decl,
+                               EdgePatternData* data,
+                               EdgePattern* walk);
+
+    // The hops a quantified pattern repeats: their edges, inner nodes and predicates resolve
+    // in a scope of their own, where the names bind one entity; outside it the same names
+    // bind the whole path's lists
+    void analyzeHops(EdgePattern* walk);
+
+    // The name a quantified pattern's inner node or edge groups, rejected when the query has
+    // already bound it and declared as the list of that name otherwise
+    void throwIfGroupNameIsBound(const DeclContext* outer, const Symbol* symbol, const EdgePattern* walk) const;
+    VarDecl* declareGroupVariable(DeclContext* outer, EvaluatedType type, std::string_view name);
+
+    // Declares the variable a `MATCH p = ...` names the whole element with, once its
+    // entities are bound
+    void analyzeNamedPath(PatternElement* element);
+
+    void enterScope(DeclContext* scope);
+
+    // The predicate a YIELD ... WHERE filters the rows its statement produced with. Shared
+    // by every statement that yields, since what a yield binds is what the predicate reads.
+    void analyzeYieldFilter(const YieldItems* yieldItems);
+
+    // Rejects a literal UNWIND argument that is no list: a literal carries its type at
+    // plan time, so anything but a list - null aside, which unwinds into no row - is a
+    // type error rather than a value to spread over rows
+    void throwOnNonListLiteral(const Expr* arg) const;
+
+    VarDecl* resolveShortestPathEndpoint(const Symbol* endpoint, const ShortestPathStmt* spSt) const;
 
     [[noreturn]] void throwError(std::string_view msg, const void* obj = 0) const;
 };

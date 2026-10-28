@@ -1,8 +1,11 @@
 #include "TuringTest.h"
 
 #include <array>
+#include <string>
+#include <vector>
 
 #include "VecLibAccessor.h"
+#include "VecLibWriteAccessor.h"
 #include "VectorDatabase.h"
 #include "BatchVectorCreate.h"
 #include "VectorSearchQuery.h"
@@ -91,6 +94,108 @@ TEST_F(VectorReloadTest, exactSearchAfterReload) {
         searchNearest(db, firstId, resultCount);
         ASSERT_GT(resultCount, 0u);
         ASSERT_EQ(firstId, 1);
+    }
+}
+
+TEST_F(VectorReloadTest, rebuiltIndexSurvivesReload) {
+    constexpr Dimension dimension = 2;
+    constexpr std::array<float, dimension> axisX {1.0f, 0.0f};
+    constexpr std::array<float, dimension> axisY {0.0f, 1.0f};
+    constexpr std::array<float, dimension> flippedX {-1.0f, 0.0f};
+
+    for (const IndexType indexType : {IndexType::FLAT, IndexType::HNSW}) {
+        const std::string libName = indexType == IndexType::FLAT ? "flatlib" : "hnswlib";
+        SCOPED_TRACE(libName);
+
+        {
+            VectorDatabase db;
+            ASSERT_TRUE(db.init(_rootDir));
+            ASSERT_TRUE(db.createLibrary(libName, dimension, DistanceMetric::EUCLIDEAN_DIST, indexType));
+
+            VecLibWriteAccessor accessor = db.getLibraryForWrite(libName);
+            ASSERT_TRUE(accessor.isValid());
+
+            BatchVectorCreate first;
+            accessor.prepareCreateBatch(&first);
+            first.addPoint(0, axisX);
+            first.addPoint(1, axisY);
+            ASSERT_TRUE(accessor.addEmbeddings(&first));
+
+            BatchVectorCreate second;
+            accessor.prepareCreateBatch(&second);
+            second.addPoint(0, flippedX);
+            ASSERT_TRUE(accessor.addEmbeddings(&second));
+        }
+
+        VectorDatabase db;
+        ASSERT_TRUE(db.init(_rootDir));
+
+        VecLibAccessor accessor = db.getLibrary(libName);
+        ASSERT_TRUE(accessor.isValid());
+
+        VectorSearchResult results;
+        VectorSearchQuery query(dimension);
+        query.setVector(axisX);
+        query.setMaxResultCount(3);
+        ASSERT_TRUE(accessor.search(&query, &results));
+
+        const std::vector<int64_t> ids(results.ids().begin(), results.ids().end());
+        const std::vector<float> distances(results.distances().begin(), results.distances().end());
+        EXPECT_EQ(ids, (std::vector<int64_t> {1, 0}));
+        EXPECT_EQ(distances, (std::vector<float> {2.0f, 4.0f}));
+    }
+}
+
+// Adding embeddings to a library that was loaded from disk has to work for every index
+// type. An HNSW index is mapped from its file on load, and faiss aborts the process
+// rather than grow a mapped index, so the library reads it back in owned to add to it.
+TEST_F(VectorReloadTest, addAfterReload) {
+    constexpr Dimension dimension = 2;
+    constexpr std::array<float, dimension> axisX {1.0f, 0.0f};
+    constexpr std::array<float, dimension> axisY {0.0f, 1.0f};
+
+    for (const IndexType indexType : {IndexType::FLAT, IndexType::HNSW}) {
+        const std::string libName = indexType == IndexType::FLAT ? "flataddlib" : "hnswaddlib";
+        SCOPED_TRACE(libName);
+
+        {
+            VectorDatabase db;
+            ASSERT_TRUE(db.init(_rootDir));
+            ASSERT_TRUE(db.createLibrary(libName, dimension, DistanceMetric::EUCLIDEAN_DIST, indexType));
+
+            VecLibWriteAccessor accessor = db.getLibraryForWrite(libName);
+            ASSERT_TRUE(accessor.isValid());
+
+            BatchVectorCreate batch;
+            accessor.prepareCreateBatch(&batch);
+            batch.addPoint(0, axisX);
+            ASSERT_TRUE(accessor.addEmbeddings(&batch));
+        }
+
+        VectorDatabase db;
+        ASSERT_TRUE(db.init(_rootDir));
+
+        {
+            VecLibWriteAccessor accessor = db.getLibraryForWrite(libName);
+            ASSERT_TRUE(accessor.isValid());
+
+            BatchVectorCreate batch;
+            accessor.prepareCreateBatch(&batch);
+            batch.addPoint(1, axisY);
+            ASSERT_TRUE(accessor.addEmbeddings(&batch));
+        }
+
+        VecLibAccessor accessor = db.getLibrary(libName);
+        ASSERT_TRUE(accessor.isValid());
+
+        VectorSearchResult results;
+        VectorSearchQuery query(dimension);
+        query.setVector(axisY);
+        query.setMaxResultCount(2);
+        ASSERT_TRUE(accessor.search(&query, &results));
+
+        const std::vector<int64_t> ids(results.ids().begin(), results.ids().end());
+        EXPECT_EQ(ids, (std::vector<int64_t> {1, 0}));
     }
 }
 

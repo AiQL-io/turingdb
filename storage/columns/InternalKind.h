@@ -7,11 +7,13 @@
 
 #include "EntityList.h"
 #include "columns/KindTypes.h"
+#include "map/MapEntryView.h"
 #include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
 #include "versioning/ChangeID.h"
 #include "GraphPath.h"
 #include "list/ListView.h"
+#include "map/MapView.h"
 
 namespace db {
 
@@ -52,6 +54,7 @@ public:
         EntityID,
         NodeID,
         EdgeID,
+        PathRef,
         Path,
         EntityList,
         LabelSetID,
@@ -72,6 +75,8 @@ public:
         types::Bool::Primitive,
         types::String::Primitive,
         types::Embedding::Primitive,
+        types::DateTime::Primitive,
+        types::Duration::Primitive,
         std::optional<EntityID>,
         std::optional<NodeID>,
         std::optional<EdgeID>,
@@ -86,6 +91,8 @@ public:
         std::optional<types::Bool::Primitive>,
         std::optional<types::String::Primitive>,
         std::optional<types::Embedding::Primitive>,
+        std::optional<types::DateTime::Primitive>,
+        std::optional<types::Duration::Primitive>,
         std::optional<std::string>,
         std::optional<ValueType>,
         std::optional<ChangeID>,
@@ -95,7 +102,12 @@ public:
         const Change*,
         Column*,
         ListView,
-        ListElementView
+        std::optional<ListView>,
+        ListElementView,
+        std::optional<ListElementView>,
+        MapView,
+        MapEntryView,
+        std::optional<MapView>
     >;
 
     using Code = uint8_t;

@@ -6,7 +6,6 @@
 
 namespace db {
 
-
 /**
  * @brief Non-owning view into a series of contiguously-stored @ref ListElementViews.
  */
@@ -29,6 +28,13 @@ public:
     ListElementView front() const { return _elements.front(); }
     ListElementView back() const { return _elements.back(); }
 
+    /// Returns this list without its first element; an empty list has none to drop.
+    ListView tail() const { return empty() ? *this : ListView {_elements.data() + 1, _elements.size() - 1}; }
+
+    /// Returns the run of @param count elements starting at @param from, which the caller
+    /// has clamped to this list: the elements are the ones this list already holds.
+    ListView slice(size_t from, size_t count) const { return ListView {_elements.data() + from, count}; }
+
     explicit operator bool() { return _elements.data() != nullptr; }
 
 private:
@@ -42,4 +48,7 @@ private:
 
     std::span<const ListElementView> _elements;
 };
+
+bool operator==(ListView lhs, ListView rhs);
+
 }

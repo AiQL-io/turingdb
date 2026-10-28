@@ -14,8 +14,10 @@ class DeclContext;
 class ExprAnalyzer;
 class Stmt;
 class CreateStmt;
+class MergeStmt;
 class SetStmt;
 class SetItem;
+class RemoveStmt;
 class DeleteStmt;
 class Pattern;
 class PatternElement;
@@ -50,16 +52,22 @@ private:
     ExprAnalyzer* _exprAnalyzer {nullptr};
     std::unordered_set<const VarDecl*> _toBeCreated;
     const GraphMetadata& _graphMetadata;
-    bool _hasCreate {false};
 
     void analyze(const CreateStmt* createStmt);
+    void analyze(const MergeStmt* mergeStmt);
     void analyze(const SetStmt* setStmt);
+    void analyze(const RemoveStmt* removeStmt);
     void analyze(const DeleteStmt* deleteStmt);
     void analyze(const Pattern* pattern);
-    void analyze(const PatternElement* element);
+    void analyze(PatternElement* element);
+    void analyzeNamedPath(PatternElement* element);
     void analyze(NodePattern* node);
     void analyze(EdgePattern* edge);
     void analyze(SetItem* item);
+
+    void throwOnEntityWhere(const Pattern* pattern, std::string_view clause) const;
+    void throwOnUndirectedEdge(const Pattern* pattern) const;
+    void throwOnNullProperty(const Pattern* pattern) const;
 
     [[noreturn]] void throwError(std::string_view msg, const void* obj = 0) const;
 

@@ -1,7 +1,6 @@
 #pragma once
 
-#include "versioning/ChangeID.h"
-#include "versioning/CommitHash.h"
+#include "TuringProtoServerNlSink.h"
 
 namespace net {
 
@@ -17,8 +16,7 @@ class TuringDB;
 
 class TuringProtoServerProcessor {
 public:
-    TuringProtoServerProcessor(TuringDB& db,
-                               net::TCPConnection& connection);
+    TuringProtoServerProcessor(TuringDB& db, net::TCPConnection& connection);
     ~TuringProtoServerProcessor();
 
     TuringProtoServerProcessor(const TuringProtoServerProcessor&) = delete;
@@ -29,20 +27,13 @@ public:
     void process(net::AbstractThreadContext* threadContext);
 
 private:
-    struct TransactionInfo {
-        std::string_view graphName;
-        CommitHash commit;
-        ChangeID change;
-        std::string_view query;
-    };
-
     TuringDB& _db;
     net::TCPConnection& _connection;
     DBThreadContext* _threadContext {nullptr};
+    TuringProtoServerNlSink _protoNLSink;
 
     void handleQuery();
     void writeQueryError(std::string_view message);
-    TransactionInfo getTransactionInfo() const;
 };
 
 }

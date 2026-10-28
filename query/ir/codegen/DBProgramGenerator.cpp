@@ -1,13 +1,25 @@
 #include "DBProgramGenerator.h"
 
+#include <ctype.h>
 #include <algorithm>
+#include <array>
 #include <memory>
+#include <numbers>
+#include <optional>
+#include <span>
+#include <sstream>
+#include <string>
 #include <string_view>
 #include <type_traits>
+#include <variant>
+#include <vector>
 
 #include "EntityPattern.h"
+#include "LabelExpr.h"
 #include "NodePattern.h"
+#include "Parameter.h"
 #include "expr/Operators.h"
+
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Block.h"
 #include "mlir/IR/Builders.h"
@@ -17,43 +29,111 @@
 #include "mlir/IR/Value.h"
 #include "mlir/IR/ValueRange.h"
 #include "mlir/Interfaces/DataLayoutInterfaces.h"
+#include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
+#include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/StringRef.h"
+#include "llvm/Support/SaveAndRestore.h"
 
 #include "DBDialect.h"
 #include "DBOps.h"
+#include "DBPassPipeline.h"
+#include "DBPasses.h"
 #include "DBTypes.h"
+#include "DBSystemProgramGenerator.h"
+#include "StorageAttributes.h"
 #include "StorageDialect.h"
+#include "StorageEnums.h"
 #include "StorageTypes.h"
+#include "PathHopArguments.h"
+#include "IRConstantColumn.h"
+#include "IRLiteralList.h"
+#include "IRValueTypes.h"
+#include "ExplainReport.h"
 
 #include "DependencyEdge.h"
 #include "EdgeMetadata.h"
 #include "VariableDependency.h"
 #include "VariableDependencyGraph.h"
+#include "VariableDependencyGraphDumper.h"
 
 #include "CypherAST.h"
+#include "DiagnosticsManager.h"
+#include "FunctionInvocation.h"
+#include "FunctionSignature.h"
 #include "Pattern.h"
 #include "PatternElement.h"
 #include "Projection.h"
 #include "QueryCommand.h"
 #include "SinglePartQuery.h"
+#include "UnionQuery.h"
+#include "ConditionalQuery.h"
+#include "Symbol.h"
 #include "WhereClause.h"
+#include "YieldClause.h"
+#include "YieldItems.h"
+#include "stmt/CallStmt.h"
+#include "stmt/CallSubqueryStmt.h"
+#include "stmt/StmtContainer.h"
+#include "decl/DeclContext.h"
+#include "decl/EvaluatedType.h"
 #include "decl/PatternData.h"
 #include "decl/VarDecl.h"
+#include "FunctionInvocation.h"
+#include "FunctionSignature.h"
 #include "Literal.h"
 #include "expr/BinaryExpr.h"
+#include "expr/CaseExpr.h"
+#include "expr/EntityTypeExpr.h"
+#include "expr/ExistsExpr.h"
+#include "expr/CountSubqueryExpr.h"
+#include "expr/CollectSubqueryExpr.h"
 #include "expr/Expr.h"
+#include "expr/ExprChain.h"
+#include "expr/ExprChildren.h"
+#include "expr/FunctionInvocationExpr.h"
+#include "expr/IndexExpr.h"
+#include "expr/ListComprehensionExpr.h"
+#include "expr/ListPredicateExpr.h"
+#include "expr/ReduceExpr.h"
+#include "expr/ListExpr.h"
+#include "expr/ListSliceExpr.h"
 #include "expr/LiteralExpr.h"
+#include "expr/LogicalExpr.h"
+#include "expr/PatternComprehensionExpr.h"
 #include "expr/PropertyExpr.h"
+#include "expr/PropertyLookupExpr.h"
+#include "expr/StringExpr.h"
+#include "expr/StructuralExpressionComparator.h"
 #include "expr/SymbolExpr.h"
 #include "expr/UnaryExpr.h"
 #include "stmt/CreateStmt.h"
+#include "stmt/MergeStmt.h"
+#include "stmt/NextSegmentStmt.h"
+#include "stmt/DeleteStmt.h"
+#include "expr/ExprChain.h"
 #include "stmt/Limit.h"
+#include "stmt/LoadCSVStmt.h"
 #include "stmt/MatchStmt.h"
+#include "stmt/OrderBy.h"
+#include "stmt/OrderByItem.h"
+#include "stmt/RemoveStmt.h"
 #include "stmt/ReturnStmt.h"
+#include "stmt/SetItem.h"
+#include "stmt/SetStmt.h"
+#include "stmt/ShortestPathStmt.h"
 #include "stmt/Skip.h"
 #include "stmt/StmtContainer.h"
+#include "stmt/UnwindStmt.h"
+#include "stmt/VectorSearchStmt.h"
+#include "stmt/WithStmt.h"
 #include "Symbol.h"
 #include "SymbolChain.h"
+
+#include "columns/BinaryOperators.h"
 
 #include "BioAssert.h"
 #include "FatalException.h"
@@ -63,11 +143,590 @@ using namespace db;
 
 namespace {
 
+// The name a VECTOR SEARCH gives the metric column; anything else it yields is the
+// neighbour ID column, the analyzer having rejected every other name.
+constexpr std::string_view vectorSearchScoreYield = "score";
+
+std::string_view toStringView(llvm::StringRef text) {
+    return std::string_view(text.data(), text.size());
+}
+
+mlir::storage::UnicodeNormalForm toStorageNormalForm(UnicodeNormalForm form) {
+    switch (form) {
+        case UnicodeNormalForm::NFC:
+            return mlir::storage::UnicodeNormalForm::NFC;
+        break;
+        case UnicodeNormalForm::NFD:
+            return mlir::storage::UnicodeNormalForm::NFD;
+        break;
+        case UnicodeNormalForm::NFKC:
+            return mlir::storage::UnicodeNormalForm::NFKC;
+        break;
+        case UnicodeNormalForm::NFKD:
+            return mlir::storage::UnicodeNormalForm::NFKD;
+        break;
+        default:
+            bioassert(false, "Unhandled Unicode normal form");
+            return mlir::storage::UnicodeNormalForm::NFC;
+        break;
+    }
+}
+
+// Whether @param column is one @param aggregateOp bound, or one computed from what it
+// bound: anything computed before it holds the matched rows the aggregate consumed. A
+// column of another block is one the body being generated binds, which no aggregate reduced
+bool boundAtOrAfter(mlir::Value column, mlir::Operation* aggregateOp) {
+    mlir::Operation* const definingOp = column.getDefiningOp();
+
+    if (!definingOp || definingOp->getBlock() != aggregateOp->getBlock()) {
+        return true;
+    }
+
+    return definingOp == aggregateOp || aggregateOp->isBeforeInBlock(definingOp);
+}
+
+// Whether @param lhs is computed before @param rhs in the block both are bound in: a block
+// argument comes before any result, then the order the ops were built in
+bool computedBefore(mlir::Value lhs, mlir::Value rhs) {
+    mlir::Operation* const lhsOp = lhs.getDefiningOp();
+    mlir::Operation* const rhsOp = rhs.getDefiningOp();
+
+    if (!lhsOp || !rhsOp) {
+        const auto lhsArgument = mlir::dyn_cast<mlir::BlockArgument>(lhs);
+        const auto rhsArgument = mlir::dyn_cast<mlir::BlockArgument>(rhs);
+
+        if (lhsArgument && rhsArgument) {
+            return lhsArgument.getArgNumber() < rhsArgument.getArgNumber();
+        }
+
+        return !lhsOp;
+    }
+
+    if (lhsOp == rhsOp) {
+        const auto lhsResult = mlir::cast<mlir::OpResult>(lhs);
+        const auto rhsResult = mlir::cast<mlir::OpResult>(rhs);
+
+        return lhsResult.getResultNumber() < rhsResult.getResultNumber();
+    }
+
+    return lhsOp->isBeforeInBlock(rhsOp);
+}
+
+// Puts @param keys in the order the program computes the columns @param columns maps them
+// to. A map hands its entries out in address order, so the same query would otherwise
+// compile to a different operand order from one run to the next.
+template <typename Key, typename Map>
+void sortByProgramOrder(llvm::SmallVectorImpl<Key>& keys, const Map& columns) {
+    std::ranges::sort(keys, [&columns](const Key& lhs, const Key& rhs) {
+        return computedBefore(columns.at(lhs), columns.at(rhs));
+    });
+}
+
+// The variable a projection item publishes as it stands, or null for an item that computes
+// a value from one: only the first keeps an entity, the second leaves it behind. A wildcard
+// expands to the declarations themselves, anything written out to a bare symbol expression
+const VarDecl* projectedVariable(const Projection::ReturnItem& item) {
+    if (VarDecl* const* itemDecl = std::get_if<VarDecl*>(&item)) {
+        return *itemDecl;
+    }
+
+    const Expr* itemExpr = *std::get_if<Expr*>(&item);
+    if (itemExpr->getKind() != Expr::Kind::SYMBOL) {
+        return nullptr;
+    }
+
+    return itemExpr->getExprVarDecl();
+}
+
+// The untyped null column the null literal compiles to: nullable with no value type of
+// its own, so nothing about it says which column would carry a value
+bool isUntypedNullColumn(mlir::Value column) {
+    const auto columnType = mlir::dyn_cast<mlir::db::ColumnType>(column.getType());
+    if (!columnType) {
+        return false;
+    }
+
+    const auto nullableType = mlir::dyn_cast<mlir::storage::NullableType>(columnType.getType());
+    return nullableType && mlir::isa<mlir::NoneType>(nullableType.getValueType());
+}
+
+mlir::Type pathElementsType(mlir::MLIRContext* context, mlir::storage::PathElementsKind kind) {
+    switch (kind) {
+        case mlir::storage::PathElementsKind::Nodes:
+            return mlir::storage::ListType::get(context, mlir::storage::NodeIDType::get(context));
+        break;
+
+        case mlir::storage::PathElementsKind::Relationships:
+            return mlir::storage::ListType::get(context, mlir::storage::EdgeIDType::get(context));
+        break;
+
+        case mlir::storage::PathElementsKind::Length:
+            return mlir::IntegerType::get(context, 64, mlir::IntegerType::Unsigned);
+        break;
+    }
+
+    return mlir::Type();
+}
+
+mlir::storage::ListPredicateKind listPredicateKind(ListPredicateExpr::Quantifier quantifier) {
+    switch (quantifier) {
+        case ListPredicateExpr::Quantifier::All:
+            return mlir::storage::ListPredicateKind::All;
+        break;
+
+        case ListPredicateExpr::Quantifier::Any:
+            return mlir::storage::ListPredicateKind::Any;
+        break;
+
+        case ListPredicateExpr::Quantifier::None:
+            return mlir::storage::ListPredicateKind::None;
+        break;
+
+        case ListPredicateExpr::Quantifier::Single:
+            return mlir::storage::ListPredicateKind::Single;
+        break;
+    }
+
+    return mlir::storage::ListPredicateKind::All;
+}
+
+template <SchemaNameKind Kind>
+mlir::Type schemaNameParameterType(mlir::MLIRContext* context) {
+    if constexpr (Kind == SchemaNameKind::Label) {
+        return mlir::storage::LabelIDType::get(context);
+    } else {
+        return mlir::storage::EdgeTypeIDType::get(context);
+    }
+}
+
+// The attribute a schema name stands as: the string, or the parameter typed as a label or
+// an edge type
+template <SchemaNameKind Kind>
+mlir::Attribute schemaNameAttr(mlir::OpBuilder& builder, const SchemaNameRef<Kind>& ref) {
+    const llvm::StringRef name(ref._name.data(), ref._name.size());
+    if (ref._isParameter) {
+        mlir::MLIRContext* const context = builder.getContext();
+        return mlir::storage::ParameterAttr::get(context, name, schemaNameParameterType<Kind>(context));
+    }
+
+    return builder.getStringAttr(name);
+}
+
+template <SchemaNameKind Kind>
+mlir::ArrayAttr schemaNamesAttr(mlir::OpBuilder& builder, std::span<const SchemaNameRef<Kind>> names) {
+    llvm::SmallVector<mlir::Attribute> refs;
+    for (const SchemaNameRef<Kind>& name : names) {
+        refs.push_back(schemaNameAttr(builder, name));
+    }
+
+    return builder.getArrayAttr(refs);
+}
+
+// The stage a dump of one pass is reported under: "after fuse_scan_edges", or "after
+// trim_unread_columns 2" for a run of a pass the pipeline runs more than once
+void makePassLabel(std::string_view selector, std::string_view passName, size_t run, std::string& label) {
+    label = selector;
+    label += passName;
+
+    if (run > 0) {
+        label += ' ';
+        label += std::to_string(run);
+    }
+}
+
+// Which run of its pass the pipeline position is, counted from 1, or 0 for a pass the
+// pipeline runs once
+size_t passRunNumber(std::span<const std::string_view> pipelinePasses, size_t passIndex) {
+    const std::string_view passName = pipelinePasses[passIndex];
+    if (std::ranges::count(pipelinePasses, passName) == 1) {
+        return 0;
+    }
+
+    return static_cast<size_t>(std::ranges::count(pipelinePasses.first(passIndex + 1), passName));
+}
+
+// The row tag an OPTIONAL MATCH carries beside the columns its pattern walks. A backtick
+// can appear in no Cypher identifier, quoted or not, so no variable of the query's own is
+// ever taken for the tag - the columns are keyed by name.
+constexpr std::string_view optionalTagName {"`optional_tag"};
+
+// The row tag a pattern comprehension carries beside the columns its pattern walks, under
+// a name of the same shape and for the same reason as the one above.
+constexpr std::string_view comprehensionTagName {"`comprehension_tag"};
+
+// The columns a CALL subquery carries past its body are bound under this prefix, so no
+// clause of the body resolves or drops them - the columns are keyed by name.
+constexpr std::string_view hiddenColumnPrefix {"`hidden_"};
+
+std::string hiddenName(std::string_view name) {
+    std::string hidden {hiddenColumnPrefix};
+    hidden += name;
+    return hidden;
+}
+
+bool isHiddenName(std::string_view name) {
+    return name.starts_with(hiddenColumnPrefix);
+}
+
+// The row tag an OPTIONAL CALL body carries, under a hidden name no input's own hidden
+// name can be: an identifier holds no backtick
+constexpr std::string_view subqueryTagName {"`hidden_`tag"};
+
+// The row tag an EXISTS body carries, under a hidden name no clause of the body resolves
+// or drops - a barrier inside it carries the column on as it does a CALL's tag
+constexpr std::string_view existsTagName {"`hidden_`exists_tag"};
+
+constexpr std::string_view countTagName {"`hidden_`count_tag"};
+
+constexpr std::string_view collectTagName {"`hidden_`collect_tag"};
+
+// The mask of an entity a MERGE wrote is bound past a WITH under the entity's name behind
+// this prefix. No hidden name starts with it, so a barrier publishing no entity drops it
+constexpr std::string_view pendingMaskPrefix {"`pending_"};
+
+std::string pendingMaskName(std::string_view entityName) {
+    std::string name {pendingMaskPrefix};
+    name += entityName;
+    return name;
+}
+
+bool matchCarriesRows(const MatchStmt* matchStmt) {
+    return !matchStmt->hasOrderBy() && !matchStmt->hasSkip() && !matchStmt->hasLimit();
+}
+
+bool projectionCarriesRows(const Projection* projection) {
+    return !projection->isAggregate()
+           && !projection->isDistinct()
+           && !projection->hasOrderBy()
+           && !projection->hasSkip()
+           && !projection->hasLimit();
+}
+
+// Whether the rows this clause leaves in flight are each still paired with the input row
+// they came from. Fanning out and filtering keep that pairing - the input column rides
+// along - so the question is not whether the row count survives.
+bool statementCarriesRows(const Stmt* stmt) {
+    const Stmt::Kind kind = stmt->getKind();
+
+    switch (kind) {
+        case Stmt::Kind::MATCH:
+            return matchCarriesRows(static_cast<const MatchStmt*>(stmt));
+        break;
+
+        case Stmt::Kind::WITH:
+            return projectionCarriesRows(static_cast<const WithStmt*>(stmt)->getProjection());
+        break;
+
+        // A source of its own is crossed with the rows already in flight, so each row it
+        // makes carries the input row it was paired with; an updating clause writes once
+        // per row and leaves the rows alone
+        case Stmt::Kind::CALL:
+        case Stmt::Kind::CREATE:
+        case Stmt::Kind::MERGE:
+        case Stmt::Kind::SET:
+        case Stmt::Kind::REMOVE:
+        case Stmt::Kind::DELETE:
+        case Stmt::Kind::LOAD_CSV:
+        case Stmt::Kind::VECTOR_SEARCH:
+        case Stmt::Kind::UNWIND:
+        case Stmt::Kind::CALL_SUBQUERY:
+            return true;
+        break;
+
+        // A shortest path answers for the whole source and target columns with one
+        // distance and one path, so its rows are not the rows it read. A RETURN is the
+        // body's tail, read off getReturnStmt() rather than walked here. A NEXT segment
+        // replaces the rows it read with the ones it returns.
+        case Stmt::Kind::SHORTESTPATH:
+        case Stmt::Kind::RETURN:
+        case Stmt::Kind::NEXT_SEGMENT:
+            return false;
+        break;
+    }
+
+    return false;
+}
+
+using UnaryFunctionEmitter = mlir::Value (*)(mlir::OpBuilder& builder,
+                                             mlir::Location loc,
+                                             mlir::db::ColumnType resultType,
+                                             mlir::Value input);
+
+template <typename Op>
+mlir::Value emitUnaryFunction(mlir::OpBuilder& builder,
+                              mlir::Location loc,
+                              mlir::db::ColumnType resultType,
+                              mlir::Value input) {
+    return builder.create<Op>(loc, resultType, input).getResult();
+}
+
+const std::unordered_map<std::string_view, UnaryFunctionEmitter> unaryFunctionEmitters = {
+    {"labels", &emitUnaryFunction<mlir::db::Labels>},
+    {"type", &emitUnaryFunction<mlir::db::EdgeType>},
+    {"keys", &emitUnaryFunction<mlir::db::Keys>},
+    {"properties", &emitUnaryFunction<mlir::db::PropertyMap>},
+    {"startNode", &emitUnaryFunction<mlir::db::StartNode>},
+    {"endNode", &emitUnaryFunction<mlir::db::EndNode>},
+    {"toInteger", &emitUnaryFunction<mlir::db::ToInteger>},
+    {"toFloat", &emitUnaryFunction<mlir::db::ToFloat>},
+    {"toString", &emitUnaryFunction<mlir::db::ToString>},
+    {"toBoolean", &emitUnaryFunction<mlir::db::ToBoolean>},
+    {"toIntegerOrNull", &emitUnaryFunction<mlir::db::ToIntegerOrNull>},
+    {"toFloatOrNull", &emitUnaryFunction<mlir::db::ToFloatOrNull>},
+    {"toStringOrNull", &emitUnaryFunction<mlir::db::ToStringOrNull>},
+    {"toBooleanOrNull", &emitUnaryFunction<mlir::db::ToBooleanOrNull>},
+    {"datetime", &emitUnaryFunction<mlir::db::ToDateTime>},
+    {"duration", &emitUnaryFunction<mlir::db::ToDuration>},
+    {"size", &emitUnaryFunction<mlir::db::Size>},
+    {"length", &emitUnaryFunction<mlir::db::Size>},
+    {"char_length", &emitUnaryFunction<mlir::db::CharLength>},
+    {"character_length", &emitUnaryFunction<mlir::db::CharLength>},
+    {"head", &emitUnaryFunction<mlir::db::Head>},
+    {"last", &emitUnaryFunction<mlir::db::Last>},
+    {"tail", &emitUnaryFunction<mlir::db::Tail>},
+    {"abs", &emitUnaryFunction<mlir::db::Abs>},
+    {"sign", &emitUnaryFunction<mlir::db::Sign>},
+    {"ceil", &emitUnaryFunction<mlir::db::Ceil>},
+    {"floor", &emitUnaryFunction<mlir::db::Floor>},
+    {"round", &emitUnaryFunction<mlir::db::Round>},
+    {"sqrt", &emitUnaryFunction<mlir::db::Sqrt>},
+    {"exp", &emitUnaryFunction<mlir::db::Exp>},
+    {"log", &emitUnaryFunction<mlir::db::Log>},
+    {"log10", &emitUnaryFunction<mlir::db::Log10>},
+    {"sin", &emitUnaryFunction<mlir::db::Sin>},
+    {"cos", &emitUnaryFunction<mlir::db::Cos>},
+    {"tan", &emitUnaryFunction<mlir::db::Tan>},
+    {"cot", &emitUnaryFunction<mlir::db::Cot>},
+    {"asin", &emitUnaryFunction<mlir::db::Asin>},
+    {"acos", &emitUnaryFunction<mlir::db::Acos>},
+    {"atan", &emitUnaryFunction<mlir::db::Atan>},
+    {"degrees", &emitUnaryFunction<mlir::db::Degrees>},
+    {"radians", &emitUnaryFunction<mlir::db::Radians>},
+    {"haversin", &emitUnaryFunction<mlir::db::Haversin>},
+    {"toUpper", &emitUnaryFunction<mlir::db::ToUpper>},
+    {"toLower", &emitUnaryFunction<mlir::db::ToLower>},
+    {"trim", &emitUnaryFunction<mlir::db::Trim>},
+    {"ltrim", &emitUnaryFunction<mlir::db::LTrim>},
+    {"rtrim", &emitUnaryFunction<mlir::db::RTrim>},
+    {"reverse", &emitUnaryFunction<mlir::db::Reverse>},
+};
+
+using BinaryFunctionEmitter = mlir::Value (*)(mlir::OpBuilder& builder,
+                                              mlir::Location loc,
+                                              mlir::db::ColumnType resultType,
+                                              mlir::Value lhs,
+                                              mlir::Value rhs);
+
+template <typename Op>
+mlir::Value emitBinaryFunction(mlir::OpBuilder& builder,
+                               mlir::Location loc,
+                               mlir::db::ColumnType resultType,
+                               mlir::Value lhs,
+                               mlir::Value rhs) {
+    return builder.create<Op>(loc, resultType, lhs, rhs).getResult();
+}
+
+const std::unordered_map<std::string_view, BinaryFunctionEmitter> binaryFunctionEmitters = {
+    {"cosine_similarity", &emitBinaryFunction<mlir::db::CosineSimilarity>},
+    {"euclidean_distance", &emitBinaryFunction<mlir::db::EuclideanDistance>},
+};
+
+// The list a literal UNWIND spreads, null for the one literal that is no list and still
+// analyzes - `UNWIND null`, which spreads into no row. Anything else here is a statement
+// the analyzer let through and neither of the sources built from one can lower.
+const ListLiteral* literalUnwindList(const DiagnosticsManager* diagnostics, const UnwindStmt* unwind) {
+    const LiteralExpr* literalExpr = dynamic_cast<const LiteralExpr*>(unwind->arg());
+    if (!literalExpr) {
+        diagnostics->throwError("Non-literal UNWIND expressions are not yet supported.", unwind);
+    }
+
+    const Literal* literal = literalExpr->getLiteral();
+    if (literal->getKind() == Literal::Kind::NULL_LITERAL) {
+        return nullptr;
+    }
+
+    const ListLiteral* list = dynamic_cast<const ListLiteral*>(literal);
+    if (!list) {
+        diagnostics->throwError("Non-list arguments to UNWIND are not yet supported.", unwind);
+    }
+
+    return list;
+}
+
+// True when a value is one of `columns` or is computed from one.
+bool readsAnyColumn(mlir::ValueRange values, llvm::ArrayRef<mlir::Value> columns) {
+    llvm::DenseSet<mlir::Value> columnSet;
+    for (const mlir::Value column : columns) {
+        columnSet.insert(column);
+    }
+
+    llvm::SmallVector<mlir::Value> worklist(values.begin(), values.end());
+    llvm::DenseSet<mlir::Value> visited;
+
+    while (!worklist.empty()) {
+        const mlir::Value value = worklist.pop_back_val();
+        if (!visited.insert(value).second) {
+            continue;
+        }
+
+        if (columnSet.contains(value)) {
+            return true;
+        }
+
+        mlir::Operation* const definingOp = value.getDefiningOp();
+        if (definingOp) {
+            worklist.append(definingOp->operand_begin(), definingOp->operand_end());
+        }
+    }
+
+    return false;
+}
+
+// The variables a YIELD binds.
+void collectYieldVariables(const YieldClause* yield, llvm::SmallVectorImpl<const VarDecl*>& variables) {
+    const YieldItems* yieldItems = yield ? yield->getItems() : nullptr;
+    if (!yieldItems) {
+        return;
+    }
+
+    for (const SymbolExpr* item : *yieldItems) {
+        variables.push_back(item->getDecl());
+    }
+}
+
+// The YIELD of a statement that binds variables of its own: a CALL or a VECTOR SEARCH.
+const YieldClause* yieldClauseOf(const Stmt* stmt) {
+    const Stmt::Kind kind = stmt->getKind();
+
+    if (kind == Stmt::Kind::CALL) {
+        return static_cast<const CallStmt*>(stmt)->getYield();
+    }
+
+    bioassert(kind == Stmt::Kind::VECTOR_SEARCH, "Only a CALL or a VECTOR SEARCH binds a YIELD.");
+
+    return static_cast<const VectorSearchStmt*>(stmt)->getYield();
+}
+
+// The variables a statement binds of its own: the return values a YIELD names, and the
+// element an UNWIND spreads.
+void collectStatementVariables(const Stmt* stmt, llvm::SmallVectorImpl<const VarDecl*>& variables) {
+    if (stmt->getKind() == Stmt::Kind::UNWIND) {
+        variables.push_back(static_cast<const UnwindStmt*>(stmt)->getDecl());
+        return;
+    }
+
+    collectYieldVariables(yieldClauseOf(stmt), variables);
+}
+
+// The ops values are transitively defined by: the chain that has to travel with them for
+// them to stay usable where they land.
+void collectDefiningOps(mlir::ValueRange values, llvm::DenseSet<mlir::Operation*>& ops) {
+    llvm::SmallVector<mlir::Value> worklist(values.begin(), values.end());
+
+    while (!worklist.empty()) {
+        const mlir::Value value = worklist.pop_back_val();
+
+        mlir::Operation* const definingOp = value.getDefiningOp();
+        if (!definingOp || !ops.insert(definingOp).second) {
+            continue;
+        }
+
+        worklist.append(definingOp->operand_begin(), definingOp->operand_end());
+    }
+}
+
+bool constrainsHop(const NodePattern* node) {
+    if (!node) {
+        return false;
+    }
+
+    const NodePatternData* data = node->getData();
+    return data && (!data->labelConstraints().empty()
+                    || !data->labelExprConstraints().empty()
+                    || !data->exprConstraints().empty());
+}
+
+bool hasHopConstraints(const EdgePattern* pattern) {
+    if (!pattern) {
+        return false;
+    }
+
+    const size_t hopCount = pattern->getHopCount();
+    bool constrainsANode = false;
+    bool repeatsAName = false;
+    for (size_t position = 0; position <= hopCount; position++) {
+        const NodePattern* node = pattern->getHopNode(position);
+        constrainsANode |= constrainsHop(node);
+
+        for (size_t earlier = 0; node && earlier < position; earlier++) {
+            const NodePattern* other = pattern->getHopNode(earlier);
+            repeatsAName |= other && other->getDecl() == node->getDecl();
+        }
+    }
+
+    bool constrainsAHopType = false;
+    for (size_t hopIndex = 0; hopIndex < hopCount; hopIndex++) {
+        const EdgePatternData* hopData = pattern->getHop(hopIndex)->getData();
+        constrainsAHopType |= hopData && !hopData->edgeTypeExprConstraints().empty();
+    }
+
+    return !pattern->hopPredicates().empty() || constrainsANode || repeatsAName || constrainsAHopType;
+}
+
+// The position along the walk of an entity of the repeated pattern, nodes at even positions
+// and edges at odd ones: a walk taken against the pattern reads it from its far end
+size_t walkPositionOf(size_t patternPosition, size_t hopCount, bool reversed) {
+    return reversed ? 2 * hopCount - patternPosition : patternPosition;
+}
+
+mlir::storage::PathDirection walkDirectionOf(EdgePattern::Direction direction, bool reversed) {
+    switch (direction) {
+        case EdgePattern::Direction::Forward:
+            return reversed ? mlir::storage::PathDirection::Backward : mlir::storage::PathDirection::Forward;
+        break;
+
+        case EdgePattern::Direction::Backward:
+            return reversed ? mlir::storage::PathDirection::Forward : mlir::storage::PathDirection::Backward;
+        break;
+
+        case EdgePattern::Direction::Undirected:
+            return mlir::storage::PathDirection::Both;
+        break;
+    }
+
+    throw FatalException("Uncaught edge pattern direction.");
+}
+
+bool isPathColumn(mlir::Value column) {
+    const auto columnType = mlir::dyn_cast<mlir::db::ColumnType>(column.getType());
+    return columnType && mlir::isa<mlir::storage::PathRefType>(columnType.getType());
+}
+
+bool isListColumn(mlir::Value column) {
+    const auto columnType = mlir::dyn_cast<mlir::db::ColumnType>(column.getType());
+    return columnType && mlir::isa<mlir::storage::ListType>(columnType.getType());
+}
+
+const VarDecl* declOfReturnItem(const Projection::ReturnItem& item) {
+    const auto declOf = [](auto&& projected) -> const VarDecl* {
+        using Type = std::remove_cvref_t<decltype(projected)>;
+
+        if constexpr (std::is_same_v<Type, VarDecl*>) {
+            return projected;
+        } else {
+            return projected->getExprVarDecl();
+        }
+    };
+
+    return std::visit(declOf, item);
+}
+
 bool producesEdgeVar(const DependencyEdge* e) {
     const EdgeMetadata::EdgeType producedType = e->data().type();
     const bool getOut = producedType == EdgeMetadata::EdgeType::GET_OUT_EDGES;
     const bool getIn = producedType == EdgeMetadata::EdgeType::GET_IN_EDGES;
-    return getOut || getIn;
+    const bool getEdges = producedType == EdgeMetadata::EdgeType::GET_EDGES;
+    return getOut || getIn || getEdges;
 }
 
 bool producesNodeVar(const DependencyEdge* e) {
@@ -87,6 +746,10 @@ EdgeMetadata::EdgeType reverseEdge(EdgeMetadata::EdgeType type) {
             return db::EdgeMetadata::EdgeType::GET_OUT_EDGES;
         break;
 
+        case EdgeMetadata::EdgeType::GET_EDGES:
+            return db::EdgeMetadata::EdgeType::GET_EDGES;
+        break;
+
         default:
             throw FatalException("Invalid attempt to reverse direction");
         break;
@@ -94,6 +757,84 @@ EdgeMetadata::EdgeType reverseEdge(EdgeMetadata::EdgeType type) {
 
     throw FatalException("Uncaught edge type.");
 
+}
+
+// A constant column holds the same value in every row, so a step shaped by rows - a
+// dedup, a sort, a cut - is not given one: reading it would anchor that step where the
+// constant is bound, above the loop the other columns are read in
+void collectRowColumns(const Projection* projection,
+                       const llvm::SmallVectorImpl<mlir::Value>& projected,
+                       llvm::SmallVectorImpl<size_t>& items,
+                       llvm::SmallVectorImpl<mlir::Value>& columns) {
+    bioassert(projected.size() == projection->items().size(),
+              "One projected column per return item expected");
+
+    for (size_t itemIndex = 0; itemIndex < projected.size(); itemIndex++) {
+        const mlir::Value column = projected[itemIndex];
+        if (yieldsConstantColumn(column)) {
+            continue;
+        }
+
+        items.push_back(itemIndex);
+        columns.push_back(column);
+    }
+}
+
+// The columns a SKIP or a LIMIT is charged to: the ones that carry rows, or the whole
+// projection when it is constants alone - one row repeated, which the cut still cuts
+void collectCutColumns(const Projection* projection,
+                       const llvm::SmallVectorImpl<mlir::Value>& projected,
+                       llvm::SmallVectorImpl<size_t>& items,
+                       llvm::SmallVectorImpl<mlir::Value>& columns) {
+    collectRowColumns(projection, projected, items, columns);
+    if (!columns.empty()) {
+        return;
+    }
+
+    for (size_t itemIndex = 0; itemIndex < projected.size(); itemIndex++) {
+        items.push_back(itemIndex);
+        columns.push_back(projected[itemIndex]);
+    }
+}
+
+// The same pick over the columns a WITH carries beside its projection
+void collectCarriedRowColumns(llvm::ArrayRef<DBProgramGenerator::PublishedColumn> carriedColumns,
+                              llvm::SmallVectorImpl<size_t>& indices,
+                              llvm::SmallVectorImpl<mlir::Value>& columns) {
+    for (size_t index = 0; index < carriedColumns.size(); index++) {
+        const mlir::Value column = carriedColumns[index]._column;
+        if (yieldsConstantColumn(column)) {
+            continue;
+        }
+
+        indices.push_back(index);
+        columns.push_back(column);
+    }
+}
+
+// The element type of the lists a db.make_list builds: the one type its element columns
+// name, or the type-erased tagged scalar where they name no single one. A column whose own
+// type is resolved during lowering names `none`, and no verdict can be taken against a
+// type that is not known yet: the whole list stays `none` and lowering takes the verdict
+// over the resolved chunks.
+mlir::Type sharedColumnElement(mlir::MLIRContext* context, llvm::ArrayRef<mlir::Value> columns) {
+    mlir::Type shared;
+
+    for (const mlir::Value column : columns) {
+        const mlir::Type element = mlir::cast<mlir::db::ColumnType>(column.getType()).getType();
+
+        if (mlir::isa<mlir::NoneType>(element)) {
+            return element;
+        }
+
+        if (!shared) {
+            shared = element;
+        } else if (shared != element) {
+            return mlir::storage::AnyType::get(context);
+        }
+    }
+
+    return shared;
 }
 
 mlir::Value findVarOrThrow(const DBProgramGenerator::VariableIdentityMap& map,
@@ -105,12 +846,167 @@ mlir::Value findVarOrThrow(const DBProgramGenerator::VariableIdentityMap& map,
     return identities.back();
 }
 
+void flattenConjuncts(const Expr* expr, std::vector<const Expr*>& conjuncts) {
+    if (expr->getKind() == Expr::Kind::LOGICAL) {
+        const LogicalExpr* logicalExpr = static_cast<const LogicalExpr*>(expr);
+
+        // Two links of a comparison chain read the same operand, so a filter standing
+        // between them would leave the second link reading a column laid out over rows the
+        // first one cut. The chain is one predicate and filters once
+        const bool splits = logicalExpr->getOperator() == LogicalOperator::And
+                            && !logicalExpr->isComparisonChain();
+
+        if (splits) {
+            for (const Expr* operand : logicalExpr->getOperands()) {
+                flattenConjuncts(operand, conjuncts);
+            }
+            return;
+        }
+    }
+
+    conjuncts.push_back(expr);
 }
 
-DBProgramGenerator::DBProgramGenerator(mlir::ModuleOp* mainModule)
+int64_t applyConstantUnary(const DiagnosticsManager* diagnostics,
+                           const Expr* expr,
+                           UnaryOperator op,
+                           int64_t operand) {
+    switch (op) {
+        case UnaryOperator::Plus:
+            return operand;
+        break;
+
+        case UnaryOperator::Minus:
+            return -operand;
+        break;
+
+        default:
+            diagnostics->throwError(fmt::format("Unsupported unary operator in SKIP/LIMIT expression: {}",
+                                                UnaryOperatorDescription::value(op)),
+                                    expr);
+        break;
+    }
+}
+
+int64_t applyConstantBinary(const DiagnosticsManager* diagnostics,
+                            const Expr* expr,
+                            BinaryOperator op,
+                            int64_t lhs,
+                            int64_t rhs) {
+    switch (op) {
+        case BinaryOperator::Add:
+            return Add {}(lhs, rhs);
+        break;
+
+        case BinaryOperator::Sub:
+            return Sub {}(lhs, rhs);
+        break;
+
+        case BinaryOperator::Mult:
+            return Mul {}(lhs, rhs);
+        break;
+
+        case BinaryOperator::Div:
+            return Div {}(lhs, rhs);
+        break;
+
+        case BinaryOperator::Mod:
+            return Mod {}(lhs, rhs);
+        break;
+
+        default:
+            diagnostics->throwError(fmt::format("Unsupported operator in SKIP/LIMIT expression: {}",
+                                                BinaryOperatorDescription::value(op)),
+                                    expr);
+        break;
+    }
+}
+
+int64_t evaluateConstantInteger(const DiagnosticsManager* diagnostics, const Expr* expr) {
+    const Expr::Kind kind = expr->getKind();
+
+    switch (kind) {
+        case Expr::Kind::LITERAL: {
+            const LiteralExpr* literalExpr = static_cast<const LiteralExpr*>(expr);
+            const Literal* literal = literalExpr->getLiteral();
+
+            if (literal->getKind() != Literal::Kind::INTEGER) {
+                diagnostics->throwError("SKIP/LIMIT expression must evaluate to an integer", expr);
+            }
+
+            const IntegerLiteral* integerLiteral = static_cast<const IntegerLiteral*>(literal);
+            return integerLiteral->getValue();
+        }
+        break;
+
+        case Expr::Kind::UNARY: {
+            const UnaryExpr* unaryExpr = static_cast<const UnaryExpr*>(expr);
+            const int64_t operand = evaluateConstantInteger(diagnostics, unaryExpr->getSubExpr());
+            return applyConstantUnary(diagnostics, expr, unaryExpr->getOperator(), operand);
+        }
+        break;
+
+        case Expr::Kind::BINARY: {
+            const BinaryExpr* binaryExpr = static_cast<const BinaryExpr*>(expr);
+            const int64_t lhs = evaluateConstantInteger(diagnostics, binaryExpr->getLHS());
+            const int64_t rhs = evaluateConstantInteger(diagnostics, binaryExpr->getRHS());
+            return applyConstantBinary(diagnostics, expr, binaryExpr->getOperator(), lhs, rhs);
+        }
+        break;
+
+        default:
+            diagnostics->throwError(fmt::format("Unsupported expression in SKIP/LIMIT: {}",
+                                                ExprKindDescription::value(kind)),
+                                    expr);
+        break;
+    }
+}
+
+// A percentile is read off every value of its group at once, so it gathers them the way
+// collect does
+bool takesAPercentile(std::string_view funcName) {
+    return funcName == "percentileCont" || funcName == "percentileDisc";
+}
+
+bool gathersItsValues(std::string_view funcName) {
+    return funcName == "collect" || takesAPercentile(funcName);
+}
+
+bool gathersItsValues(const Expr* item) {
+    if (item->getKind() != Expr::Kind::FUNCTION_INVOCATION) {
+        return false;
+    }
+
+    const FunctionInvocationExpr* funcExpr = static_cast<const FunctionInvocationExpr*>(item);
+    const FunctionInvocation* invocation = funcExpr->getFunctionInvocation();
+
+    return gathersItsValues(invocation->getSignature()->getFullName());
+}
+
+// The collects that dedupe, by their position among the collected columns: db.collect
+// names them that way rather than carrying a flag, since one projection may collect a
+// column both ways
+void collectDistinctValueIndices(llvm::ArrayRef<const FunctionInvocationExpr*> collects,
+                                 llvm::SmallVectorImpl<int64_t>& distinctValues) {
+    for (size_t collectIndex = 0; collectIndex < collects.size(); collectIndex++) {
+        const FunctionInvocation* invocation = collects[collectIndex]->getFunctionInvocation();
+
+        if (invocation->isDistinct()) {
+            distinctValues.push_back(static_cast<int64_t>(collectIndex));
+        }
+    }
+}
+
+}
+
+DBProgramGenerator::DBProgramGenerator(mlir::ModuleOp* mainModule,
+                                       ExplainReport* explain,
+                                       const mlir::db::DBPassContext& passContext)
     : _module(mainModule),
     _mlirCtxt(_module->getContext()),
-    _opBuilder(_module->getBodyRegion())
+    _opBuilder(_module->getBodyRegion()),
+    _explain(explain),
+    _passContext(passContext)
 {
 }
 
@@ -122,11 +1018,49 @@ mlir::db::ColumnType DBProgramGenerator::allocColumnType(mlir::Type type) {
 }
 
 void DBProgramGenerator::registerValue(const VariableDependency* var, mlir::TypedValue<mlir::Type> val) {
-    _varMap[var].emplace_back(val);
+    _part._varMap[var].emplace_back(val);
+}
+
+void DBProgramGenerator::rebindYieldedColumn(const VarDecl* decl, mlir::TypedValue<mlir::Type> val) {
+    for (YieldedColumn& yielded : _part._yieldedColumns) {
+        if (yielded._decl == decl) {
+            yielded._column = val;
+        }
+    }
+}
+
+void DBProgramGenerator::rebindNamedPath(const VarDecl* decl, mlir::Value column) {
+    const bool namesAPath = _part._namedPaths.contains(decl) || _part._namedPathWalks.contains(decl);
+    if (!namesAPath) {
+        return;
+    }
+
+    // The column is a built path now, no longer the walk's handle
+    _part._namedPathWalks.erase(decl);
+    _part._namedPaths[decl] = column;
+}
+
+void DBProgramGenerator::rebindGroupVariable(const VarDecl* decl, mlir::Value column) {
+    const auto bindingIt = _part._pathBindings.find(decl);
+    if (bindingIt == end(_part._pathBindings)) {
+        return;
+    }
+
+    const VariableDependency* walk = bindingIt->second._path;
+    const bool readOffAWalk = walk && walk->getDecl() != decl;
+    if (!readOffAWalk) {
+        return;
+    }
+
+    // The column holds the group's list now, no longer read off the walk's paths
+    _part._pathBindings.erase(bindingIt);
+
+    const VariableDependency* var = _vdg.registerBoundVariable(decl->getName(), decl);
+    registerValue(var, column);
 }
 
 void DBProgramGenerator::addScanNodes(const VariableDependency* var) {
-    bioassert(!_varMap.contains(var), "ScanNodes for registered variable");
+    bioassert(!_part._varMap.contains(var), "ScanNodes for registered variable");
 
     const auto col = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
     auto scan = _opBuilder.create<mlir::db::ScanNodes>(_opBuilder.getUnknownLoc(), col);
@@ -134,53 +1068,314 @@ void DBProgramGenerator::addScanNodes(const VariableDependency* var) {
     registerValue(var, scan.getResult());
 }
 
+void DBProgramGenerator::addYieldedColumn(const VariableDependency* var, mlir::Value column) {
+    bioassert(!_part._varMap.contains(var), "Yielded column for registered variable");
+
+    registerValue(var, column);
+
+    // The variable owns those rows now. Leaving them among the yields as well would give one
+    // column two names, and only the variable's is rebound as the expansion replicates it.
+    const auto declaresVar = [&](const YieldedColumn& yielded) {
+        return yielded._decl == var->getDecl();
+    };
+
+    std::erase_if(_part._yieldedColumns, declaresVar);
+}
+
+void DBProgramGenerator::addConstScanNodes(const VariableDependency* var, const UnwindStmt* unwind) {
+    bioassert(!_part._varMap.contains(var), "ConstScanNodes for registered variable");
+
+    const ListLiteral* list = literalUnwindList(_ast->getDiagnosticsManager(), unwind);
+
+    llvm::SmallVector<mlir::Attribute> elements;
+    if (list) {
+        translateListElements(list, elements);
+    }
+
+    llvm::SmallVector<int64_t> nodeIDs;
+    nodeIDs.reserve(elements.size());
+
+    for (const mlir::Attribute element : elements) {
+        const mlir::IntegerAttr nodeID = mlir::dyn_cast<mlir::IntegerAttr>(element);
+        if (!nodeID) {
+            throwError("Only node IDs can be unwound into a node pattern.", unwind);
+        }
+
+        nodeIDs.push_back(nodeID.getInt());
+    }
+
+    const mlir::db::ColumnType nodeColumnType = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
+
+    mlir::db::ConstScanNodes constScan = _opBuilder.create<mlir::db::ConstScanNodes>(_opBuilder.getUnknownLoc(),
+                                                                                    nodeColumnType,
+                                                                                    nodeIDs);
+
+    registerValue(var, constScan.getResult());
+    _part._seededVars.insert(var);
+}
+
+void DBProgramGenerator::addUnwindConst(const VariableDependency* var, const UnwindStmt* unwind) {
+    bioassert(!_part._varMap.contains(var), "UnwindConst for registered variable");
+
+    const ListLiteral* list = literalUnwindList(_ast->getDiagnosticsManager(), unwind);
+
+    llvm::SmallVector<mlir::Attribute> elements;
+    if (list) {
+        translateListElements(list, elements);
+    }
+
+    const mlir::ArrayAttr elementsAttr = _opBuilder.getArrayAttr(elements);
+
+    const mlir::Type sharedType = sharedLiteralElementType(elementsAttr);
+    const mlir::Type elementType = sharedType ? sharedType
+                                              : mlir::storage::AnyType::get(_mlirCtxt);
+
+    const mlir::db::ColumnType resultType = allocColumnType(elementType);
+
+    mlir::db::UnwindConst unwindConst = _opBuilder.create<mlir::db::UnwindConst>(_opBuilder.getUnknownLoc(),
+                                                                                resultType,
+                                                                                elementsAttr);
+
+    registerValue(var, unwindConst.getResult());
+}
+
+void DBProgramGenerator::translateListElements(const ListLiteral* list,
+                                               llvm::SmallVectorImpl<mlir::Attribute>& elements) {
+    const ListLiteral::Items& items = list->items();
+    elements.reserve(items.size());
+
+    for (const Expr* item : items) {
+        const LiteralExpr* literalExpr = dynamic_cast<const LiteralExpr*>(item);
+        if (!literalExpr) {
+            throwError("Only literal elements are supported in a list.", item);
+        }
+
+        elements.push_back(listElementAttr(literalExpr->getLiteral()));
+    }
+}
+
+mlir::Attribute DBProgramGenerator::literalAttr(const Literal* literal) {
+    const Literal::Kind kind = literal->getKind();
+
+    if (kind == Literal::Kind::NULL_LITERAL) {
+        return _opBuilder.getUnitAttr();
+    } else if (kind == Literal::Kind::EMBEDDING) {
+        return embeddingLiteralAttr(static_cast<const EmbeddingLiteral*>(literal));
+    } else if (kind == Literal::Kind::LIST) {
+        const ListLiteral* nested = static_cast<const ListLiteral*>(literal);
+
+        llvm::SmallVector<mlir::Attribute> nestedElements;
+        translateListElements(nested, nestedElements);
+
+        return _opBuilder.getArrayAttr(nestedElements);
+    } else if (kind == Literal::Kind::MAP) {
+        const MapLiteral* nested = static_cast<const MapLiteral*>(literal);
+
+        llvm::SmallVector<mlir::NamedAttribute> nestedEntries;
+        translateMapEntries(nested, nestedEntries);
+
+        return _opBuilder.getDictionaryAttr(nestedEntries);
+    }
+
+    return scalarLiteralAttr(literal);
+}
+
+mlir::Attribute DBProgramGenerator::listElementAttr(const Literal* literal) {
+    const mlir::Attribute element = literalAttr(literal);
+
+    if (!element) {
+        throwError("Only booleans, integers, floats, strings, nulls, embeddings, maps and "
+                   "lists are supported as list elements.",
+                   literal);
+    }
+
+    return element;
+}
+
+mlir::Value DBProgramGenerator::translateListLiteral(const ListLiteral* list) {
+    if (!list->isLiteralTree()) {
+        return translateListOfColumns(list);
+    }
+
+    llvm::SmallVector<mlir::Attribute> elements;
+    translateListElements(list, elements);
+
+    // A list literal is a constant like any other, carried as the array of its elements.
+    // The column type is db.constant's to infer: an array attribute has none of its own, so
+    // the op reads the homogeneity verdict off the elements.
+    mlir::db::ConstantOp constant = _opBuilder.create<mlir::db::ConstantOp>(_opBuilder.getUnknownLoc(),
+                                                                           _opBuilder.getArrayAttr(elements));
+
+    return constant.getResult();
+}
+
+mlir::Value DBProgramGenerator::singletonList(mlir::Value column) {
+    const mlir::Type elementType = mlir::cast<mlir::db::ColumnType>(column.getType()).getType();
+    const mlir::Type listType = mlir::storage::ListType::get(_mlirCtxt, elementType);
+
+    mlir::db::MakeList makeList = _opBuilder.create<mlir::db::MakeList>(_opBuilder.getUnknownLoc(),
+                                                                        allocColumnType(listType),
+                                                                        mlir::ValueRange {column});
+
+    return makeList.getResult();
+}
+
+mlir::Value DBProgramGenerator::translateListOfColumns(const ListLiteral* list) {
+    llvm::SmallVector<mlir::Value> elementColumns;
+    for (const Expr* item : list->items()) {
+        elementColumns.push_back(getOrTranslateExprColumn(item));
+    }
+
+    const mlir::Type elementType = sharedColumnElement(_mlirCtxt, elementColumns);
+    const mlir::Type listType = mlir::storage::ListType::get(_mlirCtxt, elementType);
+
+    mlir::db::MakeList makeList = _opBuilder.create<mlir::db::MakeList>(_opBuilder.getUnknownLoc(),
+                                                                        allocColumnType(listType),
+                                                                        mlir::ValueRange {elementColumns});
+
+    return makeList.getResult();
+}
+
+mlir::Value DBProgramGenerator::translateMapLiteral(const MapLiteral* map) {
+    if (!map->isLiteralTree()) {
+        return translateMapOfColumns(map);
+    }
+
+    llvm::SmallVector<mlir::NamedAttribute> entries;
+    translateMapEntries(map, entries);
+
+    // DictionaryAttr canonicalises by sorting on key name, so the entries reach the
+    // interpreter sorted rather than in the order MapLiteral holds them.
+    mlir::db::ConstantOp constant = _opBuilder.create<mlir::db::ConstantOp>(_opBuilder.getUnknownLoc(),
+                                                                            _opBuilder.getDictionaryAttr(entries));
+
+    return constant.getResult();
+}
+
+mlir::Value DBProgramGenerator::translateMapOfColumns(const MapLiteral* map) {
+    llvm::SmallVector<std::pair<std::string_view, const Expr*>> entries;
+    entries.reserve(map->size());
+
+    for (const auto& [key, valueExpr] : *map) {
+        entries.emplace_back(key->getName(), valueExpr);
+    }
+
+    // Sorted on key name, as the DictionaryAttr of a constant map is
+    std::sort(entries.begin(), entries.end(), [](const auto& lhs, const auto& rhs) {
+        return lhs.first < rhs.first;
+    });
+
+    llvm::SmallVector<mlir::Attribute> keys;
+    llvm::SmallVector<mlir::Value> valueColumns;
+    keys.reserve(entries.size());
+    valueColumns.reserve(entries.size());
+
+    for (const auto& [keyName, valueExpr] : entries) {
+        keys.push_back(_opBuilder.getStringAttr(llvm::StringRef(keyName.data(), keyName.size())));
+        valueColumns.push_back(getOrTranslateExprColumn(valueExpr));
+    }
+
+    mlir::db::MakeMap makeMap = _opBuilder.create<mlir::db::MakeMap>(_opBuilder.getUnknownLoc(),
+                                                                     mlir::ValueRange {valueColumns},
+                                                                     _opBuilder.getArrayAttr(keys));
+
+    return makeMap.getResult();
+}
+
+void DBProgramGenerator::translateMapEntries(const MapLiteral* map,
+                                             llvm::SmallVectorImpl<mlir::NamedAttribute>& entries) {
+    entries.reserve(map->size());
+
+    for (const auto& [key, valueExpr] : *map) {
+        const LiteralExpr* literalExpr = dynamic_cast<const LiteralExpr*>(valueExpr);
+
+        if (!literalExpr) {
+            throwError("Only literal values are supported in a map.", valueExpr);
+        }
+
+        const Literal* literal = literalExpr->getLiteral();
+        const mlir::Attribute value = literalAttr(literal);
+
+        if (!value) {
+            throwError("Only booleans, integers, floats, strings, nulls, embeddings, "
+                       "lists and maps are supported as map values.",
+                       literal);
+        }
+
+        const std::string_view keyName = key->getName();
+        entries.emplace_back(_opBuilder.getStringAttr(llvm::StringRef(keyName.data(), keyName.size())),
+                             value);
+    }
+}
+
 template<typename EdgeOp>
 void DBProgramGenerator::addEdgeTraversal(const VariableDependency* src,
                                           const VariableDependency* edge,
                                           const VariableDependency* tgt,
                                           const std::vector<const VariableDependency*>& carrySet) {
+    walkEdge<EdgeOp>(src, edge, tgt, carrySet, nullptr);
+}
+
+template<typename EdgeOp>
+mlir::Value DBProgramGenerator::addJoiningEdgeTraversal(const VariableDependency* src,
+                                                        const VariableDependency* edge,
+                                                        const VariableDependency* tgt,
+                                                        const std::vector<const VariableDependency*>& carrySet) {
+    mlir::Value landed;
+    walkEdge<EdgeOp>(src, edge, tgt, carrySet, &landed);
+
+    return landed;
+}
+
+template<typename EdgeOp>
+void DBProgramGenerator::walkEdge(const VariableDependency* src,
+                                  const VariableDependency* edge,
+                                  const VariableDependency* tgt,
+                                  const std::vector<const VariableDependency*>& carrySet,
+                                  mlir::Value* joinedTarget) {
     static_assert(std::is_same_v<EdgeOp, mlir::db::GetOutEdges>
-                      or std::is_same_v<EdgeOp, mlir::db::GetInEdges>, "Invalid op");
+                      or std::is_same_v<EdgeOp, mlir::db::GetInEdges>
+                      or std::is_same_v<EdgeOp, mlir::db::GetEdges>, "Invalid op");
 
     bioassert(src, "Null source");
     bioassert(tgt, "Null target");
 
-    bioassert(_varMap.contains(src), "Edge traversal without source");
+    bioassert(_part._varMap.contains(src), "Edge traversal without source");
 
     const auto srcs = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
     const auto eids = allocColumnType(mlir::storage::EdgeIDType::get(_mlirCtxt));
     const auto etypes = allocColumnType(mlir::storage::EdgeTypeIDType::get(_mlirCtxt));
     const auto tgts = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
 
-    const mlir::Value input = _varMap[src].back();
+    const mlir::Value input = _part._varMap[src].back();
 
-    llvm::SmallVector<const VariableDependency*> carried;
+    InFlightColumns carried;
+    collectHopCarrySet(src, carrySet, carried);
+
     llvm::SmallVector<mlir::Value> operands {input};
     llvm::SmallVector<mlir::Type> results {srcs, eids, etypes, tgts};
-    for (const VariableDependency* var : carrySet) {
-        // source variable is explicitly filtered by the edge op
-        if (var == src) {
-            continue;
-        }
-
-        const mlir::Value column = _varMap[var].back();
-        carried.push_back(var);
+    for (const mlir::Value column : carried._columns) {
         operands.push_back(column);
         results.push_back(column.getType());
     }
 
-    // Find the edge types to carry which were defined in this block
-    mlir::Block* const insertionBlock = _opBuilder.getInsertionBlock();
-    llvm::SmallVector<const VariableDependency*> carriedEdgeTypes;
-    for (auto& [edgeVar, column] : _edgeTypeMap) {
-        mlir::Operation* const definingOp = column.getDefiningOp();
-        mlir::Block* const definingBlock = definingOp
-            ? definingOp->getBlock()
-            : mlir::cast<mlir::BlockArgument>(column).getOwner();
-        if (definingBlock != insertionBlock) {
+    // A column a barrier published rides the expansion too, when the traversal it drives is
+    // generated where that column was bound: the hop replicates a row once per edge, so it
+    // comes along or it stops matching the rows beside it. A published pattern variable is
+    // walked by the component instead and is already in the carry set.
+    llvm::SmallVector<const VariableDependency*> carriedBound;
+    for (const VariableDependency* var : _vdg.boundVars()) {
+        const bool walkedHere = var == src || llvm::is_contained(carrySet, var);
+        if (walkedHere) {
             continue;
         }
-        carriedEdgeTypes.push_back(edgeVar);
+
+        const mlir::Value column = _part._varMap[var].back();
+        if (!isRowAlignedHere(column) || yieldsConstantColumn(column, _constantColumns)) {
+            continue;
+        }
+
+        carriedBound.push_back(var);
         operands.push_back(column);
         results.push_back(column.getType());
     }
@@ -193,64 +1388,1020 @@ void DBProgramGenerator::addEdgeTraversal(const VariableDependency* src,
     const mlir::Value newEtypes = op.getResult(2);
     const mlir::Value newTgts = op.getResult(3);
 
-    _edgeTypeMap[edge] = newEtypes;
+    _part._edgeTypeMap[edge] = newEtypes;
 
-    if constexpr (std::is_same_v<EdgeOp, mlir::db::GetOutEdges>) {
-        registerValue(src, newSrcs);
-        registerValue(tgt, newTgts);
-    } else {
-        registerValue(src, newTgts);
-        registerValue(tgt, newSrcs);
-    }
+    constexpr bool forwardOrientation = std::is_same_v<EdgeOp, mlir::db::GetOutEdges>
+                                        or std::is_same_v<EdgeOp, mlir::db::GetEdges>;
+    const mlir::Value sourceColumn = forwardOrientation ? newSrcs : newTgts;
+    const mlir::Value targetColumn = forwardOrientation ? newTgts : newSrcs;
+
+    registerValue(src, sourceColumn);
     registerValue(edge, newEdges);
 
-    // Register the new values of the carry set, appearing starting from index 4 in the
-    // result range
-    constexpr size_t GET_X_EDGES_RES_SIZE = 4;
-    for (size_t i = 0; i < carried.size(); i++) {
-        const size_t resultIndex = GET_X_EDGES_RES_SIZE + i;
-        registerValue(carried[i], op.getResult(resultIndex));
+    if (joinedTarget) {
+        *joinedTarget = targetColumn;
+    } else {
+        registerValue(tgt, targetColumn);
     }
 
-    // Update the new edge type vars for carried edges
-    const size_t edgeTypeOffset = GET_X_EDGES_RES_SIZE + carried.size();
-    for (size_t i = 0; i < carriedEdgeTypes.size(); i++) {
-        _edgeTypeMap[carriedEdgeTypes[i]] = op.getResult(edgeTypeOffset + i);
+    rebindInFlightColumns(op.getResults(), 4, carried);
+}
+
+void DBProgramGenerator::collectHopCarrySet(const VariableDependency* src,
+                                            const std::vector<const VariableDependency*>& carrySet,
+                                            InFlightColumns& inFlight) {
+    for (const VariableDependency* var : carrySet) {
+        // source variable is explicitly filtered by the edge op
+        if (var == src) {
+            continue;
+        }
+
+        inFlight._columns.push_back(_part._varMap[var].back());
+        inFlight._variables.push_back(var);
+    }
+
+    // A column a barrier published rides the expansion too, when the traversal it drives is
+    // generated where that column was bound: the hop replicates a row once per edge, so it
+    // comes along or it stops matching the rows beside it. A published pattern variable is
+    // walked by the component instead and is already in the carry set.
+    for (const VariableDependency* var : _vdg.boundVars()) {
+        const bool walkedHere = var == src || llvm::is_contained(carrySet, var);
+        if (walkedHere) {
+            continue;
+        }
+
+        const mlir::Value column = _part._varMap[var].back();
+        if (!isRowAlignedHere(column) || yieldsConstantColumn(column, _constantColumns)) {
+            continue;
+        }
+
+        inFlight._columns.push_back(column);
+        inFlight._variables.push_back(var);
+    }
+
+    // Find the edge types to carry which were defined in this block
+    for (auto& [edgeVar, column] : _part._edgeTypeMap) {
+        if (!isRowAlignedHere(column)) {
+            continue;
+        }
+
+        inFlight._columns.push_back(column);
+        inFlight._edgeTypeVariables.push_back(edgeVar);
+    }
+
+    // A column a CALL driving this traversal yielded is in flight here too: the expansion
+    // replicates a row once per edge, so it comes along or it stops matching the rows beside
+    // it. Nothing yielded is in flight when a call has yet to run, which is every traversal
+    // the calls do not drive.
+    for (size_t yieldedIndex = 0; yieldedIndex < _part._yieldedColumns.size(); yieldedIndex++) {
+        const mlir::Value column = _part._yieldedColumns[yieldedIndex]._column;
+        if (!isRowAlignedHere(column)) {
+            continue;
+        }
+
+        inFlight._columns.push_back(column);
+        inFlight._yieldedIndices.push_back(yieldedIndex);
     }
 }
 
-void DBProgramGenerator::generate(const CypherAST* ast) {
+void DBProgramGenerator::throwError(std::string_view msg, const void* obj) const {
+    _ast->getDiagnosticsManager()->throwError(msg, obj);
+}
+
+void DBProgramGenerator::addExplorePaths(const VariableDependency* src,
+                                         const VariableDependency* edge,
+                                         const VariableDependency* tgt,
+                                         const std::vector<const VariableDependency*>& carrySet,
+                                         const EdgeMetadata& metadata,
+                                         bool reversed,
+                                         mlir::Value* joinedTarget) {
+    bioassert(src, "Null source");
+    bioassert(tgt, "Null target");
+    bioassert(_part._varMap.contains(src), "Path exploration without source");
+
+    const VarDecl* edgeDecl = edge->getDecl();
+    bioassert(edgeDecl, "Path exploration over an edge without a declaration");
+
+    const mlir::db::ColumnType nodeType = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
+    const mlir::db::ColumnType pathType = allocColumnType(mlir::storage::PathRefType::get(_mlirCtxt));
+
+    const mlir::Value input = _part._varMap[src].back();
+
+    InFlightColumns carried;
+    collectHopCarrySet(src, carrySet, carried);
+
+    llvm::SmallVector<mlir::Type> results {nodeType, nodeType, pathType};
+    for (const mlir::Value column : carried._columns) {
+        results.push_back(column.getType());
+    }
+
+    const auto patternIt = _part._quantifiedEdges.find(edgeDecl);
+    bioassert(patternIt != end(_part._quantifiedEdges), "Path exploration over a walk the part does not hold");
+    const EdgePattern* pattern = patternIt->second;
+
+    llvm::SmallVector<const VarDecl*> hopImports;
+    llvm::SmallVector<mlir::Value> hopImportColumns;
+    collectHopImports(pattern, hopImports, hopImportColumns);
+
+    mlir::IntegerAttr maxHopsAttr;
+    if (metadata.getMaxHops() != EdgeMetadata::UNBOUNDED_HOPS) {
+        const mlir::IntegerType hopType = mlir::IntegerType::get(_mlirCtxt, 64, mlir::IntegerType::Unsigned);
+        maxHopsAttr = mlir::IntegerAttr::get(hopType, metadata.getMaxHops());
+    }
+
+    const size_t hopCount = pattern->getHopCount();
+
+    // The walk takes the pattern's hops in the order it walks them
+    llvm::SmallVector<int64_t> directions;
+    llvm::SmallVector<mlir::Attribute> stepEdgeTypes;
+    bool typesAStep = false;
+    for (size_t step = 0; step < hopCount; step++) {
+        const EdgePattern* hop = pattern->getHop(reversed ? hopCount - 1 - step : step);
+        const EdgePatternData* hopData = hop->getData();
+        const std::span<const EdgeTypeRef> names = hopData->edgeTypeConstraints();
+        typesAStep |= !names.empty();
+
+        directions.push_back(static_cast<int64_t>(walkDirectionOf(hop->getDirection(), reversed)));
+        stepEdgeTypes.push_back(schemaNamesAttr(_opBuilder, names));
+    }
+
+    const mlir::ArrayAttr edgeTypesAttr = typesAStep ? _opBuilder.getArrayAttr(stepEdgeTypes) : mlir::ArrayAttr();
+
+    auto op = _opBuilder.create<mlir::db::ExplorePaths>(_opBuilder.getUnknownLoc(),
+                                                        results,
+                                                        input,
+                                                        carried._columns,
+                                                        mlir::Value(),
+                                                        hopImportColumns,
+                                                        directions,
+                                                        metadata.getMinHops(),
+                                                        maxHopsAttr,
+                                                        edgeTypesAttr,
+                                                        mlir::ArrayAttr(),
+                                                        mlir::ArrayAttr(),
+                                                        mlir::IntegerAttr(),
+                                                        false,
+                                                        false,
+                                                        static_cast<unsigned>(hopCount));
+
+    registerValue(src, op.getSrcids());
+    registerValue(edge, op.getPaths());
+
+    if (joinedTarget) {
+        *joinedTarget = op.getTgtids();
+    } else {
+        registerValue(tgt, op.getTgtids());
+    }
+
+    rebindInFlightColumns(op.getResults(), 3, carried);
+
+    _part._pathBindings[edgeDecl] = PartScope::PathBinding {mlir::storage::PathExpansionKind::Edges, src, edge, reversed};
+
+    // A group variable reads its node or edge off each repetition at the step of the walk
+    // taking it: the source of that step, or the end of the last one for the node the
+    // repetition ends on, which a walk taken against the pattern swaps
+    for (size_t position = 0; position <= hopCount; position++) {
+        const VarDecl* group = pattern->getHopNodeGroup(position);
+        if (!group) {
+            continue;
+        }
+
+        const size_t walkNode = walkPositionOf(2 * position, hopCount, reversed) / 2;
+        const bool endsTheRepetition = walkNode == hopCount;
+        const mlir::storage::PathExpansionKind kind = endsTheRepetition ? mlir::storage::PathExpansionKind::Ends
+                                                                        : mlir::storage::PathExpansionKind::Sources;
+        const size_t step = endsTheRepetition ? hopCount - 1 : walkNode;
+
+        _part._pathBindings[group] = PartScope::PathBinding {kind, src, edge, reversed, step, hopCount};
+    }
+
+    for (size_t hopIndex = 0; hopIndex < hopCount; hopIndex++) {
+        const EdgePattern* hop = pattern->getHop(hopIndex);
+        if (!hop->getSymbol()) {
+            continue;
+        }
+
+        const size_t step = reversed ? hopCount - 1 - hopIndex : hopIndex;
+        _part._pathBindings[hop->getDecl()] = PartScope::PathBinding {mlir::storage::PathExpansionKind::Edges, src, edge, reversed, step, hopCount};
+    }
+
+    if (hasHopConstraints(pattern)) {
+        generateHopRegion(op, pattern, hopImports, reversed);
+    }
+}
+
+void DBProgramGenerator::collectHopImports(const EdgePattern* pattern,
+                                           llvm::SmallVectorImpl<const VarDecl*>& imports,
+                                           llvm::SmallVectorImpl<mlir::Value>& columns) {
+    for (const VarDecl* decl : pattern->hopImports()) {
+        const mlir::Value column = resolveEntityColumn(decl);
+        if (column && yieldsConstantColumn(column, _constantColumns)) {
+            continue;
+        }
+
+        const bool readable = column && isRowAlignedHere(column);
+        if (!readable) {
+            throw TuringException(fmt::format("A predicate on a hop cannot read '{}': it holds no value while the path is walked",
+                                              decl->getName()));
+        }
+
+        imports.push_back(decl);
+        columns.push_back(column);
+    }
+}
+
+void DBProgramGenerator::collectQuantifiedEdges(std::span<Stmt* const> stmts) {
+    for (const Stmt* stmt : stmts) {
+        if (stmt->getKind() != Stmt::Kind::MATCH) {
+            continue;
+        }
+
+        const MatchStmt* matchStmt = static_cast<const MatchStmt*>(stmt);
+        for (const PatternElement* element : matchStmt->getPattern()->elements()) {
+            for (auto [edgePattern, nodePattern] : element->getElementChain()) {
+                if (edgePattern->getQuantifiedPath()) {
+                    _part._quantifiedEdges[edgePattern->getDecl()] = edgePattern;
+                }
+            }
+        }
+    }
+}
+
+void DBProgramGenerator::collectHopLabelMask(const NodePattern* node,
+                                             mlir::Value column,
+                                             llvm::SmallVectorImpl<mlir::Value>& masks) {
+    const NodePatternData* data = node->getData();
+    if (!data) {
+        return;
+    }
+
+    const std::span<const LabelRef> labels = data->labelConstraints();
+    if (!labels.empty()) {
+        masks.push_back(checkNodeLabels(column, labels, false));
+    }
+
+    for (const LabelExpr* labelExpr : data->labelExprConstraints()) {
+        masks.push_back(checkNodeLabelExpr(column, labelExpr, false));
+    }
+}
+
+void DBProgramGenerator::collectHopTypeMask(const EdgePattern* hop,
+                                            mlir::Value column,
+                                            llvm::SmallVectorImpl<mlir::Value>& masks) {
+    const EdgePatternData* data = hop->getData();
+    if (!data || data->edgeTypeExprConstraints().empty()) {
+        return;
+    }
+
+    const mlir::Value edgeTypeColumn = fetchEdgeTypeColumn(column);
+    for (const LabelExpr* typeExpr : data->edgeTypeExprConstraints()) {
+        masks.push_back(checkEdgeTypeExpr(edgeTypeColumn, typeExpr, false));
+    }
+}
+
+void DBProgramGenerator::generateHopRegion(mlir::db::ExplorePaths exploration,
+                                          const EdgePattern* pattern,
+                                          llvm::ArrayRef<const VarDecl*> imports,
+                                          bool reversed) {
+    const size_t hopCount = pattern->getHopCount();
+    const size_t lastStep = hopCount - 1;
+
+    // A name the pattern gives two of its nodes is read at the first of them the walk takes
+    std::unordered_map<const VarDecl*, size_t> declPositions;
+    const auto placeDecl = [&declPositions, hopCount, reversed](const VarDecl* decl, size_t patternPosition) {
+        const size_t walkPosition = walkPositionOf(patternPosition, hopCount, reversed);
+        const auto [placed, inserted] = declPositions.emplace(decl, walkPosition);
+        if (!inserted) {
+            placed->second = std::min(placed->second, walkPosition);
+        }
+    };
+
+    llvm::SmallVector<std::pair<const NodePattern*, size_t>> nodes;
+    for (size_t position = 0; position <= hopCount; position++) {
+        if (const NodePattern* node = pattern->getHopNode(position)) {
+            placeDecl(node->getDecl(), 2 * position);
+            nodes.emplace_back(node, walkPositionOf(2 * position, hopCount, reversed));
+        }
+    }
+
+    for (size_t hopIndex = 0; hopIndex < hopCount; hopIndex++) {
+        const EdgePattern* hop = pattern->getHop(hopIndex);
+        placeDecl(hop->getHopDecl(), 2 * hopIndex + 1);
+    }
+
+    const mlir::OpBuilder::InsertionGuard guard(_opBuilder);
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    const mlir::db::ColumnType nodeType = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
+    const mlir::db::ColumnType edgeType = allocColumnType(mlir::storage::EdgeIDType::get(_mlirCtxt));
+    const size_t hopArguments = mlir::hopWalkArgumentCount(lastStep);
+
+    llvm::SmallVector<mlir::Type> argumentTypes;
+    mlir::buildHopArgumentTypes(lastStep, nodeType, edgeType, exploration.getHopImports(), argumentTypes);
+
+    const llvm::SmallVector<mlir::Location> argumentLocations(argumentTypes.size(), loc);
+
+    mlir::Region& hop = exploration.getHops()[lastStep];
+    mlir::Block* block = _opBuilder.createBlock(&hop, hop.end(), argumentTypes, argumentLocations);
+
+    _part._hopColumns.clear();
+    for (const auto& [decl, walkPosition] : declPositions) {
+        _part._hopColumns[decl] = block->getArgument(static_cast<unsigned>(walkPosition));
+    }
+
+    for (size_t importIndex = 0; importIndex < imports.size(); importIndex++) {
+        _part._hopColumns[imports[importIndex]] = block->getArgument(static_cast<unsigned>(hopArguments + importIndex));
+    }
+
+    llvm::SmallVector<mlir::Value> masks;
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    for (const auto& [node, walkPosition] : nodes) {
+        collectHopLabelMask(node, block->getArgument(static_cast<unsigned>(walkPosition)), masks);
+    }
+
+    for (size_t hopIndex = 0; hopIndex < hopCount; hopIndex++) {
+        const size_t walkPosition = walkPositionOf(2 * hopIndex + 1, hopCount, reversed);
+        collectHopTypeMask(pattern->getHop(hopIndex), block->getArgument(static_cast<unsigned>(walkPosition)), masks);
+    }
+
+    for (const auto& [node, walkPosition] : nodes) {
+        const size_t namedAt = declPositions.at(node->getDecl());
+        if (namedAt != walkPosition) {
+            const mlir::Value named = block->getArgument(static_cast<unsigned>(namedAt));
+            const mlir::Value bound = block->getArgument(static_cast<unsigned>(walkPosition));
+            masks.push_back(_opBuilder.create<mlir::db::EqOp>(loc, boolType, named, bound).getResult());
+        }
+    }
+
+    std::vector<const Expr*> conjuncts;
+    for (const Expr* predicate : pattern->hopPredicates()) {
+        flattenConjuncts(predicate, conjuncts);
+    }
+
+    for (const auto& [node, walkPosition] : nodes) {
+        if (const NodePatternData* data = node->getData()) {
+            for (const EntityPropertyConstraint& constraint : data->exprConstraints()) {
+                conjuncts.push_back(constraint._expr);
+            }
+        }
+    }
+
+    for (const Expr* conjunct : conjuncts) {
+        translateExpr(conjunct);
+        masks.push_back(_part._exprMap.at(conjunct));
+    }
+
+    bioassert(!masks.empty(), "Hop region without a predicate");
+
+    mlir::Value mask = masks.front();
+    for (size_t maskIndex = 1; maskIndex < masks.size(); maskIndex++) {
+        mask = _opBuilder.create<mlir::db::AndOp>(loc, boolType, mask, masks[maskIndex]).getResult();
+    }
+
+    _opBuilder.create<mlir::db::Yield>(loc, mlir::ValueRange {mask});
+
+    _part._hopColumns.clear();
+}
+
+mlir::Value DBProgramGenerator::listColumnOf(const VarDecl* decl, mlir::Value column) {
+    if (!isPathColumn(column)) {
+        return column;
+    }
+
+    const auto walkIt = _part._namedPathWalks.find(decl);
+    if (walkIt != end(_part._namedPathWalks)) {
+        return namedPathColumn(walkIt->second);
+    }
+
+    // A path a WITH published carries no binding of its own: it reads as its edges
+    PartScope::PathBinding binding;
+    const auto bindingIt = _part._pathBindings.find(decl);
+    if (bindingIt != end(_part._pathBindings)) {
+        binding = bindingIt->second;
+    }
+
+    mlir::Value seeds;
+    if (binding._seed) {
+        seeds = _part._varMap.at(binding._seed).back();
+    }
+
+    const bool expandsEdges = binding._kind == mlir::storage::PathExpansionKind::Edges;
+    const mlir::Type elementType = expandsEdges
+                                     ? static_cast<mlir::Type>(mlir::storage::EdgeIDType::get(_mlirCtxt))
+                                     : static_cast<mlir::Type>(mlir::storage::NodeIDType::get(_mlirCtxt));
+    const mlir::db::ColumnType listType = allocColumnType(mlir::storage::ListType::get(_mlirCtxt, elementType));
+
+    mlir::IntegerAttr stepAttr;
+    mlir::IntegerAttr stepsAttr;
+    if (binding._steps > 1) {
+        const mlir::IntegerType stepType = mlir::IntegerType::get(_mlirCtxt, 64, mlir::IntegerType::Unsigned);
+        stepAttr = mlir::IntegerAttr::get(stepType, binding._step);
+        stepsAttr = mlir::IntegerAttr::get(stepType, binding._steps);
+    }
+
+    return _opBuilder.create<mlir::db::ExpandPath>(_opBuilder.getUnknownLoc(),
+                                                   listType,
+                                                   column,
+                                                   seeds,
+                                                   binding._kind,
+                                                   binding._reversed,
+                                                   stepAttr,
+                                                   stepsAttr).getResult();
+}
+
+mlir::Value DBProgramGenerator::columnLeavingScope(const VarDecl* decl, mlir::Value column) {
+    const auto bindingIt = _part._pathBindings.find(decl);
+    const bool readsOtherThanItsEdges = bindingIt != end(_part._pathBindings) && !bindingIt->second.readsAsItsEdges();
+
+    return readsOtherThanItsEdges ? listColumnOf(decl, column) : column;
+}
+
+void DBProgramGenerator::expandPathItems(const Projection* projection, llvm::SmallVectorImpl<mlir::Value>& projected) {
+    const auto& items = projection->items();
+    bioassert(projected.size() == items.size(), "One projected column per return item expected");
+
+    size_t itemIndex = 0;
+    for (const Projection::ReturnItem& item : items) {
+        const mlir::Value column = projected[itemIndex];
+        if (isPathColumn(column)) {
+            projected[itemIndex] = listColumnOf(declOfReturnItem(item), column);
+        }
+
+        itemIndex++;
+    }
+}
+
+void DBProgramGenerator::buildNamedPathItems(const Projection* projection, llvm::SmallVectorImpl<mlir::Value>& projected) {
+    if (_part._namedPathWalks.empty()) {
+        return;
+    }
+
+    const auto& items = projection->items();
+    bioassert(projected.size() == items.size(), "One projected column per return item expected");
+
+    size_t itemIndex = 0;
+    for (const Projection::ReturnItem& item : items) {
+        const VarDecl* decl = declOfReturnItem(item);
+        const mlir::Value column = projected[itemIndex];
+
+        const bool namesAWalk = decl && _part._namedPathWalks.contains(decl);
+        if (namesAWalk && isPathColumn(column)) {
+            projected[itemIndex] = listColumnOf(decl, column);
+        }
+
+        itemIndex++;
+    }
+}
+
+mlir::Value DBProgramGenerator::pathLengthColumn(const Expr* argExpr, mlir::Value column) {
+    if (!isPathColumn(column)) {
+        throw TuringException("size() reads the length of a variable-length path: its argument is a single entity");
+    }
+
+    const mlir::IntegerType countType = mlir::IntegerType::get(_mlirCtxt, 64, mlir::IntegerType::Unsigned);
+    const mlir::db::ColumnType resultType = allocColumnType(countType);
+
+    return _opBuilder.create<mlir::db::PathLength>(_opBuilder.getUnknownLoc(), resultType, column).getResult();
+}
+
+mlir::Value DBProgramGenerator::pathElementsColumn(mlir::Value column, mlir::storage::PathElementsKind kind) {
+    const auto columnType = mlir::dyn_cast<mlir::db::ColumnType>(column.getType());
+    const bool readsAPath = columnType && mlir::isa<mlir::storage::EntityListType, mlir::storage::PathType>(columnType.getType());
+    bioassert(readsAPath, "A named path is read off the entity sequence its element built or the path a SHORTESTPATH found");
+
+    const mlir::Type resultType = pathElementsType(_mlirCtxt, kind);
+    const mlir::db::ColumnType nullableType =
+        allocColumnType(mlir::storage::NullableType::get(_mlirCtxt, resultType));
+
+    return _opBuilder.create<mlir::db::PathElements>(_opBuilder.getUnknownLoc(), nullableType, column, kind).getResult();
+}
+
+void DBProgramGenerator::createMain() {
     bioassert(_module, "Null module");
     bioassert(_mlirCtxt, "Null context");
 
     _mlirCtxt->loadDialect<mlir::db::DB>();
     _mlirCtxt->loadDialect<mlir::storage::Storage>();
     _mlirCtxt->loadDialect<mlir::func::FuncDialect>();
+
+    _opBuilder.setInsertionPointToEnd(_module->getBody());
+
+    const mlir::FunctionType funcType = mlir::FunctionType::get(_mlirCtxt, {}, {});
+    auto func = _opBuilder.create<mlir::func::FuncOp>(_opBuilder.getUnknownLoc(), "main", funcType);
+    mlir::Block& block = *func.addEntryBlock();
+
+    _opBuilder.setInsertionPointToStart(&block);
+}
+
+void DBProgramGenerator::generate(const CypherAST* ast) {
+    _ast = ast;
+    _constantColumns.clear();
+    _vdg.setDiagnosticsManager(ast->getDiagnosticsManager());
+
+    createMain();
+
     const mlir::Location uloc = _opBuilder.getUnknownLoc();
 
-    { // Create main
-        _opBuilder.setInsertionPointToEnd(_module->getBody());
-        const mlir::FunctionType funcType = mlir::FunctionType::get(_mlirCtxt, {}, {});
-        auto func = _opBuilder.create<mlir::func::FuncOp>(uloc, "main", funcType);
-        mlir::Block& block = *func.addEntryBlock();
-        _opBuilder.setInsertionPointToStart(&block);
+    if (generateSystemCommand(ast)) {
+        _opBuilder.create<mlir::func::ReturnOp>(uloc);
+
+        explainModule(ExplainStage::CODEGEN);
+        explainModule(ExplainStage::DB);
+        return;
     }
 
-    generateTraversal(ast);
-    resolveEdgeIdentities();
-    generatePropertyConstraints(ast);
-    generateLabelConstraints(ast);
-    generateEdgeTypeConstraints(ast);
-    generateFilters(ast);
-    generateCreate(ast);
-    generateOutput(ast);
+    const CypherAST::QueryCommands& queries = ast->queries();
+    if (queries.size() != 1) {
+        throwError("Multiple queries not yet supported.", queries.front());
+    }
+
+    const QueryCommand* command = queries.front();
+
+    const QueryCommand::Kind kind = command->getKind();
+
+    if (kind == QueryCommand::Kind::UNION_QUERY) {
+        generateUnion(static_cast<const UnionQuery*>(command));
+    } else if (kind == QueryCommand::Kind::CONDITIONAL_QUERY) {
+        generateConditionalQuery(static_cast<const ConditionalQuery*>(command));
+    } else if (kind == QueryCommand::Kind::SINGLE_PART_QUERY) {
+        generateQuery(static_cast<const SinglePartQuery*>(command), nullptr);
+    } else {
+        throwError("Non-single part queries are not yet supported.", command);
+    }
+
+    _opBuilder.create<mlir::func::ReturnOp>(uloc);
+
+    explainModule(ExplainStage::CODEGEN);
+
+    runPasses();
+
+    explainModule(ExplainStage::DB);
+}
+
+void DBProgramGenerator::generateExplainResult(const ExplainReport& report) {
+    createMain();
+
+    const mlir::Location uloc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType stringColumn = allocColumnType(mlir::storage::StringType::get(_mlirCtxt));
+
+    const std::vector<std::string>& stages = report.getStages();
+    const std::vector<std::string>& dumps = report.getDumps();
+
+    const llvm::SmallVector<llvm::StringRef> stageNames(stages.begin(), stages.end());
+    const llvm::SmallVector<llvm::StringRef> stageDumps(dumps.begin(), dumps.end());
+
+    mlir::db::Explain explain = _opBuilder.create<mlir::db::Explain>(uloc,
+                                                                     stringColumn,
+                                                                     stringColumn,
+                                                                     _opBuilder.getStrArrayAttr(stageNames),
+                                                                     _opBuilder.getStrArrayAttr(stageDumps));
+
+    _opBuilder.create<mlir::db::Output>(uloc,
+                                        mlir::ValueRange {explain.getStages(), explain.getDumps()},
+                                        _opBuilder.getStrArrayAttr({"stage", "dump"}));
 
     _opBuilder.create<mlir::func::ReturnOp>(uloc);
 }
 
-void DBProgramGenerator::generateTraversal(const CypherAST* ast) {
-    _vdg.buildFromAST(ast);
+void DBProgramGenerator::explainModule(ExplainStage stage) {
+    if (!_explain) {
+        return;
+    }
 
+    _explain->addModule(stage, *_module);
+}
+
+void DBProgramGenerator::explainDependencyGraph() {
+    if (!_explain || !_explain->isRequested(ExplainStage::VDG)) {
+        return;
+    }
+
+    _explainedParts++;
+
+    std::ostringstream graph;
+    VariableDependencyGraphDumper::dumpMermaid(_vdg, graph);
+
+    const std::string label = "vdg " + std::to_string(_explainedParts);
+    _explain->addText(label, graph.str());
+}
+
+void DBProgramGenerator::generateQuery(const SinglePartQuery* query, const UnionBranch* branch) {
+    generateQueryParts(query);
+
+    const ReturnStmt* returnStmt = query->getReturnStmt();
+    const Projection* projection = returnStmt ? returnStmt->getProjection() : nullptr;
+
+    if (projection) {
+        generateGroupAggregate(projection);
+        generateOutput(projection, branch);
+    } else {
+        generateYieldedOutput(query);
+    }
+}
+
+// Each branch is generated into a region of its own, as a query body in its own right:
+// the branches share no variable, so the scope and the dependency graph are dropped
+// between them the way a barrier drops them.
+void DBProgramGenerator::generateUnion(const UnionQuery* unionQuery) {
+    const UnionQuery::Branches& branches = unionQuery->branches();
+    const size_t dedupedBranches = UnionQuery::getDedupedBranchCount(branches);
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    mlir::Value distinctSet;
+    if (dedupedBranches > 0) {
+        distinctSet = _opBuilder.create<mlir::db::DistinctSet>(loc).getSet();
+    }
+
+    mlir::db::Union unionOp = _opBuilder.create<mlir::db::Union>(loc, branches.size());
+
+    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
+        _part = PartScope {};
+        _vdg.clear();
+
+        _opBuilder.setInsertionPointToStart(&unionOp.getBranches()[branchIndex].front());
+
+        const bool dedupsWithTheBranchesBeforeIt = branchIndex < dedupedBranches;
+        const UnionBranch branch {dedupsWithTheBranchesBeforeIt ? distinctSet : mlir::Value()};
+
+        generateQuery(branches[branchIndex]._query, &branch);
+    }
+
+    _opBuilder.setInsertionPointAfter(unionOp);
+}
+
+void DBProgramGenerator::generateConditionalQuery(const ConditionalQuery* query) {
+    const CallSubqueryStmt::Branches& branches = query->getBody()->branches();
+
+    const std::vector<llvm::SmallVector<PublishedColumn>> branchScopes(branches.size());
+    const std::vector<CarriedEntities> importedEntities(branches.size());
+
+    llvm::SmallVector<PublishedColumn> yielded;
+    CarriedEntities returnedEntities;
+    generateSubqueryConditional(branches, branchScopes, importedEntities, yielded, returnedEntities);
+
+    const ReturnStmt* returnStmt = branches.front()._query->getReturnStmt();
+    if (!returnStmt) {
+        return;
+    }
+
+    llvm::SmallVector<mlir::Value> columns;
+    llvm::SmallVector<llvm::StringRef> names;
+    for (const VarDecl* decl : returnStmt->getProjection()->publishedDecls()) {
+        const auto columnIt = std::ranges::find(yielded, decl, &PublishedColumn::_decl);
+        bioassert(columnIt != yielded.end(), "Column '{}' of a WHEN not yielded by its branches", decl->getName());
+
+        columns.push_back(columnIt->_column);
+        names.push_back(columnIt->_name);
+    }
+
+    _opBuilder.create<mlir::db::Output>(_opBuilder.getUnknownLoc(),
+                                       mlir::ValueRange {columns},
+                                       _opBuilder.getStrArrayAttr(names));
+}
+
+void DBProgramGenerator::generateQueryParts(const SinglePartQuery* query) {
+    const StmtContainer* queryStmts = query->getStmts();
+    if (!queryStmts) {
+        return;
+    }
+
+    const std::span<Stmt* const> stmts {queryStmts->stmts()};
+
+    // A WITH closes a query part: the statements before it feed its projection, and the
+    // columns that projection publishes are all the statements after it can read
+    size_t partBegin = 0;
+    for (size_t index = 0; index < stmts.size(); index++) {
+        const Stmt* stmt = stmts[index];
+
+        if (stmt->getKind() == Stmt::Kind::WITH) {
+            generatePartStatements(stmts.subspan(partBegin, index - partBegin));
+            generateWith(static_cast<const WithStmt*>(stmt));
+            partBegin = index + 1;
+        } else if (stmt->getKind() == Stmt::Kind::NEXT_SEGMENT) {
+            generatePartStatements(stmts.subspan(partBegin, index - partBegin));
+            generateNextSegment(static_cast<const NextSegmentStmt*>(stmt));
+            partBegin = index + 1;
+        } else if (closesPartOnItsCut(stmt, stmts.subspan(index + 1))) {
+            generatePartStatements(stmts.subspan(partBegin, index + 1 - partBegin));
+            publishInFlightColumns();
+            partBegin = index + 1;
+        }
+    }
+
+    generatePartStatements(stmts.subspan(partBegin));
+}
+
+// The reading clauses of a part build the rows its updating clauses write one entity per,
+// so the whole traversal is generated before the first write. The analyzer has already
+// rejected a part that reads again after writing, so the split is a single cut
+void DBProgramGenerator::generatePartStatements(std::span<Stmt* const> stmts) {
+    const auto isUpdating = [](const Stmt* stmt) {
+        return Stmt::isUpdating(stmt);
+    };
+
+    const auto firstUpdate = std::ranges::find_if(stmts, isUpdating);
+    const size_t readingCount = static_cast<size_t>(firstUpdate - stmts.begin());
+
+    if (readingCount > 0) {
+        generateOptionalParts(stmts.subspan(0, readingCount));
+    }
+
+    generateUpdates(stmts.subspan(readingCount));
+}
+
+void DBProgramGenerator::generateOptionalParts(std::span<Stmt* const> stmts) {
+    // A CALL subquery closes the traversal before it as an optional pattern does: its body
+    // reads the rows in flight through a region of its own
+    const auto closesTheTraversal = [](const Stmt* stmt) {
+        const Stmt::Kind kind = stmt->getKind();
+
+        if (kind == Stmt::Kind::MATCH) {
+            return static_cast<const MatchStmt*>(stmt)->isOptional();
+        }
+
+        return kind == Stmt::Kind::CALL_SUBQUERY;
+    };
+
+    size_t partBegin = 0;
+    for (size_t index = 0; index < stmts.size(); index++) {
+        const Stmt* stmt = stmts[index];
+        if (!closesTheTraversal(stmt)) {
+            continue;
+        }
+
+        generatePart(stmts.subspan(partBegin, index - partBegin));
+
+        if (stmt->getKind() == Stmt::Kind::MATCH) {
+            generateOptionalMatch(stmts.subspan(index, 1));
+        } else {
+            generateCallSubquery(static_cast<const CallSubqueryStmt*>(stmt));
+        }
+
+        partBegin = index + 1;
+    }
+
+    if (partBegin < stmts.size()) {
+        generatePart(stmts.subspan(partBegin));
+    }
+}
+
+bool DBProgramGenerator::closesPartOnItsCut(const Stmt* stmt, std::span<Stmt* const> following) const {
+    if (stmt->getKind() != Stmt::Kind::MATCH) {
+        return false;
+    }
+
+    const MatchStmt* matchStmt = static_cast<const MatchStmt*>(stmt);
+    const bool carriesACut = matchStmt->hasOrderBy() || matchStmt->hasSkip() || matchStmt->hasLimit();
+
+    if (!carriesACut) {
+        return false;
+    }
+
+    for (const Stmt* next : following) {
+        const Stmt::Kind kind = next->getKind();
+
+        if (kind == Stmt::Kind::WITH || kind == Stmt::Kind::NEXT_SEGMENT) {
+            return false;
+        } else if (kind == Stmt::Kind::MATCH || kind == Stmt::Kind::CALL_SUBQUERY) {
+            return true;
+        } else if (kind == Stmt::Kind::UNWIND) {
+            // A literal UNWIND opens a dataflow of its own, multiplying the rows the cut
+            // applies to exactly as a following MATCH does. One evaluated per row does not.
+            const UnwindStmt* unwindStmt = static_cast<const UnwindStmt*>(next);
+            if (unwindStmt->unwindsLiteral()) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+void DBProgramGenerator::generatePart(std::span<Stmt* const> stmts) {
+    _vdg.build(stmts);
+    collectQuantifiedEdges(stmts);
+
+    explainDependencyGraph();
+
+    generateLeadingYields(stmts);
+    generateTraversal(stmts);
+    throwOnUnboundPatternVariable();
+    throwOnDroppedUnwindSeed();
+    closeBoundMerges();
+    closeBoundEdges();
+    resolveEdgeIdentities();
+    generateCSVLoads(stmts);
+    generateStatementOperations(stmts);
+    resolveYieldedIdentities();
+    generateShortestPath(stmts);
+}
+
+bool DBProgramGenerator::generateSystemCommand(const CypherAST* ast) {
+    const CypherAST::QueryCommands& queries = ast->queries();
+    if (queries.size() != 1) {
+        throwError("Multiple queries not yet supported.", queries.front());
+    }
+
+    DBSystemProgramGenerator systemGenerator(&_opBuilder);
+
+    return systemGenerator.generate(queries.front());
+}
+
+void DBProgramGenerator::runPasses() {
+    if (explainsPasses()) {
+        runExplainedPasses();
+    } else if (_passPipeline) {
+        _passPipeline->run(*_module, _passContext);
+    } else {
+        DBPassPipeline passPipeline(_mlirCtxt);
+        passPipeline.run(*_module, _passContext);
+    }
+}
+
+bool DBProgramGenerator::explainsPasses() const {
+    if (!_explain) {
+        return false;
+    }
+
+    return _explain->isRequested(ExplainStage::PASSES) || _explain->hasNamedPasses();
+}
+
+void DBProgramGenerator::runExplainedPasses() {
+    throwOnUnknownExplainPass();
+
+    const bool printsEveryPass = _explain->isRequested(ExplainStage::PASSES);
+
+    std::vector<std::string_view> pipelinePasses;
+    DBPassPipeline::fillPassNames(pipelinePasses);
+
+    std::string module;
+    ExplainReport::renderModule(*_module, module);
+
+    for (size_t passIndex = 0; passIndex < pipelinePasses.size(); passIndex++) {
+        std::unique_ptr<mlir::Pass> pass = DBPassPipeline::createPass(passIndex, &_passContext);
+        const std::string_view passName = pipelinePasses[passIndex];
+        const size_t run = passRunNumber(pipelinePasses, passIndex);
+
+        if (_explain->isPassPrintedBefore(passName)) {
+            std::string label;
+            makePassLabel("before ", passName, run, label);
+
+            _explain->addText(label, module);
+        }
+
+        mlir::PassManager passManager(_mlirCtxt);
+        passManager.enableVerifier(false);
+        passManager.addPass(std::move(pass));
+
+        if (mlir::failed(passManager.run(*_module))) {
+            throw FatalException("DB pass pipeline failed");
+        }
+
+        std::string rewritten;
+        ExplainReport::renderModule(*_module, rewritten);
+
+        const bool changedTheModule = rewritten != module;
+        if (_explain->isPassPrintedAfter(passName) || (printsEveryPass && changedTheModule)) {
+            std::string label;
+            makePassLabel("after ", passName, run, label);
+
+            _explain->addText(label, rewritten);
+        }
+
+        module = rewritten;
+    }
+}
+
+void DBProgramGenerator::throwOnUnknownExplainPass() const {
+    std::vector<std::string_view> pipelinePasses;
+    DBPassPipeline::fillPassNames(pipelinePasses);
+
+    const std::string_view unknownPass = _explain->findUnknownPass(pipelinePasses);
+    if (unknownPass.empty()) {
+        return;
+    }
+
+    std::string message = "Unknown EXPLAIN pass '";
+    message += unknownPass;
+    message += "'. The pipeline runs: ";
+
+    for (size_t index = 0; index < pipelinePasses.size(); index++) {
+        if (index > 0) {
+            message += ", ";
+        }
+
+        message += pipelinePasses[index];
+    }
+
+    throw TuringException(std::move(message));
+}
+
+bool DBProgramGenerator::isValidRoot(const VariableDependency& var) const {
+    const auto isEdgeTgtMetaVar = [](const DependencyEdge* e) -> bool {
+        return e->isMetaEdge();
+    };
+
+    // A valid root is a non-meta Cypher variable which is a node
+    return std::ranges::none_of(var.incoming(), [&](const DependencyEdge* e) {
+        return producesEdgeVar(e) || isEdgeTgtMetaVar(e);
+    });
+}
+
+void DBProgramGenerator::collectComponentRoots(llvm::SmallVectorImpl<const VariableDependency*>& roots) const {
+    // Every variable a component holds can be a valid root of its own - the target of an
+    // expansion has no incoming edge that produces an edge variable either - so a component
+    // is opened by the first of them the graph lists, and the rest are reached from it.
+    std::unordered_set<const VariableDependency*> visited;
+
+    for (const VariableDependency& var : _vdg.vars()) {
+        const bool opensComponent = !visited.contains(&var) && isValidRoot(var);
+        if (!opensComponent) {
+            continue;
+        }
+
+        roots.push_back(&var);
+
+        llvm::SmallVector<const VariableDependency*> worklist {&var};
+        while (!worklist.empty()) {
+            const VariableDependency* const current = worklist.pop_back_val();
+            if (!visited.insert(current).second) {
+                continue;
+            }
+
+            for (const DependencyEdge* edge : current->edges()) {
+                worklist.push_back(edge->src() == current ? edge->tgt() : edge->src());
+            }
+        }
+    }
+}
+
+// Breaking a cycle leaves the variable it closed on standing behind one merge edge per
+// end, and that variable carries no rows until every end it merges holds some. A root
+// inside the broken cycle reaches those ends without crossing it; one outside reaches the
+// variable first and stalls there, having nothing to open the ends with.
+bool DBProgramGenerator::reachesTheMergesItCrosses(const VariableDependency& root) const {
+    const auto isMerged = [](const VariableDependency* var) {
+        return std::ranges::any_of(var->incoming(),
+                                   [](const DependencyEdge* edge) { return edge->isMetaEdge(); });
+    };
+
+    llvm::SmallVector<const VariableDependency*> worklist {&root};
+    std::unordered_set<const VariableDependency*> reached {&root};
+    llvm::SmallVector<const VariableDependency*> crossed;
+
+    while (!worklist.empty()) {
+        const VariableDependency* const current = worklist.pop_back_val();
+
+        if (isMerged(current)) {
+            crossed.push_back(current);
+            continue;
+        }
+
+        for (const DependencyEdge* edge : current->edges()) {
+            const VariableDependency* const other = edge->src() == current ? edge->tgt() : edge->src();
+            if (reached.insert(other).second) {
+                worklist.push_back(other);
+            }
+        }
+    }
+
+    return std::ranges::all_of(crossed, [&reached](const VariableDependency* var) {
+        return std::ranges::all_of(var->incoming(), [&reached](const DependencyEdge* edge) {
+            return !edge->isMetaEdge() || reached.contains(edge->src());
+        });
+    });
+}
+
+void DBProgramGenerator::collectOrderedRoots(llvm::SmallVectorImpl<const VariableDependency*>& roots) const {
+    for (const VariableDependency& var : _vdg.vars()) {
+        if (isValidRoot(var)) {
+            roots.push_back(&var);
+        }
+    }
+
+    // Both ends a broken cycle leaves behind can open it, but only the one the pattern
+    // traverses out of walks it the way the pattern was written; opening it at the other
+    // emits the reverse traversal, whose path lists its hops back to front.
+    const auto walksOutOfABrokenCycle = [](const VariableDependency* root) {
+        const VariableDependency::Edges& outgoing = root->outgoing();
+
+        const auto isMeta = [](const DependencyEdge* edge) { return edge->isMetaEdge(); };
+
+        return std::ranges::any_of(outgoing, isMeta)
+            && !std::ranges::all_of(outgoing, isMeta);
+    };
+
+    const auto opensItsOwnMerges = [this](const VariableDependency* root) {
+        return reachesTheMergesItCrosses(*root);
+    };
+
+    std::stable_partition(roots.begin(), roots.end(), walksOutOfABrokenCycle);
+    std::stable_partition(roots.begin(), roots.end(), opensItsOwnMerges);
+}
+
+void DBProgramGenerator::generateTraversal(std::span<Stmt* const> stmts) {
     if (_vdg.empty()) {
         return;
     }
@@ -260,26 +2411,41 @@ void DBProgramGenerator::generateTraversal(const CypherAST* ast) {
 
     DefinedVars defined;
 
+    // The dataflow already standing in the main block: the component a leading call drives
+    // from a column it bound there, or the one a barrier left behind, extended by the hops
+    // of this part.
+    TranslatedComponent mainComponent;
+
+    const VariableDependencyGraph::BoundVars& bound = _vdg.boundVars();
+    if (_part._drivenRoot) {
+        // A column the barrier published holds its rows already, so it opens no component
+        // of its own: it stands in the main block beside the rows the leading statements
+        // bound, and rides with them into any island crossed with them.
+        for (const VariableDependency* var : bound) {
+            defined.insert(var);
+
+            if (!yieldsConstantColumn(_part._varMap.at(var).back(), _constantColumns)) {
+                mainComponent._vars.push_back(var);
+            }
+        }
+
+        translateComponent(_part._drivenRoot, defined, mainComponent._vars);
+    } else if (!bound.empty()) {
+        extendBoundDataflow(defined, mainComponent._vars);
+    }
+
     // Connected components
     std::vector<TranslatedComponent> components;
 
+    llvm::SmallVector<const VariableDependency*> roots;
+    collectOrderedRoots(roots);
+
+    llvm::SmallVector<const VariableDependency*> crossedRoots;
+    DefinedVars crossedComponentVars;
+
     // TODO: Use nodes at ends of diameter
-    for (const VariableDependency& root : _vdg.vars()) {
-        if (defined.contains(&root)) {
-            continue;
-        }
-
-        const auto isEdgeTgtMetaVar = [](const DependencyEdge* e) -> bool {
-            return e->isMetaEdge();
-        };
-
-        // A valid root is a non-meta Cypher variable which is a node
-        const bool validRoot =
-            std::ranges::none_of(root.incoming(), [&](const DependencyEdge* e) {
-                return producesEdgeVar(e) || isEdgeTgtMetaVar(e);
-            });
-
-        if (!validRoot) {
+    for (const VariableDependency* root : roots) {
+        if (defined.contains(root) || crossedComponentVars.contains(root)) {
             continue;
         }
 
@@ -290,16 +2456,36 @@ void DBProgramGenerator::generateTraversal(const CypherAST* ast) {
         component._region->push_back(scratch); // Region destructor frees scratch
         _opBuilder.setInsertionPointToStart(scratch);
 
-        translateComponent(&root, defined, component._vars);
+        DefinedVars componentVars;
+        collectComponentVars(root, componentVars);
+
+        if (walkReadsAnotherComponent(componentVars)) {
+            openComponent(root);
+            defined.insert(root);
+            component._vars.push_back(root);
+
+            crossedRoots.push_back(root);
+            crossedComponentVars.insert(componentVars.begin(), componentVars.end());
+        } else {
+            translateComponent(root, defined, component._vars);
+        }
 
         for (const VariableDependency* var : component._vars) {
-            bioassert(_varMap.contains(var), "Component var {} not registered", var->getName());
-            component._columns.push_back(_varMap[var].back());
+            bioassert(_part._varMap.contains(var), "Component var {} not registered", var->getName());
+            component._columns.push_back(_part._varMap[var].back());
         }
     }
 
     if (components.empty()) {
         return;
+    }
+
+    // A pattern naming none of the variables already flowing matches on its own, so its
+    // rows are crossed with theirs. A scope of constants alone carries no rows to cross:
+    // one value stands for every row of either factor
+    if (!mainComponent._vars.empty()) {
+        takeMainDataflow(mainBlock, mainComponent);
+        components.insert(components.begin(), std::move(mainComponent));
     }
 
     // Single connected component, no need to X prod any islands
@@ -336,63 +2522,226 @@ void DBProgramGenerator::generateTraversal(const CypherAST* ast) {
     }
 
     _opBuilder.setInsertionPointToEnd(mainBlock);
+
+    expandCrossedComponents(crossedRoots, components, defined);
+}
+
+// A chunk holds the rows of the loop whose body binds it, so a column bound in an
+// enclosing block holds a different row set. Stricter than dominance on purpose: such
+// a value does dominate here, it is just the wrong rows.
+bool DBProgramGenerator::isRowAlignedHere(mlir::Value column) const {
+    mlir::Operation* const definingOp = column.getDefiningOp();
+    mlir::Block* const definingBlock = definingOp
+        ? definingOp->getBlock()
+        : mlir::cast<mlir::BlockArgument>(column).getOwner();
+
+    mlir::Block* const insertionBlock = _opBuilder.getInsertionBlock();
+    if (definingBlock == insertionBlock) {
+        return true;
+    }
+
+    const auto rowBlockIt = _unionBranchRowBlocks.find(insertionBlock);
+
+    return rowBlockIt != _unionBranchRowBlocks.end() && rowBlockIt->second == definingBlock;
+}
+
+// Whether @param column holds the rows in flight here: the rows of the block the insertion
+// point is in, and the groups rather than what the grouping consumed where an aggregate has
+// reduced them
+bool DBProgramGenerator::holdsTheRowsInFlight(mlir::Value column) const {
+    if (!isRowAlignedHere(column)) {
+        return false;
+    }
+
+    return !_part._aggregateOp || boundAtOrAfter(column, _part._aggregateOp);
+}
+
+void DBProgramGenerator::collectInFlightColumns(InFlightColumns& inFlight) {
+    for (auto& [var, values] : _part._varMap) {
+        const mlir::Value column = values.back();
+        if (!holdsTheRowsInFlight(column)) {
+            continue;
+        }
+
+        // A constant stands for every row rather than holding rows of its own, so an op
+        // over the row set has no row of it to cut or to cross
+        if (yieldsConstantColumn(column, _constantColumns)) {
+            continue;
+        }
+
+        inFlight._columns.push_back(column);
+        inFlight._variables.push_back(var);
+    }
+
+    for (auto& [var, column] : _part._edgeTypeMap) {
+        if (!holdsTheRowsInFlight(column)) {
+            continue;
+        }
+
+        inFlight._columns.push_back(column);
+        inFlight._edgeTypeVariables.push_back(var);
+    }
+
+    for (auto& [decl, column] : _part._namedPaths) {
+        if (!isRowAlignedHere(column)) {
+            continue;
+        }
+
+        inFlight._columns.push_back(column);
+        inFlight._namedPathDecls.push_back(decl);
+    }
+
+    // A column an earlier CALL yielded is in flight too: a later op taking the whole row
+    // set must take it along, or the rows it holds would stop matching the ones beside it.
+    for (size_t yieldedIndex = 0; yieldedIndex < _part._yieldedColumns.size(); yieldedIndex++) {
+        const YieldedColumn& yielded = _part._yieldedColumns[yieldedIndex];
+        if (!holdsTheRowsInFlight(yielded._column)) {
+            continue;
+        }
+
+        inFlight._columns.push_back(yielded._column);
+        inFlight._yieldedIndices.push_back(yieldedIndex);
+    }
+
+    collectElementColumns(inFlight);
+}
+
+// The element a list comprehension bound is in flight inside its body, which is where a
+// comprehension nested in that body has to take it along - once per element of its own, as
+// it takes the rest along
+void DBProgramGenerator::collectElementColumns(InFlightColumns& inFlight) {
+    const ElementColumnMap& elements = _part._comprehensionElements;
+
+    for (const auto& [decl, column] : elements) {
+        if (!isRowAlignedHere(column)) {
+            continue;
+        }
+
+        inFlight._comprehensionDecls.push_back(decl);
+    }
+
+    sortByProgramOrder(inFlight._comprehensionDecls, elements);
+
+    for (const VarDecl* decl : inFlight._comprehensionDecls) {
+        inFlight._columns.push_back(elements.at(decl));
+    }
+}
+
+void DBProgramGenerator::rebindInFlightColumns(mlir::ValueRange columns,
+                                               size_t firstColumn,
+                                               const InFlightColumns& inFlight) {
+    size_t columnIndex = firstColumn;
+
+    for (const VariableDependency* variable : inFlight._variables) {
+        registerValue(variable, columns[columnIndex]);
+        columnIndex++;
+    }
+
+    for (const VariableDependency* variable : inFlight._edgeTypeVariables) {
+        _part._edgeTypeMap[variable] = columns[columnIndex];
+        columnIndex++;
+    }
+
+    for (const VarDecl* decl : inFlight._namedPathDecls) {
+        _part._namedPaths[decl] = columns[columnIndex];
+        columnIndex++;
+    }
+
+    for (const size_t yieldedIndex : inFlight._yieldedIndices) {
+        _part._yieldedColumns[yieldedIndex]._column = columns[columnIndex];
+        columnIndex++;
+    }
+
+    for (const VarDecl* decl : inFlight._comprehensionDecls) {
+        _part._comprehensionElements[decl] = columns[columnIndex];
+        columnIndex++;
+    }
+
+    for (const Expr* expr : inFlight._exprs) {
+        _part._exprMap[expr] = columns[columnIndex];
+        columnIndex++;
+    }
+}
+
+mlir::Value DBProgramGenerator::findYieldedColumn(const VarDecl* decl) const {
+    if (!decl) {
+        return mlir::Value {};
+    }
+
+    for (const YieldedColumn& yielded : _part._yieldedColumns) {
+        if (yielded._decl == decl) {
+            return yielded._column;
+        }
+    }
+
+    return mlir::Value();
+}
+
+std::string_view DBProgramGenerator::findCSVFieldRow(const VarDecl* decl) const {
+    const auto foundIt = _csvFieldRows.find(decl);
+    if (foundIt == end(_csvFieldRows)) {
+        return {};
+    }
+
+    return foundIt->second;
 }
 
 void DBProgramGenerator::filterAllColumns(mlir::Value predicate) {
-    if (_varMap.empty()) {
-        return;
-    }
+    InFlightColumns inFlight;
+    collectInFlightColumns(inFlight);
 
-    // Only filter columns defined in the current insertion block
-    mlir::Block* const insertionBlock = _opBuilder.getInsertionBlock();
-
-    llvm::SmallVector<mlir::Value> columnsToFilter;
-    llvm::SmallVector<const VariableDependency*> orderedVars;
-    for (auto& [var, values] : _varMap) {
-        const mlir::Value column = values.back();
-        mlir::Operation* const definingOp = column.getDefiningOp();
-        mlir::Block* const definingBlock = definingOp
-            ? definingOp->getBlock()
-            : mlir::cast<mlir::BlockArgument>(column).getOwner();
-        if (definingBlock != insertionBlock) {
-            continue;
-        }
-        columnsToFilter.push_back(column);
-        orderedVars.push_back(var);
-    }
-
-    llvm::SmallVector<const VariableDependency*> orderedEdgeTypeVars;
-    for (auto& [var, column] : _edgeTypeMap) {
-        mlir::Operation* const definingOp = column.getDefiningOp();
-        mlir::Block* const definingBlock = definingOp
-            ? definingOp->getBlock()
-            : mlir::cast<mlir::BlockArgument>(column).getOwner();
-        if (definingBlock != insertionBlock) {
-            continue;
-        }
-        columnsToFilter.push_back(column);
-        orderedEdgeTypeVars.push_back(var);
-    }
-
-    if (columnsToFilter.empty()) {
+    // A scope of constants alone carries no rows for the filter to cut, so the predicate is
+    // laid out over the single row those constants are, and cuts that one instead
+    if (inFlight._columns.empty()) {
+        filterConstantScope(predicate);
         return;
     }
 
     llvm::SmallVector<mlir::Type> resultTypes;
-    for (const mlir::Value column : columnsToFilter) {
+    for (const mlir::Value column : inFlight._columns) {
         resultTypes.push_back(column.getType());
     }
 
     const mlir::Location loc = _opBuilder.getUnknownLoc();
-    auto filterOp = _opBuilder.create<mlir::db::FilterOp>(loc, resultTypes, predicate, columnsToFilter);
+    auto filterOp = _opBuilder.create<mlir::db::FilterOp>(loc, resultTypes, predicate, inFlight._columns);
 
-    for (size_t index = 0; index < orderedVars.size(); index++) {
-        registerValue(orderedVars[index], filterOp.getResult(index));
+    rebindInFlightColumns(filterOp.getResults(), /*firstResult=*/0, inFlight);
+}
+
+void DBProgramGenerator::filterConstantScope(mlir::Value predicate) {
+    llvm::SmallVector<const VariableDependency*> constantVars;
+    for (auto& [var, values] : _part._varMap) {
+        if (yieldsConstantColumn(values.back(), _constantColumns)) {
+            constantVars.push_back(var);
+        }
     }
 
-    const size_t edgeTypeOffset = orderedVars.size();
-    for (size_t index = 0; index < orderedEdgeTypeVars.size(); index++) {
-        _edgeTypeMap[orderedEdgeTypeVars[index]] = filterOp.getResult(edgeTypeOffset + index);
+    if (constantVars.empty()) {
+        return;
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+    const mlir::Value noDriver;
+
+    const mlir::Value mask =
+        _opBuilder.create<mlir::db::BroadcastConstant>(loc, noneType, predicate, noDriver).getResult();
+
+    llvm::SmallVector<mlir::Value> columnsToFilter;
+    llvm::SmallVector<mlir::Type> resultTypes;
+    for (const VariableDependency* var : constantVars) {
+        const mlir::Value column = _part._varMap.at(var).back();
+        const mlir::Value laidOut =
+            _opBuilder.create<mlir::db::BroadcastConstant>(loc, noneType, column, noDriver).getResult();
+
+        columnsToFilter.push_back(laidOut);
+        resultTypes.push_back(laidOut.getType());
+    }
+
+    auto filterOp = _opBuilder.create<mlir::db::FilterOp>(loc, resultTypes, mask, columnsToFilter);
+
+    for (size_t index = 0; index < constantVars.size(); index++) {
+        registerValue(constantVars[index], filterOp.getResult(index));
     }
 }
 
@@ -413,8 +2762,8 @@ void DBProgramGenerator::addMergeFilter(const VariableDependency* mergeVar,
     bioassert(fstMergeSource && sndMergeSource, "MERGE target without two sources");
 
     const mlir::Location uloc = _opBuilder.getUnknownLoc();
-    const mlir::Value fstSourceCol = _varMap.at(fstMergeSource).back();
-    const mlir::Value sndSourceCol = _varMap.at(sndMergeSource).back();
+    const mlir::Value fstSourceCol = findVarOrThrow(_part._varMap, fstMergeSource);
+    const mlir::Value sndSourceCol = findVarOrThrow(_part._varMap, sndMergeSource);
     const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
     // Create an EQ op to keep only rows where both sources are the same
     auto eq =
@@ -422,7 +2771,7 @@ void DBProgramGenerator::addMergeFilter(const VariableDependency* mergeVar,
     const mlir::Value eqRes = eq.getResult();
 
     // Register mergeVar's initial value (first source, arbitrary) so filterAllColumns
-    // picks it up along with the rest of _varMap.
+    // picks it up along with the rest of the part's variables.
     registerValue(mergeVar, fstSourceCol);
     filterAllColumns(eqRes);
     carriedSet.push_back(mergeVar);
@@ -444,8 +2793,8 @@ void DBProgramGenerator::resolveEdgeIdentities() {
         for (size_t index = 0; index + 1 < vars.size(); index++) {
             const VariableDependency* fstVar = vars[index];
             const VariableDependency* sndVar = vars[index + 1];
-            const mlir::Value fstCol = findVarOrThrow(_varMap, fstVar);
-            const mlir::Value sndCol = findVarOrThrow(_varMap, sndVar);
+            const mlir::Value fstCol = findVarOrThrow(_part._varMap, fstVar);
+            const mlir::Value sndCol = findVarOrThrow(_part._varMap, sndVar);
 
             auto eqOp = _opBuilder.create<mlir::db::EqOp>(uloc, boolType, fstCol, sndCol);
             const mlir::Value eq = eqOp.getResult();
@@ -462,9 +2811,373 @@ void DBProgramGenerator::resolveEdgeIdentities() {
     }
 }
 
+bool DBProgramGenerator::holdsColumn(const VariableDependency* var) const {
+    const auto findIt = _part._varMap.find(var);
+
+    return findIt != _part._varMap.end() && !findIt->second.empty();
+}
+
+void DBProgramGenerator::throwOnUnboundPatternVariable() const {
+    for (const VariableDependency& var : _vdg.vars()) {
+        if (holdsColumn(&var)) {
+            continue;
+        }
+
+        throwError(fmt::format("Reaching the pattern variable '{}' from the rest "
+                               "of the query is not yet supported.",
+                               var.getName()),
+                   var.getDecl());
+    }
+}
+
+void DBProgramGenerator::throwOnDroppedUnwindSeed() const {
+    for (const auto& [var, unwind] : _vdg.unwindSources()) {
+        const VarDecl* const decl = var->getDecl();
+        const bool namesAPatternNode = decl && decl->getType() == EvaluatedType::NodePattern;
+
+        if (!namesAPatternNode || _part._seededVars.contains(var)) {
+            continue;
+        }
+
+        throwError(fmt::format("Unwinding node IDs into the pattern variable '{}' is "
+                               "not yet supported where the pattern reaches it from "
+                               "elsewhere.",
+                               var->getName()),
+                   var->getDecl());
+    }
+}
+
+void DBProgramGenerator::extendBoundDataflow(DefinedVars& defined,
+                                             std::vector<const VariableDependency*>& dataflowVars) {
+    const VariableDependencyGraph::BoundVars& bound = _vdg.boundVars();
+
+    // Every column the barrier published already holds its rows, so no scan opens a
+    // dataflow here: the hops of this part extend that one, carrying those columns along.
+    // A constant has no rows to carry and rides along untouched
+    std::vector<const VariableDependency*> carriedSet;
+    for (const VariableDependency* var : bound) {
+        defined.insert(var);
+
+        if (!yieldsConstantColumn(_part._varMap.at(var).back(), _constantColumns)) {
+            carriedSet.push_back(var);
+            dataflowVars.push_back(var);
+        }
+    }
+
+    for (const VariableDependency* var : bound) {
+        applyConstraints(var);
+    }
+
+    for (const VariableDependency* var : bound) {
+        expandComponent(var, defined, carriedSet, dataflowVars);
+    }
+
+    closeBoundJoins(carriedSet, dataflowVars);
+}
+
+void DBProgramGenerator::closeBoundMerges() {
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+    const mlir::Location uloc = _opBuilder.getUnknownLoc();
+
+    for (const VariableDependency* var : _vdg.boundVars()) {
+        for (const DependencyEdge* inEdge : var->incoming()) {
+            if (!inEdge->isMetaEdge()) {
+                continue;
+            }
+
+            const mlir::Value landed = findVarOrThrow(_part._varMap, inEdge->src());
+            const mlir::Value bound = findVarOrThrow(_part._varMap, var);
+
+            auto eq = _opBuilder.create<mlir::db::EqOp>(uloc, boolType, landed, bound);
+            filterAllColumns(eq.getResult());
+        }
+    }
+}
+
+void DBProgramGenerator::closeBoundEdges() {
+    const VariableDependencyGraph::EdgeIdentityMap& identities = _vdg.edgeIdentities();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+    const mlir::Location uloc = _opBuilder.getUnknownLoc();
+
+    for (const VariableDependency* var : _vdg.boundVars()) {
+        const auto identityIt = identities.find(var->getDecl());
+        if (identityIt == identities.end()) {
+            continue;
+        }
+
+        const mlir::Value matched = findVarOrThrow(_part._varMap, identityIt->second.front());
+        const mlir::Value bound = findVarOrThrow(_part._varMap, var);
+
+        auto eq = _opBuilder.create<mlir::db::EqOp>(uloc, boolType, matched, bound);
+        filterAllColumns(eq.getResult());
+    }
+}
+
+void DBProgramGenerator::resolveYieldedIdentities() {
+    struct YieldedIdentity {
+        const VariableDependency* _variable {nullptr};
+        size_t _yieldedIndex {0};
+    };
+
+    const VariableDependencyGraph::EdgeIdentityMap& edgeIdentities = _vdg.edgeIdentities();
+
+    llvm::SmallVector<YieldedIdentity> identities;
+    for (size_t yieldedIndex = 0; yieldedIndex < _part._yieldedColumns.size(); yieldedIndex++) {
+        const VarDecl* yieldedDecl = _part._yieldedColumns[yieldedIndex]._decl;
+        if (!yieldedDecl) {
+            continue;
+        }
+
+        for (const auto& [var, values] : _part._varMap) {
+            if (var->getDecl() != yieldedDecl) {
+                continue;
+            }
+
+            identities.push_back({var, yieldedIndex});
+        }
+
+        const auto edgeIt = edgeIdentities.find(yieldedDecl);
+        const bool yieldsAPatternEdge = edgeIt != edgeIdentities.end() && !edgeIt->second.empty();
+        if (yieldsAPatternEdge) {
+            identities.push_back({edgeIt->second.front(), yieldedIndex});
+        }
+    }
+
+    if (identities.empty()) {
+        return;
+    }
+
+    const mlir::Location uloc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    for (const YieldedIdentity& identity : identities) {
+        const mlir::Value patternColumn = _part._varMap.at(identity._variable).back();
+        const mlir::Value yieldedColumn = _part._yieldedColumns[identity._yieldedIndex]._column;
+
+        const bool patternAligned = isRowAlignedHere(patternColumn);
+        const bool yieldedAligned = isRowAlignedHere(yieldedColumn);
+        bioassert(patternAligned && yieldedAligned,
+                  "Yielded variable {} was not paired with its pattern",
+                  identity._variable->getName());
+
+        auto eqOp = _opBuilder.create<mlir::db::EqOp>(uloc, boolType, patternColumn, yieldedColumn);
+
+        filterAllColumns(eqOp.getResult());
+    }
+}
+
+void DBProgramGenerator::closeBoundJoins(std::vector<const VariableDependency*>& carriedSet,
+                                         std::vector<const VariableDependency*>& dataflowVars) {
+    // The walk orients a hop by the one end of it that is not yet bound, so it leaves
+    // behind the hops whose ends were both bound already - a pattern reaching back to a
+    // variable the barrier published, which constrains the rows rather than fanning them out
+    for (const VariableDependency& var : _vdg.vars()) {
+        if (holdsColumn(&var)) {
+            continue;
+        }
+
+        const VariableDependency::Edges& incoming = var.incoming();
+        const VariableDependency::Edges& outgoing = var.outgoing();
+
+        const auto edgeProducerIt = std::ranges::find_if(incoming, producesEdgeVar);
+        const auto nodeProducerIt = std::ranges::find_if(outgoing, producesNodeVar);
+
+        const bool isPatternEdge = edgeProducerIt != end(incoming) && nodeProducerIt != end(outgoing);
+        if (!isPatternEdge) {
+            continue;
+        }
+
+        const VariableDependency* target = (*nodeProducerIt)->tgt();
+
+        // A hop left behind with an end still open is not a join but a pattern of its own,
+        // which this walk does not reach: only both ends holding a column already make the
+        // hop a constraint on the rows they were bound over
+        const bool closesAJoin = holdsColumn((*edgeProducerIt)->src()) && holdsColumn(target);
+        if (!closesAJoin) {
+            continue;
+        }
+
+        closeBoundJoin(*edgeProducerIt, &var, target, carriedSet, dataflowVars);
+    }
+}
+
+void DBProgramGenerator::closeBoundJoin(const DependencyEdge* edgeProducer,
+                                        const VariableDependency* edge,
+                                        const VariableDependency* target,
+                                        std::vector<const VariableDependency*>& carriedSet,
+                                        std::vector<const VariableDependency*>& dataflowVars) {
+    const VariableDependency* source = edgeProducer->src();
+
+    mlir::Value landed;
+    const EdgeMetadata& metadata = edgeProducer->data();
+    const EdgeMetadata::EdgeType direction = metadata.type();
+
+    if (metadata.isQuantified()) {
+        addExplorePaths(source, edge, target, carriedSet, metadata, /*reversed=*/false, &landed);
+    } else {
+        switch (direction) {
+            case EdgeMetadata::EdgeType::GET_OUT_EDGES:
+                landed = addJoiningEdgeTraversal<mlir::db::GetOutEdges>(source, edge, target, carriedSet);
+            break;
+
+            case EdgeMetadata::EdgeType::GET_IN_EDGES:
+                landed = addJoiningEdgeTraversal<mlir::db::GetInEdges>(source, edge, target, carriedSet);
+            break;
+
+            case EdgeMetadata::EdgeType::GET_EDGES:
+                landed = addJoiningEdgeTraversal<mlir::db::GetEdges>(source, edge, target, carriedSet);
+            break;
+
+            default:
+                throw FatalException(fmt::format("Attempted to close a join over {}",
+                                                 EdgeTypeName::value(direction)));
+            break;
+        }
+    }
+
+    const mlir::Value bound = findVarOrThrow(_part._varMap, target);
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    auto eq = _opBuilder.create<mlir::db::EqOp>(_opBuilder.getUnknownLoc(), boolType, landed, bound);
+    filterAllColumns(eq.getResult());
+
+    if (!metadata.isQuantified()) {
+        applyConstraints(edge);
+    }
+
+    carriedSet.push_back(edge);
+
+    // The walk lists an edge as soon as it reaches it, before any hop has given it a
+    // column, so one whose ends were both bound is already there with nothing behind it
+    if (std::ranges::find(dataflowVars, edge) == dataflowVars.end()) {
+        dataflowVars.push_back(edge);
+    }
+}
+
+void DBProgramGenerator::openComponent(const VariableDependency* root) {
+    // A root's dataflow opens with whatever already holds its rows: the column a CALL bound
+    // it to, the literal list an UNWIND binds it to, or - a pattern variable nothing has
+    // bound yet - a scan of the graph's nodes.
+    const VariableDependencyGraph::UnwindSourceMap& unwindSources = _vdg.unwindSources();
+    const auto unwindIt = unwindSources.find(root);
+    const mlir::Value yieldedColumn = findYieldedColumn(root->getDecl());
+
+    if (yieldedColumn) {
+        addYieldedColumn(root, yieldedColumn);
+    } else if (unwindIt != unwindSources.end()) {
+        const VarDecl* const decl = root->getDecl();
+        const bool seedsAPatternNode = decl && decl->getType() == EvaluatedType::NodePattern;
+
+        // A pattern naming the unwound variable makes its list a set of node IDs rather
+        // than a column of values, so the nodes themselves open the dataflow.
+        if (seedsAPatternNode) {
+            addConstScanNodes(root, unwindIt->second);
+        } else {
+            addUnwindConst(root, unwindIt->second);
+        }
+    } else {
+        addScanNodes(root);
+    }
+
+    applyConstraints(root);
+}
+
 void DBProgramGenerator::translateComponent(const VariableDependency* root,
                                             DefinedVars& defined,
                                             std::vector<const VariableDependency*>& outVars) {
+    openComponent(root);
+
+    // Forms the "carried set" for this connected component
+    std::vector<const VariableDependency*> carriedSet;
+
+    expandComponent(root, defined, carriedSet, outVars);
+
+    closeBoundJoins(carriedSet, outVars);
+}
+
+void DBProgramGenerator::collectComponentVars(const VariableDependency* root, DefinedVars& componentVars) const {
+    llvm::SmallVector<const VariableDependency*> worklist {root};
+    while (!worklist.empty()) {
+        const VariableDependency* const current = worklist.pop_back_val();
+        if (!componentVars.insert(current).second) {
+            continue;
+        }
+
+        for (const DependencyEdge* edge : current->edges()) {
+            worklist.push_back(edge->src() == current ? edge->tgt() : edge->src());
+        }
+    }
+}
+
+void DBProgramGenerator::collectVarsOfDecl(const VarDecl* decl, llvm::SmallVectorImpl<const VariableDependency*>& vars) const {
+    const VariableDependencyGraph::EdgeIdentityMap& edgeIdentities = _vdg.edgeIdentities();
+    const auto identityIt = edgeIdentities.find(decl);
+    if (identityIt != edgeIdentities.end()) {
+        vars.append(identityIt->second.begin(), identityIt->second.end());
+    }
+
+    for (const VariableDependency& var : _vdg.vars()) {
+        if (var.getDecl() == decl) {
+            vars.push_back(&var);
+        }
+    }
+}
+
+bool DBProgramGenerator::walkReadsAnotherComponent(const DefinedVars& componentVars) {
+    const auto inComponent = [&componentVars](const VariableDependency* var) {
+        return componentVars.contains(var);
+    };
+
+    llvm::SmallVector<const VariableDependency*> walkVars;
+    llvm::SmallVector<const VariableDependency*> importVars;
+
+    for (const auto& [edgeDecl, pattern] : _part._quantifiedEdges) {
+        walkVars.clear();
+        collectVarsOfDecl(edgeDecl, walkVars);
+
+        if (!llvm::any_of(walkVars, inComponent)) {
+            continue;
+        }
+
+        for (const VarDecl* import : pattern->hopImports()) {
+            importVars.clear();
+            collectVarsOfDecl(import, importVars);
+
+            for (const VariableDependency* var : importVars) {
+                if (inComponent(var)) {
+                    continue;
+                }
+
+                const bool holdsRows = !holdsColumn(var) || !yieldsConstantColumn(_part._varMap.at(var).back(), _constantColumns);
+                if (holdsRows) {
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+void DBProgramGenerator::expandCrossedComponents(llvm::ArrayRef<const VariableDependency*> roots,
+                                                 const std::vector<TranslatedComponent>& components,
+                                                 DefinedVars& defined) {
+    std::vector<const VariableDependency*> carriedSet;
+    for (const TranslatedComponent& component : components) {
+        carriedSet.insert(carriedSet.end(), component._vars.begin(), component._vars.end());
+    }
+
+    std::vector<const VariableDependency*> expandedVars;
+    for (const VariableDependency* root : roots) {
+        expandComponent(root, defined, carriedSet, expandedVars);
+        closeBoundJoins(carriedSet, expandedVars);
+    }
+}
+
+void DBProgramGenerator::expandComponent(const VariableDependency* root,
+                                         DefinedVars& defined,
+                                         std::vector<const VariableDependency*>& carriedSet,
+                                         std::vector<const VariableDependency*>& outVars) {
     struct Frame {
         const VariableDependency* _var {nullptr};
         const DependencyEdge* _predEdge {nullptr};
@@ -478,32 +3191,58 @@ void DBProgramGenerator::translateComponent(const VariableDependency* root,
         }
     };
 
-    addScanNodes(root);
     markDefined(root);
 
-    // Forms the "carried set" for this connected component
-    std::vector<const VariableDependency*> carriedSet;
+    // A merge target is defined by whatever reaches it first, and holds a column before
+    // the rest of its merge does: each merge edge left open closes on a filter at the end
+    std::vector<const VariableDependency*> earlyMergeTargets;
+    std::unordered_set<const DependencyEdge*> mergesTaken;
 
     std::vector<Frame> stack;
+    std::vector<Frame> deferred;
 
     // DFS from this root
     stack.emplace_back(root, nullptr);
-    while (!stack.empty()) {
-        const auto [var, pred, predPred] = stack.back();
-        stack.pop_back();
+    while (!stack.empty() || !deferred.empty()) {
+        // A merge is taken early only once no other path is left to its other sources: a
+        // hop still on the stack may be the one that gives them their column
+        const bool forcesAMerge = stack.empty();
+        std::vector<Frame>& frames = forcesAMerge ? deferred : stack;
+
+        const auto [var, pred, predPred] = frames.back();
+        frames.pop_back();
 
         const auto seenOrMeta = [&defined](const DependencyEdge* e) {
             return !e->isMetaEdge() || defined.contains(e->src());
         };
         const bool canTraverse = std::ranges::all_of(var->incoming(), seenOrMeta);
 
-        // If we cannot traverse now, we will find another path to this node
-        if (!canTraverse) {
-            continue;
-        }
+        // A merge edge joins two dataflows instead of traversing the graph, so it never
+        // is half of a (source, edge, target) triple: it closes the chain it lands on,
+        // and whatever leaves its target opens a new one.
+        const bool predTraverses = pred && !pred->isMetaEdge();
 
         // Have we found a (source, edge, target) triple yet on this traversal?
-        const bool haveTriple = pred && predPred;
+        const bool haveTriple = predTraverses && predPred;
+
+        const bool reachedOverMerge = pred && pred->isMetaEdge();
+        const bool reachedFromMergeTarget = reachedOverMerge && pred->src() == var;
+
+        const bool takesMergeEarly = reachedOverMerge && (reachedFromMergeTarget || !canTraverse);
+
+        if (reachedOverMerge && defined.contains(var)) {
+            continue;
+        } else if (takesMergeEarly && !forcesAMerge) {
+            deferred.emplace_back(var, pred, predPred);
+            continue;
+        } else if (takesMergeEarly) {
+            const VariableDependency* definedEnd = reachedFromMergeTarget ? pred->tgt() : pred->src();
+
+            registerValue(var, findVarOrThrow(_part._varMap, definedEnd));
+            mergesTaken.insert(pred);
+            earlyMergeTargets.push_back(var);
+            carriedSet.push_back(var);
+        }
 
         for (const DependencyEdge* e : var->edges()) {
             const VariableDependency* other = e->src() == var ? e->tgt() : e->src();
@@ -511,9 +3250,10 @@ void DBProgramGenerator::translateComponent(const VariableDependency* root,
                 continue;
             }
 
-            if (haveTriple) {
-                // We have discovered a full (src, edge, tgt) triple, set the next
-                // elements on the stack to only have (src, edge) and await tgt
+            if (haveTriple || !predTraverses) {
+                // We have discovered a full (src, edge, tgt) triple, or @ref pred is a
+                // merge edge that cannot open one: either way the next elements on the
+                // stack only have (src, edge) and await tgt
                 stack.emplace_back(other, e, nullptr);
             } else {
                 // We have not yet discovered a full (src, edge, tgt) triple, but the
@@ -524,8 +3264,12 @@ void DBProgramGenerator::translateComponent(const VariableDependency* root,
 
         // Only translate when we have a full triple
         if (!haveTriple) {
-            if (pred && pred->isMetaEdge()) {
-                addMergeFilter(var, carriedSet);
+            if (reachedOverMerge && !reachedFromMergeTarget) {
+                if (!takesMergeEarly) {
+                    addMergeFilter(var, carriedSet);
+                }
+
+                applyConstraints(var);
             }
 
             markDefined(var);
@@ -564,45 +3308,108 @@ void DBProgramGenerator::translateComponent(const VariableDependency* root,
 
         // We may walk an edge backwards compared to the cypher pattern. In such a
         // case we emit the opposite traversal.
-        const EdgeMetadata::EdgeType prodType = edgeVarProd->data().type();
+        const EdgeMetadata& metadata = edgeVarProd->data();
+        const EdgeMetadata::EdgeType prodType = metadata.type();
         const EdgeMetadata::EdgeType logicalDir =
             edgeSrcDefined ? prodType : reverseEdge(prodType);
 
-        switch (logicalDir) {
-            case EdgeMetadata::EdgeType::GET_OUT_EDGES:
-                addGetOutEdges(src, edge, tgt, carriedSet);
-            break;
+        if (metadata.isQuantified()) {
+            addExplorePaths(src, edge, tgt, carriedSet, metadata, !edgeSrcDefined, nullptr);
+        } else {
+            switch (logicalDir) {
+                case EdgeMetadata::EdgeType::GET_OUT_EDGES:
+                    addGetOutEdges(src, edge, tgt, carriedSet);
+                break;
 
-            case EdgeMetadata::EdgeType::GET_IN_EDGES:
-                addGetInEdges(src, edge, tgt, carriedSet);
-            break;
+                case EdgeMetadata::EdgeType::GET_IN_EDGES:
+                    addGetInEdges(src, edge, tgt, carriedSet);
+                break;
 
-            case EdgeMetadata::EdgeType::MERGE:
-                throw TuringException("MERGE edges not yet supported.");
-            break;
+                case EdgeMetadata::EdgeType::MERGE:
+                    throw TuringException("MERGE edges not yet supported.");
+                break;
 
-            case EdgeMetadata::EdgeType::GET_EDGES:
-                throw TuringException("Undirected edges not yet supported.");
-            break;
+                case EdgeMetadata::EdgeType::GET_EDGES:
+                    addGetEdges(src, edge, tgt, carriedSet);
+                break;
 
-            case EdgeMetadata::EdgeType::GET_EDGE_TGT:
-            case EdgeMetadata::EdgeType::GET_EDGE_SRC:
-                throw FatalException(fmt::format("Attempted to translate {}",
-                                                 EdgeTypeName::value(logicalDir)));
-            break;
+                case EdgeMetadata::EdgeType::GET_EDGE_TGT:
+                case EdgeMetadata::EdgeType::GET_EDGE_SRC:
+                    throw FatalException(fmt::format("Attempted to translate {}",
+                                                     EdgeTypeName::value(logicalDir)));
+                break;
 
-            case EdgeMetadata::EdgeType::_SIZE:
-                throw FatalException("Attempted to translate invalid edge.");
-            break;
+                case EdgeMetadata::EdgeType::_SIZE:
+                    throw FatalException("Attempted to translate invalid edge.");
+                break;
+            }
         }
 
         markDefined(src);
         markDefined(edge);
         markDefined(tgt);
 
+        // The type of a variable-length hop filters inside the exploration; a path has
+        // no single edge type column to check afterwards
+        if (!metadata.isQuantified()) {
+            applyConstraints(edge);
+        }
+        applyConstraints(tgt);
+
         carriedSet.push_back(src);
         carriedSet.push_back(edge);
         carriedSet.push_back(tgt);
+
+        if (!canTraverse) {
+            earlyMergeTargets.push_back(tgt);
+        }
+    }
+
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+    const mlir::Location uloc = _opBuilder.getUnknownLoc();
+
+    for (const VariableDependency* mergeTarget : earlyMergeTargets) {
+        for (const DependencyEdge* inEdge : mergeTarget->incoming()) {
+            const bool closesACycle = inEdge->isMetaEdge() && !mergesTaken.contains(inEdge);
+            if (!closesACycle) {
+                continue;
+            }
+
+            const mlir::Value copy = findVarOrThrow(_part._varMap, inEdge->src());
+            const mlir::Value target = findVarOrThrow(_part._varMap, mergeTarget);
+
+            auto eq = _opBuilder.create<mlir::db::EqOp>(uloc, boolType, copy, target);
+            filterAllColumns(eq.getResult());
+        }
+    }
+}
+
+void DBProgramGenerator::takeMainDataflow(mlir::Block* mainBlock, TranslatedComponent& component) {
+    for (const VariableDependency* var : component._vars) {
+        bioassert(holdsColumn(var), "Main dataflow var {} not registered", var->getName());
+        component._columns.push_back(_part._varMap.at(var).back());
+    }
+
+    component._region = std::make_unique<mlir::Region>();
+    mlir::Block* const scratch = new mlir::Block(); // Region destructor frees scratch
+    component._region->push_back(scratch);
+
+    const auto bindsAConstant = [this](mlir::Value result) {
+        return yieldsConstantColumn(result, _constantColumns);
+    };
+
+    // A constant is left above the product: it holds one value standing for every row, so
+    // neither factor crosses it and both read the one binding
+    for (mlir::Operation& operation : llvm::make_early_inc_range(*mainBlock)) {
+        const bool bindsColumns = operation.getNumResults() > 0;
+        const bool bindsConstantsOnly = bindsColumns
+                                        && llvm::all_of(operation.getResults(), bindsAConstant);
+
+        if (bindsConstantsOnly) {
+            continue;
+        }
+
+        operation.moveBefore(scratch, scratch->end());
     }
 }
 
@@ -680,29 +3487,1369 @@ void DBProgramGenerator::moveComponentToFactor(TranslatedComponent& component,
     _opBuilder.create<mlir::db::Yield>(loc, mlir::ValueRange {component._columns});
 }
 
-void DBProgramGenerator::generateCreate(const CypherAST* ast) {
-    const CypherAST::QueryCommands& queries = ast->queries();
-    if (queries.size() != 1) {
-        throw TuringException("Multiple queries not yet supported.");
-    }
-
-    const QueryCommand* query = queries.front();
-    const SinglePartQuery* sglPart = dynamic_cast<const SinglePartQuery*>(query);
-    if (!sglPart) {
-        throw TuringException("Non-single part queries are not yet supported.");
-    }
-
-    const StmtContainer* updateStmts = sglPart->getUpdateStmts();
-    if (!updateStmts) {
+void DBProgramGenerator::generateLeadingYields(std::span<Stmt* const> stmts) {
+    if (_vdg.empty()) {
         return;
     }
 
-    // Collect MATCH-bound columns by variable name so CREATE patterns can reference them.
-    std::unordered_map<std::string_view, mlir::Value> knownVars;
-    for (const auto& [var, identities] : _varMap) {
-        if (!identities.empty()) {
-            knownVars[var->getName()] = identities.back();
+    // A pattern variable a barrier published is a dataflow this part extends, so what a
+    // statement binds is paired with its rows after the traversal rather than driving it.
+    // A published value is no such dataflow - it is read, the way an UNWIND reads the list
+    // it spreads - and the rows a statement turns it into can drive.
+    const auto bindsAValue = [](const VariableDependency* bound) {
+        const VarDecl* decl = bound->getDecl();
+        const EvaluatedType type = decl ? decl->getType() : EvaluatedType::Invalid;
+
+        return type != EvaluatedType::NodePattern && type != EvaluatedType::EdgePattern;
+    };
+
+    if (!std::ranges::all_of(_vdg.boundVars(), bindsAValue)) {
+        return;
+    }
+
+    llvm::SmallVector<const Stmt*> leading;
+    for (const Stmt* stmt : stmts) {
+        const Stmt::Kind kind = stmt->getKind();
+
+        if (kind == Stmt::Kind::MATCH) {
+            break;
+        } else if (kind == Stmt::Kind::CALL || kind == Stmt::Kind::VECTOR_SEARCH) {
+            leading.push_back(stmt);
+        } else if (kind == Stmt::Kind::UNWIND) {
+            // A literal UNWIND is a dataflow of its own that the dependency graph already
+            // roots, and seeds the pattern node it names from there.
+            const UnwindStmt* unwindStmt = static_cast<const UnwindStmt*>(stmt);
+            if (!unwindStmt->unwindsLiteral()) {
+                leading.push_back(stmt);
+            }
         }
+    }
+
+    if (leading.empty()) {
+        return;
+    }
+
+    llvm::SmallVector<const VariableDependency*> componentRoots;
+    collectComponentRoots(componentRoots);
+
+    // A published value opens no traversal: it rides the rows as a column of its own, so
+    // it is no island for the driven component to be crossed with.
+    const auto opensNoTraversal = [this](const VariableDependency* root) {
+        return llvm::is_contained(_vdg.boundVars(), root);
+    };
+
+    llvm::erase_if(componentRoots, opensNoTraversal);
+
+    llvm::SmallVector<const VarDecl*> yieldedVariables;
+    for (const Stmt* stmt : leading) {
+        collectStatementVariables(stmt, yieldedVariables);
+    }
+
+    // Any variable they bound can open the component, not only the one the graph lists
+    // first: a pattern that reaches the yielded variable from its other end is walked
+    // backwards from it, which is the traversal a reversed edge already emits.
+    const VariableDependency* drivenRoot = nullptr;
+    for (const VariableDependency& var : _vdg.vars()) {
+        const bool bound = llvm::is_contained(yieldedVariables, var.getDecl());
+        const bool canDrive = bound && isValidRoot(var);
+
+        if (canDrive) {
+            drivenRoot = &var;
+            break;
+        }
+    }
+
+    if (!drivenRoot) {
+        return;
+    }
+
+    // Crossing a second component with the driven one leaves anything else the statements
+    // yielded inside a factor of that product, out of reach of the clause that reads it, so
+    // only the root coming out of them alone makes the island safe to cross.
+    const bool hasIslands = componentRoots.size() > 1;
+    const bool yieldsTheRootAlone = yieldedVariables.size() == 1
+                                    && yieldedVariables.front() == drivenRoot->getDecl();
+
+    if (hasIslands && !yieldsTheRootAlone) {
+        return;
+    }
+
+    for (const Stmt* stmt : leading) {
+        const Stmt::Kind kind = stmt->getKind();
+
+        if (kind == Stmt::Kind::CALL) {
+            generateCall(static_cast<const CallStmt*>(stmt));
+        } else if (kind == Stmt::Kind::VECTOR_SEARCH) {
+            generateVectorSearch(static_cast<const VectorSearchStmt*>(stmt));
+        } else {
+            generateUnwind(static_cast<const UnwindStmt*>(stmt));
+        }
+    }
+
+    _part._drivenRoot = drivenRoot;
+}
+
+void DBProgramGenerator::generateStatementOperations(std::span<Stmt* const> stmts) {
+    // In statement order, so a call or a search reading what an earlier one yielded sees
+    // it, a MATCH's constraints and WHERE reading a yielded or unwound value are generated
+    // once the statement that binds it has run, and an UNWIND expands the rows the
+    // statements ahead of it left in flight.
+    bool matchSeen = false;
+    for (const Stmt* stmt : stmts) {
+        const Stmt::Kind kind = stmt->getKind();
+        const bool drivesTheTraversal = _part._drivenRoot && !matchSeen;
+
+        if (kind == Stmt::Kind::MATCH) {
+            matchSeen = true;
+
+            const MatchStmt* matchStmt = static_cast<const MatchStmt*>(stmt);
+            generateNamedPaths(matchStmt);
+            generateMatchConstraints(matchStmt);
+            generateMatchFilter(matchStmt);
+
+            if (!matchStmt->isOptional()) {
+                generateMatchOrderBy(matchStmt);
+                generateMatchWindow(matchStmt);
+            }
+        } else if (kind == Stmt::Kind::CALL && !drivesTheTraversal) {
+            generateCall(static_cast<const CallStmt*>(stmt));
+        } else if (kind == Stmt::Kind::VECTOR_SEARCH && !drivesTheTraversal) {
+            generateVectorSearch(static_cast<const VectorSearchStmt*>(stmt));
+        } else if (kind == Stmt::Kind::UNWIND && !drivesTheTraversal) {
+            const UnwindStmt* unwindStmt = static_cast<const UnwindStmt*>(stmt);
+
+            // A literal UNWIND opened a dataflow of its own during the traversal, which
+            // the cross product has already paired with the rows beside it.
+            if (!unwindStmt->unwindsLiteral()) {
+                generateUnwind(unwindStmt);
+            }
+        }
+    }
+}
+
+void DBProgramGenerator::generateMatchFilter(const MatchStmt* matchStmt) {
+    const Pattern* pattern = matchStmt->getPattern();
+    const WhereClause* where = pattern->getWhere();
+    if (!where) {
+        return;
+    }
+
+    std::vector<const Expr*> conjuncts;
+    flattenConjuncts(where->getExpr(), conjuncts);
+
+    applyPredicateFilters(conjuncts);
+}
+
+void DBProgramGenerator::generateNamedPaths(const MatchStmt* matchStmt) {
+    const Pattern* pattern = matchStmt->getPattern();
+
+    for (const PatternElement* element : pattern->elements()) {
+        if (const VarDecl* pathDecl = element->getPathDecl()) {
+            generateNamedPath(element, pathDecl);
+        }
+    }
+}
+
+void DBProgramGenerator::generateNamedPath(const PatternElement* element, const VarDecl* pathDecl) {
+    // A walk already holds its path: the rows carry its handles, and p is another name for
+    // that column until something reads it
+    if (const EdgePattern* walked = singleQuantifiedRelationship(element)) {
+        const auto bindingIt = _part._pathBindings.find(walked->getDecl());
+        bioassert(bindingIt != end(_part._pathBindings), "Quantified relationship without a path column");
+
+        const PartScope::PathBinding& binding = bindingIt->second;
+        _part._namedPathWalks[pathDecl] = PartScope::NamedPathWalk {binding._seed, binding._path, binding._reversed};
+
+        return;
+    }
+
+    const NodePattern* rootNode = static_cast<const NodePattern*>(element->getRootEntity());
+
+    llvm::SmallVector<mlir::Value> entities {resolveEntityColumn(rootNode->getDecl())};
+    llvm::SmallVector<int64_t> reversedPaths;
+
+    for (auto [edgePattern, nodePattern] : element->getElementChain()) {
+        // A walk lands on the node the pattern ends the hop with, so its own last entry
+        // is that node and the pattern's column would repeat it
+        if (edgePattern->getQuantifiedPath()) {
+            const VarDecl* const walkDecl = edgePattern->getDecl();
+            entities.push_back(pathHandleColumn(walkDecl));
+
+            // Seeded from the far end, the walk lands on the node ahead of it instead, and
+            // the node it seeded from follows it
+            const PartScope::PathBinding& binding = _part._pathBindings.at(walkDecl);
+            if (binding._reversed) {
+                reversedPaths.push_back(static_cast<int64_t>(entities.size() - 1));
+                entities.push_back(resolveEntityColumn(nodePattern->getDecl()));
+            }
+        } else {
+            entities.push_back(resolveEntityColumn(edgePattern->getDecl()));
+            entities.push_back(resolveEntityColumn(nodePattern->getDecl()));
+        }
+    }
+
+    for (const mlir::Value entity : entities) {
+        bioassert(entity, "A named path over an entity the traversal left unbound");
+    }
+
+    _part._namedPaths[pathDecl] = makePathColumn(entities, reversedPaths);
+}
+
+mlir::Value DBProgramGenerator::makePathColumn(llvm::ArrayRef<mlir::Value> entities, llvm::ArrayRef<int64_t> reversedPaths) {
+    const mlir::db::ColumnType pathType = allocColumnType(mlir::storage::EntityListType::get(_mlirCtxt));
+    const mlir::ArrayAttr reversedAttr = reversedPaths.empty() ? mlir::ArrayAttr() : _opBuilder.getI64ArrayAttr(reversedPaths);
+
+    return _opBuilder.create<mlir::db::MakePath>(_opBuilder.getUnknownLoc(), pathType, entities, reversedAttr).getResult();
+}
+
+const EdgePattern* DBProgramGenerator::singleQuantifiedRelationship(const PatternElement* element) {
+    const PatternElement::EntityPatterns& entities = element->getEntities();
+    if (entities.size() != 3) {
+        return nullptr;
+    }
+
+    const EdgePattern* edge = static_cast<const EdgePattern*>(entities[1]);
+
+    return edge->getQuantifiedPath() ? edge : nullptr;
+}
+
+mlir::Value DBProgramGenerator::pathHandleColumn(const VarDecl* edgeDecl) {
+    const auto bindingIt = _part._pathBindings.find(edgeDecl);
+    bioassert(bindingIt != end(_part._pathBindings), "Quantified relationship without a path column");
+
+    return _part._varMap.at(bindingIt->second._path).back();
+}
+
+mlir::Value DBProgramGenerator::namedPathColumn(const PartScope::NamedPathWalk& walk) {
+    const mlir::Value seedColumn = _part._varMap.at(walk._seed).back();
+    const mlir::Value pathColumn = _part._varMap.at(walk._path).back();
+
+    // A walk taken against the pattern ends on the node the pattern opens with, so its hops
+    // come first and the node it seeded from is the element's last entity
+    llvm::SmallVector<mlir::Value, 2> entities;
+    mlir::ArrayAttr reversedPaths;
+    if (walk._reversed) {
+        entities = {pathColumn, seedColumn};
+        reversedPaths = _opBuilder.getI64ArrayAttr({0});
+    } else {
+        entities = {seedColumn, pathColumn};
+    }
+
+    const mlir::db::ColumnType pathType = allocColumnType(mlir::storage::EntityListType::get(_mlirCtxt));
+
+    return _opBuilder.create<mlir::db::MakePath>(_opBuilder.getUnknownLoc(), pathType, entities, reversedPaths).getResult();
+}
+
+void DBProgramGenerator::generateMatchOrderBy(const MatchStmt* matchStmt) {
+    if (!matchStmt->hasOrderBy()) {
+        return;
+    }
+
+    InFlightColumns inFlight;
+    collectInFlightColumns(inFlight);
+
+    if (inFlight._columns.empty()) {
+        return;
+    }
+
+    VariableColumnMap variableColumns;
+    collectVariableColumns(variableColumns);
+
+    llvm::SmallVector<mlir::Value> sorted(inFlight._columns.begin(), inFlight._columns.end());
+    llvm::SmallVector<int64_t> keyColumns;
+    llvm::SmallVector<bool> keyAscending;
+
+    for (const OrderByItem* item : matchStmt->getOrderBy()->getItems()) {
+        const Expr* keyExpr = item->getExpr();
+
+        // A constant key holds the same value in every row, so it changes no order
+        if (!keyExpr->isDynamic()) {
+            continue;
+        }
+
+        const mlir::Value keyColumn = getOrTranslateExprColumn(variableColumns, keyExpr);
+        if (yieldsConstantColumn(keyColumn, _constantColumns)) {
+            continue;
+        }
+
+        // A key the match does not carry - the n.name of MATCH (n) ORDER BY n.name - is
+        // handed to the sort as one more column, so that it moves with the row it belongs
+        // to; its result is then left unread, which is what keeps it out of the rows
+        auto sortedKey = std::find(sorted.begin(), sorted.end(), keyColumn);
+        if (sortedKey == sorted.end()) {
+            sorted.push_back(keyColumn);
+            sortedKey = std::prev(sorted.end());
+        }
+
+        keyColumns.push_back(static_cast<int64_t>(std::distance(sorted.begin(), sortedKey)));
+        keyAscending.push_back(item->getType() == OrderByType::ASC);
+    }
+
+    if (keyColumns.empty()) {
+        return;
+    }
+
+    llvm::SmallVector<mlir::Type> sortResultTypes;
+    for (const mlir::Value column : sorted) {
+        sortResultTypes.push_back(column.getType());
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    auto sortOp = _opBuilder.create<mlir::db::Sort>(loc,
+                                                    sortResultTypes,
+                                                    mlir::ValueRange {sorted},
+                                                    keyColumns,
+                                                    keyAscending);
+
+    rebindInFlightColumns(sortOp.getResults(), /*firstResult=*/0, inFlight);
+}
+
+void DBProgramGenerator::generateMatchWindow(const MatchStmt* matchStmt) {
+    if (matchStmt->hasSkip()) {
+        const int64_t skipValue = evaluateConstantInteger(_ast->getDiagnosticsManager(),
+                                                         matchStmt->getSkip()->getExpr());
+
+        if (skipValue < 0) {
+            throwError("SKIP expression must be a non-negative integer", matchStmt->getSkip());
+        }
+
+        cutAllColumns<mlir::db::Skip>(static_cast<uint64_t>(skipValue));
+    }
+
+    if (matchStmt->hasLimit()) {
+        const int64_t limitValue = evaluateConstantInteger(_ast->getDiagnosticsManager(),
+                                                          matchStmt->getLimit()->getExpr());
+
+        if (limitValue < 0) {
+            throwError("LIMIT expression must be a non-negative integer", matchStmt->getLimit());
+        }
+
+        cutAllColumns<mlir::db::Limit>(static_cast<uint64_t>(limitValue));
+    }
+}
+
+template <typename CutOp>
+void DBProgramGenerator::cutAllColumns(uint64_t count) {
+    InFlightColumns inFlight;
+    collectInFlightColumns(inFlight);
+
+    if (inFlight._columns.empty()) {
+        return;
+    }
+
+    llvm::SmallVector<mlir::Type> resultTypes;
+    for (const mlir::Value column : inFlight._columns) {
+        resultTypes.push_back(column.getType());
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    auto cutOp = _opBuilder.create<CutOp>(loc, resultTypes, inFlight._columns, count);
+
+    rebindInFlightColumns(cutOp.getResults(), /*firstResult=*/0, inFlight);
+}
+
+void DBProgramGenerator::generateCall(const CallStmt* callStmt) {
+    const FunctionInvocationExpr* funcExpr = callStmt->getFunc();
+    if (!funcExpr) {
+        throwError("CALL statement has no procedure invocation.", callStmt);
+    }
+
+    const FunctionInvocation* invocation = funcExpr->getFunctionInvocation();
+    if (!invocation) {
+        throwError("CALL statement has no function invocation.", callStmt);
+    }
+
+    const FunctionSignature* signature = invocation->getSignature();
+    if (!signature) {
+        throwError("CALL statement has an unresolved procedure name.", callStmt);
+    }
+
+    const std::string_view procedureName = signature->getFullName();
+
+    // The yielded return values name the columns the call produces.
+    const YieldClause* yield = callStmt->getYield();
+    const YieldItems* yieldItems = yield ? yield->getItems() : nullptr;
+
+    llvm::SmallVector<mlir::Attribute> yieldedNames;
+    llvm::SmallVector<YieldedColumn> yielded;
+    if (yieldItems && !yieldItems->getItems().empty()) {
+        for (const SymbolExpr* item : *yieldItems) {
+            const Symbol* symbol = item->getSymbol();
+
+            // The original name is the procedure's own name for the return value, which
+            // is what the call op names; the symbol's name is what the query calls it,
+            // which is the alias when the YIELD renamed it.
+            yieldedNames.push_back(_opBuilder.getStringAttr(symbol->getOriginalName()));
+            yielded.push_back({item->getDecl(), symbol->getName(), mlir::Value {}, /*isResult=*/true});
+        }
+    } else {
+        // A call naming no return value produces every one the procedure declares, under
+        // the procedure's own names - and none at all for a procedure declaring none,
+        // which is called for what it does rather than for rows. Only a standalone call
+        // gets here: the analyzer requires a YIELD of any call inside a query.
+        for (const FunctionReturnType& returnType : signature->returnTypes()) {
+            yieldedNames.push_back(_opBuilder.getStringAttr(returnType.getName()));
+            yielded.push_back({nullptr, returnType.getName(), mlir::Value {}, /*isResult=*/true});
+        }
+    }
+
+    // One argument column per declared procedure argument, in the order written: a
+    // variable resolves to its current column, a literal to a constant.
+    llvm::SmallVector<mlir::Value> inputs;
+    const ExprChain* arguments = invocation->getArguments();
+    if (arguments) {
+        for (const Expr* argument : *arguments) {
+            translateExprOverRows(argument);
+            inputs.push_back(_part._exprMap.at(argument));
+        }
+    }
+
+    // Everything already in flight rides through the carry set, so the projection can
+    // still read it after the call: the procedure need not emit one row per row it was
+    // given, and the call replicates a carried row once per row it emitted for it.
+    InFlightColumns inFlight;
+    collectInFlightColumns(inFlight);
+
+    // A call reading none of those rows produces the same rows for every one of them, which
+    // is their cartesian product rather than anything a carry set can express. Taking no
+    // argument is one way to read none of them; taking only constant ones is another.
+    if (!inFlight._columns.empty() && !readsAnyColumn(inputs, inFlight._columns)) {
+        generateCrossedCall(procedureName, yieldedNames, yielded, inputs, inFlight);
+        generateYieldFilter(yieldItems);
+        return;
+    }
+
+    // The yielded columns' value types come from the procedure's declared return types,
+    // resolved during lowering, so they are left unresolved here - as a property fetch's
+    // value column is. A carried column keeps its own type: the call replicates its rows,
+    // it never retypes them.
+    llvm::SmallVector<mlir::Type> resultTypes;
+    for (size_t yieldIndex = 0; yieldIndex < yieldedNames.size(); yieldIndex++) {
+        resultTypes.push_back(mlir::db::ColumnType::get(_mlirCtxt));
+    }
+
+    for (const mlir::Value column : inFlight._columns) {
+        resultTypes.push_back(column.getType());
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    auto callOp = _opBuilder.create<mlir::db::CallProcedure>(loc,
+                                                            resultTypes,
+                                                            _opBuilder.getStringAttr(procedureName),
+                                                            mlir::ValueRange {inputs},
+                                                            mlir::ValueRange {inFlight._columns},
+                                                            _opBuilder.getArrayAttr(yieldedNames));
+
+    // The yielded columns are new variables of the query; the carried ones are the rows
+    // already in flight, now aligned with what the procedure emitted.
+    const mlir::Operation::result_range results = callOp.getResults();
+    for (size_t yieldIndex = 0; yieldIndex < yielded.size(); yieldIndex++) {
+        yielded[yieldIndex]._column = results[yieldIndex];
+        _part._yieldedColumns.push_back(yielded[yieldIndex]);
+    }
+
+    rebindInFlightColumns(results, yielded.size(), inFlight);
+
+    generateYieldFilter(yieldItems);
+}
+
+void DBProgramGenerator::generateCSVLoads(std::span<Stmt* const> stmts) {
+    for (const Stmt* stmt : stmts) {
+        if (stmt->getKind() == Stmt::Kind::LOAD_CSV) {
+            generateLoadCSV(static_cast<const LoadCSVStmt*>(stmt));
+        }
+    }
+}
+
+void DBProgramGenerator::generateLoadCSV(const LoadCSVStmt* loadCSVStmt) {
+    const std::span<const LoadCSVStmt::Field> fields = loadCSVStmt->fields();
+
+    const auto positionAttr = [this](size_t index) -> mlir::Attribute {
+        return mlir::IntegerAttr::get(_opBuilder.getIntegerType(64, /*isSigned=*/false), index);
+    };
+
+    llvm::SmallVector<mlir::Attribute> fieldAttrs;
+    llvm::SmallVector<const VarDecl*> fieldDecls;
+    for (const LoadCSVStmt::Field& field : fields) {
+        if (field._byHeader) {
+            const llvm::StringRef header {field._header.data(), field._header.size()};
+            fieldAttrs.push_back(_opBuilder.getStringAttr(header));
+        } else {
+            fieldAttrs.push_back(positionAttr(field._index));
+        }
+
+        fieldDecls.push_back(field._decl);
+    }
+
+    // A query naming no field still runs over the file's records - one CREATE per record,
+    // a tally of them - and a row set needs a column to ride: the first field stands for
+    // them, since every record carries one. No access names it, so it is published under
+    // no declaration - only the rows it holds are read.
+    if (fieldAttrs.empty()) {
+        fieldAttrs.push_back(positionAttr(0));
+        fieldDecls.push_back(nullptr);
+    }
+
+    const std::string_view path = loadCSVStmt->getFilePath().get();
+    const mlir::StringAttr pathAttr = _opBuilder.getStringAttr(llvm::StringRef {path.data(), path.size()});
+    const mlir::ArrayAttr fieldsAttr = _opBuilder.getArrayAttr(fieldAttrs);
+
+    const mlir::db::ColumnType fieldType = allocColumnType(mlir::storage::StringType::get(_mlirCtxt));
+    const llvm::SmallVector<mlir::Type> fieldTypes(fieldAttrs.size(), fieldType);
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    const auto emitLoad = [&]() -> mlir::db::LoadCSV {
+        return _opBuilder.create<mlir::db::LoadCSV>(loc,
+                                                    fieldTypes,
+                                                    pathAttr,
+                                                    fieldsAttr,
+                                                    loadCSVStmt->hasHeaders(),
+                                                    loadCSVStmt->skipOnError());
+    };
+
+    InFlightColumns inFlight;
+    collectInFlightColumns(inFlight);
+
+    if (inFlight._columns.empty()) {
+        publishLoadCSVFields(loadCSVStmt, fieldDecls, emitLoad().getResults());
+        return;
+    }
+
+    // The load reads no column at all, so it produces the same records for every row
+    // already in flight: their cartesian product, which is what a search reading none of
+    // them is paired with too.
+    mlir::Block* const currentBlock = _opBuilder.getInsertionBlock();
+
+    llvm::SmallVector<mlir::Type> resultTypes;
+    for (const mlir::Value column : inFlight._columns) {
+        resultTypes.push_back(column.getType());
+    }
+
+    resultTypes.append(fieldTypes.begin(), fieldTypes.end());
+
+    _opBuilder.setInsertionPointToEnd(currentBlock);
+    mlir::db::CrossProduct crossProduct = _opBuilder.create<mlir::db::CrossProduct>(loc, resultTypes);
+
+    mlir::Block* const leftBlock = &crossProduct.getLeftFactor().front();
+    mlir::Block* const rightBlock = &crossProduct.getRightFactor().front();
+
+    moveDataflowIntoLeftFactor(crossProduct);
+    hoistConstantsOutOfLeftFactor(crossProduct);
+
+    _opBuilder.setInsertionPointToEnd(leftBlock);
+    _opBuilder.create<mlir::db::Yield>(loc, mlir::ValueRange {inFlight._columns});
+
+    _opBuilder.setInsertionPointToEnd(rightBlock);
+    mlir::db::LoadCSV load = emitLoad();
+    _opBuilder.create<mlir::db::Yield>(loc, mlir::ValueRange {load.getResults()});
+
+    // Anything generated from here on reads the product's results, not the factors'.
+    _opBuilder.setInsertionPointToEnd(currentBlock);
+
+    const mlir::Operation::result_range results = crossProduct.getResults();
+    rebindInFlightColumns(results, /*firstResult=*/0, inFlight);
+
+    publishLoadCSVFields(loadCSVStmt, fieldDecls, results.drop_front(inFlight._columns.size()));
+}
+
+void DBProgramGenerator::publishLoadCSVFields(const LoadCSVStmt* loadCSVStmt,
+                                              llvm::ArrayRef<const VarDecl*> fieldDecls,
+                                              mlir::ResultRange fields) {
+    bioassert(fieldDecls.size() == fields.size(), "One declaration per loaded field expected");
+
+    // A scope rebind tells its columns apart by name, so each field goes under its own
+    // declaration's rather than under the row's, which every field shares
+    const std::string_view alias = loadCSVStmt->getAliasDecl()->getName();
+
+    for (size_t index = 0; index < fieldDecls.size(); index++) {
+        const VarDecl* fieldDecl = fieldDecls[index];
+        const std::string_view name = fieldDecl ? fieldDecl->getName() : alias;
+
+        _part._yieldedColumns.push_back({fieldDecl, name, fields[index]});
+
+        if (fieldDecl) {
+            _csvFieldRows[fieldDecl] = alias;
+        }
+    }
+}
+
+void DBProgramGenerator::generateVectorSearch(const VectorSearchStmt* vectorSearchStmt) {
+    const EmbeddingLiteral* queryVector = vectorSearchStmt->getQueryVector();
+    if (!queryVector) {
+        throwError("VECTOR SEARCH statement has no query vector.", vectorSearchStmt);
+    }
+
+    const YieldClause* yield = vectorSearchStmt->getYield();
+    const YieldItems* yieldItems = yield ? yield->getItems() : nullptr;
+    if (!yieldItems || yieldItems->getItems().empty()) {
+        throwError("VECTOR SEARCH statement names no yielded value.", vectorSearchStmt);
+    }
+
+    const std::span<const float> queryValues = queryVector->getValue();
+    const mlir::DenseF32ArrayAttr queryVectorAttr =
+        _opBuilder.getDenseF32ArrayAttr(llvm::ArrayRef<float> {queryValues.data(), queryValues.size()});
+
+    const std::string_view searchedIndex = vectorSearchStmt->getIndexName();
+    const llvm::StringRef indexName {searchedIndex.data(), searchedIndex.size()};
+    const uint64_t neighbourCount = vectorSearchStmt->getK();
+
+    const mlir::db::ColumnType idType = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
+    const mlir::db::ColumnType scoreType = allocColumnType(_opBuilder.getF64Type());
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    InFlightColumns inFlight;
+    collectInFlightColumns(inFlight);
+
+    if (inFlight._columns.empty()) {
+        mlir::db::VectorSearch search = _opBuilder.create<mlir::db::VectorSearch>(loc,
+                                                                                  idType,
+                                                                                  scoreType,
+                                                                                  indexName,
+                                                                                  neighbourCount,
+                                                                                  queryVectorAttr);
+
+        publishVectorSearchYields(yieldItems, search.getIds(), search.getScores());
+        generateYieldFilter(yieldItems);
+        return;
+    }
+
+    // The search takes no column at all, so it produces the same neighbours for every row
+    // already in flight: their cartesian product, which is what a call reading none of
+    // them is paired with too.
+    mlir::Block* const currentBlock = _opBuilder.getInsertionBlock();
+
+    llvm::SmallVector<mlir::Type> resultTypes;
+    for (const mlir::Value column : inFlight._columns) {
+        resultTypes.push_back(column.getType());
+    }
+
+    resultTypes.push_back(idType);
+    resultTypes.push_back(scoreType);
+
+    _opBuilder.setInsertionPointToEnd(currentBlock);
+    mlir::db::CrossProduct crossProduct = _opBuilder.create<mlir::db::CrossProduct>(loc, resultTypes);
+
+    mlir::Block* const leftBlock = &crossProduct.getLeftFactor().front();
+    mlir::Block* const rightBlock = &crossProduct.getRightFactor().front();
+
+    moveDataflowIntoLeftFactor(crossProduct);
+    hoistConstantsOutOfLeftFactor(crossProduct);
+
+    _opBuilder.setInsertionPointToEnd(leftBlock);
+    _opBuilder.create<mlir::db::Yield>(loc, mlir::ValueRange {inFlight._columns});
+
+    _opBuilder.setInsertionPointToEnd(rightBlock);
+    mlir::db::VectorSearch search = _opBuilder.create<mlir::db::VectorSearch>(loc,
+                                                                              idType,
+                                                                              scoreType,
+                                                                              indexName,
+                                                                              neighbourCount,
+                                                                              queryVectorAttr);
+    _opBuilder.create<mlir::db::Yield>(loc, mlir::ValueRange {search.getIds(), search.getScores()});
+
+    // Anything generated from here on reads the product's results, not the factors'.
+    _opBuilder.setInsertionPointToEnd(currentBlock);
+
+    const mlir::Operation::result_range results = crossProduct.getResults();
+    rebindInFlightColumns(results, /*firstResult=*/0, inFlight);
+
+    const size_t searchOffset = inFlight._columns.size();
+    publishVectorSearchYields(yieldItems, results[searchOffset], results[searchOffset + 1]);
+
+    generateYieldFilter(yieldItems);
+}
+
+void DBProgramGenerator::publishVectorSearchYields(const YieldItems* yieldItems,
+                                                   mlir::Value ids,
+                                                   mlir::Value scores) {
+    for (const SymbolExpr* item : *yieldItems) {
+        const Symbol* symbol = item->getSymbol();
+
+        // The statement's own name for the value - the one an alias renamed - is what picks
+        // the column, and the analyzer has already rejected every name but these two.
+        const bool isScore = symbol->getOriginalName() == vectorSearchScoreYield;
+
+        _part._yieldedColumns.push_back({item->getDecl(),
+                                         symbol->getName(),
+                                         isScore ? scores : ids,
+                                         /*isResult=*/true});
+    }
+}
+
+void DBProgramGenerator::generateUnwind(const UnwindStmt* unwind) {
+    const Symbol* symbol = unwind->symbol();
+    bioassert(symbol, "UNWIND without a variable.");
+
+    VariableColumnMap variableColumns;
+    collectVariableColumns(variableColumns);
+
+    const Expr* arg = unwind->arg();
+    const mlir::Value source = getOrTranslateExprColumn(variableColumns, arg);
+
+    // Everything already in flight rides through the carry set, replicated once per row
+    // the cell beside it unwound into, so the rest of the query still reads it row-aligned
+    // with the elements.
+    InFlightColumns inFlight;
+    collectInFlightColumns(inFlight);
+
+    // The element column takes the type the source's elements carry. A carried column keeps
+    // its own type: the unwind replicates its rows, it never retypes them.
+    const mlir::Type sourceElement = mlir::cast<mlir::db::ColumnType>(source.getType()).getType();
+    llvm::SmallVector<mlir::Type> resultTypes {allocColumnType(unwoundElementType(_mlirCtxt, sourceElement))};
+    for (const mlir::Value column : inFlight._columns) {
+        resultTypes.push_back(column.getType());
+    }
+
+    auto unwindOp = _opBuilder.create<mlir::db::Unwind>(_opBuilder.getUnknownLoc(),
+                                                        resultTypes,
+                                                        source,
+                                                        mlir::ValueRange {inFlight._columns});
+
+    const mlir::Operation::result_range results = unwindOp.getResults();
+    rebindInFlightColumns(results, /*firstResult=*/1, inFlight);
+
+    _part._yieldedColumns.push_back({unwind->getDecl(), symbol->getName(), results[0], /*isResult=*/false});
+}
+
+void DBProgramGenerator::generateYieldFilter(const YieldItems* yieldItems) {
+    const WhereClause* where = yieldItems ? yieldItems->getWhereClause() : nullptr;
+    if (!where) {
+        return;
+    }
+
+    // The predicate reads what the call produced, so it filters the rows the call emitted
+    // rather than the ones it was given - the MATCH's WHERE, applied one stage later. Every
+    // column in flight goes through the filter, the yields among them, so they stay
+    // row-aligned with each other.
+    const Expr* predicateExpr = where->getExpr();
+    translateExprOverRows(predicateExpr);
+
+    const auto findIt = _part._exprMap.find(predicateExpr);
+    bioassert(findIt != end(_part._exprMap), "Failed to get value for YIELD WHERE expr");
+
+    filterAllColumns(findIt->second);
+}
+
+void DBProgramGenerator::moveDataflowIntoLeftFactor(mlir::db::CrossProduct crossProduct) {
+    mlir::Block* const currentBlock = crossProduct->getBlock();
+    mlir::Block* const leftBlock = &crossProduct.getLeftFactor().front();
+
+    mlir::Block::OpListType& blockOps = currentBlock->getOperations();
+    leftBlock->getOperations().splice(leftBlock->end(),
+                                     blockOps,
+                                     blockOps.begin(),
+                                     crossProduct->getIterator());
+}
+
+void DBProgramGenerator::hoistConstantsOutOfLeftFactor(mlir::db::CrossProduct crossProduct) {
+    mlir::Block* const leftBlock = &crossProduct.getLeftFactor().front();
+
+    // Every operand of a constant column is itself a constant column, so the whole cone
+    // moves and nothing left outside reads what stayed in. Each op of that cone is asked
+    // in turn, so an answer is kept for the ops above it rather than rewalked under each.
+    llvm::DenseMap<mlir::Value, bool> classified;
+
+    llvm::SmallVector<mlir::Operation*> constantOps;
+    for (mlir::Operation& op : *leftBlock) {
+        const bool yieldsAConstant = op.getNumResults() > 0 && yieldsConstantColumn(op.getResult(0), classified);
+
+        if (yieldsAConstant) {
+            constantOps.push_back(&op);
+        }
+    }
+
+    for (mlir::Operation* op : constantOps) {
+        op->moveBefore(crossProduct);
+    }
+}
+
+void DBProgramGenerator::generateCrossedCall(std::string_view procedureName,
+                                             llvm::ArrayRef<mlir::Attribute> yieldedNames,
+                                             llvm::SmallVectorImpl<YieldedColumn>& yielded,
+                                             mlir::ValueRange inputs,
+                                             const InFlightColumns& inFlight) {
+    // The call reads none of the rows already in flight, so it produces the same rows for
+    // every one of them: their cartesian product. Each side becomes a factor of a
+    // db.cross_product - what the query has matched so far on the left, the call on the
+    // right - and the product pairs them, which is exactly what it exists for.
+    mlir::Block* const currentBlock = _opBuilder.getInsertionBlock();
+
+    llvm::SmallVector<mlir::Type> resultTypes;
+    for (const mlir::Value column : inFlight._columns) {
+        resultTypes.push_back(column.getType());
+    }
+
+    for (size_t yieldIndex = 0; yieldIndex < yieldedNames.size(); yieldIndex++) {
+        resultTypes.push_back(mlir::db::ColumnType::get(_mlirCtxt));
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    _opBuilder.setInsertionPointToEnd(currentBlock);
+    auto crossProduct = _opBuilder.create<mlir::db::CrossProduct>(loc, resultTypes);
+
+    mlir::Block* const leftBlock = &crossProduct.getLeftFactor().front();
+    mlir::Block* const rightBlock = &crossProduct.getRightFactor().front();
+
+    moveDataflowIntoLeftFactor(crossProduct);
+
+    // The argument columns were built into the block that has just become the left factor,
+    // but the call reading them is the right one and a value cannot cross a region
+    // boundary. None of them reads what the left factor yields - that is what makes this a
+    // product - so the whole chain behind them moves across intact, in its original order.
+    llvm::DenseSet<mlir::Operation*> argumentOps;
+    collectDefiningOps(inputs, argumentOps);
+
+    llvm::SmallVector<mlir::Operation*> argumentOpsInOrder;
+    for (mlir::Operation& op : *leftBlock) {
+        if (argumentOps.contains(&op)) {
+            argumentOpsInOrder.push_back(&op);
+        }
+    }
+
+    for (mlir::Operation* op : argumentOpsInOrder) {
+        op->moveBefore(rightBlock, rightBlock->end());
+    }
+
+    hoistConstantsOutOfLeftFactor(crossProduct);
+
+    _opBuilder.setInsertionPointToEnd(leftBlock);
+    _opBuilder.create<mlir::db::Yield>(loc, mlir::ValueRange {inFlight._columns});
+
+    // The call is the right factor, opening its own dataflow there: it carries nothing,
+    // since the rows it is paired with are the other factor's.
+    llvm::SmallVector<mlir::Type> callResultTypes;
+    for (size_t yieldIndex = 0; yieldIndex < yieldedNames.size(); yieldIndex++) {
+        callResultTypes.push_back(mlir::db::ColumnType::get(_mlirCtxt));
+    }
+
+    _opBuilder.setInsertionPointToEnd(rightBlock);
+    auto callOp = _opBuilder.create<mlir::db::CallProcedure>(loc,
+                                                            callResultTypes,
+                                                            _opBuilder.getStringAttr(procedureName),
+                                                            inputs,
+                                                            mlir::ValueRange {},
+                                                            _opBuilder.getArrayAttr(yieldedNames));
+    _opBuilder.create<mlir::db::Yield>(loc, mlir::ValueRange {callOp.getResults()});
+
+    // Anything generated from here on reads the product's results, not the factors'.
+    _opBuilder.setInsertionPointToEnd(currentBlock);
+
+    // Its results are the left factor's columns then the right's: the rows already in
+    // flight, now paired, followed by the call's own.
+    const mlir::Operation::result_range results = crossProduct.getResults();
+    rebindInFlightColumns(results, /*firstResult=*/0, inFlight);
+
+    for (size_t yieldIndex = 0; yieldIndex < yielded.size(); yieldIndex++) {
+        yielded[yieldIndex]._column = results[inFlight._columns.size() + yieldIndex];
+        _part._yieldedColumns.push_back(yielded[yieldIndex]);
+    }
+}
+
+bool DBProgramGenerator::PartScope::WrittenEntity::operator==(const WrittenEntity& other) const {
+    return _labels == other._labels && _edgeType == other._edgeType
+        && _labelsKnown == other._labelsKnown && _edgeTypeKnown == other._edgeTypeKnown;
+}
+
+void DBProgramGenerator::publishCreatedEntity(const VarDecl* decl,
+                                              mlir::Value column,
+                                              std::span<const LabelRef> labels,
+                                              const EdgeTypeRef& edgeType,
+                                              llvm::ArrayRef<llvm::StringRef> propNames,
+                                              llvm::ArrayRef<mlir::Value> propValues) {
+    bioassert(propNames.size() == propValues.size(), "One value per created property expected");
+
+    PartScope::CreatedEntity& created = _part._createdEntities[decl];
+    created._column = column;
+
+    PartScope::WrittenEntity& written = _part._writtenEntities[decl];
+
+    written._labels.clear();
+    written._labels.reserve(labels.size());
+    written._labelsKnown = !holdsParameter(labels);
+    for (const LabelRef& label : labels) {
+        if (!label._isParameter) {
+            written._labels.emplace_back(label._name);
+        }
+    }
+
+    written._edgeTypeKnown = !edgeType._isParameter;
+    written._edgeType.assign(edgeType._isParameter ? std::string_view {} : edgeType._name);
+
+    for (size_t index = 0; index < propNames.size(); index++) {
+        const llvm::StringRef propName = propNames[index];
+        created._properties[std::string_view {propName.data(), propName.size()}] = propValues[index];
+    }
+}
+
+void DBProgramGenerator::publishMergedEntity(const VarDecl* decl,
+                                             mlir::Value column,
+                                             mlir::Value pending) {
+    PartScope::CreatedEntity& merged = _part._createdEntities[decl];
+
+    merged._column = column;
+    merged._pending = pending;
+}
+
+const DBProgramGenerator::PartScope::WrittenEntity* DBProgramGenerator::findWrittenEntity(const VarDecl* decl) const {
+    if (!decl) {
+        return nullptr;
+    }
+
+    const auto findIt = _part._writtenEntities.find(decl);
+    if (findIt == end(_part._writtenEntities)) {
+        return nullptr;
+    }
+
+    return &findIt->second;
+}
+
+bool DBProgramGenerator::isPendingThroughout(const VarDecl* decl) const {
+    return findWrittenEntity(decl) != nullptr;
+}
+
+mlir::Value DBProgramGenerator::findPendingMask(const VarDecl* decl) const {
+    const auto createdIt = _part._createdEntities.find(decl);
+    if (createdIt != end(_part._createdEntities)) {
+        return createdIt->second._pending;
+    }
+
+    const auto maskIt = _part._pendingMasks.find(decl);
+    if (maskIt == end(_part._pendingMasks)) {
+        return mlir::Value {};
+    }
+
+    return _part._varMap.at(maskIt->second).back();
+}
+
+void DBProgramGenerator::rebindGroupedWrittenEntity(const VarDecl* decl,
+                                                    mlir::Value column,
+                                                    mlir::Value pending) {
+    const auto createdIt = _part._createdEntities.find(decl);
+    if (createdIt != end(_part._createdEntities)) {
+        PartScope::CreatedEntity& created = createdIt->second;
+
+        created._column = column;
+        created._pending = pending;
+        created._properties.clear();
+    } else if (pending) {
+        registerValue(_part._pendingMasks.at(decl), pending);
+    }
+}
+
+void DBProgramGenerator::generateUpdates(std::span<Stmt* const> stmts) {
+    for (const Stmt* stmt : stmts) {
+        switch (stmt->getKind()) {
+            case Stmt::Kind::MERGE:
+                generateMergeStmt(static_cast<const MergeStmt*>(stmt));
+            break;
+
+            case Stmt::Kind::CREATE:
+                generateCreateStmt(static_cast<const CreateStmt*>(stmt));
+            break;
+
+            case Stmt::Kind::SET:
+                generateSetItems(static_cast<const SetStmt*>(stmt), mlir::Value {});
+            break;
+
+            case Stmt::Kind::REMOVE:
+                generateRemoveProperties(static_cast<const RemoveStmt*>(stmt));
+            break;
+
+            case Stmt::Kind::DELETE:
+                generateDeleteStmt(static_cast<const DeleteStmt*>(stmt));
+            break;
+
+            case Stmt::Kind::CALL_SUBQUERY:
+                generateCallSubquery(static_cast<const CallSubqueryStmt*>(stmt));
+            break;
+
+            default:
+                throw TuringException(fmt::format("Unsupported update statement of kind {}",
+                                                  static_cast<int>(stmt->getKind())));
+            break;
+        }
+    }
+}
+
+void DBProgramGenerator::generateMergeStmt(const MergeStmt* mergeStmt) {
+    MergePattern pattern;
+    collectMergePattern(mergeStmt, pattern);
+
+    CarrySet carrySet;
+    collectCarrySet(carrySet);
+
+    llvm::SmallVector<mlir::Type> resultTypes;
+    const mlir::db::ColumnType nodeIDType = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
+    const mlir::db::ColumnType edgeIDType = allocColumnType(mlir::storage::EdgeIDType::get(_mlirCtxt));
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    // A bound node's rows come back through the carry set, so the op produces a column
+    // and a mask only for the chain nodes it looks up or writes
+    for (const MergeEntity& node : pattern._nodes) {
+        if (node._bound) {
+            continue;
+        }
+
+        resultTypes.push_back(nodeIDType);
+        resultTypes.push_back(boolType);
+    }
+
+    for (size_t hopIndex = 0; hopIndex < pattern._hops.size(); hopIndex++) {
+        resultTypes.push_back(edgeIDType);
+        resultTypes.push_back(boolType);
+    }
+
+    resultTypes.push_back(boolType);
+
+    for (const mlir::Value column : carrySet._columns) {
+        resultTypes.push_back(column.getType());
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    mlir::db::Merge merge = _opBuilder.create<mlir::db::Merge>(loc,
+                                                               resultTypes,
+                                                               _opBuilder.getArrayAttr(pattern._nodeLabels),
+                                                               _opBuilder.getArrayAttr(pattern._nodePropNames),
+                                                               _opBuilder.getArrayAttr(pattern._edgeTypes),
+                                                               _opBuilder.getArrayAttr(pattern._edgePropNames),
+                                                               _opBuilder.getDenseI64ArrayAttr(pattern._directions),
+                                                               _opBuilder.getDenseI64ArrayAttr(pattern._pendingNodes),
+                                                               pattern._boundNodes,
+                                                               pattern._boundPending,
+                                                               pattern._nodePropValues,
+                                                               pattern._edgePropValues,
+                                                               carrySet._columns);
+
+    const mlir::Operation::result_range results = merge.getResults();
+
+    // A bound node keeps the binding it came in under, which the carry set hands back
+    // re-indexed onto the rows the merge emitted; every other entity of the pattern is
+    // published under the column and mask the merge produced for it.
+    size_t resultIndex = 0;
+    for (const MergeEntity& node : pattern._nodes) {
+        if (node._bound) {
+            continue;
+        }
+
+        publishMergedEntity(node._decl, results[resultIndex], results[resultIndex + 1]);
+        resultIndex += 2;
+    }
+
+    llvm::SmallVector<mlir::Value> hopColumns;
+    for (const MergeEntity& hop : pattern._hops) {
+        if (hop._decl) {
+            publishMergedEntity(hop._decl, results[resultIndex], results[resultIndex + 1]);
+        }
+
+        hopColumns.push_back(results[resultIndex]);
+        resultIndex += 2;
+    }
+
+    const mlir::Value created = results[resultIndex];
+
+    rebindCarrySet(results, results.size() - carrySet._columns.size(), carrySet);
+
+    const PatternElement* element = mergeStmt->getPattern()->elements().front();
+    if (const VarDecl* pathDecl = element->getPathDecl()) {
+        llvm::SmallVector<mlir::Value> pathEntities;
+        for (size_t nodeIndex = 0; nodeIndex < pattern._nodes.size(); nodeIndex++) {
+            pathEntities.push_back(resolveEntityColumn(pattern._nodes[nodeIndex]._decl));
+
+            if (nodeIndex < hopColumns.size()) {
+                pathEntities.push_back(hopColumns[nodeIndex]);
+            }
+        }
+
+        _part._namedPaths[pathDecl] = makePathColumn(pathEntities);
+    }
+
+    generateMergeActions(mergeStmt, created);
+}
+
+void DBProgramGenerator::collectMergePattern(const MergeStmt* mergeStmt, MergePattern& pattern) {
+    const Pattern* patternAst = mergeStmt->getPattern();
+    bioassert(patternAst->elements().size() == 1, "MERGE carries a single path pattern");
+
+    const PatternElement* element = patternAst->elements().front();
+    const std::vector<EntityPattern*>& entities = element->getEntities();
+
+    for (size_t index = 0; index < entities.size(); index++) {
+        const bool isNode = index % 2 == 0;
+
+        if (isNode) {
+            collectMergeNode(static_cast<const NodePattern*>(entities[index]), pattern);
+        } else {
+            collectMergeHop(static_cast<const EdgePattern*>(entities[index]), pattern);
+        }
+    }
+}
+
+void DBProgramGenerator::collectMergeNode(const NodePattern* nodePattern, MergePattern& pattern) {
+    MergeEntity node;
+    node._decl = nodePattern->getDecl();
+
+    const NodePatternData* data = nodePattern->getData();
+
+    // The analyzer leaves a node the query already bound without pattern data: its rows
+    // come in through a column rather than from labels and property values
+    node._bound = data == nullptr;
+
+    if (node._bound) {
+        const mlir::Value column = resolveEntityColumn(node._decl);
+        if (!column) {
+            throw TuringException(fmt::format("MERGE cannot bind '{}': nothing ahead of it in the "
+                                              "query binds it",
+                                              node._decl->getName()));
+        }
+
+        mlir::Value pending = findPendingMask(node._decl);
+
+        // A CREATE's entities are provisional and in no graph a merge reads, so the merge
+        // is told every row is one: unmasked, it would match against whichever committed
+        // node the provisional ID collides with
+        if (!pending && isPendingThroughout(node._decl)) {
+            pending = constantBool(true);
+        }
+
+        if (pending) {
+            pattern._pendingNodes.push_back(static_cast<int64_t>(pattern._nodes.size()));
+            pattern._boundPending.push_back(pending);
+        }
+
+        pattern._boundNodes.push_back(column);
+        pattern._nodeLabels.push_back(_opBuilder.getStrArrayAttr({}));
+        pattern._nodePropNames.push_back(_opBuilder.getStrArrayAttr({}));
+        pattern._nodes.push_back(node);
+        return;
+    }
+
+    collectMergeProperties(data, node);
+
+    pattern._nodeLabels.push_back(schemaNamesAttr(_opBuilder, data->labelConstraints()));
+    pattern._nodePropNames.push_back(_opBuilder.getStrArrayAttr(node._propNames));
+    pattern._nodePropValues.append(node._propValues.begin(), node._propValues.end());
+    pattern._nodes.push_back(node);
+}
+
+void DBProgramGenerator::collectMergeHop(const EdgePattern* edgePattern, MergePattern& pattern) {
+    const EdgePatternData* data = edgePattern->getData();
+    bioassert(data && !data->edgeTypeConstraints().empty(), "MERGE hop must have an edge type");
+
+    MergeEntity hop;
+    const VarDecl* decl = edgePattern->getDecl();
+    if (decl && !decl->isUnnamed()) {
+        hop._decl = decl;
+    }
+
+    collectMergeProperties(data, hop);
+
+    pattern._edgeTypes.push_back(schemaNameAttr(_opBuilder, data->edgeTypeConstraints().front()));
+    pattern._edgePropNames.push_back(_opBuilder.getStrArrayAttr(hop._propNames));
+    pattern._edgePropValues.append(hop._propValues.begin(), hop._propValues.end());
+    pattern._directions.push_back(static_cast<int64_t>(mergeDirectionOf(edgePattern)));
+    pattern._hops.push_back(hop);
+}
+
+void DBProgramGenerator::collectMergeProperties(const PatternData* data, MergeEntity& entity) {
+    for (const EntityPropertyConstraint& constraint : data->exprConstraints()) {
+        translateExprOverRows(constraint._expr);
+
+        const std::string_view propName = constraint._propTypeName;
+        entity._propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
+        entity._propValues.push_back(_part._exprMap.at(constraint._expr));
+    }
+}
+
+mlir::storage::EdgeDirection DBProgramGenerator::mergeDirectionOf(const EdgePattern* edgePattern) {
+    switch (edgePattern->getDirection()) {
+        case EdgePattern::Direction::Undirected:
+            return mlir::storage::EdgeDirection::Undirected;
+        break;
+
+        case EdgePattern::Direction::Backward:
+            return mlir::storage::EdgeDirection::Backward;
+        break;
+
+        case EdgePattern::Direction::Forward:
+            return mlir::storage::EdgeDirection::Forward;
+        break;
+    }
+
+    bioassert(false, "Unhandled edge pattern direction");
+    return mlir::storage::EdgeDirection::Forward;
+}
+
+void DBProgramGenerator::collectCarrySet(CarrySet& carrySet) {
+    collectInFlightColumns(carrySet._inFlight);
+    carrySet._columns.append(carrySet._inFlight._columns.begin(), carrySet._inFlight._columns.end());
+
+    // What an earlier CREATE or MERGE wrote is in flight too, and no VDG variable, so
+    // collectInFlightColumns knows nothing of it: an op that hands the rows to a body has
+    // to take those columns along or they would stop matching the rows beside them. The
+    // value columns of the properties a CREATE recorded go along for the same reason - a
+    // projection reads a created property off them rather than off the graph.
+    for (const auto& [decl, written] : _part._createdEntities) {
+        bioassert(isRowAlignedHere(written._column),
+                  "Cannot carry '{}' along: what wrote it holds another row set here",
+                  decl->getName());
+
+        CarriedEntity carried;
+        carried._decl = decl;
+
+        for (const auto& [propName, propColumn] : written._properties) {
+            // A constant holds one value standing for every row rather than rows of its
+            // own, so the fan-out leaves it as it is
+            if (yieldsConstantColumn(propColumn, _constantColumns)) {
+                continue;
+            }
+
+            bioassert(isRowAlignedHere(propColumn),
+                      "Cannot carry '{}.{}' along: what wrote it holds another row set here",
+                      decl->getName(),
+                      propName);
+
+            carried._propNames.push_back(propName);
+        }
+
+        std::ranges::sort(carried._propNames);
+
+        carrySet._writtenEntities.push_back(carried);
+    }
+
+    // Ordered by the name the query gave each entity, so the carry set a program carries
+    // is the query's choice and not the addresses'
+    std::ranges::sort(carrySet._writtenEntities, [](const CarriedEntity& lhs, const CarriedEntity& rhs) {
+        return lhs._decl->getName() < rhs._decl->getName();
+    });
+
+    for (const CarriedEntity& carried : carrySet._writtenEntities) {
+        const PartScope::CreatedEntity& written = _part._createdEntities.at(carried._decl);
+
+        carrySet._columns.push_back(written._column);
+
+        if (written._pending) {
+            carrySet._columns.push_back(written._pending);
+        }
+
+        for (const std::string_view propName : carried._propNames) {
+            carrySet._columns.push_back(written._properties.at(propName));
+        }
+    }
+}
+
+void DBProgramGenerator::collectGroupedColumns(CarrySet& carrySet) {
+    InFlightColumns& inFlight = carrySet._inFlight;
+    const ExprValueMap& exprMap = _part._exprMap;
+
+    // No grouping reduced the elements of a list, so a comprehension this one sits inside
+    // still holds its element here
+    collectElementColumns(inFlight);
+
+    for (const auto& [expr, column] : exprMap) {
+        const bool holdsTheGroupedRows = isRowAlignedHere(column)
+                                      && !yieldsConstantColumn(column, _constantColumns)
+                                      && boundAtOrAfter(column, _part._aggregateOp);
+
+        if (holdsTheGroupedRows) {
+            inFlight._exprs.push_back(expr);
+        }
+    }
+
+    sortByProgramOrder(inFlight._exprs, exprMap);
+
+    for (const Expr* expr : inFlight._exprs) {
+        inFlight._columns.push_back(exprMap.at(expr));
+    }
+
+    carrySet._columns.append(inFlight._columns.begin(), inFlight._columns.end());
+}
+
+void DBProgramGenerator::rebindCarrySet(mlir::ValueRange columns,
+                                        size_t firstColumn,
+                                        const CarrySet& carrySet) {
+    rebindInFlightColumns(columns, firstColumn, carrySet._inFlight);
+
+    size_t columnIndex = firstColumn + carrySet._inFlight._columns.size();
+    for (const CarriedEntity& carried : carrySet._writtenEntities) {
+        PartScope::CreatedEntity& written = _part._createdEntities.at(carried._decl);
+
+        written._column = columns[columnIndex];
+        columnIndex++;
+
+        if (written._pending) {
+            written._pending = columns[columnIndex];
+            columnIndex++;
+        }
+
+        for (const std::string_view propName : carried._propNames) {
+            written._properties.at(propName) = columns[columnIndex];
+            columnIndex++;
+        }
+    }
+}
+
+// A projected item publishes its column under the declaration its alias shares with it, and
+// a symbol reads that column before any variable of the same name. The binding has to
+// follow the carried columns into a body, or a read there answers with the outer rows.
+void DBProgramGenerator::rebindProjectedColumns(mlir::ValueRange from, mlir::ValueRange to) {
+    for (auto& [decl, column] : _part._projectedColumns) {
+        for (size_t columnIndex = 0; columnIndex < from.size(); columnIndex++) {
+            if (column != from[columnIndex]) {
+                continue;
+            }
+
+            column = to[columnIndex];
+            break;
+        }
+    }
+}
+
+void DBProgramGenerator::generateMergeActions(const MergeStmt* mergeStmt, mlir::Value created) {
+    const SetStmt* onCreate = mergeStmt->getOnCreate();
+    if (onCreate) {
+        generateSetItems(onCreate, created);
+    }
+
+    const SetStmt* onMatch = mergeStmt->getOnMatch();
+    if (!onMatch) {
+        return;
+    }
+
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+    const mlir::Value matched =
+        _opBuilder.create<mlir::db::NotOp>(_opBuilder.getUnknownLoc(), boolType, created).getResult();
+
+    generateSetItems(onMatch, matched);
+}
+
+void DBProgramGenerator::generateCreateStmt(const CreateStmt* createStmt) {
+    // Collect the columns a MATCH bound or a CALL yielded, by variable, so CREATE
+    // patterns can reference them.
+    std::unordered_map<const VarDecl*, mlir::Value> knownVars;
+    for (const auto& [var, identities] : _part._varMap) {
+        const VarDecl* decl = var->getDecl();
+        if (decl && !identities.empty()) {
+            knownVars[decl] = identities.back();
+        }
+    }
+
+    for (const YieldedColumn& yieldedColumn : _part._yieldedColumns) {
+        if (yieldedColumn._decl && isRowAlignedHere(yieldedColumn._column)) {
+            knownVars[yieldedColumn._decl] = yieldedColumn._column;
+        }
+    }
+
+    for (const auto& [writtenDecl, written] : _part._createdEntities) {
+        knownVars[writtenDecl] = written._column;
+    }
+
+    // The pattern's own order picks the column, since reading an arbitrary bucket of
+    // knownVars would make the number of nodes written depend on where a name hashed. A
+    // scope of nothing but yielded columns has no such order to read, so it falls back on
+    // one of them
+    mlir::Value matchCardinality = resolveWildcardColumn();
+    if (!matchCardinality && !knownVars.empty()) {
+        matchCardinality = knownVars.begin()->second;
     }
 
     const mlir::db::ColumnType nodeIDType = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
@@ -710,46 +4857,42 @@ void DBProgramGenerator::generateCreate(const CypherAST* ast) {
     const mlir::Location loc = _opBuilder.getUnknownLoc();
 
     // Emit db.create_node for a node that is not already in knownVars, then register
-    // the result under the node's variable name so later patterns can reference it.
+    // the result under the node's variable so later patterns can reference it.
     const auto resolveOrCreateNode = [&](const NodePattern* node) -> mlir::Value {
         const VarDecl* decl = node->getDecl();
-        const std::string_view name = decl ? decl->getName() : "";
 
-        if (!name.empty() && knownVars.contains(name)) {
-            return knownVars.at(name);
+        if (decl && knownVars.contains(decl)) {
+            return knownVars.at(decl);
         }
 
-        llvm::SmallVector<llvm::StringRef> labelNames;
-        const SymbolChain* labels = node->labels();
-        if (labels) {
-            for (const Symbol* sym : *labels) {
-                const std::string_view symName = sym->getName();
-                labelNames.push_back(llvm::StringRef(symName.data(), symName.size()));
-            }
-        }
+        const NodePatternData* data = node->getData();
+        const std::span<const LabelRef> labels = data ? data->labelConstraints() : std::span<const LabelRef> {};
 
         llvm::SmallVector<llvm::StringRef> propNames;
         llvm::SmallVector<mlir::Value> propValues;
-        const NodePatternData* data = node->getData();
         if (data) {
             for (const EntityPropertyConstraint& constraint : data->exprConstraints()) {
-                translateExpr(constraint._expr);
+                translateExprOverRows(constraint._expr);
                 const std::string_view propName = constraint._propTypeName;
                 propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
-                propValues.push_back(_exprMap.at(constraint._expr));
+                propValues.push_back(_part._exprMap.at(constraint._expr));
             }
         }
+
+        const mlir::Value cardinality = matchCardinality;
 
         mlir::db::CreateNode createNode = _opBuilder.create<mlir::db::CreateNode>(
             loc,
             nodeIDType,
-            _opBuilder.getStrArrayAttr(labelNames),
+            schemaNamesAttr(_opBuilder, labels),
             _opBuilder.getStrArrayAttr(propNames),
-            mlir::ValueRange{propValues});
+            mlir::ValueRange{propValues},
+            cardinality);
         const mlir::Value nodeValue = createNode.getResult();
 
-        if (!name.empty()) {
-            knownVars[name] = nodeValue;
+        if (decl) {
+            knownVars[decl] = nodeValue;
+            publishCreatedEntity(decl, nodeValue, labels, EdgeTypeRef {}, propNames, propValues);
         }
 
         return nodeValue;
@@ -758,484 +4901,2740 @@ void DBProgramGenerator::generateCreate(const CypherAST* ast) {
     llvm::SmallVector<llvm::StringRef> propNames;
     llvm::SmallVector<mlir::Value> propValues;
 
-    for (const Stmt* stmt : updateStmts->stmts()) {
-        if (stmt->getKind() != Stmt::Kind::CREATE) {
+    const Pattern* pattern = createStmt->getPattern();
+
+    for (const PatternElement* element : pattern->elements()) {
+        const EntityPattern* entPtn = element->getRootEntity();
+        const auto* nodePtn = dynamic_cast<const NodePattern*>(entPtn);
+        bioassert(nodePtn, "Unknown root entity");
+
+        const NodePattern* lhsNode = nodePtn;
+        mlir::Value lhsValue = resolveOrCreateNode(nodePtn);
+
+        llvm::SmallVector<mlir::Value> pathEntities {lhsValue};
+
+        for (auto [edge, targetNode] : element->getElementChain()) {
+            const mlir::Value rhsValue = resolveOrCreateNode(targetNode);
+
+            propNames.clear();
+            propValues.clear();
+            const EdgePatternData* edgeData = edge->getData();
+            if (edgeData) {
+                for (const EntityPropertyConstraint& constraint : edgeData->exprConstraints()) {
+                    translateExprOverRows(constraint._expr);
+                    const std::string_view propName = constraint._propTypeName;
+                    propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
+                    propValues.push_back(_part._exprMap.at(constraint._expr));
+                }
+            }
+
+            bioassert(edgeData && !edgeData->edgeTypeConstraints().empty(),
+                      "CREATE edge must have an edge type");
+            const EdgeTypeRef& edgeType = edgeData->edgeTypeConstraints().front();
+
+            const bool backward = edge->getDirection() == EdgePattern::Direction::Backward;
+            const NodePattern* srcNode = backward ? targetNode : lhsNode;
+            const NodePattern* tgtNode = backward ? lhsNode : targetNode;
+            const mlir::Value srcValue = backward ? rhsValue : lhsValue;
+            const mlir::Value tgtValue = backward ? lhsValue : rhsValue;
+
+            mlir::db::CreateEdge createEdge = _opBuilder.create<mlir::db::CreateEdge>(
+                loc,
+                edgeIDType,
+                srcValue,
+                tgtValue,
+                schemaNameAttr(_opBuilder, edgeType),
+                _opBuilder.getStrArrayAttr(propNames),
+                mlir::ValueRange{propValues},
+                findPendingMask(srcNode->getDecl()),
+                findPendingMask(tgtNode->getDecl()),
+                isPendingThroughout(srcNode->getDecl()),
+                isPendingThroughout(tgtNode->getDecl()));
+
+            const VarDecl* edgeDecl = edge->getDecl();
+            if (edgeDecl && !edgeDecl->isUnnamed()) {
+                publishCreatedEntity(edgeDecl,
+                                     createEdge.getResult(),
+                                     {},
+                                     edgeType,
+                                     propNames,
+                                     propValues);
+            }
+
+            pathEntities.push_back(createEdge.getResult());
+            pathEntities.push_back(rhsValue);
+
+            lhsNode = targetNode;
+            lhsValue = rhsValue;
+        }
+
+        if (const VarDecl* pathDecl = element->getPathDecl()) {
+            _part._namedPaths[pathDecl] = makePathColumn(pathEntities);
+        }
+    }
+}
+
+mlir::Value DBProgramGenerator::resolveEntityColumn(const VarDecl* decl) {
+    // The element a list comprehension bound rides the block argument of its body, which
+    // stands only while that body is translated
+    const auto elementIt = _part._comprehensionElements.find(decl);
+    if (elementIt != end(_part._comprehensionElements)) {
+        return elementIt->second;
+    }
+
+    const auto hopIt = _part._hopColumns.find(decl);
+    if (hopIt != end(_part._hopColumns)) {
+        return hopIt->second;
+    }
+
+    for (const auto& [var, values] : _part._varMap) {
+        if (var->getDecl() == decl && !values.empty()) {
+            return values.back();
+        }
+    }
+
+    const VariableDependencyGraph::EdgeIdentityMap& edgeIdentities = _vdg.edgeIdentities();
+    const auto findIt = edgeIdentities.find(decl);
+    const bool foundEdgeIdentity = findIt != edgeIdentities.end() && !findIt->second.empty();
+    if (foundEdgeIdentity) {
+        const VariableDependency* representative = findIt->second.front();
+        return _part._varMap.at(representative).back();
+    }
+
+    const auto createdIt = _part._createdEntities.find(decl);
+    if (createdIt != end(_part._createdEntities)) {
+        return createdIt->second._column;
+    }
+
+    const auto walkIt = _part._namedPathWalks.find(decl);
+    if (walkIt != end(_part._namedPathWalks)) {
+        return namedPathColumn(walkIt->second);
+    }
+
+    const auto namedPathIt = _part._namedPaths.find(decl);
+    if (namedPathIt != end(_part._namedPaths)) {
+        return namedPathIt->second;
+    }
+
+    // A group variable of a quantified pattern is the list of one entity per repetition,
+    // read off the paths of its walk
+    const auto pathIt = _part._pathBindings.find(decl);
+    if (pathIt != end(_part._pathBindings) && pathIt->second._path) {
+        return listColumnOf(decl, _part._varMap.at(pathIt->second._path).back());
+    }
+
+    return findYieldedColumn(decl);
+}
+
+mlir::Value DBProgramGenerator::checkNodeLabels(mlir::Value nodeColumn,
+                                                std::span<const LabelRef> labels,
+                                                bool nullable) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType labelSetIDType =
+        allocColumnType(mlir::storage::LabelSetIDType::get(_mlirCtxt));
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    const mlir::Value labelSetIDColumn = _opBuilder.create<mlir::db::GetNodeLabelSet>(
+        loc,
+        labelSetIDType,
+        nodeColumn).getResult();
+
+    const mlir::ArrayAttr alternatives = _opBuilder.getArrayAttr({schemaNamesAttr(_opBuilder, labels)});
+
+    return _opBuilder.create<mlir::db::CheckLabelConstraint>(
+        loc,
+        boolType,
+        labelSetIDColumn,
+        alternatives,
+        nullable).getResult();
+}
+
+mlir::Value DBProgramGenerator::checkEdgeType(mlir::Value edgeTypeColumn,
+                                              std::span<const EdgeTypeRef> edgeTypes,
+                                              bool nullable) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    return _opBuilder.create<mlir::db::CheckEdgeTypeConstraint>(
+        loc,
+        boolType,
+        edgeTypeColumn,
+        schemaNamesAttr(_opBuilder, edgeTypes),
+        nullable).getResult();
+}
+
+mlir::Value DBProgramGenerator::checkNodeLabelExpr(mlir::Value nodeColumn,
+                                                   const LabelExpr* labelExpr,
+                                                   bool nullable) {
+    const auto checkLabelSet = [this, nodeColumn, nullable](const SymbolChain* labels) {
+        std::vector<LabelRef> refs;
+        collectSchemaNames(labels, refs);
+
+        return checkNodeLabels(nodeColumn, refs, nullable);
+    };
+
+    return combineLabelSetChecks(labelExpr, checkLabelSet);
+}
+
+mlir::Value DBProgramGenerator::checkEdgeTypeExpr(mlir::Value edgeTypeColumn,
+                                                  const LabelExpr* labelExpr,
+                                                  bool nullable) {
+    const auto checkTypeSet = [this, edgeTypeColumn, nullable](const SymbolChain* types) {
+        std::vector<EdgeTypeRef> refs;
+        collectSchemaNames(types, refs);
+
+        mlir::Value conjunction;
+        for (const EdgeTypeRef& ref : refs) {
+            const mlir::Value check = checkEdgeType(edgeTypeColumn, std::span<const EdgeTypeRef> {&ref, 1}, nullable);
+            conjunction = conjunction ? translateLogicalOperator(LogicalOperator::And, conjunction, check) : check;
+        }
+
+        return conjunction;
+    };
+
+    return combineLabelSetChecks(labelExpr, checkTypeSet);
+}
+
+mlir::Value DBProgramGenerator::combineLabelSetChecks(const LabelExpr* labelExpr, LabelSetCheck checkLabelSet) {
+    const LabelExpr::Operands& operands = labelExpr->getOperands();
+
+    switch (labelExpr->getKind()) {
+        case LabelExpr::Kind::LABELS:
+            return checkLabelSet(labelExpr->getLabels());
+        break;
+        case LabelExpr::Kind::NOT: {
+            const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+            const mlir::Value operand = combineLabelSetChecks(operands.front(), checkLabelSet);
+
+            return _opBuilder.create<mlir::db::NotOp>(_opBuilder.getUnknownLoc(), boolType, operand).getResult();
+        }
+        break;
+        case LabelExpr::Kind::AND:
+        case LabelExpr::Kind::OR: {
+            const LogicalOperator op = labelExpr->getKind() == LabelExpr::Kind::AND ? LogicalOperator::And
+                                                                                     : LogicalOperator::Or;
+
+            mlir::Value result;
+            for (const LabelExpr* operandExpr : operands) {
+                const mlir::Value operand = combineLabelSetChecks(operandExpr, checkLabelSet);
+                result = result ? translateLogicalOperator(op, result, operand) : operand;
+            }
+
+            return result;
+        }
+        break;
+    }
+
+    throwError("Unknown label expression.");
+}
+
+mlir::Value DBProgramGenerator::resolveEdgeTypeColumn(const VarDecl* decl) const {
+    const VariableDependencyGraph::EdgeIdentityMap& edgeIdentities = _vdg.edgeIdentities();
+
+    const auto identityIt = edgeIdentities.find(decl);
+    if (identityIt == edgeIdentities.end() || identityIt->second.empty()) {
+        return mlir::Value {};
+    }
+
+    const auto findIt = _part._edgeTypeMap.find(identityIt->second.front());
+    if (findIt == _part._edgeTypeMap.end() || !isRowAlignedHere(findIt->second)) {
+        return mlir::Value {};
+    }
+
+    return findIt->second;
+}
+
+mlir::Value DBProgramGenerator::resolveOrFetchEdgeTypeColumn(const VarDecl* decl,
+                                                             std::string_view varName) {
+    const mlir::Value published = resolveEdgeTypeColumn(decl);
+    if (published) {
+        return published;
+    }
+
+    const mlir::Value edgeColumn = resolveEntityColumn(decl);
+    bioassert(edgeColumn, "Type test on unknown edge variable: {}", varName);
+
+    return fetchEdgeTypeColumn(edgeColumn);
+}
+
+mlir::Value DBProgramGenerator::fetchEdgeTypeColumn(mlir::Value edgeColumn) {
+    const mlir::db::ColumnType edgeTypeIDType =
+        allocColumnType(mlir::storage::EdgeTypeIDType::get(_mlirCtxt));
+
+    return _opBuilder.create<mlir::db::GetEdgeTypes>(
+        _opBuilder.getUnknownLoc(),
+        edgeTypeIDType,
+        edgeColumn).getResult();
+}
+
+mlir::Value DBProgramGenerator::resolveColumnInScope(ColumnPredicate accept) const {
+    for (const VariableDependency& var : _vdg.vars()) {
+        const auto findIt = _part._varMap.find(&var);
+        if (findIt == _part._varMap.end() || findIt->second.empty()) {
             continue;
         }
-        const CreateStmt* createStmt = static_cast<const CreateStmt*>(stmt);
-        const Pattern* pattern = createStmt->getPattern();
 
-        for (const PatternElement* element : pattern->elements()) {
-            const EntityPattern* entPtn = element->getRootEntity();
-            const auto* nodePtn = dynamic_cast<const NodePattern*>(entPtn);
-            bioassert(nodePtn, "Unknown root entity");
+        const mlir::Value column = findIt->second.back();
+        if (!holdsTheRowsInFlight(column) || !accept(column)) {
+            continue;
+        }
 
-            mlir::Value lhsValue = resolveOrCreateNode(nodePtn);
+        return column;
+    }
 
-            for (auto [edge, targetNode] : element->getElementChain()) {
-                const mlir::Value rhsValue = resolveOrCreateNode(targetNode);
+    for (const YieldedColumn& yielded : _part._yieldedColumns) {
+        if (holdsTheRowsInFlight(yielded._column) && accept(yielded._column)) {
+            return yielded._column;
+        }
+    }
 
-                propNames.clear();
-                propValues.clear();
-                const EdgePatternData* edgeData = edge->getData();
-                if (edgeData) {
-                    for (const EntityPropertyConstraint& constraint : edgeData->exprConstraints()) {
-                        translateExpr(constraint._expr);
-                        const std::string_view propName = constraint._propTypeName;
-                        propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
-                        propValues.push_back(_exprMap.at(constraint._expr));
-                    }
+    return mlir::Value {};
+}
+
+mlir::Value DBProgramGenerator::readWalkEntities(const Expr* argExpr, mlir::Value column) {
+    if (!isPathColumn(column)) {
+        return column;
+    }
+
+    return listColumnOf(argExpr->getExprVarDecl(), column);
+}
+
+mlir::Value DBProgramGenerator::translateAggregateInput(const Expr* argExpr,
+                                                        const VariableColumnMap* variableColumns) {
+    // An aggregate reads the rows ahead of every reduction, one an earlier aggregate of the
+    // same projection emitted included
+    const llvm::SaveAndRestore<mlir::Operation*> readsTheRowsAhead(_part._aggregateOp, nullptr);
+
+    const EvaluatedType argType = argExpr->getType();
+
+    if (argType == EvaluatedType::Null) {
+        return alignConstantToDriver(nullConstantColumn());
+    }
+
+    const bool isEntity = argType == EvaluatedType::NodePattern || argType == EvaluatedType::EdgePattern;
+
+    if (isEntity) {
+        if (variableColumns) {
+            return getOrTranslateBoundColumn(*variableColumns, argExpr);
+        }
+
+        return getOrTranslateBoundColumn(argExpr);
+    } else if (argType != EvaluatedType::Wildcard) {
+        translateExprOverRows(argExpr);
+
+        return alignConstantToDriver(_part._exprMap.at(argExpr));
+    }
+
+    const mlir::Value column = resolveWildcardColumn();
+    if (column) {
+        return column;
+    }
+
+    // A query binding no column runs over one row of its own, and count(*) tallies
+    // that row: a constant stands for it, as the 42 of RETURN count(42) does
+    const bool bindsNoColumn = _part._varMap.empty() && _part._yieldedColumns.empty();
+    bioassert(bindsNoColumn, "count(*) over no column holding the rows it counts.");
+
+    const mlir::TypedAttr oneAttr = _opBuilder.getI64IntegerAttr(1);
+    const mlir::db::ColumnType oneType = allocColumnType(oneAttr.getType());
+
+    return _opBuilder.create<mlir::db::ConstantOp>(_opBuilder.getUnknownLoc(), oneType, oneAttr).getResult();
+}
+
+mlir::Value DBProgramGenerator::resolveRowCarryingColumn() {
+    const mlir::Value column = resolveColumnInScope([this](mlir::Value column) { return !yieldsConstantColumn(column, _constantColumns); });
+    if (column || !_part._aggregateOp) {
+        return column;
+    }
+
+    // Under a grouping key no variable names, the groups are held by the aggregate's results alone
+    return _part._aggregateOp->getResult(0);
+}
+
+mlir::Value DBProgramGenerator::alignConstantToDriver(mlir::Value column) {
+    if (!yieldsConstantColumn(column, _constantColumns)) {
+        return column;
+    }
+
+    const mlir::Value driver = resolveRowCarryingColumn();
+    if (!driver) {
+        return column;
+    }
+
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    return _opBuilder.create<mlir::db::BroadcastConstant>(_opBuilder.getUnknownLoc(), noneType, column, driver).getResult();
+}
+
+void DBProgramGenerator::alignConstantOperandsToDriver(mlir::Block::iterator first, mlir::Block::iterator last) {
+    const mlir::Value driver = resolveRowCarryingColumn();
+    if (!driver) {
+        return;
+    }
+
+    const auto isConstant = [this](mlir::Value value) { return yieldsConstantColumn(value, _constantColumns); };
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+    const mlir::OpBuilder::InsertionGuard insertionGuard(_opBuilder);
+
+    for (mlir::Operation& op : llvm::make_range(first, last)) {
+        const bool readsConstantsAlone = op.getNumOperands() > 0 && llvm::all_of(op.getOperands(), isConstant);
+        const bool runsPerRow = !llvm::all_of(op.getResults(), isConstant);
+        if (!readsConstantsAlone || !runsPerRow) {
+            continue;
+        }
+
+        _opBuilder.setInsertionPoint(&op);
+        for (mlir::OpOperand& operand : op.getOpOperands()) {
+            operand.set(_opBuilder.create<mlir::db::BroadcastConstant>(loc, noneType, operand.get(), driver).getResult());
+        }
+    }
+}
+
+void DBProgramGenerator::translateExprOverRows(const Expr* expr) {
+    mlir::Block* const block = _opBuilder.getInsertionBlock();
+    const mlir::Block::iterator insertionPoint = _opBuilder.getInsertionPoint();
+    mlir::Operation* const lastOpBefore = insertionPoint == block->begin() ? nullptr : &*std::prev(insertionPoint);
+
+    translateExpr(expr);
+
+    const mlir::Block::iterator firstTranslated = lastOpBefore ? std::next(lastOpBefore->getIterator()) : block->begin();
+    alignConstantOperandsToDriver(firstTranslated, _opBuilder.getInsertionPoint());
+}
+
+mlir::Value DBProgramGenerator::resolveWildcardColumn() {
+    const mlir::Value rowColumn = resolveRowCarryingColumn();
+    if (rowColumn) {
+        return rowColumn;
+    }
+
+    return resolveColumnInScope([](mlir::Value) { return true; });
+}
+
+void DBProgramGenerator::generatePropertyWrite(const PropertyExpr* propertyExpr,
+                                               mlir::Value valueColumn,
+                                               mlir::Value rows) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    const VarDecl* entityDecl = propertyExpr->getEntityVarDecl();
+    const std::string_view varName = entityDecl->getName();
+    const std::string_view propName = propertyExpr->getPropName();
+
+    const mlir::Value entityColumn = resolveEntityColumn(entityDecl);
+    bioassert(entityColumn, "Property write on unknown variable: {}", varName);
+
+    // if there was a previous write to this property within this query, erase it
+    const auto createdIt = _part._createdEntities.find(entityDecl);
+    if (createdIt != end(_part._createdEntities)) {
+        createdIt->second._properties.erase(propName);
+    }
+
+    // A merge's rows mix entities it wrote with entities it bound, and the two are
+    // written to differently: the mask says which is which
+    const mlir::Value pending = findPendingMask(entityDecl);
+    const bool allPending = isPendingThroughout(entityDecl);
+
+    const mlir::StringAttr propAttr = _opBuilder.getStringAttr(propName);
+    const EvaluatedType entityType = entityDecl->getType();
+    const bool isNode = entityType == EvaluatedType::NodePattern;
+    const bool isEdge = entityType == EvaluatedType::EdgePattern;
+    bioassert(isNode || isEdge, "Property write on non-entity variable: {}", varName);
+
+    if (isNode) {
+        _opBuilder.create<mlir::db::SetNodeProperty>(loc,
+                                                     entityColumn,
+                                                     propAttr,
+                                                     valueColumn,
+                                                     pending,
+                                                     rows,
+                                                     allPending);
+    } else /* (isEdge) */ {
+        _opBuilder.create<mlir::db::SetEdgeProperty>(loc,
+                                                     entityColumn,
+                                                     propAttr,
+                                                     valueColumn,
+                                                     pending,
+                                                     rows,
+                                                     allPending);
+    }
+}
+
+void DBProgramGenerator::generateSetItems(const SetStmt* setStmt, mlir::Value rows) {
+    for (const SetItem* item : setStmt->getItems()) {
+        const SetItem::PropertyExprAssign* assign =
+            std::get_if<SetItem::PropertyExprAssign>(&item->item());
+        bioassert(assign, "Only property-assignment SET items are supported");
+
+        translateExprOverRows(assign->_propValueExpr);
+
+        generatePropertyWrite(assign->_propTypeExpr,
+                              _part._exprMap.at(assign->_propValueExpr),
+                              rows);
+    }
+}
+
+void DBProgramGenerator::generateRemoveProperties(const RemoveStmt* removeStmt) {
+    for (const PropertyExpr* propertyExpr : removeStmt->getProperties()) {
+        generatePropertyWrite(propertyExpr, nullConstantColumn(), mlir::Value {});
+    }
+}
+
+void DBProgramGenerator::generateDeleteStmt(const DeleteStmt* deleteStmt) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const bool detach = deleteStmt->isDetaching();
+
+    for (const Expr* expr : *deleteStmt->getExpressions()) {
+        if (expr->getKind() != Expr::Kind::SYMBOL) {
+            throwError("Expressions in DELETE statements can only be symbols", expr);
+        }
+
+        const SymbolExpr* symbolExpr = static_cast<const SymbolExpr*>(expr);
+        const VarDecl* decl = symbolExpr->getDecl();
+        bioassert(decl, "DELETE target symbol has no declaration");
+        const std::string_view varName = decl->getName();
+
+        const mlir::Value entityColumn = resolveEntityColumn(decl);
+        if (!entityColumn) {
+            throwError("Cannot delete unbound variable: " + std::string(varName), expr);
+        }
+
+        // A merge's rows mix entities the graph holds with entities this change wrote,
+        // and the two are deleted differently: the mask says which is which. A CREATE's
+        // rows are provisional throughout and carry no mask, which the write buffer
+        // reads off the column the create produced.
+        const mlir::Value pending = findPendingMask(decl);
+
+        const EvaluatedType entityType = decl->getType();
+        const bool isNode = entityType == EvaluatedType::NodePattern;
+        const bool isEdge = entityType == EvaluatedType::EdgePattern;
+
+        const bool allPending = isPendingThroughout(decl);
+
+        if (isNode) {
+            _opBuilder.create<mlir::db::DeleteNode>(loc, entityColumn, detach, pending, allPending);
+        } else if (isEdge) {
+            _opBuilder.create<mlir::db::DeleteEdge>(loc, entityColumn, pending, allPending);
+        } else {
+            throwError("Can only delete nodes or edges", expr);
+        }
+    }
+}
+
+const ShortestPathStmt* DBProgramGenerator::findShortestPathStmt(std::span<Stmt* const> stmts) const {
+    for (const Stmt* stmt : stmts) {
+        if (stmt->getKind() == Stmt::Kind::SHORTESTPATH) {
+            return static_cast<const ShortestPathStmt*>(stmt);
+        }
+    }
+
+    return nullptr;
+}
+
+void DBProgramGenerator::generateShortestPath(std::span<Stmt* const> stmts) {
+    const ShortestPathStmt* stmt = findShortestPathStmt(stmts);
+    if (!stmt) {
+        return;
+    }
+
+    const std::string_view sourceName = stmt->getSource()->getName();
+    const std::string_view targetName = stmt->getTarget()->getName();
+    const std::string_view propertyName = stmt->getEdgeProperty()->getName();
+    const std::string_view distName = stmt->getDistVar()->getName();
+    const std::string_view pathName = stmt->getPathVar()->getName();
+
+    const mlir::Value sourceColumn = resolveEntityColumn(stmt->getSourceDecl());
+    bioassert(sourceColumn, "SHORTESTPATH source not bound: {}", sourceName);
+
+    const mlir::Value targetColumn = resolveEntityColumn(stmt->getTargetDecl());
+    bioassert(targetColumn, "SHORTESTPATH target not bound: {}", targetName);
+
+    // The distance column is a none placeholder resolved to the weight property's value
+    // type at lowering
+    const mlir::db::ColumnType distanceType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+    const mlir::db::ColumnType pathType = allocColumnType(mlir::storage::PathType::get(_mlirCtxt));
+    const mlir::StringAttr propertyAttr = _opBuilder.getStringAttr(propertyName);
+
+    auto shortestPath = _opBuilder.create<mlir::db::ShortestPath>(_opBuilder.getUnknownLoc(),
+                                                                  distanceType,
+                                                                  pathType,
+                                                                  sourceColumn,
+                                                                  targetColumn,
+                                                                  propertyAttr);
+
+    _part._yieldedColumns.push_back({stmt->getDistDecl(), distName, shortestPath.getDistance()});
+    _part._yieldedColumns.push_back({stmt->getPathDecl(), pathName, shortestPath.getPath()});
+}
+
+mlir::Value DBProgramGenerator::resolveProjectionDriver(llvm::ArrayRef<mlir::Value> projected) {
+    for (const mlir::Value column : projected) {
+        if (!yieldsConstantColumn(column, _constantColumns)) {
+            return column;
+        }
+    }
+
+    return resolveRowCarryingColumn();
+}
+
+void DBProgramGenerator::generateOutput(const Projection* projection, const UnionBranch* branch) {
+    VariableColumnMap variableColumns;
+    collectVariableColumns(variableColumns);
+
+    llvm::SmallVector<mlir::Value> outputted;
+    llvm::SmallVector<llvm::StringRef> outputNames;
+    translateProjection(projection, variableColumns, outputted, outputNames);
+
+    broadcastConstantProjection(outputted);
+
+    buildNamedPathItems(projection, outputted);
+    expandPathItems(projection, outputted);
+
+    translateProjectionTail(projection, variableColumns, outputted, {});
+
+    if (branch) {
+        broadcastUnionProjection(outputted);
+
+        if (branch->_distinctSet) {
+            dedupUnionBranch(branch->_distinctSet, outputted);
+        }
+    }
+
+    _opBuilder.create<mlir::db::Output>(_opBuilder.getUnknownLoc(),
+                                       mlir::ValueRange {outputted},
+                                       _opBuilder.getStrArrayAttr(outputNames));
+}
+
+void DBProgramGenerator::broadcastUnionProjection(llvm::SmallVectorImpl<mlir::Value>& projected) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    const mlir::Value driver = resolveProjectionDriver(projected);
+
+    for (mlir::Value& column : projected) {
+        if (yieldsConstantColumn(column, _constantColumns)) {
+            column = _opBuilder.create<mlir::db::BroadcastConstant>(loc, noneType, column, driver).getResult();
+        }
+    }
+}
+
+void DBProgramGenerator::emitRemoveDuplicates(llvm::ArrayRef<mlir::Value> keyColumns,
+                                              mlir::Value distinctSet,
+                                              llvm::SmallVectorImpl<mlir::Value>& deduped) {
+    llvm::SmallVector<mlir::Type> dedupedTypes;
+    for (const mlir::Value column : keyColumns) {
+        dedupedTypes.push_back(column.getType());
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    auto distinctOp = _opBuilder.create<mlir::db::RemoveDuplicates>(loc,
+                                                                   dedupedTypes,
+                                                                   mlir::ValueRange {keyColumns},
+                                                                   distinctSet);
+
+    const mlir::ResultRange results = distinctOp.getResults();
+    deduped.assign(results.begin(), results.end());
+}
+
+// The rows a branch contributes, recorded in the set its siblings share, so that the
+// union tells apart rows reaching the result through different branches. Every column is
+// part of the key here - unlike RETURN DISTINCT, which leaves a constant one out: `RETURN
+// n.name, 1` and `RETURN m.name, 2` are distinct rows, and the constant is what says so.
+void DBProgramGenerator::dedupUnionBranch(mlir::Value distinctSet,
+                                          llvm::SmallVectorImpl<mlir::Value>& projected) {
+    llvm::SmallVector<mlir::Value> deduped;
+    emitRemoveDuplicates(projected, distinctSet, deduped);
+
+    projected.assign(deduped.begin(), deduped.end());
+}
+
+// A standalone CALL ends no projection, so what it yielded is the result: the columns go
+// out in yield order, under the names the YIELD gave them. A query that writes is not
+// standalone whatever it yielded - its result is its RETURN, and it has none - so a CALL
+// or a LOAD CSV feeding a CREATE reports no row rather than every row it wrote one for.
+void DBProgramGenerator::generateYieldedOutput(const SinglePartQuery* query) {
+    if (query->writesToTheGraph()) {
+        return;
+    }
+
+    llvm::SmallVector<mlir::Value> yielded;
+    llvm::SmallVector<llvm::StringRef> yieldedNames;
+    for (const YieldedColumn& yieldedColumn : _part._yieldedColumns) {
+        // An UNWIND's elements ride here so the rest of the part reads them, but they are
+        // no result of their own: a query with no projection returns nothing.
+        if (!yieldedColumn._isResult) {
+            continue;
+        }
+
+        yielded.push_back(yieldedColumn._column);
+        yieldedNames.push_back(llvm::StringRef(yieldedColumn._name.data(), yieldedColumn._name.size()));
+    }
+
+    if (yielded.empty()) {
+        return;
+    }
+
+    _opBuilder.create<mlir::db::Output>(_opBuilder.getUnknownLoc(),
+                                       mlir::ValueRange {yielded},
+                                       _opBuilder.getStrArrayAttr(yieldedNames));
+}
+
+void DBProgramGenerator::generateWith(const WithStmt* with) {
+    publishProjection(with->getProjection(), with);
+
+    const WhereClause* where = with->getWhere();
+    if (!where) {
+        return;
+    }
+
+    std::vector<const Expr*> conjuncts;
+    flattenConjuncts(where->getExpr(), conjuncts);
+
+    applyPredicateFilters(conjuncts);
+
+    dropFilterColumns(with->filterImports());
+}
+
+void DBProgramGenerator::publishProjection(const Projection* projection,
+                                           const WithStmt* with,
+                                           bool returnsOutOfCall) {
+    const bool carriesPendingMasks = with || returnsOutOfCall;
+    if (!carriesPendingMasks) {
+        throwOnPublishedMerge(projection);
+    }
+
+    generateGroupAggregate(projection);
+
+    VariableColumnMap variableColumns;
+    collectVariableColumns(variableColumns);
+
+    llvm::SmallVector<PublishedColumn> carriedColumns;
+    VariableColumnMap itemColumns = variableColumns;
+
+    if (with) {
+        bindCSVRowItems(projection, itemColumns, carriedColumns);
+    }
+
+    llvm::SmallVector<mlir::Value> projected;
+    llvm::SmallVector<llvm::StringRef> names;
+    translateProjection(projection, itemColumns, projected, names);
+
+    broadcastConstantProjection(projected);
+
+    buildNamedPathItems(projection, projected);
+
+    if (with && !projection->isAggregate()) {
+        collectFilterColumns(with->filterImports(), variableColumns, carriedColumns);
+    }
+
+    if (carriesPendingMasks) {
+        collectPendingMasks(projection, names, carriedColumns);
+    }
+
+    translateProjectionTail(projection, variableColumns, projected, carriedColumns);
+
+    publishBoundColumns(projection, names, projected, carriedColumns);
+}
+
+void DBProgramGenerator::collectFilterColumns(std::span<const VarDecl* const> filterImports,
+                                              const VariableColumnMap& variableColumns,
+                                              llvm::SmallVectorImpl<PublishedColumn>& carriedColumns) {
+    for (const VarDecl* decl : filterImports) {
+        if (decl->getType() == EvaluatedType::StringTable) {
+            collectCSVFieldColumns(decl, carriedColumns);
+            continue;
+        }
+
+        const auto columnIt = variableColumns.find(decl);
+        bioassert(columnIt != end(variableColumns),
+                  "Variable '{}' read by the WHERE of a WITH is not in scope",
+                  decl->getName());
+
+        const mlir::Value column = listColumnOf(decl, columnIt->second);
+        carriedColumns.push_back({decl, std::string(decl->getName()), column});
+
+        if (const mlir::Value mask = findPendingMask(decl)) {
+            carriedColumns.push_back({nullptr, pendingMaskName(decl->getName()), mask});
+        }
+    }
+}
+
+void DBProgramGenerator::collectCSVFieldColumns(const VarDecl* row,
+                                                llvm::SmallVectorImpl<PublishedColumn>& carriedColumns) const {
+    const std::string_view rowName = row->getName();
+
+    forEachVariableColumn([this, rowName, &carriedColumns](const VarDecl* decl, std::string_view name, mlir::Value column) {
+        if (decl && findCSVFieldRow(decl) == rowName) {
+            carriedColumns.push_back({decl, std::string(name), column});
+        }
+    });
+}
+
+void DBProgramGenerator::throwCSVRowRead(const Expr* expr, std::string_view rowName) const {
+    throwError(fmt::format("A CSV row cannot be read as a whole: "
+                           "read a field of '{}' as {}[<index>] or {}.<header>",
+                           rowName, rowName, rowName),
+               expr);
+}
+
+void DBProgramGenerator::bindCSVRowItems(const Projection* projection,
+                                         VariableColumnMap& itemColumns,
+                                         llvm::SmallVectorImpl<PublishedColumn>& carriedColumns) {
+    const bool reducesRows = projection->isAggregate() || projection->isDistinct();
+
+    for (const Projection::ReturnItem& item : projection->items()) {
+        const VarDecl* row = projectedVariable(item);
+        if (!row || row->getType() != EvaluatedType::StringTable) {
+            continue;
+        }
+
+        const std::optional<std::string_view> name = std::visit([projection](auto&& projected) {
+            return projection->getName(projected);
+        }, item);
+
+        if (name != row->getName()) {
+            continue;
+        }
+
+        // A load reads only the fields the query names, which cannot tell two records apart
+        // as a dedup or a group of the whole row would have to
+        if (reducesRows && !_importedCSVRows.contains(row->getName())) {
+            continue;
+        }
+
+        const mlir::Value rowColumn = findCSVRowColumn(row);
+        bioassert(rowColumn, "CSV row '{}' projected by a WITH carries no column", row->getName());
+
+        itemColumns[row] = rowColumn;
+        collectCSVFieldColumns(row, carriedColumns);
+    }
+}
+
+mlir::Value DBProgramGenerator::findCSVRowColumn(const VarDecl* row) {
+    llvm::SmallVector<PublishedColumn> published;
+    collectPublishedColumns(published);
+
+    for (const PublishedColumn& column : published) {
+        if (carriesCSVRow(row, column._decl, column._name)) {
+            return column._column;
+        }
+    }
+
+    return mlir::Value {};
+}
+
+bool DBProgramGenerator::carriesCSVRow(const VarDecl* row, const VarDecl* decl, std::string_view name) const {
+    const std::string_view rowName = row->getName();
+
+    if (decl) {
+        return decl == row || findCSVFieldRow(decl) == rowName;
+    }
+
+    return name == rowName;
+}
+
+void DBProgramGenerator::collectCSVRowVariables(const VarDecl* row,
+                                                llvm::SmallVectorImpl<const VariableDependency*>& rowVars) const {
+    for (const auto& [var, columns] : _part._varMap) {
+        if (carriesCSVRow(row, var->getDecl(), var->getName())) {
+            rowVars.push_back(var);
+        }
+    }
+
+    std::ranges::sort(rowVars, {}, &VariableDependency::getName);
+}
+
+void DBProgramGenerator::collectPendingMasks(const Projection* projection,
+                                             llvm::ArrayRef<llvm::StringRef> names,
+                                             llvm::SmallVectorImpl<PublishedColumn>& carriedColumns) const {
+    size_t index = 0;
+    for (const Projection::ReturnItem& item : projection->items()) {
+        const mlir::Value mask = findPendingMask(projectedVariable(item));
+        if (mask) {
+            carriedColumns.push_back({nullptr, pendingMaskName(toStringView(names[index])), mask});
+        }
+
+        index++;
+    }
+}
+
+void DBProgramGenerator::dropFilterColumns(std::span<const VarDecl* const> filterImports) {
+    if (filterImports.empty()) {
+        return;
+    }
+
+    llvm::SmallVector<PublishedColumn> published;
+    collectPublishedColumns(published);
+
+    llvm::erase_if(published, [this, filterImports](const PublishedColumn& column) {
+        const std::string_view fieldRow = findCSVFieldRow(column._decl);
+
+        return std::ranges::any_of(filterImports, [&column, fieldRow](const VarDecl* decl) {
+            const std::string_view name = decl->getName();
+            const bool isFieldOfTheRow = decl->getType() == EvaluatedType::StringTable && fieldRow == name;
+
+            return column._decl == decl || column._name == pendingMaskName(name) || isFieldOfTheRow;
+        });
+    });
+
+    // The rows the filter kept may be carried by the columns it read alone
+    llvm::SmallVector<mlir::Value> columns;
+    for (const PublishedColumn& column : published) {
+        columns.push_back(column._column);
+    }
+
+    broadcastConstantProjection(columns);
+
+    for (size_t index = 0; index < published.size(); index++) {
+        published[index]._column = columns[index];
+    }
+
+    rebindScopeKeepingWrittenEntities(published);
+}
+
+bool DBProgramGenerator::subqueryCarriesRows(const SinglePartQuery* body) {
+    if (const StmtContainer* stmts = body->getStmts()) {
+        for (const Stmt* stmt : stmts->stmts()) {
+            if (!statementCarriesRows(stmt)) {
+                return false;
+            }
+        }
+    }
+
+    const ReturnStmt* returnStmt = body->getReturnStmt();
+
+    return !returnStmt || projectionCarriesRows(returnStmt->getProjection());
+}
+
+void DBProgramGenerator::generateCallSubquery(const CallSubqueryStmt* subquery) {
+    SubqueryResults results;
+    emitCallSubquery(subquery, results);
+
+    if (!subquery->isReturning()) {
+        return;
+    }
+
+    llvm::SmallVector<PublishedColumn> published = results._inputs;
+    published.append(results._returned.begin(), results._returned.end());
+    published.append(results._constants.begin(), results._constants.end());
+
+    rebindScopeKeepingWrittenEntities(published);
+    bindReturnedEntities(results._returnedEntities);
+}
+
+void DBProgramGenerator::generateNextSegment(const NextSegmentStmt* segment) {
+    const CallSubqueryStmt* body = segment->getBody();
+
+    if (!body->isReturning()) {
+        generateUpdatingSegment(segment);
+    } else if (body->isConditional()) {
+        generateConditionalSegment(body);
+    } else {
+        generateUnionSegment(body);
+    }
+}
+
+void DBProgramGenerator::generateUnionSegment(const CallSubqueryStmt* body) {
+    const CallSubqueryStmt::Branches& branches = body->branches();
+    const size_t dedupedBranches = body->getDedupedBranchCount();
+    mlir::Block* const outerBlock = _opBuilder.getInsertionBlock();
+
+    SegmentTable table;
+    materializeTable(table);
+
+    mlir::Value distinctSet;
+    if (dedupedBranches > 0) {
+        distinctSet = _opBuilder.create<mlir::db::DistinctSet>(_opBuilder.getUnknownLoc()).getSet();
+    }
+
+    SubqueryBranchResults branchResults;
+    std::vector<llvm::SmallVector<PublishedColumn>> branchScopes(branches.size());
+    std::vector<CarriedEntities> importedEntities(branches.size());
+
+    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
+        llvm::SmallVector<mlir::Value> scanned;
+        scanTable(table, openSubqueryBranch(branchResults), scanned);
+
+        collectSubqueryBranchScope(branches[branchIndex],
+                                   table._rowColumns,
+                                   scanned,
+                                   mlir::Value(),
+                                   table._constants,
+                                   /*bindsHidden=*/false,
+                                   branchScopes[branchIndex],
+                                   importedEntities[branchIndex]);
+    }
+
+    std::unordered_set<std::string_view> outerImportedCSVRows;
+    std::swap(_importedCSVRows, outerImportedCSVRows);
+
+    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
+        rebindSubqueryBranchScope(branchScopes[branchIndex], importedEntities[branchIndex]);
+
+        mlir::Block* const block = &branchResults._regions[branchIndex]->front();
+        generateSubqueryBranch(branches[branchIndex]._query, block, outerBlock, branchResults);
+    }
+
+    llvm::SmallVector<PublishedColumn> yielded;
+    CarriedEntities returnedEntities;
+    generateUnionOverBranches(distinctSet, dedupedBranches, outerBlock, branchResults, yielded, returnedEntities);
+
+    std::swap(_importedCSVRows, outerImportedCSVRows);
+
+    rebindScope(yielded);
+    bindReturnedEntities(returnedEntities);
+}
+
+// What a branch returns replaces the row, so a name the row held and the branch returns
+// again is bound afresh rather than beside the input it came from
+void DBProgramGenerator::generateConditionalSegment(const CallSubqueryStmt* body) {
+    SubqueryResults results;
+    emitCallSubquery(body, results);
+
+    rebindScope(results._returned);
+    bindReturnedEntities(results._returnedEntities);
+}
+
+// The segment after this one starts from a single row, so this one is the body of a
+// CALL () run once over that row, reading the table it is handed through a scan
+void DBProgramGenerator::generateUpdatingSegment(const NextSegmentStmt* segment) {
+    const CallSubqueryStmt* body = segment->getBody();
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    mlir::Block* const outerBlock = _opBuilder.getInsertionBlock();
+
+    SegmentTable table;
+    materializeTable(table);
+
+    mlir::Region bodyRegion;
+    mlir::Block* const bodyBlock = new mlir::Block(); // Region destructor frees it
+    bodyRegion.push_back(bodyBlock);
+
+    llvm::SmallVector<mlir::Value> scanned;
+    scanTable(table, bodyBlock, scanned);
+
+    std::unordered_set<std::string_view> outerImportedCSVRows;
+    std::swap(_importedCSVRows, outerImportedCSVRows);
+
+    if (body->isConditional()) {
+        llvm::SmallVector<PublishedColumn> scope;
+        for (size_t columnIndex = 0; columnIndex < scanned.size(); columnIndex++) {
+            const PublishedColumn& rowColumn = table._rowColumns[columnIndex];
+            scope.push_back({rowColumn._decl, rowColumn._name, scanned[columnIndex]});
+        }
+
+        scope.append(table._constants.begin(), table._constants.end());
+
+        _opBuilder.setInsertionPointToEnd(bodyBlock);
+        rebindScopeKeepingWrittenEntities(scope);
+
+        SubqueryResults results;
+        emitCallSubquery(body, results);
+    } else {
+        const CallSubqueryStmt::Branch& branch = body->branches().front();
+
+        llvm::SmallVector<PublishedColumn> scope;
+        CarriedEntities importedEntities;
+        collectSubqueryBranchScope(branch,
+                                   table._rowColumns,
+                                   scanned,
+                                   mlir::Value(),
+                                   table._constants,
+                                   /*bindsHidden=*/false,
+                                   scope,
+                                   importedEntities);
+
+        _opBuilder.setInsertionPointToEnd(bodyBlock);
+        rebindSubqueryBranchScope(scope, importedEntities);
+        generateQueryParts(branch._query);
+    }
+
+    _opBuilder.create<mlir::db::SubqueryYield>(loc, mlir::Value(), mlir::ValueRange {});
+
+    std::swap(_importedCSVRows, outerImportedCSVRows);
+
+    _opBuilder.setInsertionPointToEnd(outerBlock);
+
+    mlir::db::CallSubquery callOp = _opBuilder.create<mlir::db::CallSubquery>(loc,
+                                                                             mlir::TypeRange {},
+                                                                             mlir::ValueRange {},
+                                                                             /*unit=*/true,
+                                                                             /*carriesScope=*/false,
+                                                                             /*optional=*/false);
+    callOp.getBody().takeBody(bodyRegion);
+
+    llvm::SmallVector<PublishedColumn> carried;
+    for (const VarDecl* decl : segment->getCarriedImports()) {
+        const std::string_view name = decl->getName();
+        const auto columnIt = std::ranges::find(_subqueryRowColumns, name, &PublishedColumn::_name);
+        bioassert(columnIt != _subqueryRowColumns.end(), "Import '{}' of no CALL row", name);
+
+        carried.push_back({decl, std::string(name), columnIt->_column});
+    }
+
+    rebindScope(carried);
+}
+
+void DBProgramGenerator::materializeTable(SegmentTable& table) {
+    llvm::SmallVector<PublishedColumn> scopeColumns;
+    collectPublishedColumns(scopeColumns);
+
+    splitConstantColumns(scopeColumns, table._rowColumns, table._constants);
+
+    if (table._rowColumns.empty()) {
+        return;
+    }
+
+    llvm::SmallVector<mlir::Value> rowColumns;
+    for (const PublishedColumn& rowColumn : table._rowColumns) {
+        rowColumns.push_back(rowColumn._column);
+    }
+
+    const mlir::db::MaterializedType rowsType = mlir::db::MaterializedType::get(_mlirCtxt);
+    table._rows = _opBuilder.create<mlir::db::Materialize>(_opBuilder.getUnknownLoc(), rowsType, rowColumns).getRows();
+}
+
+void DBProgramGenerator::scanTable(const SegmentTable& table,
+                                   mlir::Block* block,
+                                   llvm::SmallVectorImpl<mlir::Value>& scanned) {
+    if (!table._rows) {
+        return;
+    }
+
+    llvm::SmallVector<mlir::Type> columnTypes;
+    for (const PublishedColumn& rowColumn : table._rowColumns) {
+        columnTypes.push_back(rowColumn._column.getType());
+    }
+
+    _opBuilder.setInsertionPointToStart(block);
+    mlir::db::ScanMaterialized scan = _opBuilder.create<mlir::db::ScanMaterialized>(_opBuilder.getUnknownLoc(),
+                                                                                   columnTypes,
+                                                                                   table._rows);
+
+    const mlir::ResultRange columns = scan.getColumns();
+    scanned.assign(columns.begin(), columns.end());
+}
+
+void DBProgramGenerator::bindReturnedEntities(CarriedEntities& returnedEntities) {
+    for (auto& [decl, written] : returnedEntities) {
+        _part._writtenEntities[decl] = std::move(written);
+    }
+}
+
+void DBProgramGenerator::splitConstantColumns(llvm::ArrayRef<PublishedColumn> columns,
+                                              llvm::SmallVectorImpl<PublishedColumn>& rowColumns,
+                                              llvm::SmallVectorImpl<PublishedColumn>& constants) {
+    for (const PublishedColumn& column : columns) {
+        if (yieldsConstantColumn(column._column, _constantColumns)) {
+            constants.push_back(column);
+        } else {
+            rowColumns.push_back(column);
+        }
+    }
+}
+
+void DBProgramGenerator::emitCallSubquery(const CallSubqueryStmt* subquery, SubqueryResults& results) {
+    const CallSubqueryStmt::Branches& branches = subquery->branches();
+    const bool returning = subquery->isReturning();
+    const bool optional = returning && subquery->isOptional();
+    const bool conditional = subquery->isConditional();
+    const bool isUnion = subquery->isUnion();
+
+    // A UNION dedups the rows of each input row on their own, and a WHEN decides per input
+    // row which branch runs, so either body runs one input row at a time
+    const bool runsPerRow = isUnion || conditional;
+    const bool carriesScope = !runsPerRow && subqueryCarriesRows(branches.front()._query);
+
+    llvm::SmallVector<PublishedColumn> scopeColumns;
+    collectPublishedColumns(scopeColumns);
+
+    // A constant holds one value standing for every row rather than rows of its own, so it
+    // is no input of the body: an imported one is read where it is bound
+    llvm::SmallVector<PublishedColumn> inputs;
+    llvm::SmallVector<PublishedColumn> constants;
+    splitConstantColumns(scopeColumns, inputs, constants);
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    mlir::Block* const outerBlock = _opBuilder.getInsertionBlock();
+
+    // Built into a scratch region: the op's results are the columns the body turns out to
+    // yield, which is known only once it is generated
+    mlir::Region bodyRegion;
+    mlir::Block* const bodyBlock = new mlir::Block(); // Region destructor frees it
+    bodyRegion.push_back(bodyBlock);
+
+    llvm::SmallVector<mlir::Value> inputColumns;
+    llvm::SmallVector<mlir::Value> inputArguments;
+
+    for (const PublishedColumn& input : inputs) {
+        inputColumns.push_back(input._column);
+        inputArguments.push_back(bodyBlock->addArgument(input._column.getType(), loc));
+    }
+
+    // An optional body carrying the scope carries the row tag with it, so the rows it
+    // yields are known against the rows it was given; no input row means no row to tag
+    const bool tagsRows = optional && carriesScope && !inputs.empty();
+    mlir::Value tagArgument;
+    if (tagsRows) {
+        const mlir::db::ColumnType tagType = allocColumnType(_opBuilder.getIntegerType(64, /*isSigned=*/false));
+        tagArgument = bodyBlock->addArgument(tagType, loc);
+    }
+
+    std::vector<llvm::SmallVector<PublishedColumn>> branchScopes(branches.size());
+    std::vector<CarriedEntities> importedEntities(branches.size());
+
+    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
+        collectSubqueryBranchScope(branches[branchIndex],
+                                   inputs,
+                                   inputArguments,
+                                   tagArgument,
+                                   constants,
+                                   carriesScope,
+                                   branchScopes[branchIndex],
+                                   importedEntities[branchIndex]);
+    }
+
+    // What the query holds is set aside while the body builds a scope of its own. A unit
+    // body leaves the rows as they were, so it all comes back; a returning body's results
+    // are bound afresh under the declarations the inputs and the RETURN carry
+    PartScope outerPart = std::move(_part);
+    VariableDependencyGraph outerGraph = std::move(_vdg);
+
+    std::unordered_set<std::string_view> outerImportedCSVRows;
+    std::swap(_importedCSVRows, outerImportedCSVRows);
+
+    llvm::SmallVector<PublishedColumn> rowColumns(constants.begin(), constants.end());
+    for (size_t inputIndex = 0; inputIndex < inputs.size(); inputIndex++) {
+        const PublishedColumn& input = inputs[inputIndex];
+        rowColumns.push_back({input._decl, input._name, inputArguments[inputIndex]});
+    }
+
+    std::swap(_subqueryRowColumns, rowColumns);
+
+    _opBuilder.setInsertionPointToStart(bodyBlock);
+
+    llvm::SmallVector<PublishedColumn> yielded;
+    CarriedEntities returnedEntities;
+    mlir::Value yieldedTag;
+
+    if (conditional) {
+        generateSubqueryConditional(branches, branchScopes, importedEntities, yielded, returnedEntities);
+    } else if (isUnion) {
+        llvm::SmallVector<const SinglePartQuery*> queries;
+        for (const CallSubqueryStmt::Branch& branch : branches) {
+            queries.push_back(branch._query);
+        }
+
+        generateSubqueryUnion(queries,
+                              subquery->getDedupedBranchCount(),
+                              branchScopes,
+                              importedEntities,
+                              yielded,
+                              returnedEntities);
+    } else {
+        const SinglePartQuery* body = branches.front()._query;
+
+        rebindSubqueryBranchScope(branchScopes.front(), importedEntities.front());
+
+        generateQueryParts(body);
+
+        if (returning) {
+            publishProjection(body->getReturnStmt()->getProjection(), nullptr, true);
+
+            llvm::SmallVector<PublishedColumn> bodyColumns;
+            collectPublishedColumns(bodyColumns);
+
+            if (tagsRows) {
+                const auto tagIt = std::ranges::find(bodyColumns, subqueryTagName, &PublishedColumn::_name);
+                bioassert(tagIt != bodyColumns.end(), "Row tag lost by a CALL subquery body");
+
+                yieldedTag = tagIt->_column;
+            }
+
+            if (carriesScope) {
+                for (const PublishedColumn& input : inputs) {
+                    const std::string hidden = hiddenName(input._name);
+                    const auto foundIt = std::ranges::find(bodyColumns, hidden, &PublishedColumn::_name);
+                    bioassert(foundIt != bodyColumns.end(), "Column '{}' lost by a CALL subquery body", input._name);
+
+                    yielded.push_back({input._decl, input._name, foundIt->_column});
+                }
+            }
+
+            for (const PublishedColumn& column : bodyColumns) {
+                if (isHiddenName(column._name)) {
+                    continue;
                 }
 
-                bioassert(edgeData && !edgeData->edgeTypeConstraints().empty(),
-                          "CREATE edge must have an edge type");
-                const std::string_view edgeType = edgeData->edgeTypeConstraints().front();
+                yielded.push_back(column);
 
-                const mlir::Value srcValue =
-                    edge->getDirection() == EdgePattern::Direction::Backward ? rhsValue : lhsValue;
-                const mlir::Value tgtValue =
-                    edge->getDirection() == EdgePattern::Direction::Backward ? lhsValue : rhsValue;
+                if (const PartScope::WrittenEntity* written = findWrittenEntity(column._decl)) {
+                    returnedEntities.emplace_back(column._decl, *written);
+                }
+            }
+        }
+    }
 
-                _opBuilder.create<mlir::db::CreateEdge>(
-                    loc,
-                    edgeIDType,
-                    srcValue,
-                    tgtValue,
-                    _opBuilder.getStringAttr(edgeType),
-                    _opBuilder.getStrArrayAttr(propNames),
-                    mlir::ValueRange{propValues});
+    llvm::SmallVector<mlir::Value> yieldedColumns;
+    for (const PublishedColumn& column : yielded) {
+        yieldedColumns.push_back(column._column);
+    }
 
-                lhsValue = rhsValue;
+    _opBuilder.create<mlir::db::SubqueryYield>(loc, yieldedTag, yieldedColumns);
+
+    // The results stand for the inputs then the body's own columns: the yield holds both
+    // when the body carries the scope, its own alone otherwise
+    llvm::SmallVector<mlir::Type> resultTypes;
+    if (returning && !carriesScope) {
+        for (const mlir::Value column : inputColumns) {
+            resultTypes.push_back(column.getType());
+        }
+    }
+
+    for (const mlir::Value column : yieldedColumns) {
+        resultTypes.push_back(column.getType());
+    }
+
+    _opBuilder.setInsertionPointToEnd(outerBlock);
+
+    auto callOp = _opBuilder.create<mlir::db::CallSubquery>(loc,
+                                                           resultTypes,
+                                                           inputColumns,
+                                                           /*unit=*/!returning,
+                                                           carriesScope,
+                                                           optional);
+    callOp.getBody().takeBody(bodyRegion);
+
+    _part = std::move(outerPart);
+    _vdg = std::move(outerGraph);
+
+    std::swap(_importedCSVRows, outerImportedCSVRows);
+    std::swap(_subqueryRowColumns, rowColumns);
+
+    if (!returning) {
+        return;
+    }
+
+    const mlir::ResultRange callResults = callOp.getResults();
+    size_t resultIndex = 0;
+
+    if (!carriesScope) {
+        for (const PublishedColumn& input : inputs) {
+            results._inputs.push_back({input._decl, input._name, callResults[resultIndex]});
+            resultIndex++;
+        }
+    }
+
+    // A body carrying the scope yields the inputs ahead of its own columns
+    for (size_t yieldedIndex = 0; yieldedIndex < yielded.size(); yieldedIndex++) {
+        const PublishedColumn& column = yielded[yieldedIndex];
+        const PublishedColumn bound {column._decl, column._name, callResults[resultIndex]};
+        resultIndex++;
+
+        if (carriesScope && yieldedIndex < inputs.size()) {
+            results._inputs.push_back(bound);
+        } else {
+            results._returned.push_back(bound);
+        }
+    }
+
+    results._constants.assign(constants.begin(), constants.end());
+
+    for (auto& [decl, written] : returnedEntities) {
+        if (optional) {
+            written._labels.clear();
+            written._edgeType.clear();
+        }
+    }
+
+    results._returnedEntities = std::move(returnedEntities);
+}
+
+void DBProgramGenerator::collectSubqueryBranchScope(const CallSubqueryStmt::Branch& branch,
+                                                    llvm::ArrayRef<PublishedColumn> inputs,
+                                                    llvm::ArrayRef<mlir::Value> inputArguments,
+                                                    mlir::Value tagArgument,
+                                                    llvm::ArrayRef<PublishedColumn> constants,
+                                                    bool bindsHidden,
+                                                    llvm::SmallVectorImpl<PublishedColumn>& scope,
+                                                    CarriedEntities& importedEntities) const {
+    const std::vector<const VarDecl*>& importDecls = branch._importDecls;
+
+    const auto importedDecl = [&importDecls](std::string_view name) -> const VarDecl* {
+        const auto importIt = std::ranges::find(importDecls, name, &VarDecl::getName);
+
+        return importIt != importDecls.end() ? *importIt : nullptr;
+    };
+
+    // The body reads an import under the declaration the analyzer bound it to. A body
+    // carrying the scope holds every input under a hidden name too, so the input comes back
+    // as the body's rows left it whatever its clauses publish, and a write reading no import
+    // still has rows to write one of per. A body run per row reads the row it is handed.
+    for (size_t inputIndex = 0; inputIndex < inputs.size(); inputIndex++) {
+        const PublishedColumn& input = inputs[inputIndex];
+        const mlir::Value argument = inputArguments[inputIndex];
+
+        if (const VarDecl* imported = importedDecl(input._name)) {
+            scope.push_back({imported, input._name, argument});
+
+            if (const PartScope::WrittenEntity* written = findWrittenEntity(input._decl)) {
+                importedEntities.emplace_back(imported, *written);
+            }
+        }
+
+        const std::string_view fieldRow = findCSVFieldRow(input._decl);
+        if (!fieldRow.empty() && importedDecl(fieldRow)) {
+            scope.push_back({input._decl, input._name, argument});
+        }
+
+        const std::string_view inputName = input._name;
+        const bool masksAnImport = inputName.starts_with(pendingMaskPrefix)
+                                && importedDecl(inputName.substr(pendingMaskPrefix.size()));
+        if (masksAnImport) {
+            scope.push_back({nullptr, input._name, argument});
+        }
+
+        if (bindsHidden) {
+            scope.push_back({nullptr, hiddenName(input._name), argument});
+        }
+    }
+
+    if (tagArgument) {
+        scope.push_back({nullptr, std::string(subqueryTagName), tagArgument});
+    }
+
+    for (const PublishedColumn& constant : constants) {
+        if (const VarDecl* imported = importedDecl(constant._name)) {
+            scope.push_back({imported, constant._name, constant._column});
+        }
+    }
+}
+
+// Each branch is generated into a region of its own under the imports it names, as the
+// branches of a top-level UNION are. Every branch publishes its columns under the
+// declarations the analyzer gave the first one, so they come out in the same order.
+void DBProgramGenerator::generateSubqueryUnion(llvm::ArrayRef<const SinglePartQuery*> branches,
+                                               size_t dedupedBranches,
+                                               std::span<const llvm::SmallVector<PublishedColumn>> branchScopes,
+                                               std::span<const CarriedEntities> importedEntities,
+                                               llvm::SmallVectorImpl<PublishedColumn>& yielded,
+                                               CarriedEntities& returnedEntities) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    mlir::Block* const bodyBlock = _opBuilder.getInsertionBlock();
+
+    mlir::Value distinctSet;
+    if (dedupedBranches > 0) {
+        distinctSet = _opBuilder.create<mlir::db::DistinctSet>(loc).getSet();
+    }
+
+    SubqueryBranchResults branchResults;
+
+    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
+        rebindSubqueryBranchScope(branchScopes[branchIndex], importedEntities[branchIndex]);
+        generateSubqueryBranch(branches[branchIndex], openSubqueryBranch(branchResults), bodyBlock, branchResults);
+    }
+
+    generateUnionOverBranches(distinctSet, dedupedBranches, bodyBlock, branchResults, yielded, returnedEntities);
+}
+
+void DBProgramGenerator::generateUnionOverBranches(mlir::Value distinctSet,
+                                                   size_t dedupedBranches,
+                                                   mlir::Block* bodyBlock,
+                                                   SubqueryBranchResults& branchResults,
+                                                   llvm::SmallVectorImpl<PublishedColumn>& yielded,
+                                                   CarriedEntities& returnedEntities) {
+    const size_t branchCount = branchResults._regions.size();
+
+    yieldEveryPendingMask(branchResults);
+
+    // The branches share one distinct set, so each dedups on the same columns: its masks
+    // included, once every branch yields them all
+    for (size_t branchIndex = 0; branchIndex < dedupedBranches; branchIndex++) {
+        dedupSubqueryBranch(distinctSet, branchIndex, branchResults);
+    }
+
+    typeSubqueryBranchResults(branchResults);
+
+    _opBuilder.setInsertionPointToEnd(bodyBlock);
+
+    mlir::db::Union unionOp = _opBuilder.create<mlir::db::Union>(_opBuilder.getUnknownLoc(),
+                                                                 branchResults._resultTypes,
+                                                                 branchCount);
+    const mlir::MutableArrayRef<mlir::Region> unionBranches = unionOp.getBranches();
+
+    for (size_t branchIndex = 0; branchIndex < branchCount; branchIndex++) {
+        unionBranches[branchIndex].takeBody(*branchResults._regions[branchIndex]);
+    }
+
+    publishSubqueryBranchResults(unionOp.getResults(), branchResults, yielded, returnedEntities);
+}
+
+void DBProgramGenerator::generateSubqueryConditional(llvm::ArrayRef<CallSubqueryStmt::Branch> branches,
+                                                     std::span<const llvm::SmallVector<PublishedColumn>> branchScopes,
+                                                     std::span<const CarriedEntities> importedEntities,
+                                                     llvm::SmallVectorImpl<PublishedColumn>& yielded,
+                                                     CarriedEntities& returnedEntities) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    mlir::Block* const bodyBlock = _opBuilder.getInsertionBlock();
+
+    std::vector<std::unique_ptr<mlir::Region>> conditionRegions;
+    SubqueryBranchResults branchResults;
+
+    // A condition's region does not dominate its branch's, so the branch rebinds the scope
+    // rather than read a value the condition bound
+    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
+        const CallSubqueryStmt::Branch& branch = branches[branchIndex];
+        const llvm::SmallVector<PublishedColumn>& scope = branchScopes[branchIndex];
+        const CarriedEntities& entities = importedEntities[branchIndex];
+
+        if (const Expr* predicate = branch._condition) {
+            rebindSubqueryBranchScope(scope, entities);
+            generateConditionRegion(predicate, bodyBlock, conditionRegions);
+        }
+
+        rebindSubqueryBranchScope(scope, entities);
+        generateSubqueryBranch(branch._query, openSubqueryBranch(branchResults), bodyBlock, branchResults);
+    }
+
+    yieldEveryPendingMask(branchResults);
+    typeSubqueryBranchResults(branchResults);
+
+    _opBuilder.setInsertionPointToEnd(bodyBlock);
+
+    const size_t regionCount = conditionRegions.size() + branches.size();
+    mlir::db::Conditional conditional = _opBuilder.create<mlir::db::Conditional>(loc,
+                                                                                 branchResults._resultTypes,
+                                                                                 regionCount);
+    const mlir::MutableArrayRef<mlir::Region> regions = conditional.getBranches();
+
+    size_t regionIndex = 0;
+    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
+        if (branchIndex < conditionRegions.size()) {
+            regions[regionIndex].takeBody(*conditionRegions[branchIndex]);
+            regionIndex++;
+        }
+
+        regions[regionIndex].takeBody(*branchResults._regions[branchIndex]);
+        regionIndex++;
+    }
+
+    publishSubqueryBranchResults(conditional.getResults(), branchResults, yielded, returnedEntities);
+}
+
+void DBProgramGenerator::generateConditionRegion(const Expr* predicate,
+                                                 mlir::Block* bodyBlock,
+                                                 std::vector<std::unique_ptr<mlir::Region>>& regions) {
+    std::unique_ptr<mlir::Region>& region = regions.emplace_back(std::make_unique<mlir::Region>());
+    mlir::Block* const block = new mlir::Block(); // Region destructor frees it
+    region->push_back(block);
+
+    _unionBranchRowBlocks[block] = bodyBlock;
+
+    _opBuilder.setInsertionPointToStart(block);
+    translateExpr(predicate);
+
+    const mlir::Value condition = _part._exprMap.at(predicate);
+    _opBuilder.create<mlir::db::Yield>(_opBuilder.getUnknownLoc(), mlir::ValueRange {condition});
+
+    _unionBranchRowBlocks.erase(block);
+}
+
+void DBProgramGenerator::rebindSubqueryBranchScope(llvm::ArrayRef<PublishedColumn> scope,
+                                                   const CarriedEntities& importedEntities) {
+    rebindScope(scope);
+
+    for (const auto& [decl, written] : importedEntities) {
+        _part._writtenEntities[decl] = written;
+    }
+
+    _importedCSVRows.clear();
+
+    for (const PublishedColumn& column : scope) {
+        const VarDecl* decl = column._decl;
+        const std::string_view fieldRow = findCSVFieldRow(decl);
+
+        if (!fieldRow.empty()) {
+            _importedCSVRows.insert(fieldRow);
+        } else if (decl && decl->getType() == EvaluatedType::StringTable) {
+            _importedCSVRows.insert(decl->getName());
+        }
+    }
+}
+
+mlir::Block* DBProgramGenerator::openSubqueryBranch(SubqueryBranchResults& branchResults) {
+    std::unique_ptr<mlir::Region>& region = branchResults._regions.emplace_back(std::make_unique<mlir::Region>());
+    mlir::Block* const block = new mlir::Block(); // Region destructor frees it
+    region->push_back(block);
+
+    return block;
+}
+
+void DBProgramGenerator::generateSubqueryBranch(const SinglePartQuery* query,
+                                                mlir::Block* block,
+                                                mlir::Block* bodyBlock,
+                                                SubqueryBranchResults& branchResults) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    _unionBranchRowBlocks[block] = bodyBlock;
+
+    _opBuilder.setInsertionPointToEnd(block);
+    generateQueryParts(query);
+
+    llvm::SmallVector<PublishedColumn>& branchColumns = branchResults._branchColumns.emplace_back();
+    if (const ReturnStmt* returnStmt = query->getReturnStmt()) {
+        publishProjection(returnStmt->getProjection(), nullptr, true);
+        collectPublishedColumns(branchColumns);
+    }
+
+    std::vector<std::optional<PartScope::WrittenEntity>>& writtenColumns = branchResults._writtenColumns.emplace_back();
+
+    llvm::SmallVector<mlir::Value> projected;
+    for (const PublishedColumn& column : branchColumns) {
+        projected.push_back(column._column);
+
+        std::optional<PartScope::WrittenEntity>& written = writtenColumns.emplace_back();
+        if (const PartScope::WrittenEntity* entity = findWrittenEntity(column._decl)) {
+            written = *entity;
+        }
+    }
+
+    _opBuilder.create<mlir::db::Yield>(loc, mlir::ValueRange {projected});
+    _unionBranchRowBlocks.erase(block);
+}
+
+void DBProgramGenerator::dedupSubqueryBranch(mlir::Value distinctSet,
+                                             size_t branchIndex,
+                                             SubqueryBranchResults& branchResults) {
+    mlir::db::Yield yield = mlir::cast<mlir::db::Yield>(branchResults._regions[branchIndex]->front().back());
+    _opBuilder.setInsertionPoint(yield);
+
+    const mlir::OperandRange columns = yield.getColumns();
+    llvm::SmallVector<mlir::Value> projected(columns.begin(), columns.end());
+    dedupUnionBranch(distinctSet, projected);
+
+    yield->setOperands(projected);
+
+    llvm::SmallVector<PublishedColumn>& branchColumns = branchResults._branchColumns[branchIndex];
+    for (size_t columnIndex = 0; columnIndex < projected.size(); columnIndex++) {
+        branchColumns[columnIndex]._column = projected[columnIndex];
+    }
+}
+
+void DBProgramGenerator::yieldEveryPendingMask(SubqueryBranchResults& branchResults) {
+    std::vector<llvm::SmallVector<PublishedColumn>>& allBranchColumns = branchResults._branchColumns;
+    std::vector<std::vector<std::optional<PartScope::WrittenEntity>>>& allWrittenColumns = branchResults._writtenColumns;
+    const size_t branchCount = branchResults._regions.size();
+
+    // A column one branch created and another did not is told apart row by row: every
+    // row of a branch that created it is pending
+    std::vector<std::string> partlyWritten;
+    for (const PublishedColumn& column : allBranchColumns.front()) {
+        size_t writtenCount = 0;
+        for (size_t branchIndex = 0; branchIndex < branchCount; branchIndex++) {
+            const llvm::SmallVector<PublishedColumn>& branchColumns = allBranchColumns[branchIndex];
+            const auto columnIt = std::ranges::find(branchColumns, column._name, &PublishedColumn::_name);
+
+            const bool written = columnIt != branchColumns.end()
+                              && allWrittenColumns[branchIndex][columnIt - branchColumns.begin()];
+            if (written) {
+                writtenCount++;
+            }
+        }
+
+        if (writtenCount != 0 && writtenCount != branchCount) {
+            partlyWritten.push_back(column._name);
+        }
+    }
+
+    for (size_t branchIndex = 0; branchIndex < branchCount; branchIndex++) {
+        llvm::SmallVector<PublishedColumn>& branchColumns = allBranchColumns[branchIndex];
+        std::vector<std::optional<PartScope::WrittenEntity>>& writtenColumns = allWrittenColumns[branchIndex];
+
+        _opBuilder.setInsertionPoint(&branchResults._regions[branchIndex]->front().back());
+
+        for (const std::string& name : partlyWritten) {
+            const auto columnIt = std::ranges::find(branchColumns, name, &PublishedColumn::_name);
+            bioassert(columnIt != branchColumns.end(), "Column '{}' missing from a subquery branch", name);
+
+            std::optional<PartScope::WrittenEntity>& written = writtenColumns[columnIt - branchColumns.begin()];
+            if (!written) {
+                continue;
+            }
+
+            written.reset();
+
+            branchColumns.push_back({nullptr, pendingMaskName(name), constantBool(true)});
+            writtenColumns.emplace_back();
+        }
+    }
+
+    std::vector<std::string> names;
+    for (const llvm::SmallVector<PublishedColumn>& branchColumns : allBranchColumns) {
+        for (const PublishedColumn& column : branchColumns) {
+            if (!llvm::is_contained(names, column._name)) {
+                names.push_back(column._name);
+            }
+        }
+    }
+
+    std::ranges::sort(names);
+
+    for (size_t branchIndex = 0; branchIndex < branchCount; branchIndex++) {
+        llvm::SmallVector<PublishedColumn>& branchColumns = allBranchColumns[branchIndex];
+        std::vector<std::optional<PartScope::WrittenEntity>>& writtenColumns = allWrittenColumns[branchIndex];
+
+        mlir::db::Yield yield = mlir::cast<mlir::db::Yield>(branchResults._regions[branchIndex]->front().back());
+        _opBuilder.setInsertionPoint(yield);
+
+        llvm::SmallVector<PublishedColumn> alignedColumns;
+        std::vector<std::optional<PartScope::WrittenEntity>> alignedWritten;
+
+        for (const std::string& name : names) {
+            const auto columnIt = std::ranges::find(branchColumns, name, &PublishedColumn::_name);
+            if (columnIt != branchColumns.end()) {
+                alignedColumns.push_back(*columnIt);
+                alignedWritten.push_back(writtenColumns[columnIt - branchColumns.begin()]);
+                continue;
+            }
+
+            bioassert(name.starts_with(pendingMaskPrefix), "Column '{}' missing from a subquery branch", name);
+
+            // None of the rows of a branch that did not write the entity is pending
+            alignedColumns.push_back({nullptr, name, constantBool(false)});
+            alignedWritten.emplace_back();
+        }
+
+        llvm::SmallVector<mlir::Value> projected;
+        for (const PublishedColumn& column : alignedColumns) {
+            projected.push_back(column._column);
+        }
+
+        yield->setOperands(projected);
+
+        branchColumns = std::move(alignedColumns);
+        writtenColumns = std::move(alignedWritten);
+    }
+}
+
+void DBProgramGenerator::typeSubqueryBranchResults(SubqueryBranchResults& branchResults) {
+    llvm::SmallVector<mlir::Type>& resultTypes = branchResults._resultTypes;
+    for (const PublishedColumn& column : branchResults._branchColumns.front()) {
+        resultTypes.push_back(column._column.getType());
+    }
+
+    // A null or a property names no element type until lowering resolves it, so the
+    // first branch that names one types the result
+    for (const llvm::SmallVector<PublishedColumn>& branchColumns : branchResults._branchColumns) {
+        for (size_t columnIndex = 0; columnIndex < branchColumns.size(); columnIndex++) {
+            const mlir::db::ColumnType resultType = mlir::cast<mlir::db::ColumnType>(resultTypes[columnIndex]);
+            if (mlir::isa<mlir::NoneType>(resultType.getType())) {
+                resultTypes[columnIndex] = branchColumns[columnIndex]._column.getType();
             }
         }
     }
 }
 
-void DBProgramGenerator::generateOutput(const CypherAST* ast) {
-    const CypherAST::QueryCommands& queries = ast->queries();
-    if (queries.size() != 1) {
-        throw TuringException("Multiple queries not yet supported.");
-    };
+void DBProgramGenerator::publishSubqueryBranchResults(mlir::ResultRange results,
+                                                      const SubqueryBranchResults& branchResults,
+                                                      llvm::SmallVectorImpl<PublishedColumn>& yielded,
+                                                      CarriedEntities& returnedEntities) {
+    const llvm::SmallVector<PublishedColumn>& resultColumns = branchResults._branchColumns.front();
+    const std::vector<std::vector<std::optional<PartScope::WrittenEntity>>>& writtenColumns = branchResults._writtenColumns;
 
-    const QueryCommand* query = queries.front();
+    for (size_t columnIndex = 0; columnIndex < resultColumns.size(); columnIndex++) {
+        const PublishedColumn& column = resultColumns[columnIndex];
+        yielded.push_back({column._decl, column._name, results[columnIndex]});
 
-    const SinglePartQuery* sglPart = dynamic_cast<const SinglePartQuery*>(query);
-    if (!sglPart) {
-        throw TuringException("Non-single part queries are not yet supported.");
+        // A read of what the query wrote goes to the write buffer for every row of the
+        // column or for none, so every branch has to have written it
+        std::optional<PartScope::WrittenEntity> returned = writtenColumns.front()[columnIndex];
+
+        for (const std::vector<std::optional<PartScope::WrittenEntity>>& branchWritten : writtenColumns) {
+            const std::optional<PartScope::WrittenEntity>& written = branchWritten[columnIndex];
+
+            if (written.has_value() != returned.has_value()) {
+                throwError(fmt::format("Column '{}' of a CALL subquery holds what one branch "
+                                       "created and another did not, which is not supported",
+                                       column._name));
+            }
+
+            const bool sameTypes = !written || *written == *returned;
+            if (!sameTypes) {
+                returned->_labels.clear();
+                returned->_edgeType.clear();
+            }
+        }
+
+        if (returned) {
+            returnedEntities.emplace_back(column._decl, *returned);
+        }
+    }
+}
+
+void DBProgramGenerator::appendHiddenColumns(llvm::SmallVectorImpl<PublishedColumn>& published) const {
+    forEachVariableColumn([&published](const VarDecl* decl, std::string_view name, mlir::Value column) {
+        if (!isHiddenName(name)) {
+            return;
+        }
+
+        const auto foundIt = std::ranges::find(published, name, &PublishedColumn::_name);
+        if (foundIt != published.end()) {
+            foundIt->_column = column;
+            return;
+        }
+
+        published.push_back({decl, std::string(name), column});
+    });
+}
+
+void DBProgramGenerator::generateOptionalMatch(std::span<Stmt* const> stmt) {
+    const MatchStmt* matchStmt = static_cast<const MatchStmt*>(stmt.front());
+
+    throwOnMatchOverWrittenEntity(matchStmt, "An OPTIONAL MATCH");
+
+    llvm::SmallVector<PublishedColumn> scopeColumns;
+    collectPublishedColumns(scopeColumns);
+
+    // A constant holds one value standing for every row rather than rows of its own, so it
+    // is no row of this join: it stays bound where it is and the pattern reads it there
+    llvm::SmallVector<PublishedColumn> inputs;
+    llvm::SmallVector<PublishedColumn> constants;
+
+    for (const PublishedColumn& column : scopeColumns) {
+        if (yieldsConstantColumn(column._column, _constantColumns)) {
+            constants.push_back(column);
+        } else {
+            inputs.push_back(column);
+        }
     }
 
-    const ReturnStmt* rtn = sglPart->getReturnStmt();
-    if (!rtn) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    mlir::Block* const outerBlock = _opBuilder.getInsertionBlock();
+
+    // Built into a scratch region: the op's results are the columns the pattern turns out
+    // to yield, which is known only once it is generated
+    mlir::Region pattern;
+    mlir::Block* const patternBlock = new mlir::Block(); // Region destructor frees it
+    pattern.push_back(patternBlock);
+
+    llvm::SmallVector<mlir::Value> inputColumns;
+    llvm::SmallVector<PublishedColumn> patternScope;
+    for (const PublishedColumn& input : inputs) {
+        inputColumns.push_back(input._column);
+        patternScope.push_back({input._decl, input._name, patternBlock->addArgument(input._column.getType(), loc)});
+    }
+
+    // No input column means no input row to tag: the rows the pattern joins onto are the
+    // single empty row the query starts from, which any match marks
+    const bool tagsRows = !inputs.empty();
+    mlir::Value tagArgument;
+    if (tagsRows) {
+        const mlir::db::ColumnType tagType = allocColumnType(_opBuilder.getIntegerType(64, /*isSigned=*/false));
+        tagArgument = patternBlock->addArgument(tagType, loc);
+    }
+
+    patternScope.append(constants.begin(), constants.end());
+
+    rebindScopeKeepingWrittenEntities(patternScope);
+
+    const VariableDependency* tagVariable = nullptr;
+    if (tagsRows) {
+        tagVariable = _vdg.registerBoundVariable(optionalTagName, nullptr);
+        registerValue(tagVariable, tagArgument);
+    }
+
+    _opBuilder.setInsertionPointToStart(patternBlock);
+    generatePart(stmt);
+
+    llvm::SmallVector<PublishedColumn> matched;
+    collectPublishedColumns(matched);
+
+    const auto findMatched = [&matched](std::string_view name) {
+        const auto foundIt = std::ranges::find(matched, name, &PublishedColumn::_name);
+        bioassert(foundIt != matched.end(), "Column '{}' lost by an OPTIONAL MATCH pattern", name);
+        return foundIt;
+    };
+
+    const auto boundOutside = [&inputs, &constants](std::string_view name) {
+        const auto sameName = [name](const PublishedColumn& candidate) {
+            return candidate._name == name;
+        };
+
+        return std::ranges::any_of(inputs, sameName) || std::ranges::any_of(constants, sameName);
+    };
+
+    // The columns the pattern contributes: the ones it joins onto first, in operand order,
+    // then the variables of its own - what a row it missed comes back with null
+    llvm::SmallVector<PublishedColumn> yielded;
+    for (const PublishedColumn& input : inputs) {
+        yielded.push_back(*findMatched(input._name));
+    }
+
+    // A handle into the path trie holds for the chunk that emitted it, and the accumulator
+    // keeps rows across chunks, so a walk's column goes in as the list or path it stands for
+    for (const PublishedColumn& column : matched) {
+        if (column._name == optionalTagName || boundOutside(column._name)) {
+            continue;
+        }
+
+        PublishedColumn padded = column;
+        padded._column = listColumnOf(column._decl, column._column);
+        yielded.push_back(padded);
+    }
+
+    llvm::SmallVector<mlir::Value> yieldedColumns;
+    llvm::SmallVector<mlir::Type> resultTypes;
+    for (const PublishedColumn& column : yielded) {
+        yieldedColumns.push_back(column._column);
+        resultTypes.push_back(column._column.getType());
+    }
+
+    const mlir::Value carriedTag = tagsRows ? _part._varMap.at(tagVariable).back() : mlir::Value();
+    _opBuilder.create<mlir::db::OptionalYield>(loc, carriedTag, yieldedColumns);
+
+    _opBuilder.setInsertionPointToEnd(outerBlock);
+
+    auto optionalMatch = _opBuilder.create<mlir::db::OptionalMatch>(loc, resultTypes, inputColumns);
+    optionalMatch.getPattern().takeBody(pattern);
+
+    llvm::SmallVector<PublishedColumn> published {yielded};
+    for (size_t index = 0; index < published.size(); index++) {
+        published[index]._column = optionalMatch.getResult(index);
+    }
+
+    published.append(constants.begin(), constants.end());
+
+    rebindScopeKeepingWrittenEntities(published);
+
+    // An OPTIONAL MATCH's cut reads the rows the join produced, the padded ones included
+    generateMatchOrderBy(matchStmt);
+    generateMatchWindow(matchStmt);
+}
+
+void DBProgramGenerator::broadcastConstantProjection(llvm::SmallVectorImpl<mlir::Value>& projected) {
+    const bool constantsAlone = std::ranges::all_of(projected, [this](mlir::Value column) {
+        return yieldsConstantColumn(column, _constantColumns);
+    });
+
+    if (!constantsAlone) {
         return;
     }
 
-    const Projection* proj = rtn->getProjection();
+    const mlir::Value driver = resolveRowCarryingColumn();
+    if (!driver) {
+        return;
+    }
 
-    const bool all = proj->isReturningAll();
-    // FIXME: Detect the unused MLIR vars and return those
-    bioassert(!all, "Returning all is not yet supported.");
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
 
-    const Projection::Items& returned = proj->items();
+    for (mlir::Value& column : projected) {
+        column = _opBuilder.create<mlir::db::BroadcastConstant>(loc, noneType, column, driver).getResult();
+    }
+}
 
-    std::unordered_map<std::string_view, mlir::Value> finalIdentities;
-    for (auto& [cypherVar, mlirCol] : _varMap) {
+void DBProgramGenerator::publishBoundColumns(const Projection* projection,
+                                             llvm::ArrayRef<llvm::StringRef> names,
+                                             llvm::ArrayRef<mlir::Value> columns,
+                                             llvm::ArrayRef<PublishedColumn> carriedColumns) {
+    bioassert(names.size() == columns.size(), "One name per column a WITH publishes expected");
+    bioassert(!names.empty(), "A WITH publishes at least one column");
+
+    // The barrier opens a scope of its own, so what follows it reads these columns through
+    // the declarations that scope holds and not through the ones the projected items carry
+    const Projection::PublishedDecls& publishedDecls = projection->publishedDecls();
+    bioassert(publishedDecls.size() == names.size(), "One declaration per column a WITH publishes expected");
+
+    const auto& items = projection->items();
+    bioassert(items.size() == names.size(), "One item per column a WITH publishes expected");
+
+    llvm::SmallVector<PublishedColumn> published;
+    auto itemIt = items.begin();
+    for (size_t index = 0; index < names.size(); index++) {
+        const llvm::StringRef name = names[index];
+
+        // A CSV row is read through the columns of its fields: the one standing for it
+        // only carries its rows, as the column a load publishes when no field is read
+        const VarDecl* decl = publishedDecls[index];
+        const VarDecl* boundDecl = decl->getType() == EvaluatedType::StringTable ? nullptr : decl;
+
+        const mlir::Value column = columnLeavingScope(declOfReturnItem(*itemIt), columns[index]);
+        published.push_back({boundDecl, std::string(name.data(), name.size()), column});
+        ++itemIt;
+    }
+
+    CarriedEntities carried;
+    carryWrittenEntities(projection, published, carried);
+
+    for (const PublishedColumn& carriedColumn : carriedColumns) {
+        if (const PartScope::WrittenEntity* written = findWrittenEntity(carriedColumn._decl)) {
+            carried.emplace_back(carriedColumn._decl, *written);
+        }
+    }
+
+    published.append(carriedColumns.begin(), carriedColumns.end());
+
+    appendHiddenColumns(published);
+
+    rebindScope(published);
+
+    for (auto& [decl, written] : carried) {
+        _part._writtenEntities[decl] = std::move(written);
+    }
+}
+
+void DBProgramGenerator::carryWrittenEntities(const Projection* projection,
+                                              llvm::ArrayRef<PublishedColumn> published,
+                                              CarriedEntities& carried) const {
+    size_t index = 0;
+    for (const Projection::ReturnItem& item : projection->items()) {
+        const VarDecl* decl = projectedVariable(item);
+
+        const PartScope::WrittenEntity* written = findWrittenEntity(decl);
+        if (written) {
+            carried.emplace_back(published[index]._decl, *written);
+        }
+
+        index++;
+    }
+}
+
+// A MERGE's rows mix the entities it wrote with the ones it bound, and only the mask beside
+// them says which is which. Without it the rows past the cut would all be read off the
+// graph - right for the rows the merge matched, wrong for the ones it wrote
+void DBProgramGenerator::throwOnPublishedMerge(const Projection* projection) const {
+    for (const Projection::ReturnItem& item : projection->items()) {
+        const VarDecl* decl = projectedVariable(item);
+        if (!findPendingMask(decl)) {
+            continue;
+        }
+
+        throwError(fmt::format("A subquery cannot return '{}': a MERGE in the same query writes it, "
+                               "and what a MERGE writes is not carried out of a COUNT subquery",
+                               decl->getName()),
+                   projection);
+    }
+}
+
+// An optional pattern reads the graph, which holds nothing this change wrote until the
+// commit. A pattern naming such an entity is turned away; one that only carries it past the
+// join is not, because the join hands its input columns back unchanged
+void DBProgramGenerator::throwOnMatchOverWrittenEntity(const MatchStmt* matchStmt,
+                                                       std::string_view clause) const {
+    const Pattern* pattern = matchStmt->getPattern();
+
+    for (const PatternElement* element : pattern->elements()) {
+        for (const EntityPattern* entity : element->getEntities()) {
+            const VarDecl* decl = entity->getDecl();
+
+            if (isPendingThroughout(decl)) {
+                throwError(fmt::format("{} cannot read what a CREATE in the same query wrote: '{}'",
+                                       clause,
+                                       decl->getName()),
+                           matchStmt);
+            } else if (findPendingMask(decl)) {
+                throwError(fmt::format("{} cannot read what a MERGE in the same query wrote: '{}'",
+                                       clause,
+                                       decl->getName()),
+                           matchStmt);
+            }
+        }
+    }
+}
+
+void DBProgramGenerator::rebindScope(llvm::ArrayRef<PublishedColumn> published) {
+    _part = PartScope {};
+    _vdg.clear();
+
+    llvm::SmallVector<const VariableDependency*> boundVars;
+    for (const PublishedColumn& column : published) {
+        bioassert(!column._name.empty(), "Bound column without a name");
+
+        const VariableDependency* var = _vdg.registerBoundVariable(column._name, column._decl);
+        registerValue(var, column._column);
+        boundVars.push_back(var);
+    }
+
+    for (size_t maskIndex = 0; maskIndex < published.size(); maskIndex++) {
+        const std::string_view maskName = published[maskIndex]._name;
+        if (!maskName.starts_with(pendingMaskPrefix)) {
+            continue;
+        }
+
+        const std::string_view entityName = maskName.substr(pendingMaskPrefix.size());
+        const auto entityIt = std::ranges::find(published, entityName, &PublishedColumn::_name);
+        bioassert(entityIt != published.end(), "Pending mask '{}' published without its entity", maskName);
+
+        _part._pendingMasks[entityIt->_decl] = boundVars[maskIndex];
+    }
+}
+
+void DBProgramGenerator::rebindScopeKeepingWrittenEntities(llvm::ArrayRef<PublishedColumn> published) {
+    CarriedEntities carried;
+    for (const PublishedColumn& column : published) {
+        const PartScope::WrittenEntity* written = findWrittenEntity(column._decl);
+        if (written) {
+            carried.emplace_back(column._decl, *written);
+        }
+    }
+
+    rebindScope(published);
+
+    for (auto& [decl, written] : carried) {
+        _part._writtenEntities[decl] = std::move(written);
+    }
+}
+
+void DBProgramGenerator::collectPublishedColumns(llvm::SmallVectorImpl<PublishedColumn>& published) {
+    forEachVariableColumn([&published](const VarDecl* decl, std::string_view name, mlir::Value column) {
+        const auto sameName = [name](const PublishedColumn& candidate) {
+            return candidate._name == name;
+        };
+
+        const auto foundIt = std::ranges::find_if(published, sameName);
+        if (foundIt != published.end()) {
+            foundIt->_decl = decl;
+            foundIt->_column = column;
+            return;
+        }
+
+        published.push_back({decl, std::string(name), column});
+    });
+
+    // Under a name order rather than the map's, so the same query generates the same IR
+    std::ranges::sort(published, [](const PublishedColumn& left, const PublishedColumn& right) {
+        return left._name < right._name;
+    });
+
+    for (PublishedColumn& column : published) {
+        column._column = columnLeavingScope(column._decl, column._column);
+    }
+}
+
+void DBProgramGenerator::publishInFlightColumns() {
+    llvm::SmallVector<PublishedColumn> published;
+    collectPublishedColumns(published);
+
+    rebindScopeKeepingWrittenEntities(published);
+}
+
+void DBProgramGenerator::forEachVariableColumn(const VariableColumnBinding& bind) const {
+    for (const auto& [cypherVar, mlirCol] : _part._varMap) {
         const std::string_view varName = cypherVar->getName();
 
         bioassert(not mlirCol.empty(), "No definitions for {}", varName);
-        const mlir::Value finalValue = mlirCol.back();
 
-        finalIdentities[varName] = finalValue;
+        bind(cypherVar->getDecl(), varName, mlirCol.back());
     }
 
-    for (const auto& [name, vars] : _vdg.edgeIdentities()) {
-        bioassert(!vars.empty(), "Empty edge identity for '{}'", name);
+    // A CALL's yielded columns are variables of the query too, declared by the YIELD.
+    for (const YieldedColumn& yieldedColumn : _part._yieldedColumns) {
+        bind(yieldedColumn._decl, yieldedColumn._name, yieldedColumn._column);
+    }
+
+    // So are the entities a CREATE wrote, declared by its pattern
+    for (const auto& [createdDecl, created] : _part._createdEntities) {
+        bind(createdDecl, createdDecl->getName(), created._column);
+    }
+
+    // So is the path a `MATCH p = ...` named, declared by its pattern element. One over a
+    // walk is another name for the handle column that walk bound, and is built where it is
+    // read; any other shape was built when its element was matched.
+    for (const auto& [pathDecl, walk] : _part._namedPathWalks) {
+        bind(pathDecl, pathDecl->getName(), _part._varMap.at(walk._path).back());
+    }
+
+    for (const auto& [pathDecl, pathColumn] : _part._namedPaths) {
+        bind(pathDecl, pathDecl->getName(), pathColumn);
+    }
+
+    // So is each group variable of a quantified pattern, another name for the handle column
+    // of its walk
+    for (const auto& [groupDecl, binding] : _part._pathBindings) {
+        const bool namesTheWalk = !binding._path || binding._path->getDecl() == groupDecl;
+        if (namesTheWalk) {
+            continue;
+        }
+
+        bind(groupDecl, groupDecl->getName(), _part._varMap.at(binding._path).back());
+    }
+
+    // And so is the element a list comprehension bound, inside its body
+    for (const auto& [elementDecl, element] : _part._comprehensionElements) {
+        bind(elementDecl, elementDecl->getName(), element);
+    }
+
+    for (const auto& [decl, vars] : _vdg.edgeIdentities()) {
+        bioassert(!vars.empty(), "Empty edge identity for '{}'", decl->getName());
+
         const VariableDependency* representative = vars.front();
-        bioassert(_varMap.contains(representative), "Edge identity representative not in varMap");
-        finalIdentities[name] = _varMap.at(representative).back();
+        if (!holdsColumn(representative)) {
+            continue;
+        }
+
+        bind(decl, decl->getName(), _part._varMap.at(representative).back());
+    }
+}
+
+void DBProgramGenerator::collectVariableColumns(VariableColumnMap& variableColumns) const {
+    forEachVariableColumn([&variableColumns](const VarDecl* decl, std::string_view name, mlir::Value column) {
+        if (decl) {
+            variableColumns[decl] = column;
+        }
+    });
+}
+
+mlir::Value DBProgramGenerator::findVariableColumn(const VarDecl* decl) const {
+    if (!decl) {
+        return mlir::Value {};
     }
 
+    mlir::Value found;
+    forEachVariableColumn([&found, decl](const VarDecl* boundDecl, std::string_view name, mlir::Value column) {
+        if (boundDecl == decl) {
+            found = column;
+        }
+    });
+
+    return found;
+}
+
+void DBProgramGenerator::translateProjection(const Projection* projection,
+                                             const VariableColumnMap& variableColumns,
+                                             llvm::SmallVectorImpl<mlir::Value>& projected,
+                                             llvm::SmallVectorImpl<llvm::StringRef>& names) {
     const auto getVarForItem = [&](auto&& item) -> mlir::Value {
         using Type = std::remove_cvref_t<decltype(item)>;
 
         if constexpr (std::is_same_v<Type, VarDecl*>) {
-            const std::string_view name = item->getName();
-            const auto findIt = finalIdentities.find(name);
-            bioassert(findIt != end(finalIdentities), "Return variable '{}' not found", name);
+            const auto findIt = variableColumns.find(item);
+            bioassert(findIt != end(variableColumns), "Return variable '{}' not found", item->getName());
             return findIt->second;
         } else {
-            const VarDecl* var = item->getExprVarDecl();
-            if (var) {
-                const std::string_view name = var->getName();
-                const auto findIt = finalIdentities.find(name);
-                if (findIt != end(finalIdentities)) {
-                    return findIt->second;
-                }
-            }
-
-            translateExpr(item);
-            return _exprMap.at(item);
+            return getOrTranslateExprColumn(variableColumns, item);
         }
     };
 
-    llvm::SmallVector<mlir::Value> outputted;
-    for (const Projection::ReturnItem item : returned) {
+    // The analyzer names every item it accepts, so an item without one is left for the
+    // sink to label by position rather than being a codegen error.
+    const auto getNameForItem = [&](auto&& item) -> llvm::StringRef {
+        const std::optional<std::string_view> name = projection->getName(item);
+        if (!name) {
+            return llvm::StringRef();
+        }
+
+        return llvm::StringRef(name->data(), name->size());
+    };
+
+    for (const Projection::ReturnItem item : projection->items()) {
         const mlir::Value itemCol = std::visit(getVarForItem, item);
-        outputted.push_back(itemCol);
-    }
+        projected.push_back(itemCol);
+        names.push_back(std::visit(getNameForItem, item));
 
-    const mlir::Location loc = _opBuilder.getUnknownLoc();
-
-    if (proj->hasSkip()) {
-        const Expr* skipExpr = proj->getSkip()->getExpr();
-        const LiteralExpr* litExpr = static_cast<const LiteralExpr*>(skipExpr);
-        const IntegerLiteral* intLit = static_cast<const IntegerLiteral*>(litExpr->getLiteral());
-        const uint64_t skipCount = static_cast<uint64_t>(intLit->getValue());
-
-        llvm::SmallVector<mlir::Type> skipResultTypes;
-        for (const mlir::Value column : outputted) {
-            skipResultTypes.push_back(column.getType());
-        }
-
-        auto skipOp = _opBuilder.create<mlir::db::Skip>(loc, skipResultTypes, mlir::ValueRange{outputted}, skipCount);
-        outputted.assign(skipOp.getResults().begin(), skipOp.getResults().end());
-    }
-
-    if (proj->hasLimit()) {
-        const Expr* limitExpr = proj->getLimit()->getExpr();
-        const LiteralExpr* litExpr = static_cast<const LiteralExpr*>(limitExpr);
-        const IntegerLiteral* intLit = static_cast<const IntegerLiteral*>(litExpr->getLiteral());
-        const uint64_t limitCount = static_cast<uint64_t>(intLit->getValue());
-
-        llvm::SmallVector<mlir::Type> limitResultTypes;
-        for (const mlir::Value column : outputted) {
-            limitResultTypes.push_back(column.getType());
-        }
-
-        auto limitOp = _opBuilder.create<mlir::db::Limit>(loc, limitResultTypes, mlir::ValueRange{outputted}, limitCount);
-        outputted.assign(limitOp.getResults().begin(), limitOp.getResults().end());
-    }
-
-    _opBuilder.create<mlir::db::Output>(loc, mlir::ValueRange{outputted});
-}
-
-void DBProgramGenerator::generatePropertyConstraints(const CypherAST* ast) {
-    const CypherAST::QueryCommands& queries = ast->queries();
-    if (queries.size() != 1) {
-        throw TuringException("Multiple queries not yet supported.");
-    }
-
-    const QueryCommand* query = queries.front();
-
-    const SinglePartQuery* sglPart = dynamic_cast<const SinglePartQuery*>(query);
-    if (!sglPart) {
-        return;
-    }
-
-    const StmtContainer* stmtsContainer = sglPart->getReadStmts();
-    if (!stmtsContainer) {
-        return;
-    }
-
-    std::vector<const Expr*> constraintExprs;
-
-    for (const Stmt* stmt : stmtsContainer->stmts()) {
-        if (stmt->getKind() != Stmt::Kind::MATCH) {
+        // An alias is one variable declared once, so a key naming it holds the very
+        // declaration of the item it names: publishing the column under that declaration
+        // is what lets the key read this column instead of computing a second one
+        Expr* const* itemExpr = std::get_if<Expr*>(&item);
+        if (!itemExpr) {
             continue;
         }
 
-        const MatchStmt* matchStmt = static_cast<const MatchStmt*>(stmt);
-        const Pattern* pattern = matchStmt->getPattern();
+        const VarDecl* itemDecl = (*itemExpr)->getExprVarDecl();
+        if (itemDecl) {
+            _part._projectedColumns[itemDecl] = itemCol;
+        }
+    }
+}
 
-        constraintExprs.clear();
+void DBProgramGenerator::translateProjectionTail(const Projection* projection,
+                                                 const VariableColumnMap& variableColumns,
+                                                 llvm::SmallVectorImpl<mlir::Value>& projected,
+                                                 llvm::MutableArrayRef<PublishedColumn> carriedColumns) {
+    // DISTINCT dedups the projection, and everything after it works on the rows that
+    // survive: the sort orders the distinct rows, and SKIP and LIMIT cut them
+    if (projection->isDistinct()) {
+        translateDistinct(projection, projected, carriedColumns);
+    }
 
-        for (const PatternElement* element : pattern->elements()) {
-            const NodePattern* rootNode = static_cast<const NodePattern*>(element->getRootEntity());
-            const NodePatternData* rootData = rootNode->getData();
+    // ORDER BY reorders the whole projection, so it comes before them too: SKIP and
+    // LIMIT cut the sorted rows
+    if (projection->hasOrderBy()) {
+        translateOrderBy(projection, variableColumns, projected, carriedColumns);
+    }
 
-            if (rootData) {
-                for (const EntityPropertyConstraint& constraint : rootData->exprConstraints()) {
+    if (projection->hasSkip()) {
+        translateCut<mlir::db::Skip>(projection, projection->getSkip()->getExpr(), "SKIP", projected, carriedColumns);
+    }
+
+    if (projection->hasLimit()) {
+        translateCut<mlir::db::Limit>(projection, projection->getLimit()->getExpr(), "LIMIT", projected, carriedColumns);
+    }
+}
+
+template <typename CutOp>
+void DBProgramGenerator::translateCut(const Projection* projection,
+                                      const Expr* countExpr,
+                                      std::string_view clauseName,
+                                      llvm::SmallVectorImpl<mlir::Value>& projected,
+                                      llvm::MutableArrayRef<PublishedColumn> carriedColumns) {
+    const int64_t countValue = evaluateConstantInteger(_ast->getDiagnosticsManager(), countExpr);
+
+    if (countValue < 0) {
+        throwError(fmt::format("{} expression must be a non-negative integer", clauseName), countExpr);
+    }
+
+    llvm::SmallVector<size_t> cutItems;
+    llvm::SmallVector<mlir::Value> cut;
+    collectRowColumns(projection, projected, cutItems, cut);
+
+    llvm::SmallVector<size_t> cutCarriedColumns;
+    collectCarriedRowColumns(carriedColumns, cutCarriedColumns, cut);
+
+    if (cut.empty()) {
+        collectCutColumns(projection, projected, cutItems, cut);
+    }
+
+    llvm::SmallVector<mlir::Type> cutResultTypes;
+    for (const mlir::Value column : cut) {
+        cutResultTypes.push_back(column.getType());
+    }
+
+    auto cutOp = _opBuilder.create<CutOp>(_opBuilder.getUnknownLoc(),
+                                          cutResultTypes,
+                                          mlir::ValueRange {cut},
+                                          static_cast<uint64_t>(countValue));
+
+    const mlir::ResultRange cutResults = cutOp.getResults();
+    for (size_t resultIndex = 0; resultIndex < cutItems.size(); resultIndex++) {
+        projected[cutItems[resultIndex]] = cutResults[resultIndex];
+    }
+
+    for (size_t index = 0; index < cutCarriedColumns.size(); index++) {
+        carriedColumns[cutCarriedColumns[index]]._column = cutResults[cutItems.size() + index];
+    }
+}
+
+void DBProgramGenerator::translateDistinct(const Projection* projection,
+                                           llvm::SmallVectorImpl<mlir::Value>& projected,
+                                           llvm::MutableArrayRef<PublishedColumn> carriedColumns) {
+    // An aggregate projection emits one row per group, keyed by the grouping keys, so no
+    // two of its rows can be equal and the dedup would drop nothing. It could not read a
+    // count either: that column is neither an ID nor a nullable value.
+    if (projection->isAggregate()) {
+        return;
+    }
+
+    expandPathItems(projection, projected);
+
+    // A constant column holds the same value in every row, so it tells no two rows apart:
+    // the dedup reads the columns that vary and a constant one rides along untouched, as
+    // ORDER BY drops a constant key
+    llvm::SmallVector<size_t> dedupedItems;
+    llvm::SmallVector<mlir::Value> dedupedColumns;
+    collectRowColumns(projection, projected, dedupedItems, dedupedColumns);
+
+    llvm::SmallVector<size_t> dedupedCarriedColumns;
+    collectCarriedRowColumns(carriedColumns, dedupedCarriedColumns, dedupedColumns);
+
+    // Every column is constant, or one laid out over the rows, so the projection is one row
+    // repeated as many times as the query matched: no column tells two of those rows apart,
+    // and the one the dedup keeps is the first of them - the projection capped at a single row
+    const bool repeatsOneRow = dedupedCarriedColumns.empty()
+                            && llvm::all_of(dedupedColumns, [](mlir::Value column) {
+                                   return mlir::isa_and_nonnull<mlir::db::BroadcastConstant>(column.getDefiningOp());
+                               });
+
+    if (repeatsOneRow) {
+        translateDistinctOverConstants(projection, projected);
+    } else {
+        llvm::SmallVector<mlir::Value> deduped;
+        emitRemoveDuplicates(dedupedColumns, mlir::Value(), deduped);
+
+        // The dedup hands back one column per column it read, so its results take the place
+        // of the ones it was given and the constant columns stay as they were
+        for (size_t resultIndex = 0; resultIndex < dedupedItems.size(); resultIndex++) {
+            projected[dedupedItems[resultIndex]] = deduped[resultIndex];
+        }
+
+        for (size_t index = 0; index < dedupedCarriedColumns.size(); index++) {
+            carriedColumns[dedupedCarriedColumns[index]]._column = deduped[dedupedItems.size() + index];
+        }
+    }
+
+    rebindDistinctColumns(projection, projected);
+}
+
+void DBProgramGenerator::rebindDistinctColumns(const Projection* projection,
+                                               llvm::ArrayRef<mlir::Value> projected) {
+    bioassert(projected.size() == projection->items().size(),
+              "One projected column per return item expected");
+
+    GroupedColumns itemColumns;
+
+    size_t itemIndex = 0;
+    for (const Projection::ReturnItem& item : projection->items()) {
+        const mlir::Value column = projected[itemIndex];
+        itemIndex++;
+
+        if (const VarDecl* const* itemDecl = std::get_if<VarDecl*>(&item)) {
+            rebindVariableColumn(*itemDecl, column);
+            continue;
+        }
+
+        const Expr* itemExpr = *std::get_if<Expr*>(&item);
+        itemColumns.emplace_back(itemExpr, column);
+
+        const VarDecl* exprDecl = itemExpr->getExprVarDecl();
+        if (!exprDecl) {
+            continue;
+        }
+
+        _part._projectedColumns[exprDecl] = column;
+
+        // Only a bare variable is still that variable once the projection has run; every
+        // other item is a value computed from one, and reading the variable is no read of
+        // the column the item produced
+        if (itemExpr->getKind() == Expr::Kind::SYMBOL) {
+            rebindVariableColumn(exprDecl, column);
+        }
+    }
+
+    // A key spelling an item out again - the e.duration of
+    // RETURN DISTINCT e.duration ORDER BY e.duration + 1 - is a tree of its own, so
+    // binding it to the item's column is what stops it being computed a second time over
+    // the rows the dedup dropped
+    bindOrderByKeyColumns(projection, itemColumns);
+}
+
+void DBProgramGenerator::rebindVariableColumn(const VarDecl* decl, mlir::Value column) {
+    rebindYieldedColumn(decl, column);
+    rebindGroupVariable(decl, column);
+
+    // An edge identity has no variable of its own: its column is published under the
+    // traversal variable that produced it, which is where the replacement has to land
+    const VariableDependencyGraph::EdgeIdentityMap& edgeIdentities = _vdg.edgeIdentities();
+    const auto identityIt = edgeIdentities.find(decl);
+    const bool hasIdentity = identityIt != edgeIdentities.end() && !identityIt->second.empty();
+
+    const VariableDependency* boundVar = nullptr;
+
+    if (hasIdentity) {
+        boundVar = identityIt->second.front();
+    } else {
+        for (const auto& [var, values] : _part._varMap) {
+            if (var->getDecl() == decl) {
+                boundVar = var;
+                break;
+            }
+        }
+    }
+
+    if (!boundVar) {
+        return;
+    }
+
+    registerValue(boundVar, column);
+
+    // The edge types published for the variable were read over the rows this column
+    // replaces, so they no longer line up with it: dropping them has the next read fetch
+    // them over this column instead
+    _part._edgeTypeMap.erase(boundVar);
+}
+
+void DBProgramGenerator::translateDistinctOverConstants(const Projection* projection,
+                                                        llvm::SmallVectorImpl<mlir::Value>& projected) {
+    llvm::SmallVector<size_t> cappedItems;
+    llvm::SmallVector<mlir::Value> capped;
+    collectCutColumns(projection, projected, cappedItems, capped);
+
+    llvm::SmallVector<mlir::Type> cappedTypes;
+    for (const mlir::Value column : capped) {
+        cappedTypes.push_back(column.getType());
+    }
+
+    const uint64_t keptRowCount = 1;
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    auto limitOp = _opBuilder.create<mlir::db::Limit>(loc, cappedTypes, mlir::ValueRange{capped}, keptRowCount);
+
+    const mlir::ResultRange results = limitOp.getResults();
+    for (size_t resultIndex = 0; resultIndex < cappedItems.size(); resultIndex++) {
+        projected[cappedItems[resultIndex]] = results[resultIndex];
+    }
+}
+
+void DBProgramGenerator::translateOrderBy(const Projection* projection,
+                                          const VariableColumnMap& variableColumns,
+                                          llvm::SmallVectorImpl<mlir::Value>& projected,
+                                          llvm::MutableArrayRef<PublishedColumn> carriedColumns) {
+    const OrderBy* orderBy = projection->getOrderBy();
+    const OrderBy::ItemVector& items = orderBy->getItems();
+    bioassert(!items.empty(), "ORDER BY without a key");
+
+    const llvm::SaveAndRestore<bool> ordersTheProjection(_part._orderingProjection, true);
+
+    const size_t projectedCount = projection->items().size();
+
+    expandPathItems(projection, projected);
+
+    // A sort reorders the rows of every column it is given at once, so it is given the
+    // projected columns that carry rows and they stay row-aligned. A key the projection
+    // does not carry - the a.age of RETURN a ORDER BY a.age - is handed over as one more
+    // column, so that it moves with the row it belongs to; its result is then left
+    // unread, which is what keeps it out of the output
+    llvm::SmallVector<size_t> sortedItems;
+    llvm::SmallVector<mlir::Value> sorted;
+    collectRowColumns(projection, projected, sortedItems, sorted);
+
+    llvm::SmallVector<size_t> sortedCarriedColumns;
+    collectCarriedRowColumns(carriedColumns, sortedCarriedColumns, sorted);
+
+    llvm::SmallVector<int64_t> keyColumns;
+    llvm::SmallVector<bool> keyAscending;
+
+    // Keys are given most significant first, the order the Sort expects
+    for (const OrderByItem* item : items) {
+        const Expr* keyExpr = item->getExpr();
+
+        if (keyExpr->getType() == EvaluatedType::StringTable) {
+            throwCSVRowRead(keyExpr, keyExpr->getExprVarDecl()->getName());
+        }
+
+        const size_t projectedIndex = projection->findItemIndex(keyExpr);
+        const bool isProjected = projectedIndex < projectedCount;
+        const auto sortedItem = std::find(sortedItems.begin(), sortedItems.end(), projectedIndex);
+
+        // A constant key holds the same value in every row, so it changes no order:
+        // ORDER BY 1, n.name orders by n.name alone. An alias is only another spelling of
+        // the item it was given to, so a key naming the alias of a constant item is that
+        // same constant key - and the sort was handed no column to key it on either
+        //
+        // An aggregate is not constant however it spells its argument: count(*) reads no
+        // row and still takes a value per group, which is what orders the groups
+        const bool isConstantKey = !keyExpr->isDynamic() && !keyExpr->isAggregate();
+        const bool namesAConstantItem = isProjected && sortedItem == sortedItems.end();
+
+        if (isConstantKey || namesAConstantItem) {
+            continue;
+        }
+
+        // A key names the column to sort by through its position in the columns handed to
+        // the sort: the position the projected column was given there, or the end of the
+        // set when the key has to be appended - so two appended keys never share a position
+        if (isProjected) {
+            keyColumns.push_back(static_cast<int64_t>(std::distance(sortedItems.begin(), sortedItem)));
+        } else {
+            const mlir::Value keyColumn = getOrTranslateExprColumn(variableColumns, keyExpr);
+
+            // A key the projection does not carry is read into a column of its own, which
+            // is constant when the key computes over constants alone: one value for every
+            // row, so it orders nothing and there is no per-row column to key on
+            if (yieldsConstantColumn(keyColumn, _constantColumns)) {
+                continue;
+            }
+
+            sorted.push_back(keyColumn);
+            keyColumns.push_back(static_cast<int64_t>(sorted.size() - 1));
+        }
+
+        keyAscending.push_back(item->getType() == OrderByType::ASC);
+    }
+
+    // Every key was constant, so a sort would hand back the rows it was given in the
+    // order it was given them: the projection is already what the ORDER BY asks for
+    if (keyColumns.empty()) {
+        return;
+    }
+
+    llvm::SmallVector<mlir::Type> sortResultTypes;
+    for (const mlir::Value column : sorted) {
+        sortResultTypes.push_back(column.getType());
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    auto sortOp = _opBuilder.create<mlir::db::Sort>(loc,
+                                                    sortResultTypes,
+                                                    mlir::ValueRange {sorted},
+                                                    keyColumns,
+                                                    keyAscending);
+
+    // The columns pass through the sort in place, so each column it was given comes back as
+    // its own result; the extra key columns end the result range and are left unread, and a
+    // constant column was never handed over
+    const mlir::ResultRange results = sortOp.getResults();
+    for (size_t resultIndex = 0; resultIndex < sortedItems.size(); resultIndex++) {
+        projected[sortedItems[resultIndex]] = results[resultIndex];
+    }
+
+    for (size_t index = 0; index < sortedCarriedColumns.size(); index++) {
+        carriedColumns[sortedCarriedColumns[index]]._column = results[sortedItems.size() + index];
+    }
+}
+
+mlir::Value DBProgramGenerator::getOrTranslateExprColumn(const VariableColumnMap& variableColumns,
+                                                         const Expr* expr) {
+    const mlir::Value column = getOrTranslateBoundColumn(variableColumns, expr);
+
+    return expr->getKind() == Expr::Kind::SYMBOL ? readWalkEntities(expr, column) : column;
+}
+
+mlir::Value DBProgramGenerator::getOrTranslateBoundColumn(const VariableColumnMap& variableColumns,
+                                                          const Expr* expr) {
+    // One column is held per variable, so an expression only has a column to be found
+    // there when it is a variable and nothing else. Anything more is a computation over
+    // columns, and has to be translated - as is a symbol naming no variable but the alias
+    // of a projected item, which the translation resolves through the item that published
+    // that column
+    if (expr->getKind() == Expr::Kind::SYMBOL) {
+        const VarDecl* var = expr->getExprVarDecl();
+        bioassert(var, "Symbol expression without a declaration.");
+
+        const auto findIt = variableColumns.find(var);
+        if (findIt != end(variableColumns)) {
+            return findIt->second;
+        }
+    }
+
+    translateExprOverRows(expr);
+    return _part._exprMap.at(expr);
+}
+
+mlir::Value DBProgramGenerator::getOrTranslateExprColumn(const Expr* expr) {
+    const mlir::Value column = getOrTranslateBoundColumn(expr);
+
+    return expr->getKind() == Expr::Kind::SYMBOL ? readWalkEntities(expr, column) : column;
+}
+
+// The column as bound, which for a group variable is its walk's handle rather than its list.
+// Without a map, the one name the expression could name is looked up over the bindings
+// rather than every one of them being gathered to answer for it
+mlir::Value DBProgramGenerator::getOrTranslateBoundColumn(const Expr* expr) {
+    if (expr->getKind() == Expr::Kind::SYMBOL) {
+        const VarDecl* var = expr->getExprVarDecl();
+        bioassert(var, "Symbol expression without a declaration.");
+
+        if (const mlir::Value column = findVariableColumn(var)) {
+            return column;
+        }
+    }
+
+    translateExpr(expr);
+    return _part._exprMap.at(expr);
+}
+
+void DBProgramGenerator::applyPredicateFilters(std::span<const Expr* const> predicates) {
+    for (const Expr* predicate : predicates) {
+        translateExprOverRows(predicate);
+        filterAllColumns(_part._exprMap.at(predicate));
+    }
+}
+
+void DBProgramGenerator::generateMatchConstraints(const MatchStmt* matchStmt) {
+    const Pattern* pattern = matchStmt->getPattern();
+
+    std::vector<const Expr*> constraintExprs;
+
+    for (const PatternElement* element : pattern->elements()) {
+        const NodePattern* rootNode = static_cast<const NodePattern*>(element->getRootEntity());
+        const NodePatternData* rootData = rootNode->getData();
+
+        if (rootData) {
+            for (const EntityPropertyConstraint& constraint : rootData->exprConstraints()) {
+                constraintExprs.push_back(constraint._expr);
+            }
+        }
+
+        for (auto [edgePattern, nodePattern] : element->getElementChain()) {
+            const EdgePatternData* edgeData = edgePattern->getData();
+            if (edgeData) {
+                for (const EntityPropertyConstraint& constraint : edgeData->exprConstraints()) {
                     constraintExprs.push_back(constraint._expr);
                 }
             }
 
-            for (auto [edgePattern, nodePattern] : element->getElementChain()) {
-                const EdgePatternData* edgeData = edgePattern->getData();
-                if (edgeData) {
-                    for (const EntityPropertyConstraint& constraint : edgeData->exprConstraints()) {
-                        constraintExprs.push_back(constraint._expr);
-                    }
-                }
-
-                const NodePatternData* nodeData = nodePattern->getData();
-                if (nodeData) {
-                    for (const EntityPropertyConstraint& constraint : nodeData->exprConstraints()) {
-                        constraintExprs.push_back(constraint._expr);
-                    }
+            const NodePatternData* nodeData = nodePattern->getData();
+            if (nodeData) {
+                for (const EntityPropertyConstraint& constraint : nodeData->exprConstraints()) {
+                    constraintExprs.push_back(constraint._expr);
                 }
             }
         }
+    }
 
-        if (constraintExprs.empty()) {
-            continue;
-        }
+    applyPredicateFilters(constraintExprs);
+}
 
-        const mlir::Location loc = _opBuilder.getUnknownLoc();
-        const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+void DBProgramGenerator::applyConstraints(const VariableDependency* var) {
+    const auto registeredNodeColumn = [&]() {
+        const auto findIt = _part._varMap.find(var);
+        const bool registered = findIt != _part._varMap.end() && !findIt->second.empty();
+        bioassert(registered, "Label-constrained node not registered: {}", var->getName());
 
-        mlir::Value combinedPredicate;
+        return findIt->second.back();
+    };
 
-        for (const Expr* constraintExpr : constraintExprs) {
-            translateExpr(constraintExpr);
-            const mlir::Value predicate = _exprMap.at(constraintExpr);
+    const auto registeredEdgeTypeColumn = [&]() {
+        const auto findIt = _part._edgeTypeMap.find(var);
+        bioassert(findIt != _part._edgeTypeMap.end(),
+                  "Type-constrained edge without a type column: {}", var->getName());
 
-            if (!combinedPredicate) {
-                combinedPredicate = predicate;
+        return findIt->second;
+    };
+
+    const auto applyLabelConstraint = [&](const VariableDependency::LabelNames& labels) {
+        filterAllColumns(checkNodeLabels(registeredNodeColumn(), labels, false));
+    };
+
+    const auto applyEdgeTypeConstraint = [&](const VariableDependency::EdgeTypeNames& types) {
+        filterAllColumns(checkEdgeType(registeredEdgeTypeColumn(), types, false));
+    };
+
+    const std::optional<VariableDependency::Constraint>& constraints = var->constraints();
+    if (constraints.has_value()) {
+        std::visit([&](auto&& constraint) {
+            using T = std::decay_t<decltype(constraint)>;
+            if constexpr (std::is_same_v<T, VariableDependency::LabelNames>) {
+                applyLabelConstraint(constraint);
+            } else if constexpr (std::is_same_v<T, VariableDependency::EdgeTypeNames>) {
+                applyEdgeTypeConstraint(constraint);
             } else {
-                combinedPredicate = _opBuilder
-                                        .create<mlir::db::AndOp>(
-                                            loc, boolType, combinedPredicate, predicate)
-                                        .getResult();
+                // sizeof(T) == 0 (never true) keeps the assert dependent on T so it only
+                // fires if this branch is ever instantiated; a bare static_assert(false)
+                // is diagnosed eagerly by pre-P2593 compilers even when discarded.
+                static_assert(sizeof(T) == 0, "Unhandled constraint type.");
             }
-        }
-
-        filterAllColumns(combinedPredicate);
-    }
-}
-
-void DBProgramGenerator::generateLabelConstraints(const CypherAST* ast) {
-    const CypherAST::QueryCommands& queries = ast->queries();
-    if (queries.size() != 1) {
-        throw TuringException("Multiple queries not yet supported.");
+        }, *constraints);
     }
 
-    const QueryCommand* query = queries.front();
-
-    const SinglePartQuery* sglPart = dynamic_cast<const SinglePartQuery*>(query);
-    if (!sglPart) {
-        return;
+    for (const LabelExpr* labelExpr : var->labelExprConstraints()) {
+        filterAllColumns(checkNodeLabelExpr(registeredNodeColumn(), labelExpr, false));
     }
 
-    const StmtContainer* stmtsContainer = sglPart->getReadStmts();
-    if (!stmtsContainer) {
-        return;
-    }
-
-    using NodeDataPair = std::pair<const NodePattern*, const NodePatternData*>;
-    std::vector<NodeDataPair> labelConstrainedNodes;
-
-    for (const Stmt* stmt : stmtsContainer->stmts()) {
-        if (stmt->getKind() != Stmt::Kind::MATCH) {
-            continue;
-        }
-
-        const MatchStmt* matchStmt = static_cast<const MatchStmt*>(stmt);
-        const Pattern* pattern = matchStmt->getPattern();
-
-        labelConstrainedNodes.clear();
-
-        for (const PatternElement* element : pattern->elements()) {
-            const NodePattern* rootNode = static_cast<const NodePattern*>(element->getRootEntity());
-            const NodePatternData* rootData = rootNode->getData();
-
-            if (rootData && !rootData->labelConstraints().empty()) {
-                labelConstrainedNodes.emplace_back(rootNode, rootData);
-            }
-
-            for (auto [edgePattern, nodePattern] : element->getElementChain()) {
-                const NodePatternData* nodeData = nodePattern->getData();
-                if (nodeData && !nodeData->labelConstraints().empty()) {
-                    labelConstrainedNodes.emplace_back(nodePattern, nodeData);
-                }
-            }
-        }
-
-        if (labelConstrainedNodes.empty()) {
-            continue;
-        }
-
-        const mlir::Location loc = _opBuilder.getUnknownLoc();
-        const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
-        const mlir::db::ColumnType labelSetIDType = allocColumnType(
-            mlir::storage::LabelSetIDType::get(_mlirCtxt));
-
-        mlir::Value combinedPredicate;
-
-        for (auto [nodePattern, nodeData] : labelConstrainedNodes) {
-            const VarDecl* vardecl = nodePattern->getDecl();
-            bioassert(vardecl, "Null variable declaration.");
-            const std::string_view nodeName = vardecl->getName();
-
-            mlir::Value nodeColumn;
-            for (const auto& [var, values] : _varMap) {
-                if (var->getName() == nodeName) {
-                    nodeColumn = values.back();
-                    break;
-                }
-            }
-
-            bioassert(nodeColumn, "Label-constrained node not found in variable map: {}", nodeName);
-
-            const mlir::Value labelSetIDColumn = _opBuilder.create<mlir::db::GetNodeLabelSet>(
-                loc,
-                labelSetIDType,
-                nodeColumn).getResult();
-
-            llvm::SmallVector<llvm::StringRef> labelNames;
-            for (const std::string_view label : nodeData->labelConstraints()) {
-                labelNames.push_back(llvm::StringRef(label.data(), label.size()));
-            }
-
-            const mlir::ArrayAttr labelsAttr = _opBuilder.getStrArrayAttr(labelNames);
-            const mlir::Value labelMask = _opBuilder.create<mlir::db::CheckLabelConstraint>(
-                loc,
-                boolType,
-                labelSetIDColumn,
-                labelsAttr).getResult();
-
-            if (!combinedPredicate) {
-                combinedPredicate = labelMask;
-            } else {
-                combinedPredicate = _opBuilder.create<mlir::db::AndOp>(
-                    loc, boolType, combinedPredicate, labelMask).getResult();
-            }
-        }
-
-        filterAllColumns(combinedPredicate);
-    }
-}
-
-void DBProgramGenerator::generateEdgeTypeConstraints(const CypherAST* ast) {
-    const CypherAST::QueryCommands& queries = ast->queries();
-    if (queries.size() != 1) {
-        throw TuringException("Multiple queries not yet supported.");
-    }
-
-    const QueryCommand* query = queries.front();
-
-    const SinglePartQuery* sglPart = dynamic_cast<const SinglePartQuery*>(query);
-    if (!sglPart) {
-        return;
-    }
-
-    const StmtContainer* stmtsContainer = sglPart->getReadStmts();
-    if (!stmtsContainer) {
-        return;
-    }
-
-    const VariableDependencyGraph::EdgeIdentityMap& edgeIdentities = _vdg.edgeIdentities();
-
-    for (const Stmt* stmt : stmtsContainer->stmts()) {
-        if (stmt->getKind() != Stmt::Kind::MATCH) {
-            continue;
-        }
-
-        const MatchStmt* matchStmt = static_cast<const MatchStmt*>(stmt);
-        const Pattern* pattern = matchStmt->getPattern();
-
-        mlir::Value combinedPredicate;
-
-        llvm::SmallVector<llvm::StringRef> typeNames;
-        for (const PatternElement* element : pattern->elements()) {
-            for (auto [edgePattern, nodePattern] : element->getElementChain()) {
-                const EdgePatternData* edgeData = edgePattern->getData();
-                if (!edgeData || edgeData->edgeTypeConstraints().empty()) {
-                    continue;
-                }
-
-                const std::string_view cypherName = edgePattern->getDecl()->getName();
-                const auto identityIt = edgeIdentities.find(std::string(cypherName));
-                bioassert(identityIt != edgeIdentities.end(),
-                          "Edge variable not found in identity map: {}", cypherName);
-
-                const VariableDependency* edgeVar = identityIt->second.front();
-                const auto edgeTypeIt = _edgeTypeMap.find(edgeVar);
-                bioassert(edgeTypeIt != _edgeTypeMap.end(),
-                          "Edge type column not found for variable: {}", cypherName);
-
-                const mlir::Value edgeTypeColumn = edgeTypeIt->second;
-
-                const mlir::Location loc = _opBuilder.getUnknownLoc();
-                const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
-
-                typeNames.clear();
-                for (const std::string_view typeName : edgeData->edgeTypeConstraints()) {
-                    typeNames.push_back(llvm::StringRef(typeName.data(), typeName.size()));
-                }
-
-                const mlir::ArrayAttr edgeTypesAttr = _opBuilder.getStrArrayAttr(typeNames);
-                const mlir::Value edgeTypeMask = _opBuilder.create<mlir::db::CheckEdgeTypeConstraint>(
-                    loc, boolType, edgeTypeColumn, edgeTypesAttr).getResult();
-
-                if (!combinedPredicate) {
-                    combinedPredicate = edgeTypeMask;
-                } else {
-                    combinedPredicate = _opBuilder.create<mlir::db::AndOp>(
-                        loc, boolType, combinedPredicate, edgeTypeMask).getResult();
-                }
-            }
-        }
-
-        if (combinedPredicate) {
-            filterAllColumns(combinedPredicate);
-        }
-    }
-}
-
-void DBProgramGenerator::generateFilters(const CypherAST* ast) {
-    const CypherAST::QueryCommands& queries = ast->queries();
-    if (queries.size() != 1) {
-        throw TuringException("Multiple queries not yet supported.");
-    }
-
-    const QueryCommand* query = queries.front();
-
-    const SinglePartQuery* sglPart = dynamic_cast<const SinglePartQuery*>(query);
-    if (!sglPart) {
-        return;
-    }
-
-    const StmtContainer* stmtsContainer = sglPart->getReadStmts();
-    if (!stmtsContainer) {
-        return;
-    }
-
-    for (const Stmt* stmt : stmtsContainer->stmts()) {
-        if (stmt->getKind() != Stmt::Kind::MATCH) {
-            continue;
-        }
-
-        const MatchStmt* matchStmt = static_cast<const MatchStmt*>(stmt);
-        const Pattern* pattern = matchStmt->getPattern();
-        const WhereClause* where = pattern->getWhere();
-        if (!where) {
-            continue;
-        }
-
-        const Expr* predicateExpr = where->getExpr();
-        translateExpr(predicateExpr);
-
-        const auto findIt = _exprMap.find(predicateExpr);
-        bioassert(findIt != end(_exprMap), "Failed to get value for expr");
-        const mlir::Value predicateVal = findIt->second;
-
-        filterAllColumns(predicateVal);
+    for (const LabelExpr* typeExpr : var->edgeTypeExprConstraints()) {
+        filterAllColumns(checkEdgeTypeExpr(registeredEdgeTypeColumn(), typeExpr, false));
     }
 }
 
 void DBProgramGenerator::translateExpr(const Expr* expr) {
-    bioassert(!_exprMap.contains(expr), "Attempted to retranslate expr.");
+    if (_part._exprMap.contains(expr)) {
+        return;
+    }
 
     const Expr::Kind kind = expr->getKind();
     switch (kind) {
         case Expr::Kind::PROPERTY: {
             const PropertyExpr* propExpr = static_cast<const PropertyExpr*>(expr);
-            _exprMap[expr] = translatePropertyExpr(propExpr);
+            _part._exprMap[expr] = translatePropertyExpr(propExpr);
+        }
+        break;
+
+        case Expr::Kind::PROPERTY_LOOKUP: {
+            const PropertyLookupExpr* lookupExpr = static_cast<const PropertyLookupExpr*>(expr);
+            _part._exprMap[expr] = translatePropertyLookupExpr(lookupExpr);
         }
         break;
 
         case Expr::Kind::LITERAL: {
             const LiteralExpr* litExpr = static_cast<const LiteralExpr*>(expr);
-            _exprMap[expr] = translateLiteralExpr(litExpr->getLiteral());
+            _part._exprMap[expr] = translateLiteralExpr(litExpr->getLiteral());
         }
         break;
 
@@ -1245,18 +7644,49 @@ void DBProgramGenerator::translateExpr(const Expr* expr) {
         }
         break;
 
+        case Expr::Kind::LOGICAL: {
+            const LogicalExpr* logicalExpr = static_cast<const LogicalExpr*>(expr);
+            translateLogicalExpr(expr, logicalExpr);
+        }
+        break;
+
         case Expr::Kind::SYMBOL: {
             const SymbolExpr* symbolExpr = static_cast<const SymbolExpr*>(expr);
-            const std::string_view varName = symbolExpr->getDecl()->getName();
+            const VarDecl* decl = symbolExpr->getDecl();
+            const std::string_view varName = decl->getName();
 
-            for (const auto& [var, values] : _varMap) {
-                if (var->getName() == varName) {
-                    _exprMap[expr] = values.back();
-                    break;
+            // The symbol names either a traversal variable or the alias of a projected
+            // item, and no traversal ever publishes a column under an alias: the item is
+            // where that column comes from
+            const auto projectedIt = _part._projectedColumns.find(decl);
+
+            if (projectedIt != end(_part._projectedColumns)) {
+                _part._exprMap[expr] = projectedIt->second;
+            } else {
+                const mlir::Value entityColumn = resolveEntityColumn(decl);
+                if (entityColumn) {
+                    _part._exprMap[expr] = entityColumn;
                 }
             }
 
-            bioassert(_exprMap.contains(expr), "Symbol refers to unknown variable: {}", varName);
+            // A variable a CALL yielded appears in no pattern, so it is no VDG variable;
+            // its column is the one the call produced for that return value.
+            if (!_part._exprMap.contains(expr)) {
+                if (const mlir::Value yielded = findYieldedColumn(decl)) {
+                    _part._exprMap[expr] = yielded;
+                }
+            }
+
+            const bool bound = _part._exprMap.contains(expr);
+
+            // The row a LOAD CSV bound is not a column of its own: the load publishes one
+            // per field the query reads, and nothing stands for the whole record
+            const bool namesACSVRow = decl->getType() == EvaluatedType::StringTable;
+            if (namesACSVRow) {
+                throwCSVRowRead(expr, varName);
+            }
+
+            bioassert(bound, "Symbol refers to unknown variable: {}", varName);
         }
         break;
 
@@ -1266,14 +7696,87 @@ void DBProgramGenerator::translateExpr(const Expr* expr) {
         }
         break;
 
-        case Expr::Kind::FUNCTION_INVOCATION:
-        case Expr::Kind::INDEX:
+        case Expr::Kind::STRING: {
+            translateStringExpr(expr);
+        }
+        break;
+
+        case Expr::Kind::FUNCTION_INVOCATION: {
+            const FunctionInvocationExpr* funcExpr = static_cast<const FunctionInvocationExpr*>(expr);
+            translateFunctionInvocationExpr(expr, funcExpr);
+        }
+        break;
+
+        case Expr::Kind::INDEX: {
+            const IndexExpr* indexExpr = static_cast<const IndexExpr*>(expr);
+            translateIndexExpr(expr, indexExpr);
+        }
+        break;
+
+        case Expr::Kind::LIST_SLICE: {
+            const ListSliceExpr* slice = static_cast<const ListSliceExpr*>(expr);
+            translateListSliceExpr(expr, slice);
+        }
+        break;
+
+        case Expr::Kind::ENTITY_TYPES: {
+            const EntityTypeExpr* typeExpr = static_cast<const EntityTypeExpr*>(expr);
+            _part._exprMap[expr] = translateEntityTypeExpr(typeExpr);
+        }
+        break;
+
+        case Expr::Kind::CASE: {
+            const CaseExpr* caseExpr = static_cast<const CaseExpr*>(expr);
+            translateCaseExpr(expr, caseExpr);
+        }
+        break;
+
+        case Expr::Kind::EXISTS: {
+            const ExistsExpr* existsExpr = static_cast<const ExistsExpr*>(expr);
+            translateExistsExpr(expr, existsExpr);
+        }
+        break;
+
+        case Expr::Kind::COUNT_SUBQUERY: {
+            const CountSubqueryExpr* countExpr = static_cast<const CountSubqueryExpr*>(expr);
+            translateCountSubqueryExpr(expr, countExpr);
+        }
+        break;
+        case Expr::Kind::COLLECT_SUBQUERY: {
+            const CollectSubqueryExpr* collectExpr = static_cast<const CollectSubqueryExpr*>(expr);
+            translateCollectSubqueryExpr(expr, collectExpr);
+        }
+        break;
+
+        case Expr::Kind::LIST_COMPREHENSION: {
+            const ListComprehensionExpr* comprehension = static_cast<const ListComprehensionExpr*>(expr);
+            translateListComprehensionExpr(expr, comprehension);
+        }
+        break;
+
+        case Expr::Kind::PATTERN_COMPREHENSION: {
+            const PatternComprehensionExpr* comprehension =
+                static_cast<const PatternComprehensionExpr*>(expr);
+            translatePatternComprehensionExpr(expr, comprehension);
+        }
+        break;
+
+        case Expr::Kind::LIST_PREDICATE: {
+            const ListPredicateExpr* predicate = static_cast<const ListPredicateExpr*>(expr);
+            translateListPredicateExpr(expr, predicate);
+        }
+        break;
+
+        case Expr::Kind::REDUCE: {
+            const ReduceExpr* reduce = static_cast<const ReduceExpr*>(expr);
+            translateReduceExpr(expr, reduce);
+        }
+        break;
+
         case Expr::Kind::LIST:
-        case Expr::Kind::STRING:
-        case Expr::Kind::ENTITY_TYPES:
-        case Expr::Kind::PATH:
-            throw TuringException(fmt::format("Unsupported expression: {}",
-                                              ExprKindDescription::value(kind)));
+            throwError(fmt::format("Unsupported expression: {}",
+                                   ExprKindDescription::value(kind)),
+                       expr);
         break;
 
         case Expr::Kind::_SIZE:
@@ -1286,28 +7789,1034 @@ void DBProgramGenerator::translateUnaryExpr(const Expr* expr, const UnaryExpr* u
     const UnaryOperator op = unaryExpr->getOperator();
     const Expr* subExpr = unaryExpr->getSubExpr();
     translateExpr(subExpr);
-    bioassert(_exprMap.contains(subExpr), "Unary operation with unknown operand.");
-    const mlir::Value operandVal = _exprMap.at(subExpr);
+    bioassert(_part._exprMap.contains(subExpr), "Unary operation with unknown operand.");
+    const mlir::Value operandVal = _part._exprMap.at(subExpr);
     const mlir::Location loc = _opBuilder.getUnknownLoc();
 
     switch (op) {
         case UnaryOperator::Not: {
+            if (isUntypedNullColumn(operandVal)) {
+                _part._exprMap[expr] = nullConstantColumn();
+                break;
+            }
+
             const mlir::db::ColumnType boolType =
                 allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
             auto notOp = _opBuilder.create<mlir::db::NotOp>(loc, boolType, operandVal);
             const mlir::Value result = notOp.getResult();
-            _exprMap[expr] = result;
+            _part._exprMap[expr] = result;
         }
         break;
 
-        case UnaryOperator::Minus:
-        case UnaryOperator::Plus:
-            throw TuringException(fmt::format("Unsupported unary operator: {}",
-                                              UnaryOperatorDescription::value(op)));
+        case UnaryOperator::Minus: {
+            // Negating an unknown value is unknown: the null the operand is stands as the
+            // negation
+            if (expr->getType() == EvaluatedType::Null) {
+                _part._exprMap[expr] = nullConstantColumn();
+                break;
+            }
+
+            const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::Negate>(loc, noneType, operandVal).getResult();
+        }
+        break;
+
+        case UnaryOperator::Plus: {
+            const EvaluatedType operandType = subExpr->getType();
+            if (operandType == EvaluatedType::Null) {
+                _part._exprMap[expr] = nullConstantColumn();
+                break;
+            } else if (operandType != EvaluatedType::Any) {
+                _part._exprMap[expr] = operandVal;
+                break;
+            }
+
+            const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::UnaryPlus>(loc, noneType, operandVal).getResult();
+        }
         break;
 
         case UnaryOperator::_SIZE:
-            throw TuringException("Unknown unary operator.");
+            throwError("Unknown unary operator.", expr);
+        break;
+    }
+}
+
+void DBProgramGenerator::translateListComprehensionExpr(const Expr* expr,
+                                                        const ListComprehensionExpr* comprehension) {
+    const Expr* const sourceExpr = comprehension->getSource();
+    const mlir::Value source = getOrTranslateExprColumn(sourceExpr);
+
+    CarrySet carrySet;
+    collectElementCarrySet(carrySet);
+
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    auto comprehensionOp = _opBuilder.create<mlir::db::ListComprehension>(_opBuilder.getUnknownLoc(),
+                                                                          noneType,
+                                                                          source,
+                                                                          carrySet._columns);
+
+    generateElementRegion(comprehensionOp.getBody(),
+                          comprehension,
+                          carrySet,
+                          /*cutsElements=*/true,
+                          comprehension->getProjection());
+
+    dropUnreadCarriedColumns(comprehensionOp, comprehensionOp.getColumnsToFilter());
+
+    _part._exprMap[expr] = comprehensionOp.getResult();
+}
+
+void DBProgramGenerator::translateListPredicateExpr(const Expr* expr, const ListPredicateExpr* predicate) {
+    const ListComprehensionExpr* comprehension = predicate->getComprehension();
+    const Expr* const sourceExpr = comprehension->getSource();
+    const mlir::Value source = getOrTranslateExprColumn(sourceExpr);
+
+    CarrySet carrySet;
+    collectElementCarrySet(carrySet);
+
+    const mlir::storage::ListPredicateKind kind = listPredicateKind(predicate->getQuantifier());
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    auto predicateOp = _opBuilder.create<mlir::db::ListPredicate>(_opBuilder.getUnknownLoc(),
+                                                                  boolType,
+                                                                  source,
+                                                                  carrySet._columns,
+                                                                  kind);
+
+    generateElementRegion(predicateOp.getBody(),
+                          comprehension,
+                          carrySet,
+                          /*cutsElements=*/false,
+                          comprehension->getPredicate());
+
+    dropUnreadCarriedColumns(predicateOp, predicateOp.getColumnsToFilter());
+
+    _part._exprMap[expr] = predicateOp.getResult();
+}
+
+void DBProgramGenerator::translateReduceExpr(const Expr* expr, const ReduceExpr* reduce) {
+    const mlir::Value initialValue = getOrTranslateExprColumn(reduce->getInitialValue());
+    const mlir::Value source = getOrTranslateExprColumn(reduce->getSource());
+
+    CarrySet carrySet;
+    collectElementCarrySet(carrySet);
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    auto reduceOp = _opBuilder.create<mlir::db::Reduce>(loc,
+                                                        noneType,
+                                                        source,
+                                                        initialValue,
+                                                        carrySet._columns);
+
+    llvm::SmallVector<mlir::Type> argumentTypes {noneType, noneType};
+    llvm::SmallVector<mlir::Location> argumentLocations {loc, loc};
+
+    for (const mlir::Value column : carrySet._columns) {
+        argumentTypes.push_back(column.getType());
+        argumentLocations.push_back(loc);
+    }
+
+    const mlir::OpBuilder::InsertionGuard guard(_opBuilder);
+    mlir::Block* const bodyBlock = _opBuilder.createBlock(&reduceOp.getBody(), {}, argumentTypes, argumentLocations);
+
+    const VariableIdentityMap outerVarMap = _part._varMap;
+    const EdgeTypeColumnMap outerEdgeTypeMap = _part._edgeTypeMap;
+    const std::vector<YieldedColumn> outerYieldedColumns = _part._yieldedColumns;
+    const ElementColumnMap outerComprehensionElements = _part._comprehensionElements;
+    const PartScope::CreatedEntityMap outerCreatedEntities = _part._createdEntities;
+    const ExprValueMap outerExprMap = _part._exprMap;
+    const ProjectedColumnMap outerProjectedColumns = _part._projectedColumns;
+    const std::unordered_map<const VarDecl*, mlir::Value> outerNamedPaths = _part._namedPaths;
+
+    const mlir::Block::BlockArgListType carriedArguments = bodyBlock->getArguments().drop_front(2);
+
+    _part._exprMap.clear();
+    rebindCarrySet(carriedArguments, /*firstColumn=*/0, carrySet);
+    rebindProjectedColumns(carrySet._columns, carriedArguments);
+    _part._comprehensionElements[reduce->getItemDecl()] = bodyBlock->getArgument(0);
+    _part._comprehensionElements[reduce->getAccumulatorDecl()] = bodyBlock->getArgument(1);
+
+    const mlir::Value value = getOrTranslateExprColumn(reduce->getExpression());
+    _opBuilder.create<mlir::db::ReduceYield>(loc, value);
+
+    _part._varMap = outerVarMap;
+    _part._edgeTypeMap = outerEdgeTypeMap;
+    _part._yieldedColumns = outerYieldedColumns;
+    _part._comprehensionElements = outerComprehensionElements;
+    _part._createdEntities = outerCreatedEntities;
+    _part._exprMap = outerExprMap;
+    _part._projectedColumns = outerProjectedColumns;
+    _part._namedPaths = outerNamedPaths;
+
+    dropUnreadCarriedColumns(reduceOp, reduceOp.getColumnsToFilter());
+
+    _part._exprMap[expr] = reduceOp.getResult();
+}
+
+void DBProgramGenerator::collectElementCarrySet(CarrySet& carrySet) {
+    // The body reads the elements of one row's list rather than the rows in flight, so
+    // every column of those rows may be carried: the op repeats each over the elements of
+    // its own row. A constant stands for every row already and needs no carrying, which is
+    // the one column the collection leaves out.
+    if (_part._aggregateOp) {
+        collectGroupedColumns(carrySet);
+    } else {
+        collectCarrySet(carrySet);
+    }
+
+    llvm::SmallVector<mlir::Value> projectedColumns;
+    for (const auto& [decl, column] : _part._projectedColumns) {
+        const bool isCarriedAlready = llvm::is_contained(carrySet._columns, column)
+                                   || llvm::is_contained(projectedColumns, column);
+        const bool needsCarrying = holdsTheRowsInFlight(column)
+                                && !yieldsConstantColumn(column, _constantColumns)
+                                && !isCarriedAlready;
+
+        if (needsCarrying) {
+            projectedColumns.push_back(column);
+        }
+    }
+
+    std::ranges::sort(projectedColumns, computedBefore);
+    carrySet._columns.append(projectedColumns.begin(), projectedColumns.end());
+}
+
+void DBProgramGenerator::generateElementRegion(mlir::Region& region,
+                                               const ListComprehensionExpr* comprehension,
+                                               const CarrySet& carrySet,
+                                               bool cutsElements,
+                                               const Expr* valueExpr) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+    const mlir::db::ColumnType rowTagType =
+        allocColumnType(_opBuilder.getIntegerType(64, /*isSigned=*/false));
+
+    llvm::SmallVector<mlir::Type> argumentTypes {noneType, rowTagType};
+    llvm::SmallVector<mlir::Location> argumentLocations {loc, loc};
+
+    for (const mlir::Value column : carrySet._columns) {
+        argumentTypes.push_back(column.getType());
+        argumentLocations.push_back(loc);
+    }
+
+    const mlir::OpBuilder::InsertionGuard guard(_opBuilder);
+    mlir::Block* const bodyBlock = _opBuilder.createBlock(&region, {}, argumentTypes, argumentLocations);
+
+    const VariableIdentityMap outerVarMap = _part._varMap;
+    const EdgeTypeColumnMap outerEdgeTypeMap = _part._edgeTypeMap;
+    const std::vector<YieldedColumn> outerYieldedColumns = _part._yieldedColumns;
+    const ElementColumnMap outerComprehensionElements = _part._comprehensionElements;
+    const PartScope::CreatedEntityMap outerCreatedEntities = _part._createdEntities;
+    const ExprValueMap outerExprMap = _part._exprMap;
+    const ProjectedColumnMap outerProjectedColumns = _part._projectedColumns;
+    const std::unordered_map<const VarDecl*, mlir::Value> outerNamedPaths = _part._namedPaths;
+
+    const VarDecl* const itemDecl = comprehension->getDecl();
+
+    _part._exprMap.clear();
+    rebindCarrySet(bodyBlock->getArguments().drop_front(2), /*firstColumn=*/0, carrySet);
+    rebindProjectedColumns(carrySet._columns, bodyBlock->getArguments().drop_front(2));
+    _part._comprehensionElements[itemDecl] = bodyBlock->getArgument(0);
+
+    mlir::Value rowTags = bodyBlock->getArgument(1);
+
+    // The WHERE cuts the elements themselves rather than masking what they contribute
+    mlir::db::FilterOp elementFilter;
+    const Expr* const predicateExpr = comprehension->getPredicate();
+    if (cutsElements && predicateExpr) {
+        const mlir::Value predicate = getOrTranslateExprColumn(predicateExpr);
+
+        const llvm::SmallVector<mlir::Value> filtered(bodyBlock->args_begin(), bodyBlock->args_end());
+
+        llvm::SmallVector<mlir::Type> filteredTypes;
+        for (const mlir::Value column : filtered) {
+            filteredTypes.push_back(column.getType());
+        }
+
+        elementFilter = _opBuilder.create<mlir::db::FilterOp>(loc, filteredTypes, predicate, filtered);
+
+        _part._comprehensionElements[itemDecl] = elementFilter.getResult(0);
+        rowTags = elementFilter.getResult(1);
+
+        _part._exprMap.clear();
+        rebindCarrySet(elementFilter.getResults(), /*firstColumn=*/2, carrySet);
+        rebindProjectedColumns(filtered, elementFilter.getResults());
+    }
+
+    const mlir::Value value = valueExpr ? getOrTranslateExprColumn(valueExpr)
+                                       : _part._comprehensionElements[itemDecl];
+
+    _opBuilder.create<mlir::db::ComprehensionYield>(loc, rowTags, value);
+
+    _part._varMap = outerVarMap;
+    _part._edgeTypeMap = outerEdgeTypeMap;
+    _part._yieldedColumns = outerYieldedColumns;
+    _part._comprehensionElements = outerComprehensionElements;
+    _part._createdEntities = outerCreatedEntities;
+    _part._exprMap = outerExprMap;
+    _part._projectedColumns = outerProjectedColumns;
+    _part._namedPaths = outerNamedPaths;
+
+    if (elementFilter) {
+        dropUnreadFilteredColumns(elementFilter);
+    }
+}
+
+void DBProgramGenerator::dropUnreadCarriedColumns(mlir::Operation* op, mlir::OperandRange carried) {
+    if (carried.empty()) {
+        return;
+    }
+
+    const size_t carriedCount = carried.size();
+    const size_t operandOffset = carried.getBeginOperandIndex();
+
+    llvm::BitVector unread(carriedCount, true);
+    for (mlir::Region& region : op->getRegions()) {
+        const mlir::Block::BlockArgListType carriedArguments = region.front().getArguments().take_back(carriedCount);
+
+        for (size_t carriedIndex = 0; carriedIndex < carriedCount; carriedIndex++) {
+            if (!carriedArguments[carriedIndex].use_empty()) {
+                unread.reset(carriedIndex);
+            }
+        }
+    }
+
+    if (unread.none()) {
+        return;
+    }
+
+    for (mlir::Region& region : op->getRegions()) {
+        mlir::Block& block = region.front();
+        const size_t argumentOffset = block.getNumArguments() - carriedCount;
+
+        llvm::BitVector erasedArguments(block.getNumArguments());
+        for (const unsigned carriedIndex : unread.set_bits()) {
+            _constantColumns.erase(block.getArgument(argumentOffset + carriedIndex));
+            erasedArguments.set(argumentOffset + carriedIndex);
+        }
+
+        block.eraseArguments(erasedArguments);
+    }
+
+    llvm::BitVector erasedOperands(op->getNumOperands());
+    for (const unsigned carriedIndex : unread.set_bits()) {
+        erasedOperands.set(operandOffset + carriedIndex);
+    }
+
+    op->eraseOperands(erasedOperands);
+}
+
+void DBProgramGenerator::dropUnreadFilteredColumns(mlir::db::FilterOp filter) {
+    const mlir::OperandRange columns = filter.getColumnsToFilter();
+    const mlir::ResultRange results = filter.getResults();
+
+    llvm::SmallVector<mlir::Value> keptColumns;
+    llvm::SmallVector<mlir::Type> keptTypes;
+    llvm::SmallVector<mlir::Value> keptResults;
+
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        const mlir::Value result = results[columnIndex];
+        if (!result.use_empty()) {
+            keptColumns.push_back(columns[columnIndex]);
+            keptTypes.push_back(result.getType());
+            keptResults.push_back(result);
+        }
+    }
+
+    if (keptColumns.size() == columns.size()) {
+        return;
+    }
+
+    const mlir::OpBuilder::InsertionGuard guard(_opBuilder);
+    _opBuilder.setInsertionPoint(filter);
+
+    auto trimmed = _opBuilder.create<mlir::db::FilterOp>(filter.getLoc(), keptTypes, filter.getMask(), keptColumns);
+
+    for (size_t keptIndex = 0; keptIndex < keptResults.size(); keptIndex++) {
+        keptResults[keptIndex].replaceAllUsesWith(trimmed.getResult(keptIndex));
+    }
+
+    for (const mlir::Value result : results) {
+        _constantColumns.erase(result);
+    }
+
+    filter.erase();
+}
+
+void DBProgramGenerator::translatePatternComprehensionExpr(const Expr* expr,
+                                                           const PatternComprehensionExpr* comprehension) {
+    MatchStmt* const match = comprehension->getMatch();
+
+    throwOnMatchOverWrittenEntity(match, "A pattern comprehension");
+
+    // The lists stand beside the rows in flight, so every column of those rows is handed
+    // to the op: the pattern joins onto the ones it names and carries the rest along
+    CarrySet carrySet;
+    collectCarrySet(carrySet);
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    auto comprehensionOp = _opBuilder.create<mlir::db::PatternComprehension>(loc,
+                                                                             noneType,
+                                                                             carrySet._columns);
+
+    llvm::SmallVector<mlir::Type> argumentTypes;
+    llvm::SmallVector<mlir::Location> argumentLocations;
+
+    for (const mlir::Value column : carrySet._columns) {
+        argumentTypes.push_back(column.getType());
+        argumentLocations.push_back(loc);
+    }
+
+    // No column in flight means no input row to tag: the one list the comprehension builds
+    // covers the single empty row the query starts from
+    const bool tagsRows = !carrySet._columns.empty();
+
+    if (tagsRows) {
+        argumentTypes.push_back(allocColumnType(_opBuilder.getIntegerType(64, /*isSigned=*/false)));
+        argumentLocations.push_back(loc);
+    }
+
+    const mlir::OpBuilder::InsertionGuard guard(_opBuilder);
+    mlir::Block* const patternBlock = _opBuilder.createBlock(&comprehensionOp.getPattern(),
+                                                             {},
+                                                             argumentTypes,
+                                                             argumentLocations);
+
+    const PartScope outerPart = _part;
+
+    // The pattern reads the rows in flight through the block arguments, so the scope is
+    // moved onto them before it is handed over
+    rebindCarrySet(patternBlock->getArguments(), /*firstColumn=*/0, carrySet);
+
+    llvm::SmallVector<PublishedColumn> patternScope;
+    collectPublishedColumns(patternScope);
+
+    // The pattern is a MATCH of its own and is walked over a dependency graph of its own;
+    // the one the query is being generated from is put back once it has been.
+    VariableDependencyGraph outerVdg = std::move(_vdg);
+
+    rebindScopeKeepingWrittenEntities(patternScope);
+
+    const VariableDependency* tagVariable = nullptr;
+    if (tagsRows) {
+        tagVariable = _vdg.registerBoundVariable(comprehensionTagName, nullptr);
+        const unsigned tagArgument = static_cast<unsigned>(carrySet._columns.size());
+        registerValue(tagVariable, patternBlock->getArgument(tagArgument));
+    }
+
+    Stmt* const patternStatements[] = {match};
+    generatePart(patternStatements);
+
+    const mlir::Value value = getOrTranslateExprColumn(comprehension->getProjection());
+    const mlir::Value rowTags = tagsRows ? _part._varMap.at(tagVariable).back() : mlir::Value {};
+
+    _opBuilder.create<mlir::db::ComprehensionYield>(loc, rowTags, value);
+
+    _part = outerPart;
+    _vdg = std::move(outerVdg);
+
+    _part._exprMap[expr] = comprehensionOp.getResult();
+}
+
+// A union holds a row exactly when one of its branches does, so each branch is an EXISTS
+// of its own and the answer is their OR
+void DBProgramGenerator::translateExistsExpr(const Expr* expr, const ExistsExpr* existsExpr) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    mlir::Value exists;
+    for (const SinglePartQuery* branch : existsExpr->branches()) {
+        const mlir::Value branchExists =
+            generateSubqueryExpression<mlir::db::ExistsSubquery, mlir::db::ExistsYield>(llvm::ArrayRef(branch),
+                                                                                        0,
+                                                                                        boolType,
+                                                                                        existsTagName);
+
+        if (exists) {
+            exists = _opBuilder.create<mlir::db::OrOp>(loc, boolType, exists, branchExists).getResult();
+        } else {
+            exists = branchExists;
+        }
+    }
+
+    _part._exprMap[expr] = exists;
+}
+
+void DBProgramGenerator::translateCountSubqueryExpr(const Expr* expr, const CountSubqueryExpr* countExpr) {
+    const CountSubqueryExpr::Branches& countBranches = countExpr->getBranches();
+
+    llvm::SmallVector<const SinglePartQuery*> branches;
+    for (const UnionQuery::Branch& branch : countBranches) {
+        branches.push_back(branch._query);
+    }
+
+    const mlir::db::ColumnType countType = allocColumnType(_opBuilder.getIntegerType(64, /*isSigned=*/false));
+
+    const size_t dedupedBranches = UnionQuery::getDedupedBranchCount(countBranches);
+    if (dedupedBranches > 0) {
+        _part._exprMap[expr] =
+            generateSubqueryExpression<mlir::db::CountSubquery, mlir::db::CountSubqueryYield>(branches,
+                                                                                              dedupedBranches,
+                                                                                              countType,
+                                                                                              countTagName);
+        return;
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    mlir::Value count;
+    for (const SinglePartQuery* branch : branches) {
+        const mlir::Value branchCount =
+            generateSubqueryExpression<mlir::db::CountSubquery, mlir::db::CountSubqueryYield>(llvm::ArrayRef(branch),
+                                                                                              0,
+                                                                                              countType,
+                                                                                              countTagName);
+
+        if (count) {
+            count = _opBuilder.create<mlir::db::AddOp>(loc, noneType, count, branchCount).getResult();
+        } else {
+            count = branchCount;
+        }
+    }
+
+    _part._exprMap[expr] = count;
+}
+
+// A UNION ALL holds a row's values from every branch, one after the other, so each branch
+// is a COLLECT of its own and the lists are concatenated in branch order
+void DBProgramGenerator::translateCollectSubqueryExpr(const Expr* expr, const CollectSubqueryExpr* collectExpr) {
+    const CollectSubqueryExpr::Branches& collectBranches = collectExpr->getBranches();
+
+    llvm::SmallVector<const SinglePartQuery*> branches;
+    for (const UnionQuery::Branch& branch : collectBranches) {
+        branches.push_back(branch._query);
+    }
+
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    const size_t dedupedBranches = UnionQuery::getDedupedBranchCount(collectBranches);
+    if (dedupedBranches > 0) {
+        _part._exprMap[expr] =
+            generateSubqueryExpression<mlir::db::CollectSubquery, mlir::db::CollectSubqueryYield>(branches,
+                                                                                                  dedupedBranches,
+                                                                                                  noneType,
+                                                                                                  collectTagName);
+        return;
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    mlir::Value lists;
+    for (const SinglePartQuery* branch : branches) {
+        const mlir::Value branchLists =
+            generateSubqueryExpression<mlir::db::CollectSubquery, mlir::db::CollectSubqueryYield>(llvm::ArrayRef(branch),
+                                                                                                  0,
+                                                                                                  noneType,
+                                                                                                  collectTagName);
+
+        if (lists) {
+            lists = _opBuilder.create<mlir::db::ConcatOp>(loc, noneType, lists, branchLists).getResult();
+        } else {
+            lists = branchLists;
+        }
+    }
+
+    _part._exprMap[expr] = lists;
+}
+
+template <typename SubqueryOp, typename YieldOp>
+mlir::Value DBProgramGenerator::generateSubqueryExpression(llvm::ArrayRef<const SinglePartQuery*> branches,
+                                                           size_t dedupedBranches,
+                                                           mlir::Type resultType,
+                                                           std::string_view tagName) {
+    // A UNION dedups the rows of each input row on their own, so a union body runs one
+    // input row at a time
+    const bool isUnion = branches.size() > 1;
+    const bool carriesScope = !isUnion && subqueryCarriesRows(branches.front());
+
+    llvm::SmallVector<PublishedColumn> scopeColumns;
+    collectPublishedColumns(scopeColumns);
+
+    // An alias spelling the name of a variable shadows that variable in the ORDER BY
+    if (_part._orderingProjection) {
+        bool appended = false;
+
+        for (const SinglePartQuery* branch : branches) {
+            for (const VarDecl* decl : branch->getDeclContext()->decls()) {
+                const VarDecl* source = decl->getImportSource();
+                const auto projectedIt = _part._projectedColumns.find(source);
+
+                if (!source || projectedIt == _part._projectedColumns.end()) {
+                    continue;
+                }
+
+                const std::string_view name = decl->getName();
+                const PublishedColumn projected {source, std::string(name), projectedIt->second};
+                const auto publishedIt = std::ranges::find(scopeColumns, name, &PublishedColumn::_name);
+
+                if (publishedIt != scopeColumns.end()) {
+                    *publishedIt = projected;
+                } else {
+                    scopeColumns.push_back(projected);
+                    appended = true;
+                }
+            }
+        }
+
+        if (appended) {
+            std::ranges::sort(scopeColumns, {}, &PublishedColumn::_name);
+        }
+    }
+
+    // A constant holds one value standing for every row rather than rows of its own, so it
+    // is no input of the body: it stays bound where it is and the body reads it there
+    llvm::SmallVector<PublishedColumn> inputs;
+    llvm::SmallVector<PublishedColumn> constants;
+
+    mlir::Value consumedColumn;
+
+    for (const PublishedColumn& column : scopeColumns) {
+        const bool consumedByTheAggregate = _part._aggregateOp
+                                         && !boundAtOrAfter(column._column, _part._aggregateOp);
+
+        if (yieldsConstantColumn(column._column, _constantColumns)) {
+            constants.push_back(column);
+        } else if (!consumedByTheAggregate) {
+            inputs.push_back(column);
+        } else {
+            // A group holds no one value of a variable the aggregate consumed, and the analyzer
+            // turns away a body reading one: a WITH or a RETURN * in the body only carries it
+            if (!consumedColumn) {
+                consumedColumn = nullConstantColumn();
+            }
+
+            constants.push_back({column._decl, column._name, consumedColumn});
+        }
+    }
+
+    // Under a grouping key no variable names, the groups are held by the aggregate's
+    // results alone, which the body then answers for under no name
+    if (inputs.empty() && _part._aggregateOp) {
+        for (const mlir::Value result : _part._aggregateOp->getResults()) {
+            inputs.push_back({nullptr, std::string(), result});
+        }
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType tagType = allocColumnType(_opBuilder.getIntegerType(64, /*isSigned=*/false));
+
+    llvm::SmallVector<mlir::Value> inputColumns;
+    llvm::SmallVector<mlir::Type> argumentTypes;
+    llvm::SmallVector<mlir::Location> argumentLocations;
+
+    for (const PublishedColumn& input : inputs) {
+        inputColumns.push_back(input._column);
+        argumentTypes.push_back(input._column.getType());
+        argumentLocations.push_back(loc);
+    }
+
+    // A body that cannot keep its rows paired with the ones it was given carries no tag:
+    // it is run one input row at a time, and the row it was handed is the one it answers for
+    const bool tagsRows = carriesScope && !inputs.empty();
+    if (tagsRows) {
+        argumentTypes.push_back(tagType);
+        argumentLocations.push_back(loc);
+    }
+
+    SubqueryOp subqueryOp = _opBuilder.create<SubqueryOp>(loc, resultType, inputColumns, carriesScope);
+
+    const mlir::OpBuilder::InsertionGuard guard(_opBuilder);
+    mlir::Block* const bodyBlock = _opBuilder.createBlock(&subqueryOp.getBody(),
+                                                         {},
+                                                         argumentTypes,
+                                                         argumentLocations);
+
+    // The body is correlated: it reads every variable in flight, under the declaration its
+    // own context holds for it
+    std::vector<llvm::SmallVector<PublishedColumn>> branchScopes(branches.size());
+
+    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
+        const DeclContext* bodyContext = branches[branchIndex]->getDeclContext();
+        llvm::SmallVector<PublishedColumn>& scope = branchScopes[branchIndex];
+
+        const auto importedDecl = [bodyContext](std::string_view name) -> const VarDecl* {
+            const VarDecl* decl = bodyContext->getDecl(name);
+
+            return decl && decl->getImportSource() ? decl : nullptr;
+        };
+
+        for (size_t inputIndex = 0; inputIndex < inputs.size(); inputIndex++) {
+            const PublishedColumn& input = inputs[inputIndex];
+            const mlir::Value argument = bodyBlock->getArgument(static_cast<unsigned>(inputIndex));
+
+            if (const VarDecl* correlated = importedDecl(input._name)) {
+                scope.push_back({correlated, input._name, argument});
+            }
+
+            const std::string_view fieldRow = findCSVFieldRow(input._decl);
+            if (!fieldRow.empty() && importedDecl(fieldRow)) {
+                scope.push_back({input._decl, input._name, argument});
+            }
+        }
+
+        if (tagsRows) {
+            const mlir::Value tagArgument = bodyBlock->getArgument(static_cast<unsigned>(inputs.size()));
+            scope.push_back({nullptr, std::string(tagName), tagArgument});
+        }
+
+        for (const PublishedColumn& constant : constants) {
+            if (const VarDecl* correlated = importedDecl(constant._name)) {
+                scope.push_back({correlated, constant._name, constant._column});
+            }
+        }
+    }
+
+    // What the query holds is set aside while the body builds a scope of its own: the body
+    // binds nothing the query goes on to read, the op handing back one column and no other
+    PartScope outerPart = std::move(_part);
+    VariableDependencyGraph outerGraph = std::move(_vdg);
+
+    std::unordered_set<std::string_view> outerImportedCSVRows;
+    std::swap(_importedCSVRows, outerImportedCSVRows);
+
+    llvm::SmallVector<PublishedColumn> held;
+
+    if (isUnion) {
+        std::vector<CarriedEntities> importedEntities(branches.size());
+        CarriedEntities returnedEntities;
+
+        generateSubqueryUnion(branches,
+                              dedupedBranches,
+                              branchScopes,
+                              importedEntities,
+                              held,
+                              returnedEntities);
+    } else {
+        const SinglePartQuery* body = branches.front();
+
+        rebindSubqueryBranchScope(branchScopes.front(), CarriedEntities {});
+
+        generateQueryParts(body);
+
+        // A RETURN answers for no column here, but its cut does: SKIP can empty a body that
+        // matched, so the projection is emitted and the rows it leaves are the ones answered for
+        if (const ReturnStmt* returnStmt = body->getReturnStmt()) {
+            publishProjection(returnStmt->getProjection());
+        }
+
+        collectPublishedColumns(held);
+    }
+
+    // A tagged body is answered for by its tag alone, which a barrier in the body carries
+    // on under its hidden name. A body with no tag is answered for by the rows it holds.
+    mlir::Value carriedTag;
+    llvm::SmallVector<mlir::Value> heldColumns;
+
+    if (tagsRows) {
+        const auto tagIt = std::ranges::find(held, tagName, &PublishedColumn::_name);
+        bioassert(tagIt != held.end(), "Row tag lost by a subquery body");
+
+        carriedTag = tagIt->_column;
+    } else {
+        for (const PublishedColumn& column : held) {
+            heldColumns.push_back(column._column);
+        }
+    }
+
+    if constexpr (std::is_same_v<SubqueryOp, mlir::db::CollectSubquery>) {
+        const auto isReturned = [](const PublishedColumn& column) {
+            return !isHiddenName(column._name);
+        };
+
+        const auto valueIt = std::ranges::find_if(held, isReturned);
+        bioassert(valueIt != held.end(), "COLLECT subquery body returns no column");
+
+        _opBuilder.create<YieldOp>(loc, carriedTag, valueIt->_column, heldColumns);
+    } else {
+        _opBuilder.create<YieldOp>(loc, carriedTag, heldColumns);
+    }
+
+    _part = std::move(outerPart);
+    _vdg = std::move(outerGraph);
+
+    std::swap(_importedCSVRows, outerImportedCSVRows);
+
+    return subqueryOp.getResult();
+}
+
+void DBProgramGenerator::translateCaseExpr(const Expr* expr, const CaseExpr* caseExpr) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    // The simple form compares its subject against every WHEN value, which is the generic
+    // form with that equality as the condition
+    const Expr* const subjectExpr = caseExpr->getSubject();
+    mlir::Value subject;
+    if (subjectExpr) {
+        translateExpr(subjectExpr);
+        bioassert(_part._exprMap.contains(subjectExpr), "CASE subject with no column.");
+        subject = _part._exprMap.at(subjectExpr);
+    }
+
+    CarrySet carrySet;
+    collectElementCarrySet(carrySet);
+
+    llvm::SmallVector<mlir::Value> carried(carrySet._columns.begin(), carrySet._columns.end());
+    if (subject && !yieldsConstantColumn(subject, _constantColumns)) {
+        carried.push_back(subject);
+    }
+
+    const CaseExpr::Branches& branches = caseExpr->getBranches();
+    const Expr* const elseExpr = caseExpr->getElseExpr();
+    const size_t regionCount = 2 * branches.size() + (elseExpr ? 1 : 0);
+
+    auto caseOp = _opBuilder.create<mlir::db::LazyCase>(loc,
+                                                        noneType,
+                                                        carried,
+                                                        static_cast<unsigned>(regionCount));
+
+    const mlir::MutableArrayRef<mlir::Region> regions = caseOp.getBranches();
+
+    const auto translateValue = [this](const Expr* valueExpr) {
+        translateExpr(valueExpr);
+        bioassert(_part._exprMap.contains(valueExpr), "CASE branch with no value column.");
+
+        return _part._exprMap.at(valueExpr);
+    };
+
+    size_t regionIndex = 0;
+    for (const CaseExpr::Branch& branch : branches) {
+        generateCaseRegion(regions[regionIndex], carried, carrySet, subject, [&](mlir::Value regionSubject) {
+            mlir::Value condition;
+
+            for (const CaseExpr::Test& test : branch._tests) {
+                const mlir::Value tested = translateCaseTest(subjectExpr, regionSubject, test);
+
+                if (condition) {
+                    condition = _opBuilder.create<mlir::db::OrOp>(loc, boolType, condition, tested).getResult();
+                } else {
+                    condition = tested;
+                }
+            }
+
+            return condition;
+        });
+
+        generateCaseRegion(regions[regionIndex + 1], carried, carrySet, subject, [&](mlir::Value) {
+            return translateValue(branch._then);
+        });
+
+        regionIndex += 2;
+    }
+
+    if (elseExpr) {
+        generateCaseRegion(regions[regionIndex], carried, carrySet, subject, [&](mlir::Value) {
+            return translateValue(elseExpr);
+        });
+    }
+
+    dropUnreadCarriedColumns(caseOp, caseOp.getColumnsToFilter());
+
+    _part._exprMap[expr] = caseOp.getResult();
+}
+
+void DBProgramGenerator::generateCaseRegion(mlir::Region& region,
+                                            llvm::ArrayRef<mlir::Value> carried,
+                                            const CarrySet& carrySet,
+                                            mlir::Value subject,
+                                            CaseRegionGenerator generateValue) {
+    llvm::SmallVector<mlir::Type> argumentTypes;
+    llvm::SmallVector<mlir::Location> argumentLocations;
+
+    for (const mlir::Value column : carried) {
+        argumentTypes.push_back(column.getType());
+        argumentLocations.push_back(_opBuilder.getUnknownLoc());
+    }
+
+    const mlir::OpBuilder::InsertionGuard guard(_opBuilder);
+    mlir::Block* const block = _opBuilder.createBlock(&region, {}, argumentTypes, argumentLocations);
+    const mlir::Block::BlockArgListType arguments = block->getArguments();
+
+    const PartScope outerPart = _part;
+
+    _part._exprMap.clear();
+    rebindCarrySet(arguments, /*firstColumn=*/0, carrySet);
+    rebindProjectedColumns(carrySet._columns, arguments.take_front(carrySet._columns.size()));
+
+    const bool carriesSubject = carried.size() > carrySet._columns.size();
+    const mlir::Value regionSubject = carriesSubject ? mlir::Value(arguments.back()) : subject;
+
+    const mlir::Value value = generateValue(regionSubject);
+    _opBuilder.create<mlir::db::CaseYield>(_opBuilder.getUnknownLoc(), value);
+
+    _part = outerPart;
+}
+
+mlir::Value DBProgramGenerator::disjointComparison(mlir::Value lhs, mlir::Value rhs, bool equality) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    // A literal carries a value on every row it stands for, so only a column operand can be
+    // absent, and a null test on the literal would meet its one row against the relation's
+    llvm::SmallVector<mlir::Value, 2> columns;
+    for (const mlir::Value operand : {lhs, rhs}) {
+        if (!yieldsConstantColumn(operand, _constantColumns)) {
+            columns.push_back(operand);
+        }
+    }
+
+    if (columns.empty()) {
+        return constantBool(!equality);
+    }
+
+    mlir::Value condition;
+    for (const mlir::Value column : columns) {
+        mlir::Value test;
+        if (equality) {
+            test = _opBuilder.create<mlir::db::EqOp>(loc, boolType, column, nullConstantColumn()).getResult();
+        } else {
+            test = _opBuilder.create<mlir::db::NeqOp>(loc, boolType, column, nullConstantColumn()).getResult();
+        }
+
+        if (!condition) {
+            condition = test;
+        } else if (equality) {
+            condition = _opBuilder.create<mlir::db::OrOp>(loc, boolType, condition, test).getResult();
+        } else {
+            condition = _opBuilder.create<mlir::db::AndOp>(loc, boolType, condition, test).getResult();
+        }
+    }
+
+    if (equality) {
+        return _opBuilder.create<mlir::db::AndOp>(loc, boolType, condition, nullConstantColumn()).getResult();
+    }
+
+    return _opBuilder.create<mlir::db::OrOp>(loc, boolType, condition, nullConstantColumn()).getResult();
+}
+
+mlir::Value DBProgramGenerator::translateCaseTest(const Expr* subjectExpr,
+                                                  mlir::Value subject,
+                                                  const CaseExpr::Test& test) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    const EvaluatedType subjectType = subjectExpr ? subjectExpr->getType() : EvaluatedType::Invalid;
+
+    const bool subjectIsNull = subjectExpr
+                               && (subjectType == EvaluatedType::Null || isUntypedNullColumn(subject));
+
+    if (test._kind == CaseExpr::TestKind::IsNull) {
+        if (subjectIsNull) {
+            return constantBool(true);
+        }
+
+        return _opBuilder.create<mlir::db::EqOp>(loc, boolType, subject, nullConstantColumn()).getResult();
+    } else if (test._kind == CaseExpr::TestKind::IsNotNull) {
+        if (subjectIsNull) {
+            return constantBool(false);
+        }
+
+        return _opBuilder.create<mlir::db::NeqOp>(loc, boolType, subject, nullConstantColumn()).getResult();
+    }
+
+    translateExpr(test._value);
+    bioassert(_part._exprMap.contains(test._value), "CASE branch with no condition column.");
+
+    const mlir::Value value = _part._exprMap.at(test._value);
+    const EvaluatedType valueType = test._value->getType();
+
+    // Null is equal to nothing, itself included, and an ordering between two types with
+    // no order between them is null, so a branch comparing across either is never taken.
+    // IS NULL above is how a Cypher CASE tests for a null
+    const bool comparesAgainstNull = subjectIsNull || valueType == EvaluatedType::Null;
+    const bool comparesDisjointTypes = subjectExpr && comparesAsDisjointTypes(subjectType, valueType);
+    const bool ordersDisjointTypes = subjectExpr && ordersAsDisjointTypes(subjectType, valueType);
+
+    const bool testsEquality = test._operator == BinaryOperator::Equal
+                               || test._operator == BinaryOperator::NotEqual;
+    const bool neverTaken = comparesAgainstNull || (ordersDisjointTypes && !testsEquality);
+
+    if (!subject) {
+        return value;
+    } else if (neverTaken) {
+        return constantBool(false);
+    } else if (comparesDisjointTypes && testsEquality) {
+        return disjointComparison(subject, value, test._operator == BinaryOperator::Equal);
+    }
+
+    switch (test._operator) {
+        case BinaryOperator::Equal:
+            return _opBuilder.create<mlir::db::EqOp>(loc, boolType, subject, value).getResult();
+        break;
+        case BinaryOperator::NotEqual:
+            return _opBuilder.create<mlir::db::NeqOp>(loc, boolType, subject, value).getResult();
+        break;
+        case BinaryOperator::LessThan:
+            return _opBuilder.create<mlir::db::LtOp>(loc, boolType, subject, value).getResult();
+        break;
+        case BinaryOperator::GreaterThan:
+            return _opBuilder.create<mlir::db::GtOp>(loc, boolType, subject, value).getResult();
+        break;
+        case BinaryOperator::LessThanOrEqual:
+            return _opBuilder.create<mlir::db::LteOp>(loc, boolType, subject, value).getResult();
+        break;
+        case BinaryOperator::GreaterThanOrEqual:
+            return _opBuilder.create<mlir::db::GteOp>(loc, boolType, subject, value).getResult();
+        break;
+        default:
+            throwError(fmt::format("Unsupported comparison in a CASE branch: {}",
+                                   BinaryOperatorDescription::value(test._operator)),
+                       test._value);
+        break;
+    }
+}
+
+void DBProgramGenerator::translateLogicalExpr(const Expr* expr, const LogicalExpr* logicalExpr) {
+    const LogicalOperator op = logicalExpr->getOperator();
+
+    mlir::Value result;
+    for (const Expr* operandExpr : logicalExpr->getOperands()) {
+        translateExpr(operandExpr);
+        bioassert(_part._exprMap.contains(operandExpr), "Logical operation with unknown operand.");
+
+        const mlir::Value operand = _part._exprMap.at(operandExpr);
+        result = result ? translateLogicalOperator(op, result, operand) : operand;
+    }
+
+    _part._exprMap[expr] = result;
+}
+
+mlir::Value DBProgramGenerator::translateLogicalOperator(LogicalOperator op, mlir::Value lhs, mlir::Value rhs) {
+    // AND, OR and XOR read a null side as an unknown boolean, which the runtime truth
+    // tables answer against the other side's value per row. With both sides null there is
+    // no value to answer against and the result is null, whichever of the three it is
+    if (isUntypedNullColumn(lhs) && isUntypedNullColumn(rhs)) {
+        return nullConstantColumn();
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    switch (op) {
+        case LogicalOperator::And:
+            return _opBuilder.create<mlir::db::AndOp>(loc, boolType, lhs, rhs).getResult();
+        break;
+        case LogicalOperator::Or:
+            return _opBuilder.create<mlir::db::OrOp>(loc, boolType, lhs, rhs).getResult();
+        break;
+        case LogicalOperator::Xor:
+            return _opBuilder.create<mlir::db::XorOp>(loc, boolType, lhs, rhs).getResult();
+        break;
+        default:
+            throwError("Unknown logical operator.");
         break;
     }
 }
@@ -1319,64 +8828,274 @@ void DBProgramGenerator::translateBinaryExpr(const Expr* expr, const BinaryExpr*
     translateExpr(lhsExpr);
     translateExpr(rhsExpr);
 
-    bioassert(_exprMap.contains(lhsExpr), "Binary operation with unknown LHS operand.");
-    bioassert(_exprMap.contains(rhsExpr), "Binary operation with unknown RHS operand.");
+    bioassert(_part._exprMap.contains(lhsExpr), "Binary operation with unknown LHS operand.");
+    bioassert(_part._exprMap.contains(rhsExpr), "Binary operation with unknown RHS operand.");
 
-    const mlir::Value lhs = _exprMap.at(lhsExpr);
-    const mlir::Value rhs = _exprMap.at(rhsExpr);
+    const mlir::Value lhs = _part._exprMap.at(lhsExpr);
+    const mlir::Value rhs = _part._exprMap.at(rhsExpr);
     const mlir::Location loc = _opBuilder.getUnknownLoc();
     const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
     const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
 
     const BinaryOperator op = binExpr->getOperator();
 
+    // Two types that can never hold equal values answer the equality without reading a row
+    const bool comparesDisjointTypes = comparesAsDisjointTypes(lhsExpr->getType(), rhsExpr->getType());
+
+    const bool testsKnownNull = lhsExpr->getType() == EvaluatedType::Null || isUntypedNullColumn(lhs);
+
+    // The analyzer types Null an expression that is null on every row - a comparison with a
+    // null, an ordering across types, arithmetic over a null - and the null names no column
+    // the result could be carried in
+    if (binExpr->getType() == EvaluatedType::Null) {
+        _part._exprMap[expr] = nullConstantColumn();
+        return;
+    }
+
     switch (op) {
         case BinaryOperator::Equal:
-            _exprMap[expr] = _opBuilder.create<mlir::db::EqOp>(loc, boolType, lhs, rhs).getResult();
+            if (comparesDisjointTypes) {
+                _part._exprMap[expr] = disjointComparison(lhs, rhs, /*equality=*/true);
+            } else {
+                _part._exprMap[expr] = _opBuilder.create<mlir::db::EqOp>(loc, boolType, lhs, rhs).getResult();
+            }
         break;
-        case BinaryOperator::And:
-            _exprMap[expr] = _opBuilder.create<mlir::db::AndOp>(loc, boolType, lhs, rhs).getResult();
+        case BinaryOperator::IsNull:
+            if (testsKnownNull) {
+                _part._exprMap[expr] = constantBool(true);
+            } else {
+                _part._exprMap[expr] = _opBuilder.create<mlir::db::EqOp>(loc, boolType, lhs, rhs).getResult();
+            }
         break;
-        case BinaryOperator::Or:
-            _exprMap[expr] = _opBuilder.create<mlir::db::OrOp>(loc, boolType, lhs, rhs).getResult();
+        case BinaryOperator::IsNotNull:
+            if (testsKnownNull) {
+                _part._exprMap[expr] = constantBool(false);
+            } else {
+                _part._exprMap[expr] = _opBuilder.create<mlir::db::NeqOp>(loc, boolType, lhs, rhs).getResult();
+            }
         break;
-        case BinaryOperator::Add:
-            _exprMap[expr] = _opBuilder.create<mlir::db::AddOp>(loc, noneType, lhs, rhs).getResult();
+        case BinaryOperator::Add: {
+            const EvaluatedType resultType = binExpr->getType();
+
+            // A type-erased cell joins a list as the list it holds or as one element of it,
+            // which only its row says, so an add over one is decided row by row
+            const bool addsACell = lhsExpr->getType() == EvaluatedType::Any
+                                || rhsExpr->getType() == EvaluatedType::Any;
+            const bool joinsAsText = resultType == EvaluatedType::String;
+            const bool joinsAsList = resultType == EvaluatedType::List;
+            const bool isConcatenation = !addsACell && (joinsAsText || joinsAsList);
+
+            if (isConcatenation) {
+                // A scalar concatenated with a list joins it as the one-element list it
+                // stands for, so both sides of the concatenation are lists
+                const bool concatenatesLists = resultType == EvaluatedType::List;
+                const bool lhsJoinsAList = concatenatesLists && lhsExpr->getType() != EvaluatedType::List;
+                const bool rhsJoinsAList = concatenatesLists && rhsExpr->getType() != EvaluatedType::List;
+
+                const mlir::Value lhsColumn = lhsJoinsAList ? singletonList(lhs) : lhs;
+                const mlir::Value rhsColumn = rhsJoinsAList ? singletonList(rhs) : rhs;
+
+                _part._exprMap[expr] = _opBuilder.create<mlir::db::ConcatOp>(loc, noneType, lhsColumn, rhsColumn).getResult();
+            } else {
+                _part._exprMap[expr] = _opBuilder.create<mlir::db::AddOp>(loc, noneType, lhs, rhs).getResult();
+            }
+        }
+        break;
+        case BinaryOperator::Concat:
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::ConcatOp>(loc, noneType, lhs, rhs).getResult();
         break;
         case BinaryOperator::Sub:
-            _exprMap[expr] = _opBuilder.create<mlir::db::SubOp>(loc, noneType, lhs, rhs).getResult();
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::SubOp>(loc, noneType, lhs, rhs).getResult();
         break;
         case BinaryOperator::Mult:
-            _exprMap[expr] = _opBuilder.create<mlir::db::MulOp>(loc, noneType, lhs, rhs).getResult();
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::MulOp>(loc, noneType, lhs, rhs).getResult();
         break;
         case BinaryOperator::Div:
-            _exprMap[expr] = _opBuilder.create<mlir::db::DivOp>(loc, noneType, lhs, rhs).getResult();
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::DivOp>(loc, noneType, lhs, rhs).getResult();
         break;
         case BinaryOperator::GreaterThan:
-            _exprMap[expr] = _opBuilder.create<mlir::db::GtOp>(loc, boolType, lhs, rhs).getResult();
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::GtOp>(loc, boolType, lhs, rhs).getResult();
         break;
         case BinaryOperator::LessThan:
-            _exprMap[expr] = _opBuilder.create<mlir::db::LtOp>(loc, boolType, lhs, rhs).getResult();
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::LtOp>(loc, boolType, lhs, rhs).getResult();
         break;
         case BinaryOperator::GreaterThanOrEqual:
-            _exprMap[expr] = _opBuilder.create<mlir::db::GteOp>(loc, boolType, lhs, rhs).getResult();
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::GteOp>(loc, boolType, lhs, rhs).getResult();
         break;
         case BinaryOperator::LessThanOrEqual:
-            _exprMap[expr] = _opBuilder.create<mlir::db::LteOp>(loc, boolType, lhs, rhs).getResult();
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::LteOp>(loc, boolType, lhs, rhs).getResult();
         break;
-
-        case BinaryOperator::Xor:
         case BinaryOperator::NotEqual:
+            if (comparesDisjointTypes) {
+                _part._exprMap[expr] = disjointComparison(lhs, rhs, /*equality=*/false);
+            } else {
+                _part._exprMap[expr] = _opBuilder.create<mlir::db::NeqOp>(loc, boolType, lhs, rhs).getResult();
+            }
+        break;
         case BinaryOperator::Mod:
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::ModOp>(loc, noneType, lhs, rhs).getResult();
+        break;
         case BinaryOperator::Pow:
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::PowOp>(loc, noneType, lhs, rhs).getResult();
+        break;
         case BinaryOperator::In:
-            throw TuringException(fmt::format("Unsupported operation: {}",
-                                              BinaryOperatorDescription::value(op)));
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::InOp>(loc, boolType, lhs, rhs).getResult();
         break;
 
         case BinaryOperator::_SIZE:
         break;
     }
+}
+
+void DBProgramGenerator::translateListSliceExpr(const Expr* expr, const ListSliceExpr* slice) {
+    // There is no list to read where the query sliced a null, and the null names no column
+    // the result could be carried in: the analyzer types such a slice Null
+    if (expr->getType() == EvaluatedType::Null) {
+        _part._exprMap[expr] = nullConstantColumn();
+        return;
+    }
+
+    const mlir::Value list = getOrTranslateExprColumn(slice->getBase());
+
+    // A bound the query left out is no operand: the slice then runs from the start, or to
+    // the end
+    const Expr* const fromExpr = slice->getFrom();
+    const Expr* const toExpr = slice->getTo();
+
+    const mlir::Value from = fromExpr ? getOrTranslateExprColumn(fromExpr) : mlir::Value {};
+    const mlir::Value to = toExpr ? getOrTranslateExprColumn(toExpr) : mlir::Value {};
+
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    _part._exprMap[expr] = _opBuilder.create<mlir::db::ListSlice>(loc, noneType, list, from, to).getResult();
+}
+
+void DBProgramGenerator::translateIndexExpr(const Expr* expr, const IndexExpr* indexExpr) {
+    const Expr* base = indexExpr->getBase();
+    const Expr* index = indexExpr->getIndexExpr();
+
+    // A null index reads nothing, whatever it names, so the analyzer types such a read Null.
+    // Both operands are still emitted: an aggregate under one of them is not this layer's
+    // to drop, and a pass prunes the columns nothing reads.
+    if (expr->getType() == EvaluatedType::Null) {
+        translateExpr(base);
+        translateExpr(index);
+
+        _part._exprMap[expr] = nullConstantColumn();
+        return;
+    }
+
+    //translate a csv column read
+    if (base->getType() == EvaluatedType::StringTable) {
+        const mlir::Value fieldColumn = findVariableColumn(indexExpr->getCSVFieldDecl());
+
+        if (!fieldColumn) {
+            throwError("Only a constant index selects a CSV field: "
+                       "row[i] with a computed index is not supported yet.",
+                       expr);
+        }
+
+        _part._exprMap[expr] = fieldColumn;
+        return;
+    }
+
+    translateExpr(base);
+    translateExpr(index);
+
+    bioassert(_part._exprMap.contains(base), "Index read with unknown base.");
+    bioassert(_part._exprMap.contains(index), "Index read with unknown index.");
+
+    //translate map indexing
+    if (indexExpr->readsAMapKey()) {
+        _part._exprMap[expr] = emitDynamicMapKey(_part._exprMap.at(base), _part._exprMap.at(index));
+        return;
+    }
+
+    //translate list or path indexing
+    const mlir::Value list = readWalkEntities(base, _part._exprMap.at(base));
+
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    _part._exprMap[expr] = _opBuilder.create<mlir::db::ListIndex>(loc,
+                                                                  noneType,
+                                                                  list,
+                                                                  _part._exprMap.at(index)).getResult();
+}
+
+void DBProgramGenerator::translateStringExpr(const Expr* expr) {
+    const StringExpr* strExpr = static_cast<const StringExpr*>(expr);
+
+    const Expr* lhsExpr = strExpr->getLHS();
+    const Expr* rhsExpr = strExpr->getRHS();
+
+    translateExpr(lhsExpr);
+    translateExpr(rhsExpr);
+
+    bioassert(_part._exprMap.contains(lhsExpr), "String operation with unknown LHS operand.");
+    bioassert(_part._exprMap.contains(rhsExpr), "String operation with unknown RHS operand.");
+
+    const mlir::Value lhs = _part._exprMap.at(lhsExpr);
+    const mlir::Value rhs = _part._exprMap.at(rhsExpr);
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    const StringOperator op = strExpr->getStringOperator();
+
+    switch (op) {
+        case StringOperator::StartsWith:
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::StartsWithOp>(loc, boolType, lhs, rhs).getResult();
+        break;
+        case StringOperator::EndsWith:
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::EndsWithOp>(loc, boolType, lhs, rhs).getResult();
+        break;
+        case StringOperator::Contains:
+            _part._exprMap[expr] = _opBuilder.create<mlir::db::ContainsOp>(loc, boolType, lhs, rhs).getResult();
+        break;
+        case StringOperator::_SIZE:
+            throwError("Unknown string operator.", expr);
+        break;
+    }
+}
+
+mlir::TypedAttr DBProgramGenerator::scalarLiteralAttr(const Literal* literal) {
+    switch (literal->getKind()) {
+        case Literal::Kind::BOOL: {
+            const BoolLiteral* boolLiteral = static_cast<const BoolLiteral*>(literal);
+            return _opBuilder.getBoolAttr(boolLiteral->getValue());
+        }
+        break;
+
+        case Literal::Kind::INTEGER: {
+            const IntegerLiteral* intLiteral = static_cast<const IntegerLiteral*>(literal);
+            return _opBuilder.getI64IntegerAttr(intLiteral->getValue());
+        }
+        break;
+
+        case Literal::Kind::DOUBLE: {
+            const DoubleLiteral* doubleLiteral = static_cast<const DoubleLiteral*>(literal);
+            return _opBuilder.getF64FloatAttr(doubleLiteral->getValue());
+        }
+        break;
+
+        case Literal::Kind::STRING: {
+            const StringLiteral* stringLiteral = static_cast<const StringLiteral*>(literal);
+            const mlir::Type stringType = mlir::storage::StringType::get(_mlirCtxt);
+            return mlir::StringAttr::get(stringLiteral->getValue(), stringType);
+        }
+        break;
+
+        default:
+            return {};
+        break;
+    }
+}
+
+mlir::Attribute DBProgramGenerator::embeddingLiteralAttr(const EmbeddingLiteral* literal) {
+    const std::span<const float> floats = literal->getValue();
+
+    return mlir::DenseF32ArrayAttr::get(_mlirCtxt, llvm::ArrayRef<float> {floats.data(), floats.size()});
 }
 
 mlir::Value DBProgramGenerator::translateLiteralExpr(const Literal* literal) {
@@ -1385,45 +9104,18 @@ mlir::Value DBProgramGenerator::translateLiteralExpr(const Literal* literal) {
     mlir::TypedAttr valueAttr;
 
     switch (literal->getKind()) {
-        case Literal::Kind::BOOL: {
-            const BoolLiteral* boolLiteral = static_cast<const BoolLiteral*>(literal);
-            valueAttr = _opBuilder.getBoolAttr(boolLiteral->getValue());
-        }
-        break;
-        case Literal::Kind::INTEGER: {
-            const IntegerLiteral* intLiteral = static_cast<const IntegerLiteral*>(literal);
-            valueAttr = _opBuilder.getI64IntegerAttr(intLiteral->getValue());
-        }
-        break;
-        case Literal::Kind::DOUBLE: {
-            const DoubleLiteral* doubleLiteral = static_cast<const DoubleLiteral*>(literal);
-            valueAttr = _opBuilder.getF64FloatAttr(doubleLiteral->getValue());
-        }
-        break;
-
-        case Literal::Kind::STRING: {
-            const StringLiteral* stringLiteral = static_cast<const StringLiteral*>(literal);
-            const mlir::Type stringType = mlir::storage::StringType::get(_mlirCtxt);
-            valueAttr = mlir::StringAttr::get(stringLiteral->getValue(), stringType);
-        }
+        case Literal::Kind::BOOL:
+        case Literal::Kind::INTEGER:
+        case Literal::Kind::DOUBLE:
+        case Literal::Kind::STRING:
+            valueAttr = scalarLiteralAttr(literal);
         break;
 
         case Literal::Kind::EMBEDDING: {
-            const EmbeddingLiteral* embeddingLiteral = static_cast<const EmbeddingLiteral*>(literal);
-            const std::span<const float> floats = embeddingLiteral->getValue();
-            const mlir::FloatType f32Type = _opBuilder.getF32Type();
-            const size_t size = floats.size();
-
-            const mlir::RankedTensorType tensorType = mlir::RankedTensorType::get(size, f32Type);
-
-            const auto* bytes = reinterpret_cast<const char*>(floats.data());
-            const size_t numBytes = size * sizeof(float);
-
-            const llvm::ArrayRef<char> rawBytes {bytes, numBytes};
-
-            const mlir::TypedAttr embAttr = mlir::DenseElementsAttr::getFromRawBuffer(tensorType, rawBytes);
+            const mlir::Attribute embeddingAttr = embeddingLiteralAttr(static_cast<const EmbeddingLiteral*>(literal));
             const mlir::db::ColumnType embResultType = allocColumnType(mlir::storage::EmbeddingType::get(_mlirCtxt));
-            return _opBuilder.create<mlir::db::ConstantOp>(uloc, embResultType, embAttr).getResult();
+
+            return _opBuilder.create<mlir::db::ConstantOp>(uloc, embResultType, embeddingAttr).getResult();
         }
         break;
 
@@ -1434,9 +9126,11 @@ mlir::Value DBProgramGenerator::translateLiteralExpr(const Literal* literal) {
         }
         break;
         case Literal::Kind::LIST:
-            throw FatalException("List literals are not yet supported in MLIR codegen.");
+            return translateListLiteral(static_cast<const ListLiteral*>(literal));
         break;
-
+        case Literal::Kind::MAP:
+            return translateMapLiteral(static_cast<const MapLiteral*>(literal));
+        break;
         default:
             throw FatalException("Unsupported literal kind in WHERE clause expression.");
         break;
@@ -1446,46 +9140,1598 @@ mlir::Value DBProgramGenerator::translateLiteralExpr(const Literal* literal) {
     return _opBuilder.create<mlir::db::ConstantOp>(uloc, resultType, valueAttr).getResult();
 }
 
+// The column of a null in every row, the shape translateLiteralExpr gives the null literal
+mlir::Value DBProgramGenerator::nullConstantColumn() {
+    const mlir::Type nullableType = mlir::storage::NullableType::get(_mlirCtxt,
+                                                                    mlir::NoneType::get(_mlirCtxt));
+    const mlir::TypedAttr valueAttr = mlir::StringAttr::get("", nullableType);
+    const mlir::db::ColumnType resultType = allocColumnType(valueAttr.getType());
+
+    return _opBuilder.create<mlir::db::ConstantOp>(_opBuilder.getUnknownLoc(), resultType, valueAttr).getResult();
+}
+
+mlir::Value DBProgramGenerator::constantBool(bool value) {
+    const mlir::TypedAttr valueAttr = _opBuilder.getBoolAttr(value);
+    const mlir::db::ColumnType resultType = allocColumnType(valueAttr.getType());
+
+    return _opBuilder.create<mlir::db::ConstantOp>(_opBuilder.getUnknownLoc(), resultType, valueAttr).getResult();
+}
+
+mlir::Value DBProgramGenerator::constantDouble(double value) {
+    const mlir::TypedAttr valueAttr = _opBuilder.getF64FloatAttr(value);
+    const mlir::db::ColumnType resultType = allocColumnType(valueAttr.getType());
+
+    return _opBuilder.create<mlir::db::ConstantOp>(_opBuilder.getUnknownLoc(), resultType, valueAttr).getResult();
+}
+
+mlir::Value DBProgramGenerator::constantString(llvm::StringRef value) {
+    const mlir::Type stringType = mlir::storage::StringType::get(_mlirCtxt);
+    const mlir::TypedAttr valueAttr = mlir::StringAttr::get(value, stringType);
+    const mlir::db::ColumnType resultType = allocColumnType(stringType);
+
+    return _opBuilder.create<mlir::db::ConstantOp>(_opBuilder.getUnknownLoc(), resultType, valueAttr).getResult();
+}
+
+mlir::Value DBProgramGenerator::constantLabelList(llvm::ArrayRef<std::string> labels) {
+    const mlir::Type stringType = mlir::storage::StringType::get(_mlirCtxt);
+
+    llvm::SmallVector<mlir::Attribute> elements;
+    elements.reserve(labels.size());
+
+    for (const std::string& label : labels) {
+        elements.push_back(mlir::StringAttr::get(label, stringType));
+    }
+
+    mlir::db::ConstantOp constant = _opBuilder.create<mlir::db::ConstantOp>(_opBuilder.getUnknownLoc(),
+                                                                           _opBuilder.getArrayAttr(elements));
+
+    return constant.getResult();
+}
+
+mlir::Type DBProgramGenerator::propertyValueType(ValueType valueType) {
+    return mlir::storage::NullableType::get(_mlirCtxt, valueTypeToElementType(_opBuilder, valueType));
+}
+
 mlir::Value DBProgramGenerator::translatePropertyExpr(const PropertyExpr* propExpr) {
+    return emitComponentOf(propExpr, translatePropertyRead(propExpr));
+}
+
+mlir::Value DBProgramGenerator::emitComponentOf(const PropertyExpr* propExpr, mlir::Value value) {
+    // A component of a name no property in the graph carries is the null that read is,
+    // with no value for the component op to read off
+    const bool readsNull = propExpr->getType() == EvaluatedType::Null;
+
+    if (readsNull) {
+        return value;
+    } else if (propExpr->readsAMapKey()) {
+        return emitStaticMapKey(value, propExpr->getMapKey());
+    } else if (propExpr->readsADateTimeComponent()) {
+        return emitDateTimeComponent(propExpr->getDateTimePart(), value);
+    } else if (propExpr->readsADurationComponent()) {
+        return emitDurationComponent(propExpr->getDurationPart(), value);
+    }
+
+    return value;
+}
+
+mlir::Value DBProgramGenerator::translatePropertyLookupExpr(const PropertyLookupExpr* lookupExpr) {
+    if (lookupExpr->getType() == EvaluatedType::Null) {
+        return nullConstantColumn();
+    }
+
+    const Expr* base = lookupExpr->getBase();
+    translateExpr(base);
+
+    bioassert(_part._exprMap.contains(base), "Property lookup with unknown base.");
+
+    const mlir::Value baseColumn = _part._exprMap.at(base);
+
+    if (lookupExpr->readsAMapKey()) {
+        return emitStaticMapKey(baseColumn, lookupExpr->getPropName());
+    }
+
+    if (lookupExpr->readsADateTimeComponent()) {
+        return emitDateTimeComponent(lookupExpr->getDateTimePart(), baseColumn);
+    } else if (lookupExpr->readsADurationComponent()) {
+        return emitDurationComponent(lookupExpr->getDurationPart(), baseColumn);
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType resultType = allocColumnType(propertyValueType(lookupExpr->getValueType()));
+    const mlir::StringAttr propAttr = _opBuilder.getStringAttr(lookupExpr->getPropName());
+
+    if (base->getType() == EvaluatedType::NodePattern) {
+        auto op = _opBuilder.create<mlir::db::GetNodeProperties>(loc,
+                                                                 resultType,
+                                                                 baseColumn,
+                                                                 propAttr,
+                                                                 mlir::Value(),
+                                                                 false);
+        return op.getResult();
+    } else {
+        auto op = _opBuilder.create<mlir::db::GetEdgeProperties>(loc,
+                                                                 resultType,
+                                                                 baseColumn,
+                                                                 propAttr,
+                                                                 mlir::Value(),
+                                                                 false);
+        return op.getResult();
+    }
+}
+
+mlir::Value DBProgramGenerator::emitStaticMapKey(mlir::Value map, std::string_view key) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType entryType = allocColumnType(mlir::storage::MapElementType::get(_mlirCtxt));
+    const mlir::StringAttr keyAttr = _opBuilder.getStringAttr(llvm::StringRef(key.data(), key.size()));
+
+    return _opBuilder.create<mlir::db::StaticMapKey>(loc, entryType, map, keyAttr).getResult();
+}
+
+mlir::Value DBProgramGenerator::emitDynamicMapKey(mlir::Value map, mlir::Value key) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType entryType = allocColumnType(mlir::storage::MapElementType::get(_mlirCtxt));
+
+    return _opBuilder.create<mlir::db::DynamicMapKey>(loc, entryType, map, key).getResult();
+}
+
+mlir::Value DBProgramGenerator::emitDateTimeComponent(DateTimePart part, mlir::Value instant) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    switch (part) {
+        case DateTimePart::Year:
+            return _opBuilder.create<mlir::db::DateTimeYear>(loc, noneType, instant).getResult();
+        break;
+
+        case DateTimePart::Month:
+            return _opBuilder.create<mlir::db::DateTimeMonth>(loc, noneType, instant).getResult();
+        break;
+
+        case DateTimePart::Day:
+            return _opBuilder.create<mlir::db::DateTimeDay>(loc, noneType, instant).getResult();
+        break;
+
+        case DateTimePart::Hour:
+            return _opBuilder.create<mlir::db::DateTimeHour>(loc, noneType, instant).getResult();
+        break;
+
+        case DateTimePart::Minute:
+            return _opBuilder.create<mlir::db::DateTimeMinute>(loc, noneType, instant).getResult();
+        break;
+
+        case DateTimePart::Second:
+            return _opBuilder.create<mlir::db::DateTimeSecond>(loc, noneType, instant).getResult();
+        break;
+
+        case DateTimePart::Millisecond:
+            return _opBuilder.create<mlir::db::DateTimeMillisecond>(loc, noneType, instant).getResult();
+        break;
+
+        case DateTimePart::Microsecond:
+            return _opBuilder.create<mlir::db::DateTimeMicrosecond>(loc, noneType, instant).getResult();
+        break;
+    }
+
+    return mlir::Value();
+}
+
+mlir::Value DBProgramGenerator::emitDurationComponent(DurationPart part, mlir::Value duration) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    switch (part) {
+        case DurationPart::Years:
+            return _opBuilder.create<mlir::db::DurationYears>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::Quarters:
+            return _opBuilder.create<mlir::db::DurationQuarters>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::Months:
+            return _opBuilder.create<mlir::db::DurationMonths>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::Weeks:
+            return _opBuilder.create<mlir::db::DurationWeeks>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::Days:
+            return _opBuilder.create<mlir::db::DurationDays>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::Hours:
+            return _opBuilder.create<mlir::db::DurationHours>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::Minutes:
+            return _opBuilder.create<mlir::db::DurationMinutes>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::Seconds:
+            return _opBuilder.create<mlir::db::DurationSeconds>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::Milliseconds:
+            return _opBuilder.create<mlir::db::DurationMilliseconds>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::Microseconds:
+            return _opBuilder.create<mlir::db::DurationMicroseconds>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::QuartersOfYear:
+            return _opBuilder.create<mlir::db::DurationQuartersOfYear>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::MonthsOfYear:
+            return _opBuilder.create<mlir::db::DurationMonthsOfYear>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::MonthsOfQuarter:
+            return _opBuilder.create<mlir::db::DurationMonthsOfQuarter>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::DaysOfWeek:
+            return _opBuilder.create<mlir::db::DurationDaysOfWeek>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::MinutesOfHour:
+            return _opBuilder.create<mlir::db::DurationMinutesOfHour>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::SecondsOfMinute:
+            return _opBuilder.create<mlir::db::DurationSecondsOfMinute>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::MillisecondsOfSecond:
+            return _opBuilder.create<mlir::db::DurationMillisecondsOfSecond>(loc, noneType, duration).getResult();
+        break;
+
+        case DurationPart::MicrosecondsOfSecond:
+            return _opBuilder.create<mlir::db::DurationMicrosecondsOfSecond>(loc, noneType, duration).getResult();
+        break;
+    }
+
+    return mlir::Value();
+}
+
+mlir::Value DBProgramGenerator::translatePropertyRead(const PropertyExpr* propExpr) {
     const VarDecl* entityDecl = propExpr->getEntityVarDecl();
     const std::string_view varName = entityDecl->getName();
     const std::string_view propName = propExpr->getPropName();
 
-    mlir::Value entityColumn;
-    for (const auto& [var, values] : _varMap) {
-        if (var->getName() == varName) {
-            entityColumn = values.back();
-            break;
+    // d.year, d.hours and m.key name no property: the value the component or the key is
+    // read off is the column the variable itself was bound to
+    const EvaluatedType entityType = entityDecl->getType();
+
+    const bool readsOffTheVariableItself = entityType == EvaluatedType::DateTime
+                                        || entityType == EvaluatedType::Duration
+                                        || entityType == EvaluatedType::Map
+                                        || entityType == EvaluatedType::Any;
+
+    if (readsOffTheVariableItself) {
+        const auto projectedIt = _part._projectedColumns.find(entityDecl);
+        const mlir::Value boundColumn = projectedIt != end(_part._projectedColumns)
+                                      ? projectedIt->second
+                                      : resolveEntityColumn(entityDecl);
+
+        bioassert(boundColumn, "Dotted read on unknown variable: {}", varName);
+
+        return boundColumn;
+    }
+
+    // A header access reads a field of a loaded record rather than a property of an
+    // entity: the load published its column under the declaration the access carries
+    if (propExpr->isStringTableHeaderAccess()) {
+        const mlir::Value fieldColumn = findVariableColumn(propExpr->getCSVFieldDecl());
+        bioassert(fieldColumn, "CSV header access on a row no load published: {}.{}", varName, propName);
+
+        return fieldColumn;
+    }
+
+    // No property in the graph carries the name - the analyzer typed the read null for
+    // it - so there is nothing to fetch and every row reads null
+    if (propExpr->getType() == EvaluatedType::Null) {
+        return nullConstantColumn();
+    }
+
+    // The value of a property a CREATE wrote is the column it wrote it from, which saves
+    // the read the detour through the write buffer the fetch below takes. A MERGE's rows
+    // are a mixture, so they go through that fetch, which reads each row where its own
+    // entity lives.
+    const auto createdIt = _part._createdEntities.find(entityDecl);
+    const bool writtenByACreate = createdIt != end(_part._createdEntities) && !createdIt->second._pending;
+    if (writtenByACreate) {
+        const auto& properties = createdIt->second._properties;
+        const auto propertyIt = properties.find(propName);
+
+        if (propertyIt != end(properties)) {
+            return propertyIt->second;
         }
     }
 
-    if (!entityColumn) {
-        const VariableDependencyGraph::EdgeIdentityMap& edgeIdentities = _vdg.edgeIdentities();
-        const auto findIt = edgeIdentities.find(std::string(varName));
-        const bool foundEdgeIdentity = findIt != edgeIdentities.end() && !findIt->second.empty();
-        if (foundEdgeIdentity) {
-            const VariableDependency* representative = findIt->second.front();
-            entityColumn = _varMap.at(representative).back();
-        }
-    }
+    const mlir::Value entityColumn = resolveEntityColumn(entityDecl);
 
     bioassert(entityColumn, "WHERE clause property access on unknown variable: {}", varName);
 
     const mlir::Location loc = _opBuilder.getUnknownLoc();
-    // Use None for property type and infer during lowering
-    const mlir::db::ColumnType resultType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+    const mlir::db::ColumnType resultType = allocColumnType(propertyValueType(propExpr->getValueType()));
     const mlir::StringAttr propAttr = _opBuilder.getStringAttr(propName);
-    const EvaluatedType entityType = entityDecl->getType();
 
     const bool isNode = entityType == EvaluatedType::NodePattern;
     const bool isEdge = entityType == EvaluatedType::EdgePattern;
     bioassert(isNode || isEdge, "Property access on non-entity variable: {}", varName);
 
+    const mlir::Value pending = findPendingMask(entityDecl);
+    const bool allPending = isPendingThroughout(entityDecl);
+
     if (isNode) {
-        auto op = _opBuilder.create<mlir::db::GetNodeProperties>(loc, resultType, entityColumn, propAttr);
+        auto op = _opBuilder.create<mlir::db::GetNodeProperties>(loc,
+                                                                 resultType,
+                                                                 entityColumn,
+                                                                 propAttr,
+                                                                 pending,
+                                                                 allPending);
         return op.getResult();
     } else {
-        auto op = _opBuilder.create<mlir::db::GetEdgeProperties>(loc, resultType, entityColumn, propAttr);
+        auto op = _opBuilder.create<mlir::db::GetEdgeProperties>(loc,
+                                                                 resultType,
+                                                                 entityColumn,
+                                                                 propAttr,
+                                                                 pending,
+                                                                 allPending);
         return op.getResult();
     }
+}
+
+// A node carries every label its test names, an edge the single type it was written with
+bool DBProgramGenerator::writtenEntityPasses(const PartScope::WrittenEntity& written,
+                                             const LabelExpr* labelExpr,
+                                             bool isNode) {
+    const LabelExpr::Operands& operands = labelExpr->getOperands();
+    const auto passes = [&written, isNode](const LabelExpr* operand) {
+        return writtenEntityPasses(written, operand, isNode);
+    };
+
+    switch (labelExpr->getKind()) {
+        case LabelExpr::Kind::LABELS:
+            return std::ranges::all_of(*labelExpr->getLabels(), [&written, isNode](const Symbol* label) {
+                const std::string_view name = label->getName();
+                return isNode ? std::ranges::find(written._labels, name) != end(written._labels)
+                              : name == written._edgeType;
+            });
+        break;
+        case LabelExpr::Kind::NOT:
+            return !passes(operands.front());
+        break;
+        case LabelExpr::Kind::AND:
+            return std::ranges::all_of(operands, passes);
+        break;
+        case LabelExpr::Kind::OR:
+            return std::ranges::any_of(operands, passes);
+        break;
+    }
+
+    return false;
+}
+
+mlir::Value DBProgramGenerator::translateEntityTypeExpr(const EntityTypeExpr* typeExpr) {
+    if (typeExpr->getType() == EvaluatedType::Null) {
+        return nullConstantColumn();
+    }
+
+    const LabelExpr* labelExpr = typeExpr->getLabelExpr();
+
+    if (const Expr* operand = typeExpr->getOperand()) {
+        translateExpr(operand);
+        bioassert(_part._exprMap.contains(operand), "Type test with unknown operand.");
+
+        const mlir::Value entityColumn = _part._exprMap.at(operand);
+
+        if (operand->getType() == EvaluatedType::EdgePattern) {
+            return checkEdgeTypeExpr(fetchEdgeTypeColumn(entityColumn), labelExpr, true);
+        }
+
+        return checkNodeLabelExpr(entityColumn, labelExpr, true);
+    }
+
+    const VarDecl* entityDecl = typeExpr->getEntityVarDecl();
+    const std::string_view varName = entityDecl->getName();
+
+    const EvaluatedType entityType = entityDecl->getType();
+    const bool isNode = entityType == EvaluatedType::NodePattern;
+    const bool isEdge = entityType == EvaluatedType::EdgePattern;
+    bioassert(isNode || isEdge, "Type test on non-entity variable: {}", varName);
+
+    // The labels and the type the CREATE spelled answer a test on what the query wrote
+    // without a read, laid out over the rows the entity carries. A parameter on either
+    // side has no answer before it is bound, so that test reads the pending entity instead
+    const PartScope::WrittenEntity* written = findWrittenEntity(entityDecl);
+    const bool writtenTypesKnown = written && (isNode ? !written->_labels.empty() : !written->_edgeType.empty());
+    const bool writtenTypesUnknown = written && !(isNode ? written->_labelsKnown : written->_edgeTypeKnown);
+    const bool boundAtRuntime = labelExpr->holdsParameter() || writtenTypesUnknown;
+    if (writtenTypesKnown && !boundAtRuntime) {
+        const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+        const mlir::Value answer = constantBool(writtenEntityPasses(*written, labelExpr, isNode));
+
+        return _opBuilder.create<mlir::db::BroadcastConstant>(_opBuilder.getUnknownLoc(),
+                                                              noneType,
+                                                              answer,
+                                                              resolveEntityColumn(entityDecl)).getResult();
+    }
+
+    if (isEdge) {
+        return checkEdgeTypeExpr(resolveOrFetchEdgeTypeColumn(entityDecl, varName), labelExpr, true);
+    }
+
+    const mlir::Value nodeColumn = resolveEntityColumn(entityDecl);
+    bioassert(nodeColumn, "Label test on unknown variable: {}", varName);
+
+    return checkNodeLabelExpr(nodeColumn, labelExpr, true);
+}
+
+void DBProgramGenerator::translateFunctionInvocationExpr(const Expr* expr,
+                                                         const FunctionInvocationExpr* funcExpr) {
+    const FunctionInvocation* invocation = funcExpr->getFunctionInvocation();
+    const FunctionSignature* signature = invocation->getSignature();
+
+    // The expression's own aggregate flag is contaminated by its arguments, so a scalar
+    // function over a reduction - coalesce(max(n.age), 0) - carries it too. What says a
+    // call reduces its input is the signature it resolved to.
+    if (!signature->isAggregate()) {
+        translateFunctionExpr(expr, invocation);
+        return;
+    }
+
+    AggregateArguments arguments;
+    translateAggregateArguments(invocation, nullptr, arguments);
+
+    emitAggregate(expr, invocation, arguments);
+}
+
+void DBProgramGenerator::translateAggregateArguments(const FunctionInvocation* invocation,
+                                                     const VariableColumnMap* variableColumns,
+                                                     AggregateArguments& arguments) {
+    const ExprChain* args = invocation->getArguments();
+    bioassert(args && !args->empty(), "Aggregate function invocation with no arguments.");
+
+    const Expr* argExpr = args->front();
+    const mlir::Value translated = translateAggregateInput(argExpr, variableColumns);
+
+    // A quantified pattern binds the handle of the walk. A count reads its rows off the
+    // handles unless it counts distinct walks, and every other aggregate the entities
+    // each one stands for
+    const std::string_view funcName = invocation->getSignature()->getFullName();
+    const bool countsHandles = funcName == "count" && !invocation->isDistinct();
+    arguments._values = countsHandles ? translated : readWalkEntities(argExpr, translated);
+
+    arguments._rowPercentile = translateRowPercentile(invocation, arguments._values, variableColumns);
+}
+
+void DBProgramGenerator::emitAggregate(const Expr* expr,
+                                       const FunctionInvocation* invocation,
+                                       const AggregateArguments& arguments) {
+    const std::string_view funcName = invocation->getSignature()->getFullName();
+    const mlir::Value inputColumn = arguments._values;
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    const bool isDistinct = invocation->isDistinct();
+
+    // Dropping repeated values cannot move an extremum, so min(DISTINCT x) is min(x):
+    // the flag is spent here rather than on a seen-set the result cannot depend on
+    const bool isExtremum = funcName == "min" || funcName == "max";
+    const bool reducesDistinctValues = isDistinct && !isExtremum;
+
+    const bool countsRows = invocation->getArguments()->front()->getType() == EvaluatedType::Wildcard;
+
+    if (funcName == "count") {
+        _part._exprMap[expr] = _opBuilder.create<mlir::db::Count>(loc, noneType, inputColumn, isDistinct, countsRows).getResult();
+    } else if (funcName == "sum") {
+        _part._exprMap[expr] = _opBuilder.create<mlir::db::Sum>(loc, noneType, inputColumn, reducesDistinctValues).getResult();
+    } else if (funcName == "min") {
+        _part._exprMap[expr] = _opBuilder.create<mlir::db::Min>(loc, noneType, inputColumn, reducesDistinctValues).getResult();
+    } else if (funcName == "max") {
+        _part._exprMap[expr] = _opBuilder.create<mlir::db::Max>(loc, noneType, inputColumn, reducesDistinctValues).getResult();
+    } else if (funcName == "avg") {
+        _part._exprMap[expr] = _opBuilder.create<mlir::db::Avg>(loc, noneType, inputColumn, reducesDistinctValues).getResult();
+    } else if (funcName == "stDev") {
+        _part._exprMap[expr] = _opBuilder.create<mlir::db::StDev>(loc, noneType, inputColumn, reducesDistinctValues).getResult();
+    } else if (funcName == "stDevP") {
+        _part._exprMap[expr] = _opBuilder.create<mlir::db::StDevP>(loc, noneType, inputColumn, reducesDistinctValues).getResult();
+    } else if (gathersItsValues(funcName)) {
+        llvm::SmallVector<int64_t> distinctValues;
+        if (reducesDistinctValues) {
+            distinctValues.push_back(0);
+        }
+
+        const mlir::Value rowPercentile = arguments._rowPercentile;
+        llvm::SmallVector<mlir::Value, 1> percentileColumns;
+        if (rowPercentile) {
+            percentileColumns.push_back(rowPercentile);
+        }
+
+        const llvm::SmallVector<mlir::storage::GroupAggregateKind, 1> percentileKinds(percentileColumns.size(),
+                                                                                      mlir::storage::GroupAggregateKind::First);
+
+        // createCollect names the collect as the aggregate, which a percentile read off its
+        // list is not
+        mlir::db::Collect collectOp = createCollect({}, {inputColumn}, distinctValues, percentileColumns, percentileKinds);
+        const mlir::ResultRange results = collectOp.getResults();
+        const mlir::Value groupPercentile = rowPercentile ? results.back() : mlir::Value {};
+
+        _part._exprMap[expr] = reduceGatheredValues(invocation, results.front(), groupPercentile);
+        return;
+    } else {
+        throwError(fmt::format("Unsupported aggregate function: {}", funcName), expr);
+    }
+
+    _part._aggregateOp = _part._exprMap.at(expr).getDefiningOp();
+}
+
+mlir::Value DBProgramGenerator::translateArg(const Expr* argExpr) {
+    translateExpr(argExpr);
+    bioassert(_part._exprMap.contains(argExpr), "Function invocation with unknown argument.");
+    return _part._exprMap.at(argExpr);
+}
+
+// A MERGE's rows mix the entities it wrote with the ones it bound, so no one label set or
+// type stands for its column and it records neither: the caller falls back on the fetch,
+// which reads each row where its own entity lives
+mlir::Value DBProgramGenerator::translateCreatedMetadata(std::string_view funcName, const Expr* argExpr) {
+    if (argExpr->getKind() != Expr::Kind::SYMBOL) {
+        return {};
+    }
+
+    const SymbolExpr* symbolExpr = static_cast<const SymbolExpr*>(argExpr);
+    const PartScope::WrittenEntity* written = findWrittenEntity(symbolExpr->getDecl());
+    if (!written) {
+        return {};
+    }
+
+    const bool canReadLabels = funcName == "labels" && !written->_labels.empty() && written->_labelsKnown;
+    const bool canReadType = funcName == "type" && !written->_edgeType.empty() && written->_edgeTypeKnown;
+
+    if (canReadLabels) {
+        return constantLabelList(written->_labels);
+    } else if (canReadType) {
+        return constantString(written->_edgeType);
+    } else {
+        return {};
+    }
+}
+
+void DBProgramGenerator::translateFunctionExpr(const Expr* expr,
+                                               const FunctionInvocation* invocation) {
+    const std::string_view funcName = invocation->getSignature()->getFullName();
+    const ExprChain* args = invocation->getArguments();
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    if (expr->getType() == EvaluatedType::Null) {
+        _part._exprMap[expr] = nullConstantColumn();
+        return;
+    }
+
+    const bool isEntityMetadata = funcName == "labels" || funcName == "type";
+    if (isEntityMetadata && args && args->size() == 1) {
+        const mlir::Value createdMetadata = translateCreatedMetadata(funcName, args->front());
+        if (createdMetadata) {
+            _part._exprMap[expr] = createdMetadata;
+            return;
+        }
+    }
+
+    if (funcName == "coalesce") {
+        translateCoalesce(expr, args);
+        return;
+    } else if (funcName == "size") {
+        if (!args || args->size() != 1) {
+            throw TuringException("size() expects 1 argument.");
+        }
+
+        const Expr* argExpr = args->front();
+        const EvaluatedType argType = argExpr->getType();
+
+        if (argType == EvaluatedType::EdgePattern || argType == EvaluatedType::NodePattern) {
+            const mlir::Value column = getOrTranslateBoundColumn(argExpr);
+
+            // An OPTIONAL MATCH hands a walk on as the list of its edges, which size() reads
+            // as it reads any other list. A walk's length counts a group's entities only when
+            // its body is one hop.
+            const auto bindingIt = _part._pathBindings.find(argExpr->getExprVarDecl());
+            const bool countsEveryHop = bindingIt == end(_part._pathBindings) || bindingIt->second._steps == 1;
+            if (!isListColumn(column) && countsEveryHop) {
+                _part._exprMap[expr] = pathLengthColumn(argExpr, column);
+                return;
+            }
+        }
+    }
+
+    if (funcName == "range") {
+        translateRange(expr, args);
+        return;
+    } else if (funcName == "substring") {
+        translateSubstring(expr, args);
+        return;
+    } else if (funcName == "split") {
+        translateSplit(expr, args);
+        return;
+    } else if (funcName == "left") {
+        translateStringEnd<mlir::db::Left>(expr, args);
+        return;
+    } else if (funcName == "right") {
+        translateStringEnd<mlir::db::Right>(expr, args);
+        return;
+    } else if (funcName == "replace") {
+        translateReplace(expr, args);
+        return;
+    } else if (funcName == "normalize") {
+        translateNormalFormFunction<mlir::db::Normalize>(expr, args, mlir::storage::StringType::get(_mlirCtxt));
+        return;
+    } else if (funcName == "is_normalized") {
+        translateNormalFormFunction<mlir::db::IsNormalized>(expr, args, mlir::storage::BoolType::get(_mlirCtxt));
+        return;
+    }
+
+    const bool readsTheMapItself = funcName == "properties"
+                                && args && args->size() == 1
+                                && args->front()->getType() == EvaluatedType::Map;
+    if (readsTheMapItself) {
+        _part._exprMap[expr] = translateArg(args->front());
+        return;
+    }
+
+    const Expr* const pathExpr = args && args->size() == 1 ? args->front() : nullptr;
+    const bool readsANamedPath = pathExpr && pathExpr->getType() == EvaluatedType::GraphPath;
+    if (readsANamedPath) {
+        // Beside `RETURN p` the path rides the handle column of its walk, which reads as
+        // the entities it runs through
+        const mlir::Value path = readWalkEntities(pathExpr, translateArg(pathExpr));
+
+        if (funcName == "length") {
+            _part._exprMap[expr] = pathElementsColumn(path, mlir::storage::PathElementsKind::Length);
+        } else if (funcName == "nodes") {
+            _part._exprMap[expr] = pathElementsColumn(path, mlir::storage::PathElementsKind::Nodes);
+        } else if (funcName == "relationships") {
+            _part._exprMap[expr] = pathElementsColumn(path, mlir::storage::PathElementsKind::Relationships);
+        } else {
+            throwError(fmt::format("{}() does not read a path", funcName), expr);
+        }
+
+        return;
+    }
+
+    if (funcName == "id") {
+        if (!args || args->size() != 1) {
+            throwError("id() expects 1 argument.", expr);
+        }
+
+        const mlir::Value input = translateArg(args->front());
+        _part._exprMap[expr] = _opBuilder.create<mlir::db::ElementID>(loc, noneType, input).getResult();
+        return;
+    }
+
+    // datetime() reads the clock rather than converting an argument, so it is the one
+    // name whose call with no argument is a different op from its call with one.
+    const bool namesTheClock = funcName == "datetime" && (!args || args->empty());
+    if (namesTheClock) {
+        const mlir::db::ColumnType dateTimeType = allocColumnType(mlir::storage::DateTimeType::get(_mlirCtxt));
+
+        _part._exprMap[expr] = _opBuilder.create<mlir::db::CurrentDateTime>(loc, dateTimeType).getResult();
+        return;
+    }
+
+    if (funcName == "pi") {
+        _part._exprMap[expr] = constantDouble(std::numbers::pi);
+        return;
+    } else if (funcName == "e") {
+        _part._exprMap[expr] = constantDouble(std::numbers::e);
+        return;
+    }
+
+    const auto unaryIt = unaryFunctionEmitters.find(funcName);
+    if (unaryIt != end(unaryFunctionEmitters)) {
+        if (!args || args->size() != 1) {
+            throwError(fmt::format("{}() expects 1 argument.", funcName), expr);
+        }
+
+        const mlir::Value input = translateArg(args->front());
+        _part._exprMap[expr] = unaryIt->second(_opBuilder, loc, noneType, input);
+        return;
+    }
+
+    const auto binaryIt = binaryFunctionEmitters.find(funcName);
+    if (binaryIt != end(binaryFunctionEmitters)) {
+        if (!args || args->size() != 2) {
+            throwError(fmt::format("{}() expects 2 arguments.", funcName), expr);
+        }
+
+        const mlir::Value lhs = translateArg(args->getExprs()[0]);
+        const mlir::Value rhs = translateArg(args->getExprs()[1]);
+        _part._exprMap[expr] = binaryIt->second(_opBuilder, loc, noneType, lhs, rhs);
+        return;
+    }
+
+    throwError(fmt::format("Unsupported function: {}", funcName), expr);
+}
+
+void DBProgramGenerator::translateRange(const Expr* expr, const ExprChain* args) {
+    const size_t argCount = args ? args->size() : 0;
+    const bool boundsGiven = argCount == 2 || argCount == 3;
+    if (!boundsGiven) {
+        throwError("range() expects 2 or 3 arguments.", expr);
+    }
+
+    const ExprChain::ExprVector& argExprs = args->getExprs();
+
+    const mlir::Value start = translateArg(argExprs[0]);
+    const mlir::Value end = translateArg(argExprs[1]);
+    const mlir::Value step = argExprs.size() == 3 ? translateArg(argExprs[2]) : mlir::Value {};
+
+    const mlir::Type listType = mlir::storage::ListType::get(_mlirCtxt, _opBuilder.getI64Type());
+
+    mlir::db::Range range = _opBuilder.create<mlir::db::Range>(_opBuilder.getUnknownLoc(),
+                                                               allocColumnType(listType),
+                                                               start,
+                                                               end,
+                                                               step);
+
+    _part._exprMap[expr] = range.getResult();
+}
+
+void DBProgramGenerator::translateSubstring(const Expr* expr, const ExprChain* args) {
+    bioassert(args && (args->size() == 2 || args->size() == 3), "substring() takes 2 or 3 arguments.");
+
+    const ExprChain::ExprVector& argExprs = args->getExprs();
+
+    const mlir::Value string = translateArg(argExprs[0]);
+    const mlir::Value start = translateArg(argExprs[1]);
+    const mlir::Value length = argExprs.size() == 3 ? translateArg(argExprs[2]) : mlir::Value {};
+
+    const mlir::Type stringType = mlir::storage::StringType::get(_mlirCtxt);
+
+    mlir::db::Substring substring = _opBuilder.create<mlir::db::Substring>(_opBuilder.getUnknownLoc(),
+                                                                           allocColumnType(stringType),
+                                                                           string,
+                                                                           start,
+                                                                           length);
+
+    _part._exprMap[expr] = substring.getResult();
+}
+
+void DBProgramGenerator::translateSplit(const Expr* expr, const ExprChain* args) {
+    bioassert(args && args->size() == 2, "split() takes 2 arguments.");
+
+    const ExprChain::ExprVector& argExprs = args->getExprs();
+
+    const mlir::Value string = translateArg(argExprs[0]);
+    const mlir::Value delimiter = translateArg(argExprs[1]);
+
+    const mlir::Type stringType = mlir::storage::StringType::get(_mlirCtxt);
+    const mlir::Type listType = mlir::storage::ListType::get(_mlirCtxt, stringType);
+
+    mlir::db::Split split = _opBuilder.create<mlir::db::Split>(_opBuilder.getUnknownLoc(),
+                                                               allocColumnType(listType),
+                                                               string,
+                                                               delimiter);
+
+    _part._exprMap[expr] = split.getResult();
+}
+
+template <typename StringEndOp>
+void DBProgramGenerator::translateStringEnd(const Expr* expr, const ExprChain* args) {
+    bioassert(args && args->size() == 2, "left() and right() take 2 arguments.");
+
+    const ExprChain::ExprVector& argExprs = args->getExprs();
+
+    const mlir::Value string = translateArg(argExprs[0]);
+    const mlir::Value length = translateArg(argExprs[1]);
+
+    const mlir::Type stringType = mlir::storage::StringType::get(_mlirCtxt);
+
+    StringEndOp stringEnd = _opBuilder.create<StringEndOp>(_opBuilder.getUnknownLoc(),
+                                                           allocColumnType(stringType),
+                                                           string,
+                                                           length);
+
+    _part._exprMap[expr] = stringEnd.getResult();
+}
+
+void DBProgramGenerator::translateReplace(const Expr* expr, const ExprChain* args) {
+    bioassert(args && args->size() == 3, "replace() takes 3 arguments.");
+
+    const ExprChain::ExprVector& argExprs = args->getExprs();
+
+    const mlir::Value string = translateArg(argExprs[0]);
+    const mlir::Value search = translateArg(argExprs[1]);
+    const mlir::Value replacement = translateArg(argExprs[2]);
+
+    const mlir::Type stringType = mlir::storage::StringType::get(_mlirCtxt);
+
+    mlir::db::Replace replace = _opBuilder.create<mlir::db::Replace>(_opBuilder.getUnknownLoc(),
+                                                                     allocColumnType(stringType),
+                                                                     string,
+                                                                     search,
+                                                                     replacement);
+
+    _part._exprMap[expr] = replace.getResult();
+}
+
+template <typename NormalFormOp>
+void DBProgramGenerator::translateNormalFormFunction(const Expr* expr, const ExprChain* args, mlir::Type resultElement) {
+    bioassert(args && args->size() == 2, "A normal form function takes a string and a normal form.");
+
+    const ExprChain::ExprVector& argExprs = args->getExprs();
+
+    const mlir::Value string = translateArg(argExprs[0]);
+
+    bioassert(argExprs[1]->getType() == EvaluatedType::NormalForm, "A normal form function reads its normal form from a literal.");
+
+    const LiteralExpr* formExpr = static_cast<const LiteralExpr*>(argExprs[1]);
+    const NormalFormLiteral* formLiteral = static_cast<const NormalFormLiteral*>(formExpr->getLiteral());
+    const mlir::storage::UnicodeNormalForm form = toStorageNormalForm(formLiteral->getForm());
+
+    NormalFormOp normalFormOp = _opBuilder.create<NormalFormOp>(_opBuilder.getUnknownLoc(),
+                                                                allocColumnType(resultElement),
+                                                                string,
+                                                                form);
+
+    _part._exprMap[expr] = normalFormOp.getResult();
+}
+
+void DBProgramGenerator::translateCoalesce(const Expr* expr, const ExprChain* args) {
+    bioassert(args && !args->empty(), "coalesce() with no arguments.");
+
+    const ExprChain::ExprVector& argExprs = args->getExprs();
+
+    llvm::SmallVector<mlir::Value, 4> arguments;
+    for (const Expr* argExpr : argExprs) {
+        arguments.push_back(translateArg(argExpr));
+    }
+
+    if (arguments.size() == 1) {
+        _part._exprMap[expr] = arguments.front();
+        return;
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    const size_t branchCount = arguments.size() - 1;
+
+    llvm::SmallVector<mlir::Value, 4> conditions;
+    for (size_t argIndex = 0; argIndex < branchCount; argIndex++) {
+        // The null literal is absent on every row, so the branch it guards is never taken
+        if (argExprs[argIndex]->getType() == EvaluatedType::Null) {
+            conditions.push_back(constantBool(false));
+            continue;
+        }
+
+        const mlir::Value present = _opBuilder.create<mlir::db::NeqOp>(loc,
+                                                                       boolType,
+                                                                       arguments[argIndex],
+                                                                       nullConstantColumn())
+                                        .getResult();
+        conditions.push_back(present);
+    }
+
+    const llvm::ArrayRef<mlir::Value> branches = llvm::ArrayRef<mlir::Value>(arguments).drop_back();
+
+    _part._exprMap[expr] = _opBuilder.create<mlir::db::Case>(loc,
+                                                             noneType,
+                                                             conditions,
+                                                             branches,
+                                                             arguments.back())
+                               .getResult();
+}
+
+mlir::db::Collect DBProgramGenerator::createCollect(llvm::ArrayRef<mlir::Value> keyColumns,
+                                                    llvm::ArrayRef<mlir::Value> valueColumns,
+                                                    llvm::ArrayRef<int64_t> distinctValues,
+                                                    llvm::ArrayRef<mlir::Value> aggregateColumns,
+                                                    llvm::ArrayRef<mlir::storage::GroupAggregateKind> aggregateKinds) {
+    llvm::SmallVector<mlir::Value> columns(keyColumns.begin(), keyColumns.end());
+    columns.append(valueColumns.begin(), valueColumns.end());
+    columns.append(aggregateColumns.begin(), aggregateColumns.end());
+
+    llvm::SmallVector<mlir::Type> resultTypes;
+    for (const mlir::Value keyColumn : keyColumns) {
+        resultTypes.push_back(keyColumn.getType());
+    }
+
+    for (const mlir::Value valueColumn : valueColumns) {
+        const mlir::db::ColumnType valueType = mlir::cast<mlir::db::ColumnType>(valueColumn.getType());
+        const mlir::Type listType = mlir::storage::ListType::get(_mlirCtxt, valueType.getType());
+
+        resultTypes.push_back(allocColumnType(listType));
+    }
+
+    // An aggregate's result type is resolved during lowering, as db.group_aggregate's is.
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+    llvm::SmallVector<int64_t> kindValues;
+    for (const mlir::storage::GroupAggregateKind kind : aggregateKinds) {
+        kindValues.push_back(static_cast<int64_t>(kind));
+        resultTypes.push_back(noneType);
+    }
+
+    const mlir::DenseI64ArrayAttr kindsAttr = kindValues.empty()
+                                                  ? mlir::DenseI64ArrayAttr {}
+                                                  : _opBuilder.getDenseI64ArrayAttr(kindValues);
+
+    const mlir::DenseI64ArrayAttr distinctAttr = distinctValues.empty()
+                                                     ? mlir::DenseI64ArrayAttr {}
+                                                     : _opBuilder.getDenseI64ArrayAttr(distinctValues);
+
+    mlir::db::Collect collectOp = _opBuilder.create<mlir::db::Collect>(_opBuilder.getUnknownLoc(),
+                                                                       mlir::TypeRange {resultTypes},
+                                                                       mlir::ValueRange {columns},
+                                                                       static_cast<uint64_t>(keyColumns.size()),
+                                                                       kindsAttr,
+                                                                       distinctAttr);
+
+    _part._aggregateOp = collectOp.getOperation();
+
+    return collectOp;
+}
+
+void DBProgramGenerator::emitKeylessCollect(llvm::ArrayRef<const FunctionInvocationExpr*> collectExprs,
+                                            llvm::ArrayRef<AggregateArguments> collectArguments) {
+    llvm::SmallVector<mlir::Value> valueColumns;
+    llvm::SmallVector<mlir::Value> percentileColumns;
+    llvm::SmallVector<std::optional<size_t>> percentileIndices;
+
+    for (const AggregateArguments& arguments : collectArguments) {
+        valueColumns.push_back(arguments._values);
+
+        if (arguments._rowPercentile) {
+            percentileIndices.push_back(percentileColumns.size());
+            percentileColumns.push_back(arguments._rowPercentile);
+        } else {
+            percentileIndices.push_back(std::nullopt);
+        }
+    }
+
+    llvm::SmallVector<int64_t> distinctValues;
+    collectDistinctValueIndices(collectExprs, distinctValues);
+
+    const llvm::SmallVector<mlir::storage::GroupAggregateKind> percentileKinds(percentileColumns.size(),
+                                                                               mlir::storage::GroupAggregateKind::First);
+
+    mlir::db::Collect collectOp = createCollect({}, valueColumns, distinctValues, percentileColumns, percentileKinds);
+    const mlir::ResultRange results = collectOp.getResults();
+
+    for (size_t collectIndex = 0; collectIndex < collectExprs.size(); collectIndex++) {
+        const FunctionInvocationExpr* collectExpr = collectExprs[collectIndex];
+        const std::optional<size_t> percentileIndex = percentileIndices[collectIndex];
+        const mlir::Value groupPercentile = percentileIndex ? results[collectExprs.size() + *percentileIndex] : mlir::Value {};
+        const mlir::Value reducedColumn = reduceGatheredValues(collectExpr->getFunctionInvocation(),
+                                                               results[collectIndex],
+                                                               groupPercentile);
+
+        _part._exprMap[collectExpr] = reducedColumn;
+
+        // The alias of a collect names its list, so a later item spelling that alias
+        // reads this column instead of collecting a second time
+        const VarDecl* collectDecl = collectExpr->getExprVarDecl();
+        if (collectDecl) {
+            _part._projectedColumns[collectDecl] = reducedColumn;
+        }
+    }
+}
+
+mlir::Value DBProgramGenerator::reduceGatheredValues(const FunctionInvocation* invocation,
+                                                     mlir::Value listColumn,
+                                                     mlir::Value groupPercentile) {
+    const std::string_view funcName = invocation->getSignature()->getFullName();
+    if (!takesAPercentile(funcName)) {
+        return listColumn;
+    }
+
+    const ExprChain* args = invocation->getArguments();
+    bioassert(args && args->size() == 2, "{}() without its percentile.", funcName);
+
+    const mlir::Value percentile = groupPercentile ? groupPercentile : translateArg(args->getExprs().back());
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    if (funcName == "percentileCont") {
+        return _opBuilder.create<mlir::db::PercentileCont>(loc, noneType, listColumn, percentile).getResult();
+    } else {
+        return _opBuilder.create<mlir::db::PercentileDisc>(loc, noneType, listColumn, percentile).getResult();
+    }
+}
+
+mlir::Value DBProgramGenerator::translateRowPercentile(const FunctionInvocation* invocation,
+                                                       mlir::Value valueColumn,
+                                                       const VariableColumnMap* variableColumns) {
+    const std::string_view funcName = invocation->getSignature()->getFullName();
+    if (!takesAPercentile(funcName)) {
+        return {};
+    }
+
+    const ExprChain* args = invocation->getArguments();
+    bioassert(args && args->size() == 2, "{}() without its percentile.", funcName);
+
+    const Expr* percentileExpr = args->getExprs().back();
+    if (!percentileExpr->isDynamic()) {
+        return {};
+    }
+
+    const mlir::Value percentile = translateAggregateInput(percentileExpr, variableColumns);
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    const mlir::Value holdsAValue = _opBuilder.create<mlir::db::NeqOp>(loc, boolType, valueColumn, nullConstantColumn()).getResult();
+
+    return _opBuilder.create<mlir::db::Case>(loc,
+                                             noneType,
+                                             mlir::ValueRange {holdsAValue},
+                                             mlir::ValueRange {percentile},
+                                             mlir::Value {})
+        .getResult();
+}
+
+void DBProgramGenerator::generateKeylessAggregates(const Projection* projection) {
+    llvm::SmallVector<const FunctionInvocationExpr*> aggregateExprs;
+    for (const Projection::ReturnItem& returnItem : projection->items()) {
+        Expr* const* itemPtr = std::get_if<Expr*>(&returnItem);
+        if (!itemPtr) {
+            continue;
+        }
+
+        collectAggregateInvocations(*itemPtr, aggregateExprs);
+    }
+
+    VariableColumnMap variableColumns;
+    collectVariableColumns(variableColumns);
+
+    llvm::SmallVector<AggregateArguments> arguments(aggregateExprs.size());
+    for (size_t aggregateIndex = 0; aggregateIndex < aggregateExprs.size(); aggregateIndex++) {
+        translateAggregateArguments(aggregateExprs[aggregateIndex]->getFunctionInvocation(),
+                                    &variableColumns,
+                                    arguments[aggregateIndex]);
+    }
+
+    llvm::SmallVector<const FunctionInvocationExpr*> collectExprs;
+    llvm::SmallVector<AggregateArguments> collectArguments;
+    for (size_t aggregateIndex = 0; aggregateIndex < aggregateExprs.size(); aggregateIndex++) {
+        if (gathersItsValues(aggregateExprs[aggregateIndex])) {
+            collectExprs.push_back(aggregateExprs[aggregateIndex]);
+            collectArguments.push_back(arguments[aggregateIndex]);
+        }
+    }
+
+    const bool collectsSeveralLists = collectExprs.size() > 1;
+    if (collectsSeveralLists) {
+        emitKeylessCollect(collectExprs, collectArguments);
+    }
+
+    for (size_t aggregateIndex = 0; aggregateIndex < aggregateExprs.size(); aggregateIndex++) {
+        const FunctionInvocationExpr* aggregateExpr = aggregateExprs[aggregateIndex];
+        if (collectsSeveralLists && gathersItsValues(aggregateExpr)) {
+            continue;
+        }
+
+        emitAggregate(aggregateExpr, aggregateExpr->getFunctionInvocation(), arguments[aggregateIndex]);
+    }
+}
+
+void DBProgramGenerator::generateGroupAggregate(const Projection* projection) {
+    if (!projection->isAggregate()) {
+        return;
+    }
+
+    if (!projection->hasGroupingKeys()) {
+        generateKeylessAggregates(projection);
+        return;
+    }
+
+    VariableColumnMap variableColumns;
+    collectVariableColumns(variableColumns);
+
+    // An edge identity is carried by the traversal variable that produced it, under a
+    // declaration of its own: the representative is where its column - and its grouped
+    // replacement - is published, since the identity has no variable of its own
+    std::unordered_map<const VarDecl*, const VariableDependency*> edgeIdentityVars;
+    for (const auto& [decl, vars] : _vdg.edgeIdentities()) {
+        if (!vars.empty() && _part._varMap.contains(vars.front())) {
+            edgeIdentityVars[decl] = vars.front();
+        }
+    }
+
+    // Parallel: a key position is either a variable, declared by keyVarDeclAtPos and
+    // carried by keyVarAtPos, or an expression, held by keyExprAtPos. A column a CALL
+    // yielded is a variable with no keyVarAtPos: it appears in no pattern, so the VDG has
+    // nothing for it and its declaration is the only handle on it.
+    llvm::SmallVector<mlir::Value> keyColumns;
+    llvm::SmallVector<const VariableDependency*> keyVarAtPos;
+    llvm::SmallVector<const VarDecl*> keyVarDeclAtPos;
+    llvm::SmallVector<const Expr*> keyExprAtPos;
+
+    llvm::SmallVector<mlir::Value> aggInputColumns;
+    llvm::SmallVector<mlir::storage::GroupAggregateKind> aggKinds;
+    llvm::SmallVector<const FunctionInvocationExpr*> aggFuncExprs;
+    llvm::SmallVector<const FunctionInvocationExpr*> itemInvocations;
+
+    llvm::SmallVector<mlir::Value> collectInputColumns;
+    llvm::SmallVector<const FunctionInvocationExpr*> collectFuncExprs;
+
+    // The percentiles reading a row, and where each collect's sits among them
+    llvm::SmallVector<mlir::Value> percentileColumns;
+    llvm::SmallVector<std::optional<size_t>> percentileIndices;
+
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    for (const Projection::ReturnItem& returnItem : projection->items()) {
+        const VarDecl* projectedDecl = projectedVariable(returnItem);
+        const bool keysAnImportedCSVRow = projectedDecl
+                                       && projectedDecl->getType() == EvaluatedType::StringTable
+                                       && !variableColumns.contains(projectedDecl)
+                                       && _importedCSVRows.contains(projectedDecl->getName());
+        if (keysAnImportedCSVRow) {
+            llvm::SmallVector<const VariableDependency*> rowVars;
+            collectCSVRowVariables(projectedDecl, rowVars);
+
+            for (const VariableDependency* rowVar : rowVars) {
+                keyColumns.push_back(_part._varMap.at(rowVar).back());
+                keyVarAtPos.push_back(rowVar);
+                keyVarDeclAtPos.push_back(projectedDecl);
+                keyExprAtPos.push_back(nullptr);
+            }
+
+            continue;
+        }
+
+        if (const VarDecl* const* varDeclPtr = std::get_if<VarDecl*>(&returnItem)) {
+            const VarDecl* decl = *varDeclPtr;
+            const auto findIt = variableColumns.find(decl);
+            bioassert(findIt != variableColumns.end(), "Grouping key variable {} not found.", decl->getName());
+            const mlir::Value keyColumn = listColumnOf(decl, findIt->second);
+
+            // A constant tells no two rows apart, so it groups nothing - whether the
+            // projection spells it out or a wildcard expands it
+            if (yieldsConstantColumn(keyColumn, _constantColumns)) {
+                continue;
+            }
+
+            keyColumns.push_back(keyColumn);
+
+            // An edge identity's column is published under its representative, and that
+            // is the one the projection reads back, so the grouped column has to replace
+            // it there
+            const VariableDependency* keyVar = nullptr;
+            const auto identityIt = edgeIdentityVars.find(decl);
+
+            if (identityIt != edgeIdentityVars.end()) {
+                keyVar = identityIt->second;
+            } else {
+                for (auto& [var, values] : _part._varMap) {
+                    if (var->getDecl() == decl) {
+                        keyVar = var;
+                        break;
+                    }
+                }
+            }
+
+            keyVarAtPos.push_back(keyVar);
+            keyVarDeclAtPos.push_back(decl);
+            keyExprAtPos.push_back(nullptr);
+            continue;
+        }
+
+        const Expr* item = std::get<Expr*>(returnItem);
+
+        if (!item->isAggregate()) {
+            const mlir::Value keyColumn = getOrTranslateExprColumn(variableColumns, item);
+
+            // An aggregate may be taken over the alias of an item declared before it -
+            // count(x) of RETURN 1 AS x, count(x) - and the column that alias names is
+            // this one, so it is published under the item's declaration for the symbol
+            // to be resolved through, as the projection publishes it for an ORDER BY key
+            const VarDecl* itemDecl = item->getExprVarDecl();
+            if (itemDecl) {
+                _part._projectedColumns[itemDecl] = keyColumn;
+            }
+
+            // A constant column holds the same value in every row, so it tells no two
+            // rows apart: it groups nothing and rides along beside the groups, as it
+            // rides past a dedup or a sort
+            if (yieldsConstantColumn(keyColumn, _constantColumns)) {
+                continue;
+            }
+
+            keyColumns.push_back(keyColumn);
+            keyVarAtPos.push_back(nullptr);
+            keyVarDeclAtPos.push_back(nullptr);
+            keyExprAtPos.push_back(item);
+            continue;
+        }
+
+        // An item may carry an aggregate without being one: 2 * count(n) + 20 is an
+        // arithmetic expression the group reduces a count for, not an aggregate function
+        // it reduces whole. Its aggregates become the reduced columns, and the arithmetic
+        // around them is left for the projection to compute over the results.
+        if (!collectAggregateInvocations(item, itemInvocations)) {
+            const std::string_view itemName = item->getName();
+            throwError(fmt::format("Nested aggregates are not supported: {}", itemName), item);
+        }
+    }
+
+    // Every non-aggregate item was constant, so nothing tells the matched rows apart: the
+    // projection is the one keyless group, whichever way it spells its key - RETURN 1 AS
+    // x, count(n) counts the whole match, as RETURN count(n) does
+    if (keyColumns.empty()) {
+        generateKeylessAggregates(projection);
+        return;
+    }
+
+    // A key may order the groups by an aggregate the projection does not return -
+    // RETURN a.name ORDER BY count(b) - which the aggregation has to compute all the same.
+    // Its result column is then read by the sort alone, and no db.output reads it, which is
+    // what keeps it out of the rows
+    if (projection->hasOrderBy()) {
+        llvm::SmallVector<const FunctionInvocationExpr*> keyInvocations;
+        for (const OrderByItem* orderByItem : projection->getOrderBy()->getItems()) {
+            collectAggregateInvocations(orderByItem->getExpr(), keyInvocations);
+        }
+
+        for (const FunctionInvocationExpr* keyInvocation : keyInvocations) {
+            const bool alreadyReduced = std::any_of(itemInvocations.begin(),
+                                                    itemInvocations.end(),
+                                                    [keyInvocation](const FunctionInvocationExpr* collected) {
+                                                        return StructuralExpressionComparator::equal(collected, keyInvocation);
+                                                    });
+
+            if (!alreadyReduced) {
+                itemInvocations.push_back(keyInvocation);
+            }
+        }
+    }
+
+    for (const FunctionInvocationExpr* funcExpr : itemInvocations) {
+        const FunctionInvocation* invocation = funcExpr->getFunctionInvocation();
+        const std::string_view funcName = invocation->getSignature()->getFullName();
+
+        const ExprChain* args = invocation->getArguments();
+        bioassert(args && !args->empty(), "Aggregate function invocation with no arguments.");
+
+        const Expr* argExpr = args->front();
+
+        if (gathersItsValues(funcName)) {
+            const mlir::Value collectInput = readWalkEntities(argExpr, translateAggregateInput(argExpr, &variableColumns));
+
+            collectInputColumns.push_back(collectInput);
+            collectFuncExprs.push_back(funcExpr);
+
+            const mlir::Value rowPercentile = translateRowPercentile(invocation, collectInput, &variableColumns);
+            if (rowPercentile) {
+                percentileIndices.push_back(percentileColumns.size());
+                percentileColumns.push_back(rowPercentile);
+            } else {
+                percentileIndices.push_back(std::nullopt);
+            }
+
+            continue;
+        }
+
+        // Dropping repeated values cannot move an extremum, so min(DISTINCT x) is min(x)
+        // and takes the plain kind. The others reduce each of a group's distinct values
+        // once, which is a kind of its own, spelled as the function's name with the
+        // modifier appended
+        const bool isExtremum = funcName == "min" || funcName == "max";
+        const bool reducesDistinctValues = invocation->isDistinct() && !isExtremum;
+
+        const bool countsRows = argExpr->getType() == EvaluatedType::Wildcard;
+
+        // count(*) reads no value, so a null of the column it is anchored on is a row
+        // all the same: that is a kind of its own
+        std::string kindName {funcName};
+        std::ranges::transform(kindName, kindName.begin(), [](unsigned char letter) {
+            return static_cast<char>(tolower(letter));
+        });
+        if (countsRows) {
+            kindName += "_rows";
+        } else if (reducesDistinctValues) {
+            kindName += "_distinct";
+        }
+
+        const std::optional<mlir::storage::GroupAggregateKind> kind = mlir::storage::symbolizeGroupAggregateKind(kindName);
+        if (!kind) {
+            throwError(fmt::format("Unsupported aggregate function: {}", funcName), argExpr);
+        }
+
+        const mlir::Value inputColumn = translateAggregateInput(argExpr, &variableColumns);
+        const bool countsHandles = funcName == "count" && !invocation->isDistinct();
+
+        aggInputColumns.push_back(countsHandles ? inputColumn : readWalkEntities(argExpr, inputColumn));
+        aggKinds.push_back(*kind);
+        aggFuncExprs.push_back(funcExpr);
+    }
+
+    // The pending mask of an entity a MERGE bound is fixed by its ID, so it splits no group
+    // as a key, and as a key it is carried past the aggregate for reads to tell its rows apart
+    struct WrittenKey {
+        const VarDecl* _decl {nullptr};
+        size_t _keyIndex {0};
+        size_t _maskIndex {0};
+        bool _masked {false};
+    };
+
+    llvm::SmallVector<WrittenKey> writtenKeys;
+    const size_t itemKeyCount = keyColumns.size();
+
+    for (size_t keyIndex = 0; keyIndex < itemKeyCount; keyIndex++) {
+        const VarDecl* keyDecl = keyVarDeclAtPos[keyIndex];
+        const Expr* keyExpr = keyExprAtPos[keyIndex];
+
+        if (!keyDecl && keyExpr->getKind() == Expr::Kind::SYMBOL) {
+            keyDecl = static_cast<const SymbolExpr*>(keyExpr)->getDecl();
+        }
+
+        const mlir::Value pending = findPendingMask(keyDecl);
+        const bool writtenByACreate = _part._createdEntities.contains(keyDecl);
+        if (!pending && !writtenByACreate) {
+            continue;
+        }
+
+        WrittenKey& writtenKey = writtenKeys.emplace_back();
+        writtenKey._decl = keyDecl;
+        writtenKey._keyIndex = keyIndex;
+
+        if (pending) {
+            writtenKey._maskIndex = keyColumns.size();
+            writtenKey._masked = true;
+            keyColumns.push_back(pending);
+        }
+    }
+
+    const size_t keyCount = keyColumns.size();
+    const size_t aggCount = aggInputColumns.size();
+    const size_t collectCount = collectInputColumns.size();
+    bioassert(aggCount + collectCount > 0, "grouped aggregate with no aggregate columns.");
+
+    const bool isCollecting = collectCount > 0;
+
+    mlir::Operation* aggregateOp = nullptr;
+
+    if (isCollecting) {
+        // One accumulator holds the groups every list and every reduction reads, so the
+        // collects carry each other and the other aggregates rather than a second op
+        // grouping the same rows again.
+        llvm::SmallVector<int64_t> distinctCollects;
+        collectDistinctValueIndices(collectFuncExprs, distinctCollects);
+
+        llvm::SmallVector<mlir::Value> collectAggregateColumns(aggInputColumns.begin(), aggInputColumns.end());
+        collectAggregateColumns.append(percentileColumns.begin(), percentileColumns.end());
+
+        llvm::SmallVector<mlir::storage::GroupAggregateKind> collectAggregateKinds(aggKinds.begin(), aggKinds.end());
+        collectAggregateKinds.append(percentileColumns.size(), mlir::storage::GroupAggregateKind::First);
+
+        mlir::db::Collect collectOp = createCollect(keyColumns,
+                                                    collectInputColumns,
+                                                    distinctCollects,
+                                                    collectAggregateColumns,
+                                                    collectAggregateKinds);
+        aggregateOp = collectOp.getOperation();
+    } else {
+        llvm::SmallVector<mlir::Value> allColumns;
+        for (const mlir::Value col : keyColumns) {
+            allColumns.push_back(col);
+        }
+        for (const mlir::Value col : aggInputColumns) {
+            allColumns.push_back(col);
+        }
+
+        llvm::SmallVector<mlir::Type> resultTypes;
+        for (const mlir::Value col : keyColumns) {
+            resultTypes.push_back(col.getType());
+        }
+        for (size_t i = 0; i < aggCount; i++) {
+            resultTypes.push_back(noneType);
+        }
+
+        llvm::SmallVector<int64_t> aggKindValues;
+        for (const mlir::storage::GroupAggregateKind kind : aggKinds) {
+            aggKindValues.push_back(static_cast<int64_t>(kind));
+        }
+
+        mlir::db::GroupAggregate groupAgg = _opBuilder.create<mlir::db::GroupAggregate>(
+            loc,
+            mlir::TypeRange{resultTypes},
+            mlir::ValueRange{allColumns},
+            static_cast<uint64_t>(keyCount),
+            llvm::ArrayRef<int64_t>{aggKindValues});
+
+        aggregateOp = groupAgg.getOperation();
+        _part._aggregateOp = aggregateOp;
+    }
+
+    const mlir::ResultRange results = aggregateOp->getResults();
+
+    GroupedColumns groupedColumns;
+
+    for (size_t i = 0; i < itemKeyCount; i++) {
+        if (keyVarDeclAtPos[i]) {
+            if (keyVarAtPos[i]) {
+                registerValue(keyVarAtPos[i], results[i]);
+            }
+
+            // A YIELD can bind onto a variable a pattern already carries, which leaves the
+            // one declaration on both a variable and a yielded column, so both are rebound.
+            rebindYieldedColumn(keyVarDeclAtPos[i], results[i]);
+            rebindNamedPath(keyVarDeclAtPos[i], results[i]);
+            rebindGroupVariable(keyVarDeclAtPos[i], results[i]);
+            continue;
+        }
+
+        _part._exprMap[keyExprAtPos[i]] = results[i];
+        groupedColumns.emplace_back(keyExprAtPos[i], results[i]);
+
+        const bool isSymbol = keyExprAtPos[i]->getKind() == Expr::Kind::SYMBOL;
+        if (not isSymbol) {
+            continue;
+        }
+
+        // Symbols need their value updated: the aggregate gives them a new value.
+        // An edge variable holds an identity rather than a traversal variable of its
+        // own, and the projection reads it back through the identity's
+        // representative, so that is where the grouped column has to land
+        const SymbolExpr* sym = static_cast<const SymbolExpr*>(keyExprAtPos[i]);
+        const VarDecl* symDecl = sym->getDecl();
+
+        rebindYieldedColumn(symDecl, results[i]);
+        rebindNamedPath(symDecl, results[i]);
+        rebindGroupVariable(symDecl, results[i]);
+
+        const auto identityIt = edgeIdentityVars.find(symDecl);
+
+        if (identityIt != edgeIdentityVars.end()) {
+            registerValue(identityIt->second, results[i]);
+            continue;
+        }
+
+        for (auto& [var, values] : _part._varMap) {
+            if (var->getDecl() == symDecl) {
+                registerValue(var, results[i]);
+                break;
+            }
+        }
+    }
+
+    for (const WrittenKey& writtenKey : writtenKeys) {
+        const mlir::Value pending = writtenKey._masked ? results[writtenKey._maskIndex] : mlir::Value {};
+        rebindGroupedWrittenEntity(writtenKey._decl, results[writtenKey._keyIndex], pending);
+    }
+
+    // The results behind the keys are the collects' lists then the reductions, or - with
+    // no collect - the reductions alone.
+    llvm::SmallVector<const FunctionInvocationExpr*> aggregateItems(collectFuncExprs.begin(),
+                                                                    collectFuncExprs.end());
+    aggregateItems.append(aggFuncExprs.begin(), aggFuncExprs.end());
+
+    for (size_t i = 0; i < aggregateItems.size(); i++) {
+        const FunctionInvocationExpr* aggregateItem = aggregateItems[i];
+
+        // The group percentiles follow every list and every reduction
+        const std::optional<size_t> percentileIndex = i < collectCount ? percentileIndices[i] : std::nullopt;
+        const mlir::Value groupPercentile = percentileIndex ? results[keyCount + collectCount + aggCount + *percentileIndex]
+                                                            : mlir::Value {};
+
+        const mlir::Value aggregateColumn = reduceGatheredValues(aggregateItem->getFunctionInvocation(),
+                                                                 results[keyCount + i],
+                                                                 groupPercentile);
+
+        _part._exprMap[aggregateItem] = aggregateColumn;
+        groupedColumns.emplace_back(aggregateItem, aggregateColumn);
+
+        // The alias of an aggregate names its reduced column, so a key or a later item
+        // spelling that alias reads this column instead of computing a second aggregate
+        const VarDecl* aggregateDecl = aggregateItem->getExprVarDecl();
+        if (aggregateDecl) {
+            _part._projectedColumns[aggregateDecl] = aggregateColumn;
+        }
+    }
+
+    for (const Projection::ReturnItem& returnItem : projection->items()) {
+        const auto* itemPtr = std::get_if<Expr*>(&returnItem);
+        if (itemPtr && (*itemPtr)->isAggregate()) {
+            bindGroupedKeyColumn(*itemPtr, groupedColumns);
+        }
+    }
+
+    bindOrderByKeyColumns(projection, groupedColumns);
+}
+
+void DBProgramGenerator::bindOrderByKeyColumns(const Projection* projection,
+                                               const GroupedColumns& groupedColumns) {
+    if (!projection->hasOrderBy() || groupedColumns.empty()) {
+        return;
+    }
+
+    const OrderBy* orderBy = projection->getOrderBy();
+
+    for (const OrderByItem* item : orderBy->getItems()) {
+        bindGroupedKeyColumn(item->getExpr(), groupedColumns);
+    }
+}
+
+void DBProgramGenerator::bindGroupedKeyColumn(const Expr* expr, const GroupedColumns& groupedColumns) {
+    if (!expr || _part._exprMap.contains(expr)) {
+        return;
+    }
+
+    for (const auto& [keyExpr, keyColumn] : groupedColumns) {
+        // The key reads this grouping key whole, so the grouped column is what it reads:
+        // nothing below it has to be looked at, let alone translated again
+        if (StructuralExpressionComparator::equal(keyExpr, expr)) {
+            _part._exprMap[expr] = keyColumn;
+            return;
+        }
+    }
+
+    if (expr->getKind() == Expr::Kind::PROPERTY) {
+        const PropertyExpr* property = static_cast<const PropertyExpr*>(expr);
+
+        for (const auto& [keyExpr, keyColumn] : groupedColumns) {
+            if (StructuralExpressionComparator::readsThePropertyOfComponent(keyExpr, property)) {
+                _part._exprMap[expr] = emitComponentOf(property, keyColumn);
+                return;
+            }
+        }
+    }
+
+    std::vector<const Expr*> children;
+    if (!ExprChildren::collect(expr, children)) {
+        return;
+    }
+
+    for (const Expr* child : children) {
+        bindGroupedKeyColumn(child, groupedColumns);
+    }
+}
+
+bool DBProgramGenerator::collectAggregateInvocations(const Expr* expr,
+                                                     llvm::SmallVectorImpl<const FunctionInvocationExpr*>& found) {
+    if (!expr->isAggregate()) {
+        return true;
+    }
+
+    if (expr->getKind() == Expr::Kind::FUNCTION_INVOCATION) {
+        const FunctionInvocationExpr* funcExpr = static_cast<const FunctionInvocationExpr*>(expr);
+        const FunctionInvocation* invocation = funcExpr->getFunctionInvocation();
+
+        // An aggregate over an aggregate is invalid Cypher the analyzer turns away, so a
+        // reduced call is a leaf: its argument is the group's input, not another aggregate
+        if (invocation->getSignature()->isAggregate()) {
+            // A comparison chain hands its middle operand to both of its sides, so an
+            // aggregate standing there is reached twice and reduces one column, not two
+            if (std::ranges::find(found, funcExpr) == found.end()) {
+                found.push_back(funcExpr);
+            }
+
+            return true;
+        }
+    }
+
+    std::vector<const Expr*> children;
+    if (!ExprChildren::collect(expr, children)) {
+        return false;
+    }
+
+    for (const Expr* child : children) {
+        if (!collectAggregateInvocations(child, found)) {
+            return false;
+        }
+    }
+
+    return true;
 }

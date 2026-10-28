@@ -1,0 +1,17 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "RETURN COUNT(*) + toInteger(\"9\"), [x IN [1] | x] + COUNT(*)",
+  "expect": {
+    "result": "\"COUNT(*) + toInteger(\"\"9\"\")\",[x IN [1] | x] + COUNT(*)\n10,\"[1, 1]\"",
+    "resultJson": "{\"header\":{\"column_names\":[\"COUNT(*) + toInteger(\\\"9\\\")\",\"[x IN [1] | x] + COUNT(*)\"],\"column_types\":[\"Int64\",\"List\"]},\"data\":[[[10],[[1,1]]]]}"
+  },
+  "tags": [
+    "fuzz",
+    "crash",
+    "list",
+    "count",
+    "aggregate"
+  ],
+  "write-required": false
+}

@@ -28,13 +28,10 @@ using Token = db::YCypherParser::token;
 \n        { locationNewLine(*yylloc); }
 [ \t\r]+  { }
 
-"-"[ \t\r]*-  { return Token::TAIL_TAIL; }
 "<"[ \t\r]*-[ \t\r]*- { return Token::TIP_TAIL_TAIL; }
 "-"[ \t\r]*-[ \t\r]*> { return Token::TAIL_TAIL_TIP; }
 "<"[ \t\r]*-[ \t\r]*\[ { return Token::TIP_TAIL_BRACKET; }
-"]"[ \t\r]*-[ \t\r]*> { return Token::BRACKET_TAIL_TIP; }
 "-"[ \t\r]*\[  { return Token::TAIL_BRACKET; }
-"]"[ \t\r]*-  { return Token::BRACKET_TAIL; }
 
 "+=" { return Token::ADD_ASSIGN; }
 "<>" { return Token::NOT_EQUAL; }
@@ -56,7 +53,10 @@ using Token = db::YCypherParser::token;
 ":"  { return Token::COLON; }
 "^"  { return Token::CARET; }
 "|"  { return Token::PIPE; }
+"&"  { return Token::AMPERSAND; }
+"!"  { return Token::EXCLAMATION; }
 "+"  { return Token::PLUS; }
+"||" { return Token::CONCAT; }
 "*"  { return Token::MULT; }
 "`"  { return Token::ESC; }
 "-"  { return Token::SUB; }
@@ -84,11 +84,14 @@ using Token = db::YCypherParser::token;
 "OPTIONAL" { KEYWORD(OPTIONAL) }
 "CONTAINS" { KEYWORD(CONTAINS) }
 "DISTINCT" { KEYWORD(DISTINCT) }
+"EXPLAIN" { KEYWORD(EXPLAIN) }
+"FOREACH" { KEYWORD(FOREACH) }
 "EXTRACT" { KEYWORD(EXTRACT) }
 "REQUIRE" { KEYWORD(REQUIRE) }
 "COLLECT" { KEYWORD(COLLECT) }
 "CONNECT" { KEYWORD(CONNECT) }
 "SUBMIT" { KEYWORD(SUBMIT) }
+"SQUASH" { KEYWORD(SQUASH) }
 "CHANGE" { KEYWORD(CHANGE) }
 "COMMIT" { KEYWORD(COMMIT) }
 "STARTS" { KEYWORD(STARTS) }
@@ -121,11 +124,20 @@ using Token = db::YCypherParser::token;
 "AVAILABLE" { KEYWORD(AVAILABLE) }
 "INDEX" { KEYWORD(INDEX) }
 "INDEXES" { KEYWORD(INDEXES) }
-"COUNT" { KEYWORD(COUNT) }
+"COUNT"/[ \t\r\n]*[({] { KEYWORD(COUNT) }
+"REDUCE"/[ \t\r\n]*"(" { KEYWORD(REDUCE) }
+"NORMALIZE"/[ \t\r\n]*"(" { KEYWORD(NORMALIZE) }
+"NORMALIZED" { KEYWORD(NORMALIZED) }
 "HEADERS" { KEYWORD(HEADERS) }
+"DATETIMES" { KEYWORD(DATETIMES) }
+"DURATIONS" { KEYWORD(DURATIONS) }
 "EMBEDDINGS" { KEYWORD(EMBEDDINGS) }
 "JSONL" { KEYWORD(JSONL) }
 "LIST" { KEYWORD(LIST) }
+"NFKC" { KEYWORD(NFKC) }
+"NFKD" { KEYWORD(NFKD) }
+"NFC" { KEYWORD(NFC) }
+"NFD" { KEYWORD(NFD) }
 "DESC" { KEYWORD(DESC) }
 "CALL" { KEYWORD(CALL) }
 "NULL" { KEYWORD(NULL_) }
@@ -147,6 +159,7 @@ using Token = db::YCypherParser::token;
 "PUSH" { KEYWORD(PUSH) }
 "PULL" { KEYWORD(PULL) }
 "NEW" { KEYWORD(NEW) }
+"NEXT" { KEYWORD(NEXT) }
 "CSV" { KEYWORD(CSV) }
 "GML" { KEYWORD(GML) }
 "PARQUET" { KEYWORD(PARQUET) }
@@ -162,7 +175,6 @@ using Token = db::YCypherParser::token;
 "ADD" { KEYWORD(ADD) }
 "AND" { KEYWORD(AND) }
 "OR" { KEYWORD(OR) }
-"||" { KEYWORD(OR) }
 "IN" { KEYWORD(IN) }
 "IS" { KEYWORD(IS) }
 "S3" { KEYWORD(S3) }
@@ -193,7 +205,7 @@ using Token = db::YCypherParser::token;
     return Token::STRING_LITERAL;
 }
 
--?[0-9]*\.[0-9]+([eE][+-]?[0-9]+)?[fd]? {
+[0-9]*\.[0-9]+([eE][+-]?[0-9]+)?[fd]? {
     /* Double pattern */
     const double v = strtod(yytext, nullptr);
     yylval->emplace<double>(v);
@@ -202,7 +214,7 @@ using Token = db::YCypherParser::token;
 }
 
 
--?[0-9]+[eE][+-]?[0-9]+[fd]? {
+[0-9]+[eE][+-]?[0-9]+[fd]? {
     /* Double pattern */
     const double v = strtod(yytext, nullptr);
     yylval->emplace<double>(v);
@@ -211,7 +223,7 @@ using Token = db::YCypherParser::token;
 }
 
 
--?[0-9]+[fd] {
+[0-9]+[fd] {
     const double v = strtod(yytext, nullptr);
     yylval->emplace<double>(v);
 
@@ -221,36 +233,21 @@ using Token = db::YCypherParser::token;
 
     /*
      * Hexadecimal literals.
-     * from_chars using base 16 does not strip the leading 0x,
-     * so + 2 to the token src location, or + 3 if there is leading '-'.
-     * yytext will always be at least 2/3 characters due to the
-     * below regex, so it is always safe to + 2/3.
-     * We also need to manually negate the resultant value.
-     * NOTE: Current implementation disallows literals equal to INT_MIN,
-     * because it requires more complex processing. Values in the range
+     * from_chars using base 16 does not strip the leading 0x.
+     * A sign is the unary minus before the literal, so INT_MIN cannot be
+     * written: its magnitude is out of range. Values in the range
      * [INT_MIN + 1, INT_MAX] are allowed.
      */
--?0[xX][0-9a-fA-F]+ {
+0[xX][0-9a-fA-F]+ {
     static constexpr int HEX_BASE = 16;
 
-    const char* begin = yytext;
+    const char* begin = yytext + 2; // skip leading "0x"
     const char* end = yytext + yyleng;
-
-    const bool negative = *begin == '-';
-    if (negative) {
-        begin += 3; // skip leading "-0x"
-    } else {
-        begin += 2; // skip leading "0x"
-    }
 
     int64_t v = 0;
     const auto [_, err] = std::from_chars(begin, end, v, HEX_BASE);
     if (err == std::errc::result_out_of_range) {
         syntaxError(*yylloc, "Hexadecimal literal exceeded int64 range.");
-    }
-
-    if (negative) {
-        v = -v;
     }
 
     yylval->emplace<int64_t>(v);
@@ -261,37 +258,22 @@ using Token = db::YCypherParser::token;
 
     /*
      * Octal literals.
-     * from_chars using base 8 does not strip the leading 0o,
-     * so + 2 to the token src location, or + 3 if there is leading '-'.
-     * yytext will always be at least 2/3 characters due to the
-     * below regex, so it is always safe to + 2/3.
-     * We also need to manually negate the resultant value.
-     * NOTE: Current implementation disallows literals equal to INT_MIN,
-     * because it requires more complex processing. Values in the range
+     * from_chars using base 8 does not strip the leading 0o.
+     * A sign is the unary minus before the literal, so INT_MIN cannot be
+     * written: its magnitude is out of range. Values in the range
      * [INT_MIN + 1, INT_MAX] are allowed.
      */
--?0[oO][0-7]+ {
+0[oO][0-7]+ {
     static constexpr int OCT_BASE = 8;
 
-    const char* begin = yytext;
+    const char* begin = yytext + 2; // skips leading "0o"
     const char* end = yytext + yyleng;
-
-    const bool negative = *begin == '-';
-    if (negative) {
-        begin += 3; // skips leading "-0o"
-    } else {
-        begin += 2; // skips leading "0o"
-    }
 
     int64_t v = 0;
     const auto [_, err] = std::from_chars(begin, end, v, OCT_BASE);
 
     if (err == std::errc::result_out_of_range) {
         syntaxError(*yylloc, "Octal literal exceeded int64 range.");
-    }
-
-    if (negative) {
-        v = -v;
     }
 
     yylval->emplace<int64_t>(v);
@@ -302,24 +284,27 @@ using Token = db::YCypherParser::token;
 
     /*
      * Decimal literals; no prefix required.
-     * from_chars automatically strips leading '-' for decimal,
-     * and handles negation if present. Allows literals in the
-     * range [INT_MIN, INT_MAX].
+     * A sign is the unary minus before the literal, so the magnitude of
+     * INT_MIN, one past INT_MAX, is a token of its own that only a minus
+     * accepts. Allows literals in the range [INT_MIN, INT_MAX].
      */
--?[0-9]+ {
+[0-9]+ {
     static constexpr int DEC_BASE = 10;
+    static constexpr uint64_t NEGATED_INT64_MIN = uint64_t {1} << 63;
 
     const char* begin = yytext;
     const char* end = yytext + yyleng;
 
-    int64_t v = 0;
+    uint64_t v = 0;
     const auto [_, err] = std::from_chars(begin, end, v, DEC_BASE);
 
-    if (err == std::errc::result_out_of_range) {
+    if (err == std::errc::result_out_of_range || v > NEGATED_INT64_MIN) {
         syntaxError(*yylloc, "Decimal literal exceeded int64 range.");
+    } else if (v == NEGATED_INT64_MIN) {
+        return Token::INT64_MIN_MAGNITUDE;
     }
 
-    yylval->emplace<int64_t>(v);
+    yylval->emplace<int64_t>(static_cast<int64_t>(v));
 
     return Token::DIGIT;
 }

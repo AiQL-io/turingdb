@@ -3,9 +3,8 @@
   "graph": "simpledb",
   "query": "MATCH (n) RETURN [n.name]",
   "expect": {
-    "plan": "ANALYZE ERROR\n-------* Query error\n     1 | MATCH (n) RETURN [n.name]\n       |                   ^^^^^^\n-------* Non-literal list elements are not yet supported",
-    "result": "ANALYZE ERROR\n-------* Query error\n     1 | MATCH (n) RETURN [n.name]\n       |                   ^^^^^^\n-------* Non-literal list elements are not yet supported",
-    "resultJson": "{\"error\":\"ANALYZE_ERROR\",\"error_details\":\"-------* Query error\\n     1 | MATCH (n) RETURN [n.name]\\n       |                   ^^^^^^\\n-------* Non-literal list elements are not yet supported\"}"
+    "result": "[n.name]\n[Remy]\n[Adam]\n[Computers]\n[Eighties]\n[Bio]\n[Cooking]\n[Ghosts]\n[Padel]\n[Maxime]\n[Luc]\n[Animals]\n[Martina]\n[Suhas]\n[Gym]\n[Travel]\n[Cyrus]\n[JiuJitsu]\n[Doruk]",
+    "resultJson": "{\"header\":{\"column_names\":[\"[n.name]\"],\"column_types\":[\"List\"]},\"data\":[[[[\"Remy\"],[\"Adam\"],[\"Computers\"],[\"Eighties\"],[\"Bio\"],[\"Cooking\"],[\"Ghosts\"],[\"Padel\"],[\"Maxime\"],[\"Luc\"],[\"Animals\"],[\"Martina\"],[\"Suhas\"],[\"Gym\"],[\"Travel\"],[\"Cyrus\"],[\"JiuJitsu\"],[\"Doruk\"]]]]}"
   },
   "tags": [
     "lists",

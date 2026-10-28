@@ -1,6 +1,6 @@
 module {
   func.func @main() {
-    %0 = nl.get_edge_type("KNOWS_WELL")
+    %0 = nl.get_edge_type_set(["KNOWS_WELL"])
     %1 = nl.scan_nodes()
     nl.for %arg0 in %1 : !nl.iter<!nl.chunk<!storage.node_id>> {
       %2 = nl.get_out_edges_by_type(%arg0, %0, {})

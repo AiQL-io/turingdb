@@ -1,0 +1,5676 @@
+#pragma once
+
+#include <stddef.h>
+#include <stdint.h>
+#include <algorithm>
+#include <memory>
+#include <optional>
+#include <queue>
+#include <span>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <variant>
+#include <vector>
+
+#include "EntityList.h"
+#include "GraphPath.h"
+#include "ID.h"
+#include "LocalMemory.h"
+#include "NLHashJoinIndex.h"
+#include "NLStepBuffers.h"
+#include "NLValueStore.h"
+#include "ProcedureContext.h"
+#include "ProcedureState.h"
+#include "columns/ColumnEdgeTypes.h"
+#include "columns/ColumnIDs.h"
+#include "columns/ColumnMask.h"
+#include "columns/ColumnStringTable.h"
+#include "columns/ColumnVector.h"
+#include "iterators/ChunkConfig.h"
+#include "iterators/PathDistanceIndex.h"
+#include "iterators/PathExplorationDir.h"
+#include "iterators/PathTargetIndex.h"
+#include "list/ListBuffer.h"
+#include "list/ListView.h"
+#include "map/MapView.h"
+#include "list/PathTrie.h"
+#include "metadata/LabelSet.h"
+#include "metadata/LabelSetHandle.h"
+#include "metadata/PropertyType.h"
+
+namespace db {
+
+class NLExecutionContext;
+class NLFunctionData;
+struct NLMergeWorkingSet;
+class NLShortestPathLoopData;
+class Procedure;
+class ProcedureData;
+class LocalMemory;
+class StringBuffer;
+
+// Translation resolves every chunk SSA value
+// to a concrete ColumnVector type through this kind
+//
+// The first three are the ID columns a scan or a hop binds. The rest are what a CALL
+// yields: a procedure's declared return types map onto these, so a yielded column can be
+// crossed and carried like any other. Every one of them is a plain (never-null)
+// ColumnVector of the element type its name says.
+enum class NLChunkKind {
+    NodeID,
+    EdgeID,
+    EdgeTypeID,
+    LabelID,
+    PropertyTypeID,
+    ValueTypeCode,
+    UInt64,
+    Int64,
+    Double,
+    Bool,
+    String,
+    List,
+    Map,
+    Path,
+    DateTime,
+    Duration,
+    PathRef,
+    EntityList,
+};
+
+// Invoke handler with the column element type a chunk kind stands for, so the families of
+// per-element-type handlers are selected in one place rather than through a switch
+// repeated in each selector. handler is a template lambda - [&]<typename ElementType>(){}
+// - which is therefore instantiated for every kind, so only a family defined for all of
+// them dispatches this way: copying values (gather, broadcast, range copy) and allocating
+// the column. Ordering, key serialization and reduction are not defined for every kind, so
+// their selectors spell out the kinds they support and reject the rest.
+template <typename Handler>
+void dispatchChunkKind(NLChunkKind kind, Handler&& handler) {
+    switch (kind) {
+        case NLChunkKind::NodeID:
+            return handler.template operator()<NodeID>();
+        break;
+
+        case NLChunkKind::EdgeID:
+            return handler.template operator()<EdgeID>();
+        break;
+
+        case NLChunkKind::EdgeTypeID:
+            return handler.template operator()<EdgeTypeID>();
+        break;
+
+        case NLChunkKind::LabelID:
+            return handler.template operator()<LabelID>();
+        break;
+
+        case NLChunkKind::PropertyTypeID:
+            return handler.template operator()<PropertyTypeID>();
+        break;
+
+        case NLChunkKind::ValueTypeCode:
+            return handler.template operator()<ValueType>();
+        break;
+
+        case NLChunkKind::UInt64:
+            return handler.template operator()<types::UInt64::Primitive>();
+        break;
+
+        case NLChunkKind::Int64:
+            return handler.template operator()<types::Int64::Primitive>();
+        break;
+
+        case NLChunkKind::Double:
+            return handler.template operator()<types::Double::Primitive>();
+        break;
+
+        case NLChunkKind::Bool:
+            return handler.template operator()<types::Bool::Primitive>();
+        break;
+
+        case NLChunkKind::String:
+            return handler.template operator()<types::String::Primitive>();
+        break;
+
+        case NLChunkKind::List:
+            return handler.template operator()<ListView>();
+        break;
+
+        case NLChunkKind::Map:
+            return handler.template operator()<MapView>();
+        break;
+
+        case NLChunkKind::Path:
+            return handler.template operator()<Path>();
+        break;
+
+        case NLChunkKind::DateTime:
+            return handler.template operator()<types::DateTime::Primitive>();
+        break;
+
+        case NLChunkKind::Duration:
+            return handler.template operator()<types::Duration::Primitive>();
+        break;
+
+        case NLChunkKind::PathRef:
+            return handler.template operator()<PathRef>();
+        break;
+
+        case NLChunkKind::EntityList:
+            return handler.template operator()<EntityList>();
+        break;
+    }
+
+    bioassert(false, "Unknown NLChunkKind");
+}
+
+// Type of function pointers implementing operations
+using NLHandlerFunction = void (*)(NLExecutionContext* context, NLFunctionData* data);
+
+// Function descriptor representing translated statements
+// It consists of a function pointer and function-specific data
+class NLFunctionDescriptor {
+public:
+    NLFunctionDescriptor(NLHandlerFunction function,
+                         NLFunctionData* data)
+        : _function(function),
+        _data(data)
+    {
+    }
+
+    NLHandlerFunction getFunction() const { return _function; }
+    NLFunctionData* getData() const { return _data; }
+
+private:
+    NLHandlerFunction _function {nullptr};
+    NLFunctionData* _data {nullptr};
+};
+
+// Base class of function-specific data
+class NLFunctionData {
+public:
+    virtual ~NLFunctionData() = default;
+};
+
+// Runtime state of one LIMIT: the remaining row budget and how many rows the
+// current innermost step should emit. nl.limit resets it, nl.limit_update is the
+// sole mutator (called once per innermost step before nl.output), and the loops
+// and nl.output only read it. emitThisStep is what output emits; remaining is
+// what the loops test to early-exit.
+class NLLimitState {
+public:
+    void reset(size_t budget) {
+        _remaining = budget;
+        _emitThisStep = 0;
+    }
+
+    size_t getRemaining() const { return _remaining; }
+    size_t getEmitThisStep() const { return _emitThisStep; }
+
+    // Called once per innermost step by nl.limit_update, before nl.output: emit
+    // min(rowsAvailable, remaining) this step and charge it against the budget.
+    void update(size_t rowsAvailable) {
+        _emitThisStep = std::min(rowsAvailable, _remaining);
+        _remaining -= _emitThisStep;
+    }
+
+private:
+    size_t _remaining {0};
+    size_t _emitThisStep {0};
+};
+
+// Runtime state of one SKIP: the remaining rows still to drop, and - for the
+// current innermost step - how many of its rows to drop off the front
+// (skipThisStep, the offset into the chunk) and how many survive (emitThisStep).
+// nl.skip resets it, nl.skip_update is the sole mutator (called once per innermost
+// step before the truncate), and nl.skip_truncate only reads it. The skip sibling
+// of NLLimitState - but it never gates a loop, since every row past the dropped
+// prefix must still be produced.
+class NLSkipState {
+public:
+    void reset(size_t toSkip) {
+        _remaining = toSkip;
+        _skipThisStep = 0;
+        _emitThisStep = 0;
+    }
+
+    size_t getSkipThisStep() const { return _skipThisStep; }
+    size_t getEmitThisStep() const { return _emitThisStep; }
+
+    // Called once per innermost step by nl.skip_update, before nl.skip_truncate:
+    // drop min(rowsAvailable, remaining) rows off the front of this step, emit the
+    // rest, and charge the dropped count against the budget.
+    void update(size_t rowsAvailable) {
+        _skipThisStep = std::min(rowsAvailable, _remaining);
+        _remaining -= _skipThisStep;
+        _emitThisStep = rowsAvailable - _skipThisStep;
+    }
+
+private:
+    size_t _remaining {0};
+    size_t _skipThisStep {0};
+    size_t _emitThisStep {0};
+};
+
+// Holds the translated statements of a program or loop body
+class NLStmtContainer {
+public:
+    using Stmts = std::vector<NLFunctionDescriptor>;
+
+    const Stmts& stmts() const { return _stmts; }
+
+    void addStmt(const NLFunctionDescriptor& stmt) {
+        _stmts.push_back(stmt);
+    }
+
+    template <typename... Args>
+    void emplaceStmt(Args&&... args) {
+        _stmts.emplace_back(std::forward<Args>(args)...);
+    }
+
+private:
+    Stmts _stmts;
+};
+
+// Type of handles per column type that writes the input rows selected
+// by the indices column into output
+using NLGatherFunction = void (*)(const Column* input,
+                                  const ColumnVector<size_t>* indices,
+                                  Column* output);
+
+// A cross product pairs every outer row with every inner row, so the pair at
+// position p is outer row p/M with inner row p%M (M being the inner row count).
+// An input column holds only its N or M values, so filling a column of pairs
+// repeats them: that repetition is the broadcast. With outer [a0,a1] (N=2) and
+// inner [b0,b1,b2] (M=3) the whole product reads:
+//   outer -> [a0,a0,a0, a1,a1,a1]   each outer row repeated M times (block-repeat)
+//   inner -> [b0,b1,b2, b0,b1,b2]   the inner chunk repeated N times (tile)
+// so row k across all columns is one pair.
+//
+// A step fills the `rowCount` pairs starting at `position`, which is how the
+// product is cut into chunks: a slice may start and end mid-block or mid-tile, and
+// every column of the step slices at the same position, so they stay row-aligned.
+// `factor` is M for both directions - block-repeat divides the position by it,
+// tile takes the position modulo it.
+using NLBroadcastFunction = void (*)(const Column* input,
+                                     size_t factor,
+                                     size_t position,
+                                     size_t rowCount,
+                                     Column* output);
+
+// One column a hop predicate reads from outside the hop: the loop's own column, and the
+// chunk the region's argument reads, gathered at each candidate's seed row before each run
+struct NLHopImport {
+    const Column* _source {nullptr};
+    Column* _chunk {nullptr};
+    NLGatherFunction _gather {nullptr};
+};
+
+// Type of handle that appends the indices of the rows an nl.filter keeps into the
+// indices column. One per mask nullability: a plain mask keeps every true row, a
+// nullable mask keeps only present-and-true rows (a null drops).
+using NLMaskSurvivorFunction = void (*)(const Column* mask,
+                                        ColumnVector<size_t>* indices);
+
+// Wraps a "carried" column from previous operations
+class NLCarriedColumn {
+public:
+    NLCarriedColumn(const Column* input,
+                    Column* output,
+                    NLGatherFunction gather)
+        : _input(input),
+        _output(output),
+        _gather(gather)
+    {
+    }
+
+    const Column* getInput() const { return _input; }
+    Column* getOutput() const { return _output; }
+    NLGatherFunction getGatherFunc() const { return _gather; }
+
+private:
+    // Carried column pre-filtering
+    const Column* _input {nullptr};
+
+    // Output column after filtering
+    Column* _output {nullptr};
+
+    // Gather function to be used to process indices
+    NLGatherFunction _gather {nullptr};
+};
+
+// nl.scan_nodes loop data
+class NLScanLoopData : public NLFunctionData {
+public:
+    NLScanLoopData(ColumnNodeIDs* nodeIDs)
+        : _nodeIDs(nodeIDs)
+    {
+    }
+
+    ColumnNodeIDs* getNodeIDs() const { return _nodeIDs; }
+
+    // The governing limit counter, or null for an unbounded loop. The loop
+    // driver stops once it reaches zero.
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    ColumnNodeIDs* _nodeIDs {nullptr};
+    NLLimitState* _limit {nullptr};
+    NLStmtContainer _stmts;
+};
+
+// nl.scan_nodes_by_label loop data: a node scan restricted to the nodes whose
+// label set is a superset of _labelset. Reuses the plain scan's node chunk,
+// limit and body; adds the resolved label set the ScanNodesByLabelChunkWriter
+// filters by.
+class NLScanByLabelLoopData : public NLScanLoopData {
+public:
+    // The label set is owned here so the LabelSetHandle the executor builds each
+    // run points at storage that outlives it (this data lives for the whole
+    // program). _matchable is false when a requested label was absent from the
+    // schema, leaving the conjunction unsatisfiable, so the loop emits no row.
+    NLScanByLabelLoopData(ColumnNodeIDs* nodeIDs, const LabelSet& labelset, bool matchable)
+        : NLScanLoopData(nodeIDs),
+        _labelset(labelset),
+        _matchable(matchable)
+    {
+    }
+
+    const LabelSet& getLabelSet() const { return _labelset; }
+    bool isMatchable() const { return _matchable; }
+
+private:
+    LabelSet _labelset;
+    bool _matchable {true};
+};
+
+// nl.const_scan_nodes loop data: a node scan over a fixed, explicitly listed set
+// of node IDs rather than a walk of the graph. Reuses the plain scan's node chunk,
+// limit and body; adds the owned list of node IDs the loop emits, one chunk-sized
+// slice per step. The translator fills the list in place through addNodeID after
+// allocating the data, so the resolved IDs are never staged in a temporary; the
+// list is owned here so it outlives the op's attribute storage (this data lives
+// for the whole program).
+class NLConstScanLoopData : public NLScanLoopData {
+public:
+    NLConstScanLoopData(ColumnNodeIDs* nodeIDs)
+        : NLScanLoopData(nodeIDs)
+    {
+    }
+
+    std::span<const NodeID> getConstNodeIDs() const { return _constNodeIDs; }
+
+    // Reserve room for the resolved list, then append each valid ID in turn: the
+    // translator fills the list here directly rather than building and copying one.
+    void reserveNodeIDs(size_t count) { _constNodeIDs.reserve(count); }
+    void addNodeID(NodeID nodeID) { _constNodeIDs.push_back(nodeID); }
+
+private:
+    std::vector<NodeID> _constNodeIDs;
+};
+
+// nl.scan_nodes_by_property_value loop data. The label set and the literal are owned here
+// so the handle and the view the executor builds stay valid for every run; _matchable is
+// false when the property or a label is absent from the schema, or when no stored value
+// can equal the literal, and the loop then emits no row.
+class NLScanByPropertyValueLoopData : public NLScanLoopData {
+public:
+    using Literal = std::variant<int64_t, uint64_t, double, CustomBool, std::string>;
+
+    NLScanByPropertyValueLoopData(ColumnNodeIDs* nodeIDs,
+                                  PropertyTypeID propertyTypeID,
+                                  ValueType valueType,
+                                  const Literal& literal,
+                                  const LabelSet& labelset,
+                                  bool byLabel,
+                                  bool matchable)
+        : NLScanLoopData(nodeIDs),
+        _propertyTypeID(propertyTypeID),
+        _valueType(valueType),
+        _literal(literal),
+        _labelset(labelset),
+        _byLabel(byLabel),
+        _matchable(matchable)
+    {
+    }
+
+    PropertyTypeID getPropertyTypeID() const { return _propertyTypeID; }
+    ValueType getValueType() const { return _valueType; }
+    const Literal& getLiteral() const { return _literal; }
+    bool isMatchable() const { return _matchable; }
+    const LabelSet& getLabelSet() const { return _labelset; }
+    bool isByLabel() const { return _byLabel; }
+
+private:
+    PropertyTypeID _propertyTypeID {};
+    ValueType _valueType {ValueType::Invalid};
+    Literal _literal;
+    LabelSet _labelset;
+    bool _byLabel {false};
+    bool _matchable {false};
+};
+
+// The literal-list sibling of NLConstScanLoopData: streams a fixed ListView one chunk
+// at a time. A homogeneous list fills a nullable value column of _valueType, the shape
+// every value-chunk consumer reads; a heterogeneous list fills a
+// ColumnVector<ListElementView> of tagged scalars, in which case _valueType is unused.
+// The ListView spans the query-scoped ListBuffer, so the elements outlive the loop. A
+// plain source, so a downstream LIMIT can bound it.
+class NLUnwindConstLoopData : public NLFunctionData {
+public:
+    NLUnwindConstLoopData(Column* output, ListView list, bool heterogeneous, ValueType valueType)
+        : _output(output),
+        _list(list),
+        _heterogeneous(heterogeneous),
+        _valueType(valueType)
+    {
+    }
+
+    Column* getOutput() const { return _output; }
+    ListView getList() const { return _list; }
+    bool isHeterogeneous() const { return _heterogeneous; }
+    ValueType getValueType() const { return _valueType; }
+
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    Column* _output {nullptr};
+    ListView _list;
+    bool _heterogeneous {false};
+    ValueType _valueType {ValueType::Invalid};
+    NLLimitState* _limit {nullptr};
+    NLStmtContainer _stmts;
+};
+
+// The file sibling of NLUnwindConstLoopData: parses a CSV file one chunk of records at a
+// time into one owning string column per field the load produces. The path and the field
+// selectors are views into the module's attribute storage, which the MLIRContext keeps
+// alive for the whole execution; the path is resolved against the data directory, and a
+// header name against the file's header line, when the loop runs. The output columns are
+// the field columns of _row, which is what the parser fills. A plain source, so a
+// downstream LIMIT can bound it.
+class NLLoadCSVLoopData : public NLFunctionData {
+public:
+    // One field the load produces: the position `row[2]` named, or the header `row.age`
+    // named, which _index is resolved to against the header line.
+    struct Field {
+        std::string_view _header;
+        size_t _index {0};
+        bool _byHeader {false};
+    };
+
+    NLLoadCSVLoopData(ColumnStringTable* row,
+                      StringBuffer* stringBuffer,
+                      std::string_view path,
+                      bool hasHeaders,
+                      bool skipOnError)
+        : _row(row),
+        _stringBuffer(stringBuffer),
+        _path(path),
+        _hasHeaders(hasHeaders),
+        _skipOnError(skipOnError)
+    {
+    }
+
+    ColumnStringTable* getRow() const { return _row; }
+    StringBuffer* getStringBuffer() const { return _stringBuffer; }
+    std::string_view getPath() const { return _path; }
+    bool hasHeaders() const { return _hasHeaders; }
+    bool skipOnError() const { return _skipOnError; }
+
+    const std::vector<Field>& fields() const { return _fields; }
+    void addField(const Field& field) { _fields.push_back(field); }
+
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    ColumnStringTable* _row {nullptr};
+    StringBuffer* _stringBuffer {nullptr};
+    std::string_view _path;
+    std::vector<Field> _fields;
+    NLLimitState* _limit {nullptr};
+    bool _hasHeaders {false};
+    bool _skipOnError {false};
+    NLStmtContainer _stmts;
+};
+
+// The neighbour sibling of NLUnwindConstLoopData: runs one search against a vector index
+// and streams the neighbours it found one chunk at a time, into the node ID column of the
+// nodes the index holds the vectors under and a nullable f64 column of the distances they
+// scored. The index name and the query vector are views into the module's attribute
+// storage, which the MLIRContext keeps alive for the whole execution. A plain source, so
+// a downstream LIMIT can bound it.
+class NLVectorSearchLoopData : public NLFunctionData {
+public:
+    NLVectorSearchLoopData(ColumnNodeIDs* ids,
+                           Column* scores,
+                           std::string_view indexName,
+                           size_t neighbourCount,
+                           std::span<const float> queryVector)
+        : _ids(ids),
+        _scores(scores),
+        _indexName(indexName),
+        _neighbourCount(neighbourCount),
+        _queryVector(queryVector)
+    {
+    }
+
+    ColumnNodeIDs* getIDs() const { return _ids; }
+    Column* getScores() const { return _scores; }
+    std::string_view getIndexName() const { return _indexName; }
+    size_t getNeighbourCount() const { return _neighbourCount; }
+    std::span<const float> getQueryVector() const { return _queryVector; }
+
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+    // The neighbours the index reported, nearest first, in the types the two chunks
+    // carry. The search reads no column and its op is Pure, so one search answers every
+    // step: a loop re-entered from an enclosing cross product slices these again rather
+    // than asking the index a second time.
+    bool hasSearched() const { return _searched; }
+    void markSearched() { _searched = true; }
+
+    std::vector<NodeID>& neighbourIDs() { return _neighbourIDs; }
+    std::vector<std::optional<types::Double::Primitive>>& neighbourScores() { return _neighbourScores; }
+
+private:
+    ColumnNodeIDs* _ids {nullptr};
+    Column* _scores {nullptr};
+    std::string_view _indexName;
+    size_t _neighbourCount {0};
+    std::span<const float> _queryVector;
+    NLLimitState* _limit {nullptr};
+    std::vector<NodeID> _neighbourIDs;
+    std::vector<std::optional<types::Double::Primitive>> _neighbourScores;
+    bool _searched {false};
+    NLStmtContainer _stmts;
+};
+
+// The rows one cell of an unwound column contributes: a list its element count, a null
+// none, and any other value the single row it is. One per source column shape, selected
+// during translation.
+using NLUnwindElementCountFunction = size_t (*)(const Column* source, size_t row);
+
+// Fill the element chunk of one nl.unwind step from a column whose cells hold more than
+// the element: output row i is the element at positions[i] of the cell at rows[i].
+using NLUnwindElementEmitFunction = void (*)(const Column* source,
+                                             const ColumnVector<size_t>* rows,
+                                             const ColumnVector<size_t>* positions,
+                                             Column* output);
+
+// nl.for over nl.unwind data: the per-element expansion of a value column. Holds the
+// source column with the handler counting the rows each of its cells contributes, the
+// drain filling the element chunk, and the carry set gathered by each emitted row's
+// source row - the same NLCarriedColumn shape the edge loops use. The scratch columns
+// hold, per emitted row of the current step, the source row it came from and the
+// position of the element inside that row's cell.
+class NLUnwindLoopData : public NLFunctionData {
+public:
+    using CarriedColumns = std::vector<NLCarriedColumn>;
+
+    // @param elementEmit and @param elementOutput are null when the source's cells are
+    // themselves the elements: they are then gathered through the carry set like any
+    // other column.
+    NLUnwindLoopData(const Column* source,
+                     NLUnwindElementCountFunction elementCount,
+                     NLUnwindElementEmitFunction elementEmit,
+                     Column* elementOutput)
+        : _source(source),
+        _elementCount(elementCount),
+        _elementEmit(elementEmit),
+        _elementOutput(elementOutput)
+    {
+    }
+
+    const Column* getSource() const { return _source; }
+    NLUnwindElementCountFunction getElementCountFunc() const { return _elementCount; }
+    NLUnwindElementEmitFunction getElementEmitFunc() const { return _elementEmit; }
+    Column* getElementOutput() const { return _elementOutput; }
+
+    const CarriedColumns& carriedColumns() const { return _carriedColumns; }
+
+    void addCarriedColumn(const NLCarriedColumn& carried) {
+        _carriedColumns.push_back(carried);
+    }
+
+    ColumnVector<size_t>* getRows() { return &_rows; }
+    ColumnVector<size_t>* getPositions() { return &_positions; }
+
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    const Column* _source {nullptr};
+    NLUnwindElementCountFunction _elementCount {nullptr};
+    NLUnwindElementEmitFunction _elementEmit {nullptr};
+    Column* _elementOutput {nullptr};
+
+    NLLimitState* _limit {nullptr};
+    CarriedColumns _carriedColumns;
+    NLStmtContainer _stmts;
+
+    ColumnVector<size_t> _rows;
+    ColumnVector<size_t> _positions;
+};
+
+// Whether the cell one column holds at @param row holds no list at all - a null, not an
+// empty one. One per source column shape, selected during translation.
+using NLCellAbsentFunction = bool (*)(const Column* source, size_t row);
+
+// nl.scan_edges loop data: the edge sibling of NLScanLoopData. A source loop
+// (no input column, no carry set), so - unlike NLEdgeLoopData - it holds only
+// the four fixed output chunks a step fills (sources, edge IDs, edge type IDs,
+// targets), plus the limit and body a scan loop carries.
+class NLScanEdgesLoopData : public NLFunctionData {
+public:
+    NLScanEdgesLoopData(ColumnNodeIDs* sources,
+                        ColumnEdgeIDs* edgeIDs,
+                        ColumnEdgeTypes* edgeTypes,
+                        ColumnNodeIDs* targets)
+        : _sources(sources),
+        _edgeIDs(edgeIDs),
+        _edgeTypes(edgeTypes),
+        _targets(targets)
+    {
+    }
+
+    ColumnNodeIDs* getSources() const { return _sources; }
+    ColumnEdgeIDs* getEdgeIDs() const { return _edgeIDs; }
+    ColumnEdgeTypes* getEdgeTypes() const { return _edgeTypes; }
+    ColumnNodeIDs* getTargets() const { return _targets; }
+
+    // The governing limit counter, or null for an unbounded loop. The loop
+    // driver stops once it reaches zero.
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    // The four fixed chunks of an edge iterator step, in loop-variable order
+    ColumnNodeIDs* _sources {nullptr};
+    ColumnEdgeIDs* _edgeIDs {nullptr};
+    ColumnEdgeTypes* _edgeTypes {nullptr};
+    ColumnNodeIDs* _targets {nullptr};
+
+    NLLimitState* _limit {nullptr};
+    NLStmtContainer _stmts;
+};
+
+// nl.scan_edges_by_type loop data: the edge scan restricted to the types the pattern
+// named. Reuses the plain edge scan's chunks, limit and body; adds the resolved
+// EdgeTypeIDs the ScanEdgesByTypeChunkWriter filters by, owned here so the span it
+// walks each run points at storage that outlives it. A name absent from the schema
+// resolves to nothing, so an empty set matches no edge and the loop emits no row -
+// the scan sibling of NLEdgeByTypeLoopData.
+class NLScanEdgesByTypeLoopData : public NLScanEdgesLoopData {
+public:
+    NLScanEdgesByTypeLoopData(ColumnNodeIDs* sources,
+                              ColumnEdgeIDs* edgeIDs,
+                              ColumnEdgeTypes* edgeTypes,
+                              ColumnNodeIDs* targets,
+                              std::span<const EdgeTypeID> requestedTypes)
+        : NLScanEdgesLoopData(sources, edgeIDs, edgeTypes, targets),
+        _requestedTypes(requestedTypes.begin(), requestedTypes.end())
+    {
+    }
+
+    std::span<const EdgeTypeID> getRequestedTypes() const { return _requestedTypes; }
+    bool isMatchable() const { return !_requestedTypes.empty(); }
+
+private:
+    std::vector<EdgeTypeID> _requestedTypes;
+};
+
+// Loop data of the four by-label edge scans: the edge scan restricted to the edges hanging
+// off a node whose label set is a superset of _labelset - the ones leaving it where the
+// source carries the labels, the ones arriving at it where the target does.
+// The state is the same either way, so the four share it and differ only in the executor
+// they run. Reuses the plain edge scan's chunks, limit and body; adds the resolved label
+// set the by-label chunk writers filter by, owned here so the LabelSetHandle the executor
+// builds each run points at storage that outlives it. _matchable is false when a requested
+// label was absent from the schema, leaving the conjunction unsatisfiable, so the loop
+// emits no row.
+class NLScanEdgesByLabelLoopData : public NLScanEdgesLoopData {
+public:
+    NLScanEdgesByLabelLoopData(ColumnNodeIDs* sources,
+                               ColumnEdgeIDs* edgeIDs,
+                               ColumnEdgeTypes* edgeTypes,
+                               ColumnNodeIDs* targets,
+                               const LabelSet& labelset,
+                               bool matchable)
+        : NLScanEdgesLoopData(sources, edgeIDs, edgeTypes, targets),
+        _labelset(labelset),
+        _matchable(matchable)
+    {
+    }
+
+    const LabelSet& getLabelSet() const { return _labelset; }
+    bool isMatchable() const { return _matchable; }
+
+private:
+    LabelSet _labelset;
+    bool _matchable {true};
+};
+
+// Loop data of the two both-ends edge scans: the by-label scan's, keyed by the label set
+// of the end whose index it reads, with the label set the other end must carry.
+class NLScanEdgesByEndpointLabelsLoopData : public NLScanEdgesByLabelLoopData {
+public:
+    NLScanEdgesByEndpointLabelsLoopData(ColumnNodeIDs* sources,
+                                        ColumnEdgeIDs* edgeIDs,
+                                        ColumnEdgeTypes* edgeTypes,
+                                        ColumnNodeIDs* targets,
+                                        const LabelSet& indexedLabelSet,
+                                        const LabelSet& otherEndLabelSet,
+                                        bool matchable)
+        : NLScanEdgesByLabelLoopData(sources, edgeIDs, edgeTypes, targets, indexedLabelSet, matchable),
+        _otherEndLabelSet(otherEndLabelSet)
+    {
+    }
+
+    const LabelSet& getOtherEndLabelSet() const { return _otherEndLabelSet; }
+
+private:
+    LabelSet _otherEndLabelSet;
+};
+
+// The seed-expansion core shared by every loop that fans an input node chunk out: the
+// input, the seed and end node chunks a step fills, the row-to-input-row indices that
+// gather the carry set, the limit and the body
+class NLExpansionLoopData : public NLFunctionData {
+public:
+    using CarriedColumns = std::vector<NLCarriedColumn>;
+
+    NLExpansionLoopData(const ColumnNodeIDs* input,
+                        ColumnNodeIDs* sources,
+                        ColumnNodeIDs* targets)
+        : _inputNodeIDs(input),
+        _sources(sources),
+        _targets(targets)
+    {
+    }
+
+    const ColumnNodeIDs* getInput() const { return _inputNodeIDs; }
+
+    ColumnNodeIDs* getSources() const { return _sources; }
+    ColumnNodeIDs* getTargets() const { return _targets; }
+
+    ColumnVector<size_t>* getIndices() { return &_indices; }
+
+    const CarriedColumns& carriedColumns() const { return _carriedColumns; }
+
+    // The governing limit counter, or null for an unbounded loop. The loop
+    // driver stops once it reaches zero.
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+    void addCarriedColumn(const NLCarriedColumn& carried) {
+        _carriedColumns.push_back(carried);
+    }
+
+private:
+    const ColumnNodeIDs* _inputNodeIDs {nullptr};
+    NLLimitState* _limit {nullptr};
+
+    ColumnNodeIDs* _sources {nullptr};
+    ColumnNodeIDs* _targets {nullptr};
+
+    CarriedColumns _carriedColumns;
+    NLStmtContainer _stmts;
+
+    // Scratch for the writer's row-to-input-row map, which drives the gathers
+    ColumnVector<size_t> _indices;
+};
+
+// nl.get_out_edges and nl.get_in_edges loop data
+// The state is the same for get_out_edges/get_in_edges
+class NLEdgeLoopData : public NLExpansionLoopData {
+public:
+    NLEdgeLoopData(const ColumnNodeIDs* input,
+                   ColumnNodeIDs* sources,
+                   ColumnEdgeIDs* edgeIDs,
+                   ColumnEdgeTypes* edgeTypes,
+                   ColumnNodeIDs* targets)
+        : NLExpansionLoopData(input, sources, targets),
+        _edgeIDs(edgeIDs),
+        _edgeTypes(edgeTypes)
+    {
+    }
+
+    ColumnEdgeIDs* getEdgeIDs() const { return _edgeIDs; }
+    ColumnEdgeTypes* getEdgeTypes() const { return _edgeTypes; }
+
+private:
+    ColumnEdgeIDs* _edgeIDs {nullptr};
+    ColumnEdgeTypes* _edgeTypes {nullptr};
+};
+
+// nl.explore_paths loop data: the variable-length sibling of NLEdgeLoopData. On top of the
+// seed and end chunks it fills the path handle chunk out of the query's trie, and carries
+// the exploration's direction, hop bounds and resolved edge type. _matchable is false when
+// the type name was absent from the schema, so no hop can match: only the zero-length rows
+// of a min of zero are emitted. The hop predicate, when there is one, is the translated
+// body of the op's hop region over three loop-owned columns, ending in the mask chunk, or
+// the op's hop labels, resolved like the end labels.
+// The end labels, when the op carries them, are resolved here too; _endMatchable is false
+// when one was absent from the schema, so no path can end and nothing is emitted. The
+// distance index that prunes the walk is owned here so every chunk of the loop shares it;
+// the target index of a bound end is owned here too, rebuilt for each chunk's targets.
+// The nodes one column holds, gathered chunk by chunk while the loop that binds it runs. The
+// walk that ends on the set reads it sorted and without duplicates, which is the order its
+// membership test and its target index both want.
+class NLNodeSetState {
+public:
+    NLNodeSetState();
+    ~NLNodeSetState();
+
+    void reset();
+    void add(const std::vector<NodeID>& nodes);
+
+    std::span<const NodeID> getNodes();
+
+private:
+    std::vector<NodeID> _nodes;
+    bool _ordered {false};
+};
+
+// One step of the body an nl.explore_paths walk repeats: the direction and edge types its
+// hops follow, and the labels and the predicate they must pass. The predicate reads the
+// repetition up to the hop through the node and edge columns of its region, interleaved as
+// the region's arguments are; a null column is an argument the region does not read.
+class NLExploreStep {
+public:
+    NLExploreStep(PathExplorationDir direction,
+                  bool filtersByType,
+                  std::span<const EdgeTypeID> edgeTypes,
+                  bool matchable);
+    ~NLExploreStep();
+
+    PathExplorationDir getDirection() const { return _direction; }
+    bool filtersByType() const { return _filtersByType; }
+    std::span<const EdgeTypeID> getEdgeTypes() const { return _edgeTypes; }
+    bool isMatchable() const { return _matchable; }
+
+    void setHopLabels(const LabelSet& hopLabels, bool matchable) {
+        _hopLabels = hopLabels;
+        _filtersByHopLabels = true;
+        _hopLabelsMatchable = matchable;
+    }
+
+    bool filtersByHopLabels() const { return _filtersByHopLabels; }
+    const LabelSet& getHopLabels() const { return _hopLabels; }
+    bool areHopLabelsMatchable() const { return _hopLabelsMatchable; }
+
+    bool hasHopFilter() const { return _hopMask != nullptr; }
+
+    void setHopFilter(const Column* hopMask, NLMaskSurvivorFunction hopSurvivors) {
+        _hopMask = hopMask;
+        _hopSurvivors = hopSurvivors;
+    }
+
+    void addHopNode(ColumnNodeIDs* column) { _hopNodes.push_back(column); }
+    void addHopEdge(ColumnEdgeIDs* column) { _hopEdges.push_back(column); }
+    void addHopImport(const NLHopImport& import) { _hopImports.push_back(import); }
+
+    std::span<ColumnNodeIDs* const> getHopNodes() const { return _hopNodes; }
+    std::span<ColumnEdgeIDs* const> getHopEdges() const { return _hopEdges; }
+    size_t getHopPosition() const { return _hopEdges.size() - 1; }
+    std::span<const NLHopImport> getHopImports() const { return _hopImports; }
+    const Column* getHopMask() const { return _hopMask; }
+    NLMaskSurvivorFunction getHopSurvivors() const { return _hopSurvivors; }
+
+    NLStmtContainer* getHopStmts() { return &_hopStmts; }
+    const NLStmtContainer* getHopStmts() const { return &_hopStmts; }
+
+private:
+    PathExplorationDir _direction {PathExplorationDir::FORWARD};
+    bool _filtersByType {false};
+    std::vector<EdgeTypeID> _edgeTypes;
+    bool _matchable {true};
+
+    LabelSet _hopLabels;
+    bool _filtersByHopLabels {false};
+    bool _hopLabelsMatchable {true};
+
+    std::vector<ColumnNodeIDs*> _hopNodes;
+    std::vector<ColumnEdgeIDs*> _hopEdges;
+    const Column* _hopMask {nullptr};
+    NLMaskSurvivorFunction _hopSurvivors {nullptr};
+    std::vector<NLHopImport> _hopImports;
+    NLStmtContainer _hopStmts;
+};
+
+// The hop bounds count repetitions of the body of steps
+class NLExplorePathsLoopData : public NLExpansionLoopData {
+public:
+    NLExplorePathsLoopData(const ColumnNodeIDs* input,
+                           ColumnNodeIDs* sources,
+                           ColumnNodeIDs* targets,
+                           ColumnVector<PathRef>* paths,
+                           PathTrie* trie,
+                           uint64_t minHops,
+                           uint64_t maxHops)
+        : NLExpansionLoopData(input, sources, targets),
+        _paths(paths),
+        _trie(trie),
+        _minHops(minHops),
+        _maxHops(maxHops)
+    {
+    }
+
+    ColumnVector<PathRef>* getPaths() const { return _paths; }
+    PathTrie* getTrie() const { return _trie; }
+    uint64_t getMinHops() const { return _minHops; }
+    uint64_t getMaxHops() const { return _maxHops; }
+
+    NLExploreStep* addStep(PathExplorationDir direction,
+                           bool filtersByType,
+                           std::span<const EdgeTypeID> edgeTypes,
+                           bool matchable);
+
+    size_t getStepCount() const { return _steps.size(); }
+    NLExploreStep* getStep(size_t step) const { return _steps[step].get(); }
+
+    bool isMatchable() const;
+
+    void setEndLabels(const LabelSet& endLabels, bool matchable) {
+        _endLabels = endLabels;
+        _filtersByEndLabels = true;
+        _endMatchable = matchable;
+    }
+
+    bool filtersByEndLabels() const { return _filtersByEndLabels; }
+    const LabelSet& getEndLabels() const { return _endLabels; }
+    bool isEndMatchable() const { return _endMatchable; }
+
+    PathDistanceIndex* getDistanceIndex() { return &_distanceIndex; }
+
+    void addSeedsSeen(size_t count) { _seedsSeen += count; }
+    size_t getSeedsSeen() const { return _seedsSeen; }
+
+    void setEndNodes(const ColumnNodeIDs* endNodes) { _endNodes = endNodes; }
+    const ColumnNodeIDs* getEndNodes() const { return _endNodes; }
+
+    void setEndNodeSet(NLNodeSetState* endNodeSet) { _endNodeSet = endNodeSet; }
+    NLNodeSetState* getEndNodeSet() const { return _endNodeSet; }
+
+    PathTargetIndex* getTargetIndex() { return &_targetIndex; }
+
+    void setDistinctEnds() { _distinctEnds = true; }
+    bool isDistinctEnds() const { return _distinctEnds; }
+
+private:
+    ColumnVector<PathRef>* _paths {nullptr};
+    PathTrie* _trie {nullptr};
+    uint64_t _minHops {0};
+    uint64_t _maxHops {0};
+    std::vector<std::unique_ptr<NLExploreStep>> _steps;
+
+    LabelSet _endLabels;
+    bool _filtersByEndLabels {false};
+    bool _endMatchable {true};
+    PathDistanceIndex _distanceIndex;
+    size_t _seedsSeen {0};
+
+    const ColumnNodeIDs* _endNodes {nullptr};
+    NLNodeSetState* _endNodeSet {nullptr};
+    PathTargetIndex _targetIndex;
+    bool _distinctEnds {false};
+};
+
+// The list a path handle expands to; the interpreter-side counterpart of the MLIR
+// storage::PathExpansionKind, which the translator maps onto this
+enum class PathExpansionKind {
+    Edges,
+    Sources,
+    Ends,
+    Nodes,
+};
+
+// nl.expand_path data: one list per row, written into the query's list buffer from the
+// trie the handles index. The seeds are read for the sources kind alone.
+class NLExpandPathData : public NLFunctionData {
+public:
+    NLExpandPathData(const ColumnVector<PathRef>* paths,
+                     const ColumnNodeIDs* seeds,
+                     ColumnVector<ListView>* output,
+                     PathExpansionKind kind,
+                     bool reversed,
+                     PathHopStride hops,
+                     const PathTrie* trie,
+                     QueryListBuffer* listBuffer)
+        : _paths(paths),
+        _seeds(seeds),
+        _output(output),
+        _kind(kind),
+        _reversed(reversed),
+        _hops(hops),
+        _trie(trie),
+        _listBuffer(listBuffer)
+    {
+    }
+
+    const ColumnVector<PathRef>* getPaths() const { return _paths; }
+    const ColumnNodeIDs* getSeeds() const { return _seeds; }
+    ColumnVector<ListView>* getOutput() const { return _output; }
+    PathExpansionKind getKind() const { return _kind; }
+    bool isReversed() const { return _reversed; }
+    PathHopStride getHops() const { return _hops; }
+    const PathTrie* getTrie() const { return _trie; }
+    QueryListBuffer* getListBuffer() const { return _listBuffer; }
+
+private:
+    const ColumnVector<PathRef>* _paths {nullptr};
+    const ColumnNodeIDs* _seeds {nullptr};
+    ColumnVector<ListView>* _output {nullptr};
+    PathExpansionKind _kind {PathExpansionKind::Edges};
+    bool _reversed {false};
+    PathHopStride _hops;
+    const PathTrie* _trie {nullptr};
+    QueryListBuffer* _listBuffer {nullptr};
+};
+
+// nl.path_length data: the depth of each handle's entry, read without expanding the path
+class NLPathLengthData : public NLFunctionData {
+public:
+    NLPathLengthData(const ColumnVector<PathRef>* paths, ColumnVector<uint64_t>* output, const PathTrie* trie)
+        : _paths(paths),
+        _output(output),
+        _trie(trie)
+    {
+    }
+
+    const ColumnVector<PathRef>* getPaths() const { return _paths; }
+    ColumnVector<uint64_t>* getOutput() const { return _output; }
+    const PathTrie* getTrie() const { return _trie; }
+
+private:
+    const ColumnVector<PathRef>* _paths {nullptr};
+    ColumnVector<uint64_t>* _output {nullptr};
+    const PathTrie* _trie {nullptr};
+};
+
+// What a named path is read for; the interpreter-side counterpart of the MLIR
+// storage::PathElementsKind, which the translator maps onto this
+enum class PathElementsKind {
+    Nodes,
+    Relationships,
+    Length,
+};
+
+// nl.path_elements data: one list of node IDs, one list of edge IDs or one hop count per
+// row, read off the entity sequence of each path and null where that sequence is empty.
+// The paths are entity lists or the bare alternating IDs of a shortest path. The lists
+// are written into the query's list buffer.
+class NLPathElementsData : public NLFunctionData {
+public:
+    NLPathElementsData(const Column* paths,
+                       Column* output,
+                       PathElementsKind kind,
+                       QueryListBuffer* listBuffer)
+        : _paths(paths),
+        _output(output),
+        _kind(kind),
+        _listBuffer(listBuffer)
+    {
+    }
+
+    const Column* getPaths() const { return _paths; }
+    Column* getOutput() const { return _output; }
+    PathElementsKind getKind() const { return _kind; }
+    QueryListBuffer* getListBuffer() const { return _listBuffer; }
+
+private:
+    const Column* _paths {nullptr};
+    Column* _output {nullptr};
+    PathElementsKind _kind {PathElementsKind::Nodes};
+    QueryListBuffer* _listBuffer {nullptr};
+};
+
+// One entity of a path being built: the column holding it on each row, and which of the
+// three kinds of entity the column carries
+struct NLPathEntity {
+    enum class Kind : uint8_t {
+        Node,
+        Edge,
+        Path,
+    };
+
+    const Column* _column {nullptr};
+    Kind _kind {Kind::Node};
+    // A Path whose walk ran against the pattern, whose hops read back from its far end
+    bool _reversed {false};
+};
+
+// nl.make_path data: one entity sequence per row, appended in operand order. A Path
+// entity contributes the hops its handle stands for, read out of the trie.
+class NLMakePathData : public NLFunctionData {
+public:
+    using PathEntities = std::vector<NLPathEntity>;
+
+    NLMakePathData(ColumnVector<EntityList>* output, const PathTrie* trie)
+        : _output(output),
+        _trie(trie)
+    {
+    }
+
+    const PathEntities& entities() const { return _entities; }
+    ColumnVector<EntityList>* getOutput() const { return _output; }
+    const PathTrie* getTrie() const { return _trie; }
+
+    void addEntity(const NLPathEntity& entity) {
+        _entities.push_back(entity);
+    }
+
+private:
+    PathEntities _entities;
+    ColumnVector<EntityList>* _output {nullptr};
+    const PathTrie* _trie {nullptr};
+};
+
+// nl.get_out_edges_by_type / nl.get_in_edges_by_type loop data: an edge hop
+// restricted to the types the pattern named. Reuses the plain edge hop's chunks, limit, carry
+// set and body; adds the resolved EdgeTypeIDs the Get{Out,In}EdgesByTypeChunkWriter
+// filters by, owned here so the span it walks each run points at storage that outlives
+// it. A name absent from the schema resolves to nothing, so an empty set matches no
+// edge and the loop emits no row - the edge sibling of NLScanByLabelLoopData.
+class NLEdgeByTypeLoopData : public NLEdgeLoopData {
+public:
+    NLEdgeByTypeLoopData(const ColumnNodeIDs* input,
+                         ColumnNodeIDs* sources,
+                         ColumnEdgeIDs* edgeIDs,
+                         ColumnEdgeTypes* edgeTypes,
+                         ColumnNodeIDs* targets,
+                         std::span<const EdgeTypeID> requestedTypes)
+        : NLEdgeLoopData(input, sources, edgeIDs, edgeTypes, targets),
+        _requestedTypes(requestedTypes.begin(), requestedTypes.end())
+    {
+    }
+
+    std::span<const EdgeTypeID> getRequestedTypes() const { return _requestedTypes; }
+    bool isMatchable() const { return !_requestedTypes.empty(); }
+
+private:
+    std::vector<EdgeTypeID> _requestedTypes;
+};
+
+// nl.get_out_edges_by_label / nl.get_in_edges_by_label loop data: an edge hop restricted to
+// the edges whose far endpoint carries a label set - the target of an out-edge, the source
+// of an in-edge. Reuses the plain edge hop's chunks, limit, carry set and body; adds the
+// label set the Get{Out,In}EdgesByLabelChunkWriter filters by, owned here so the
+// LabelSetHandle the executor builds each run points at storage that outlives it.
+// _matchable is false when a requested label was absent from the schema, leaving the
+// conjunction unsatisfiable, so the loop emits no row.
+class NLEdgeByLabelLoopData : public NLEdgeLoopData {
+public:
+    NLEdgeByLabelLoopData(const ColumnNodeIDs* input,
+                          ColumnNodeIDs* sources,
+                          ColumnEdgeIDs* edgeIDs,
+                          ColumnEdgeTypes* edgeTypes,
+                          ColumnNodeIDs* targets,
+                          const LabelSet& labelset,
+                          bool matchable)
+        : NLEdgeLoopData(input, sources, edgeIDs, edgeTypes, targets),
+        _labelset(labelset),
+        _matchable(matchable)
+    {
+    }
+
+    const LabelSet& getLabelSet() const { return _labelset; }
+    bool isMatchable() const { return _matchable; }
+
+private:
+    LabelSet _labelset;
+    bool _matchable {true};
+};
+
+// nl.get_out_edges_by_type_and_label / nl.get_in_edges_by_type_and_label loop data: the
+// requested types of NLEdgeByTypeLoopData and the label set of NLEdgeByLabelLoopData
+// together. The loop emits no row when no type resolved or a label is absent.
+class NLEdgeByTypeAndLabelLoopData : public NLEdgeLoopData {
+public:
+    NLEdgeByTypeAndLabelLoopData(const ColumnNodeIDs* input,
+                                 ColumnNodeIDs* sources,
+                                 ColumnEdgeIDs* edgeIDs,
+                                 ColumnEdgeTypes* edgeTypes,
+                                 ColumnNodeIDs* targets,
+                                 std::span<const EdgeTypeID> requestedTypes,
+                                 const LabelSet& labelset,
+                                 bool labelsMatchable)
+        : NLEdgeLoopData(input, sources, edgeIDs, edgeTypes, targets),
+        _requestedTypes(requestedTypes.begin(), requestedTypes.end()),
+        _labelset(labelset),
+        _labelsMatchable(labelsMatchable)
+    {
+    }
+
+    std::span<const EdgeTypeID> getRequestedTypes() const { return _requestedTypes; }
+    const LabelSet& getLabelSet() const { return _labelset; }
+    bool isMatchable() const { return _labelsMatchable && !_requestedTypes.empty(); }
+
+private:
+    std::vector<EdgeTypeID> _requestedTypes;
+    LabelSet _labelset;
+    bool _labelsMatchable {true};
+};
+
+// nl.get_node_properties / nl.get_edge_properties data: a with-null property
+// read that maps the input ID column to a nullable value column, one value per
+// input row (missing values are null, no row dropped). The node-vs-edge ID type
+// and the value type are baked into the chosen handler; the PropertyTypeID was
+// resolved from the name against the schema during translation.
+class NLPropertyFetchData : public NLFunctionData {
+public:
+    NLPropertyFetchData(const Column* input, Column* output, PropertyTypeID propertyTypeID)
+        : _input(input),
+        _output(output),
+        _propertyTypeID(propertyTypeID)
+    {
+    }
+
+    const Column* getInput() const { return _input; }
+    Column* getOutput() const { return _output; }
+    PropertyTypeID getPropertyTypeID() const { return _propertyTypeID; }
+
+    // The rows holding a write-buffer offset rather than an ID the graph knows, or null
+    // for an input no merge produced. Such a row reads its value out of the write buffer.
+    // A column a create produced is such a row throughout, which is what _allPending says.
+    const ColumnMask* getPending() const { return _pending; }
+    void setPending(const ColumnMask* pending) { _pending = pending; }
+
+    bool isAllPending() const { return _allPending; }
+    void setAllPending(bool allPending) { _allPending = allPending; }
+
+    // The values this change wrote that a run fetched, copied in and emptied at the next run
+    NLValueStore& fetchedValues() { return _fetchedValues; }
+
+private:
+    const Column* _input {nullptr};
+    Column* _output {nullptr};
+    const ColumnMask* _pending {nullptr};
+    PropertyTypeID _propertyTypeID;
+    bool _allPending {false};
+    NLValueStore _fetchedValues;
+};
+
+class NLGetNodeLabelSetData : public NLFunctionData {
+public:
+    NLGetNodeLabelSetData(const ColumnNodeIDs* input, ColumnLabelSetIDs* output)
+        : _input(input),
+        _output(output)
+    {
+    }
+
+    const ColumnNodeIDs* getInput() const { return _input; }
+    ColumnLabelSetIDs* getOutput() const { return _output; }
+
+private:
+    const ColumnNodeIDs* _input {nullptr};
+    ColumnLabelSetIDs* _output {nullptr};
+};
+
+class NLGetEdgeTypesData : public NLFunctionData {
+public:
+    NLGetEdgeTypesData(const ColumnEdgeIDs* input, ColumnEdgeTypes* output)
+        : _input(input),
+        _output(output)
+    {
+    }
+
+    const ColumnEdgeIDs* getInput() const { return _input; }
+    ColumnEdgeTypes* getOutput() const { return _output; }
+
+private:
+    const ColumnEdgeIDs* _input {nullptr};
+    ColumnEdgeTypes* _output {nullptr};
+};
+
+class NLCheckLabelConstraintData : public NLFunctionData {
+public:
+    NLCheckLabelConstraintData(const ColumnLabelSetIDs* input, Column* output)
+        : _input(input),
+        _output(output)
+    {
+    }
+
+    const ColumnLabelSetIDs* getInput() const { return _input; }
+    Column* getOutput() const { return _output; }
+
+    void addMatchingID(LabelSetID id) { _matchingIDs.insert(id.getValue()); }
+    bool isMatching(LabelSetID id) const { return _matchingIDs.count(id.getValue()) > 0; }
+
+private:
+    const ColumnLabelSetIDs* _input {nullptr};
+    Column* _output {nullptr};
+    std::unordered_set<uint32_t> _matchingIDs;
+};
+
+class NLCheckEdgeTypeConstraintData : public NLFunctionData {
+public:
+    NLCheckEdgeTypeConstraintData(const ColumnEdgeTypes* input, Column* output)
+        : _input(input),
+        _output(output)
+    {
+    }
+
+    const ColumnEdgeTypes* getInput() const { return _input; }
+    Column* getOutput() const { return _output; }
+
+    void addMatchingID(EdgeTypeID id) { _matchingIDs.insert(id.getValue()); }
+    bool isMatching(EdgeTypeID id) const { return _matchingIDs.count(id.getValue()) > 0; }
+
+private:
+    const ColumnEdgeTypes* _input {nullptr};
+    Column* _output {nullptr};
+    std::unordered_set<uint64_t> _matchingIDs;
+};
+
+// One column used as operand of nl.cross_product: its input chunk, the output
+// chunk to fill, and the broadcast that fills one from the other.
+class NLCrossColumn {
+public:
+    NLCrossColumn(const Column* input,
+                  Column* output,
+                  NLBroadcastFunction broadcast)
+        : _input(input),
+        _output(output),
+        _broadcast(broadcast)
+    {
+    }
+
+    const Column* getInput() const { return _input; }
+    Column* getOutput() const { return _output; }
+    NLBroadcastFunction getBroadcast() const { return _broadcast; }
+
+private:
+    const Column* _input {nullptr};
+    Column* _output {nullptr};
+    NLBroadcastFunction _broadcast {nullptr};
+};
+
+// nl.cross_product loop data: the outer and inner columns of a cartesian product,
+// and the body run once per chunk of the pairs they make. N (outer rows) and M
+// (inner rows) are read at run time from the first column of each group, so the
+// product has N*M pairs; the loop walks them chunk by chunk rather than laying all
+// of them out at once.
+class NLCrossProductLoopData : public NLFunctionData {
+public:
+    using Columns = std::vector<NLCrossColumn>;
+
+    const Columns& outerColumns() const { return _outerColumns; }
+    const Columns& innerColumns() const { return _innerColumns; }
+
+    void addOuterColumn(const NLCrossColumn& column) {
+        _outerColumns.push_back(column);
+    }
+
+    void addInnerColumn(const NLCrossColumn& column) {
+        _innerColumns.push_back(column);
+    }
+
+    // The governing limit counter, or null for an unbounded loop. The loop stops
+    // once it reaches zero and a step lays out at most that many pairs; it never
+    // mutates the counter (the nl.limit_update in the body does).
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    Columns _outerColumns;
+    Columns _innerColumns;
+    NLLimitState* _limit {nullptr};
+    NLStmtContainer _stmts;
+};
+
+// nl.each_row loop data: the step's chunks and a one-row output per chunk, each filled
+// through the gather an edge hop uses, over an index column holding the one row the step
+// is at. A plain source over the step's rows, so a downstream LIMIT can bound it.
+class NLEachRowLoopData : public NLFunctionData {
+public:
+    using Columns = std::vector<NLCarriedColumn>;
+
+    const Columns& columns() const { return _columns; }
+
+    void addColumn(const NLCarriedColumn& column) { _columns.push_back(column); }
+
+    ColumnVector<size_t>* getIndices() { return &_indices; }
+
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    Columns _columns;
+    ColumnVector<size_t> _indices;
+    NLLimitState* _limit {nullptr};
+    NLStmtContainer _stmts;
+};
+
+// Lay a constant column's single value out over rowCount rows of a fresh output
+// chunk, as one present value per row. The cross product's broadcast repeats a
+// chunk's several values; this one repeats the single value a ColumnConst holds,
+// so a fold that walks rows sees the step's rows rather than the one row the
+// constant is. One per value type, selected during translation.
+using NLBroadcastConstantFunction = void (*)(const Column* value,
+                                             size_t rowCount,
+                                             Column* output);
+
+// nl.broadcast_constant data: the constant column to repeat, the driving
+// relation's chunk whose row count says how many times - null when no relation
+// drives the projection, which is a single row - the output chunk to fill and the
+// fill that writes it.
+class NLBroadcastConstantData : public NLFunctionData {
+public:
+    NLBroadcastConstantData(const Column* value,
+                            const Column* cardinality,
+                            Column* output,
+                            NLBroadcastConstantFunction fill)
+        : _value(value),
+        _cardinality(cardinality),
+        _output(output),
+        _fill(fill)
+    {
+    }
+
+    const Column* getValue() const { return _value; }
+    const Column* getCardinality() const { return _cardinality; }
+    Column* getOutput() const { return _output; }
+    NLBroadcastConstantFunction getFill() const { return _fill; }
+
+private:
+    const Column* _value {nullptr};
+    const Column* _cardinality {nullptr};
+    Column* _output {nullptr};
+    NLBroadcastConstantFunction _fill {nullptr};
+};
+
+// nl.limit data: resets a counter to its budget each time the block it lives in
+// runs - once at function scope for a top-level LIMIT, or per enclosing step for
+// a nested one.
+class NLLimitInitData : public NLFunctionData {
+public:
+    NLLimitInitData(NLLimitState* state, size_t count)
+        : _state(state),
+        _count(count)
+    {
+    }
+
+    NLLimitState* getState() const { return _state; }
+    size_t getCount() const { return _count; }
+
+private:
+    NLLimitState* _state {nullptr};
+    size_t _count {0};
+};
+
+// nl.limit_remaining data: resets a counter to the budget another one has left each
+// time the block it lives in runs.
+class NLLimitRemainingData : public NLFunctionData {
+public:
+    NLLimitRemainingData(NLLimitState* state, const NLLimitState* source)
+        : _state(state),
+        _source(source)
+    {
+    }
+
+    NLLimitState* getState() const { return _state; }
+    const NLLimitState* getSource() const { return _source; }
+
+private:
+    NLLimitState* _state {nullptr};
+    const NLLimitState* _source {nullptr};
+};
+
+// nl.limit_update data: the counter to charge and the representative column
+// whose row count is charged against it (the same column nl.output emits).
+class NLLimitUpdateData : public NLFunctionData {
+public:
+    NLLimitUpdateData(NLLimitState* state, const Column* rows)
+        : _state(state),
+        _rows(rows)
+    {
+    }
+
+    NLLimitState* getState() const { return _state; }
+    const Column* getRows() const { return _rows; }
+
+private:
+    NLLimitState* _state {nullptr};
+    const Column* _rows {nullptr};
+};
+
+// nl.limit_truncate data: the counter whose emitThisStep sizes the copy and the
+// columns to cut. Each NLCrossColumn pairs an input chunk with its fresh output
+// chunk and the broadcast that fills one from the other - a block-repeat with
+// factor 1, which copies each input row once and stops at emitThisStep, i.e. the
+// prefix [0, emitThisStep). It never mutates the counter (nl.limit_update does).
+class NLLimitTruncateData : public NLFunctionData {
+public:
+    NLLimitTruncateData(NLLimitState* state)
+        : _state(state)
+    {
+    }
+
+    NLLimitState* getState() const { return _state; }
+
+    const std::vector<NLCrossColumn>& columns() const { return _columns; }
+
+    void addColumn(const NLCrossColumn& column) {
+        _columns.push_back(column);
+    }
+
+private:
+    NLLimitState* _state {nullptr};
+    std::vector<NLCrossColumn> _columns;
+};
+
+// Copies rows [inputOffset, inputOffset + rowCount) of an input chunk into a
+// fresh, front-aligned output chunk. The skip suffix copy: nl.skip_truncate sets
+// inputOffset = skipThisStep and rowCount = emitThisStep, lifting the surviving
+// suffix to the front of the output. The block-repeat/tile broadcasts copy from
+// row zero and so cannot express the offset; this family does. Cleared and
+// resized to rowCount, the copy is a plain range copy (lowered to memcpy).
+using NLCopyFunction = void (*)(const Column* input,
+                                size_t inputOffset,
+                                size_t rowCount,
+                                Column* output);
+
+// One column used as operand of nl.skip_truncate: its input chunk, the fresh
+// output chunk to fill, and the range copy that lifts the surviving suffix from
+// one into the other. The skip sibling of NLCrossColumn - it pairs the same input
+// and output, but its copy takes an offset rather than a broadcast factor.
+class NLSkipColumn {
+public:
+    NLSkipColumn(const Column* input,
+                 Column* output,
+                 NLCopyFunction copy)
+        : _input(input),
+        _output(output),
+        _copy(copy)
+    {
+    }
+
+    const Column* getInput() const { return _input; }
+    Column* getOutput() const { return _output; }
+    NLCopyFunction getCopy() const { return _copy; }
+
+private:
+    const Column* _input {nullptr};
+    Column* _output {nullptr};
+    NLCopyFunction _copy {nullptr};
+};
+
+// nl.skip data: resets a counter to the number of rows to drop each time the
+// block it lives in runs - once at function scope for a top-level SKIP. The skip
+// sibling of NLLimitInitData.
+class NLSkipInitData : public NLFunctionData {
+public:
+    NLSkipInitData(NLSkipState* state, size_t count)
+        : _state(state),
+        _count(count)
+    {
+    }
+
+    NLSkipState* getState() const { return _state; }
+    size_t getCount() const { return _count; }
+
+private:
+    NLSkipState* _state {nullptr};
+    size_t _count {0};
+};
+
+// nl.skip_update data: the counter to charge and the representative column whose
+// row count is charged against it (the same column the consumer reads). The skip
+// sibling of NLLimitUpdateData.
+class NLSkipUpdateData : public NLFunctionData {
+public:
+    NLSkipUpdateData(NLSkipState* state, const Column* rows)
+        : _state(state),
+        _rows(rows)
+    {
+    }
+
+    NLSkipState* getState() const { return _state; }
+    const Column* getRows() const { return _rows; }
+
+private:
+    NLSkipState* _state {nullptr};
+    const Column* _rows {nullptr};
+};
+
+// nl.skip_truncate data: the counter whose skipThisStep/emitThisStep size the copy
+// and the columns to cut. Each NLSkipColumn pairs an input chunk with its fresh
+// output chunk and the range copy that lifts the surviving suffix
+// [skipThisStep, skipThisStep + emitThisStep) into it. It never mutates the counter
+// (nl.skip_update does). The skip sibling of NLLimitTruncateData.
+class NLSkipTruncateData : public NLFunctionData {
+public:
+    using SkipColumns = std::vector<NLSkipColumn>;
+
+    NLSkipTruncateData(NLSkipState* state)
+        : _state(state)
+    {
+    }
+
+    NLSkipState* getState() const { return _state; }
+
+    const SkipColumns& columns() const { return _columns; }
+
+    void addColumn(const NLSkipColumn& column) {
+        _columns.push_back(column);
+    }
+
+private:
+    NLSkipState* _state {nullptr};
+    SkipColumns _columns;
+};
+
+// Type of handle that appends one input chunk's rows to a growing sort buffer of
+// the same element type. One per column kind / value type, selected during
+// translation, the same way the gather and broadcast families are.
+using NLAppendFunction = void (*)(const Column* input, Column* buffer);
+
+// Appends a chunk of views onto the tail of a buffer, copying each value into @param values
+// so the buffer owns what it holds rather than viewing the buffer the chunk was built in
+using NLOwnedAppendFunction = void (*)(const Column* input, Column* buffer, NLValueStore& values);
+
+// Type of handle that 3-way compares two rows of one sort key column: negative
+// if row a sorts before row b, positive if after, zero if they tie on this key.
+// Direction (ascending vs descending) is applied by the caller, so the function
+// itself is direction-free; it is selected per key from the column's element type.
+using NLCompareFunction = int (*)(const Column* column, size_t a, size_t b);
+
+// Runtime state of one ORDER BY: the growing per-column row buffers, the sort
+// keys (each a buffer column, a direction and a 3-way comparator), and the row
+// permutation computed once when the emit loop first steps. nl.sort_buffer
+// resets it, nl.sort_collect appends one chunk to every buffer, and the nl.for
+// over nl.sort sorts it (once) and reads the rows in permutation order. The
+// buffer columns are borrowed: the translator pool-allocates them in the same
+// arena as the loop columns; the state only records the pointers.
+//
+// A bounded accumulator (the fused ORDER BY ... LIMIT k) keeps only the best k
+// rows: nl.sort_collect appends a chunk then calls trimIfNeeded, which selects
+// the best k and reclaims the rest, so memory stays O(k) and the final sort runs
+// over O(k) rows rather than every row.
+class NLSortState {
+public:
+    // One sort key: the buffer column it orders by, its direction (true =
+    // ascending), and the 3-way comparator for that column's element type.
+    struct Key {
+        const Column* _buffer {nullptr};
+        bool _ascending {true};
+        NLCompareFunction _compare {nullptr};
+    };
+
+    // Bound the accumulator to the best topK rows (the fused top-K form). Left
+    // unbounded, it keeps every collected row.
+    void setTopK(size_t topK) {
+        _topK = topK;
+        _bounded = true;
+    }
+
+    bool isBounded() const { return _bounded; }
+
+    // Record one column: its buffer, the scratch the trim gathers the survivors
+    // into (null when unbounded - no trimming happens), and the gather that fills
+    // one from the other. Kept parallel, one entry per collected column.
+    void addColumnBuffer(Column* buffer, Column* temp, NLGatherFunction gather) {
+        _buffers.push_back(buffer);
+        _tempBuffers.push_back(temp);
+        _gathers.push_back(gather);
+    }
+
+    const std::vector<Column*>& buffers() const { return _buffers; }
+    Column* buffer(size_t index) const { return _buffers[index]; }
+
+    void addKey(const Key& key) { _keys.push_back(key); }
+
+    // Clear every buffer and drop the computed order, so the accumulator is empty
+    // again. Runs each time nl.sort_buffer's block runs (once at function scope).
+    void reset();
+
+    // For a bounded accumulator, once the buffers have grown well past the bound,
+    // drop all but the best topK rows so memory stays O(topK). A no-op when
+    // unbounded or still within the bound.
+    void trimIfNeeded();
+
+    // Compute the row permutation that orders the buffers by the keys, stable so
+    // rows equal on every key keep their collected order; for a bounded
+    // accumulator the permutation is then capped to the best topK. Idempotent:
+    // the first emit step sorts, later calls are no-ops.
+    void sort();
+
+    const ColumnVector<size_t>& permutation() const { return _permutation; }
+
+    // The values the buffers hold. A collected view is copied in here, because the views a
+    // chunk carries point into the buffers the producing step built them in, and that step
+    // comes round again long before the emit loop reads them.
+    NLValueStore& values() { return _values; }
+
+private:
+    // Strict-weak-ordering row comparison by the keys, most significant first;
+    // each key's direction flips the sign. Shared by sort() and the trim.
+    bool rowLess(size_t leftRow, size_t rightRow) const;
+
+    // Select the best topK rows into _keptIndices and compact every buffer to
+    // them, reclaiming the rest. Called by trimIfNeeded once the buffers overflow.
+    void trimToTopK(size_t rowCount);
+
+    // One buffer per collected column, row-aligned, grown by nl.sort_collect.
+    std::vector<Column*> _buffers;
+
+    // Per-buffer compaction scratch and gather, used only by a bounded trim.
+    std::vector<Column*> _tempBuffers;
+    std::vector<NLGatherFunction> _gathers;
+
+    // The sort keys, most significant first.
+    std::vector<Key> _keys;
+
+    // Row order computed by sort(); read by the emit loop in chunk-sized slices.
+    ColumnVector<size_t> _permutation;
+
+    // The kept-row indices a trim selects, fed to the per-buffer gather.
+    ColumnVector<size_t> _keptIndices;
+
+    NLValueStore _values;
+
+    // The top-K bound (valid only when _bounded); 0 with _bounded means keep none.
+    size_t _topK {0};
+    bool _bounded {false};
+
+    bool _sorted {false};
+};
+
+// nl.sort_buffer data: resets an accumulator to empty each time the block it
+// lives in runs - once at function scope for a top-level ORDER BY.
+class NLSortResetData : public NLFunctionData {
+public:
+    NLSortResetData(NLSortState* state)
+        : _state(state)
+    {
+    }
+
+    NLSortState* getState() const { return _state; }
+
+private:
+    NLSortState* _state {nullptr};
+};
+
+// nl.sort_collect data: appends the current chunk of every column to the matching
+// buffer of the accumulator. Each entry pairs the loop's input chunk with the
+// buffer it grows and the append that copies one into the other.
+class NLSortCollectData : public NLFunctionData {
+public:
+    struct Append {
+        const Column* _input {nullptr};
+        Column* _buffer {nullptr};
+        NLAppendFunction _append {nullptr};
+
+        // Set in place of _append for a column of views, which the accumulator takes a
+        // copy of rather than a view of
+        NLOwnedAppendFunction _appendOwned {nullptr};
+    };
+
+    NLSortCollectData(NLSortState* state)
+        : _state(state)
+    {
+    }
+
+    NLSortState* getState() const { return _state; }
+
+    const std::vector<Append>& appends() const { return _appends; }
+
+    void addAppend(const Append& append) {
+        _appends.push_back(append);
+    }
+
+private:
+    NLSortState* _state {nullptr};
+    std::vector<Append> _appends;
+};
+
+// nl.for over nl.sort data: the emit phase of an ORDER BY. Holds the accumulator
+// (sorted on the first step), and per column the buffer to read, the loop
+// variable to fill and the gather that copies a chunk of rows by index - reusing
+// the same NLCarriedColumn (input, output, gather) shape the edge loops use. The
+// indices scratch holds the permutation slice of the current emit step.
+class NLSortLoopData : public NLFunctionData {
+public:
+    NLSortLoopData(NLSortState* state)
+        : _state(state)
+    {
+    }
+
+    NLSortState* getState() const { return _state; }
+
+    const std::vector<NLCarriedColumn>& columns() const { return _columns; }
+
+    void addColumn(const NLCarriedColumn& column) {
+        _columns.push_back(column);
+    }
+
+    ColumnVector<size_t>* getIndices() { return &_indices; }
+
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    NLSortState* _state {nullptr};
+    NLLimitState* _limit {nullptr};
+    std::vector<NLCarriedColumn> _columns;
+    ColumnVector<size_t> _indices;
+    NLStmtContainer _stmts;
+};
+
+// Type of handle that appends the raw bytes of one row of a column to a growing
+// row-key buffer. One per column kind / value type, selected during translation,
+// the same way the gather and append families are. The concatenated key of a row
+// (all its columns in order) is what nl.distinct_filter looks up in the seen-set:
+// bytewise key equality is row equality. A null serializes to a fixed tag byte, so
+// all nulls share a key and DISTINCT dedups them together, matching Cypher; a
+// string serializes as a length prefix then its characters, so two rows never
+// collide by concatenation (e.g. "a"+"b" versus "ab"+"").
+using NLKeyAppendFunction = void (*)(const Column* column, size_t row, std::string& key);
+
+// Type of handle that answers whether one row of a join key column can match at all. One
+// per column kind / value type, selected during translation the same way the key-append
+// family is. Two values the key bytes cannot tell apart from a matchable one are not: a
+// null, for which Cypher gives null rather than true for `=`, and a NaN, which is not
+// equal to itself - and the serializer maps every NaN payload to one canonical NaN, which
+// is what DISTINCT wants and the opposite of what a join does.
+using NLKeyIsMatchableFunction = bool (*)(const Column* column, size_t row);
+
+// Type of handle that hashes every row of a join key column, one hash per row, for the
+// build index to chain rows under and the probe to look them up by. The key is read where
+// it lives and never copied; a row the matchable gate rejects hashes to anything, since
+// no lookup ever reaches it.
+using NLKeyHashFunction = void (*)(const Column* column, std::vector<uint64_t>& hashes);
+
+// Type of handle that answers whether a probe row's key equals a build row's, both read in
+// place from columns of one chunk type.
+using NLKeyEqualFunction = bool (*)(const Column* probe, size_t probeRow, const Column* build, size_t buildRow);
+
+// The two handlers a join reads a key column through, selected together from its chunk type.
+struct NLJoinKeyFunctions {
+    NLKeyHashFunction _hash {nullptr};
+    NLKeyEqualFunction _equal {nullptr};
+};
+
+// Runtime state of one hash join's build side: the build rows, materialized column by
+// column, and the index chaining each row under its key's hash. nl.hash_join_buffer
+// empties it, nl.hash_join_collect grows it once per build-loop step, and
+// nl.hash_join_probe reads it once per probe-loop step. The joining sibling of
+// NLSortState: it indexes the rows it accumulates rather than ordering them, and they
+// come back out through the probe rather than through a loop of its own.
+class NLHashJoinState {
+public:
+    // Empty the buffers and the index, so the build side starts fresh. Runs each time
+    // nl.hash_join_buffer's block runs - once at function scope for a top-level join.
+    void reset();
+
+    // Record one build column's buffer. Kept in collect order, so the key column index
+    // the nl.hash_join_buffer carries indexes this list too.
+    void addColumnBuffer(Column* buffer) { _buffers.push_back(buffer); }
+
+    const std::vector<Column*>& buffers() const { return _buffers; }
+    Column* buffer(size_t index) const { return _buffers[index]; }
+
+    NLHashJoinIndex& getIndex() { return _index; }
+    const NLHashJoinIndex& getIndex() const { return _index; }
+
+    // The values the buffers hold, copied in as NLSortState::values' are
+    NLValueStore& values() { return _values; }
+
+private:
+    // One buffer per collected build column, row-aligned, grown by nl.hash_join_collect.
+    std::vector<Column*> _buffers;
+
+    NLHashJoinIndex _index;
+    NLValueStore _values;
+};
+
+// nl.hash_join_buffer data: empties a build side each time the block it lives in runs -
+// once at function scope for a top-level join, once per enclosing step for a nested one.
+class NLHashJoinResetData : public NLFunctionData {
+public:
+    NLHashJoinResetData(NLHashJoinState* state)
+        : _state(state)
+    {
+    }
+
+    NLHashJoinState* getState() const { return _state; }
+
+private:
+    NLHashJoinState* _state {nullptr};
+};
+
+// nl.hash_join_collect data: appends the current chunk of every build column to its
+// buffer and indexes each row's key. The appends share NLSortCollectData::Append's shape;
+// the key is one of those columns, read again through the serializer and the null test.
+class NLHashJoinCollectData : public NLFunctionData {
+public:
+    NLHashJoinCollectData(NLHashJoinState* state)
+        : _state(state)
+    {
+    }
+
+    NLHashJoinState* getState() const { return _state; }
+
+    const std::vector<NLSortCollectData::Append>& appends() const { return _appends; }
+
+    void addAppend(const NLSortCollectData::Append& append) {
+        _appends.push_back(append);
+    }
+
+    // The collected key chunk and the buffer it is appended to, whose rows a new row's key
+    // is compared against to find the group already holding it.
+    void setKeyColumns(const Column* key,
+                       const Column* buildKey,
+                       const NLJoinKeyFunctions& keyFunctions,
+                       NLKeyIsMatchableFunction isMatchable) {
+        _key = key;
+        _buildKey = buildKey;
+        _keyFunctions = keyFunctions;
+        _keyIsMatchable = isMatchable;
+    }
+
+    const Column* getKeyColumn() const { return _key; }
+    const Column* getBuildKeyColumn() const { return _buildKey; }
+    NLKeyHashFunction getKeyHash() const { return _keyFunctions._hash; }
+    NLKeyEqualFunction getKeyEqual() const { return _keyFunctions._equal; }
+    NLKeyIsMatchableFunction getKeyIsMatchable() const { return _keyIsMatchable; }
+
+    std::vector<uint64_t>* getHashScratch() { return &_hashScratch; }
+
+private:
+    NLHashJoinState* _state {nullptr};
+    std::vector<NLSortCollectData::Append> _appends;
+
+    const Column* _key {nullptr};
+    const Column* _buildKey {nullptr};
+    NLJoinKeyFunctions _keyFunctions;
+    NLKeyIsMatchableFunction _keyIsMatchable {nullptr};
+
+    // This step's key hashes, one per row of the collected chunk
+    std::vector<uint64_t> _hashScratch;
+};
+
+// nl.hash_join_probe data: per probe column its input chunk, the fresh output chunk and
+// the gather that repeats a row once per match; per build column its buffer, the fresh
+// output chunk and the gather that reads the matched rows back - both in the
+// NLCarriedColumn (input, output, gather) shape the edge and sort loops use. The two
+// index scratches hold this step's matched pairs, one row of each side per output row.
+class NLHashJoinProbeLoopData : public NLFunctionData {
+public:
+    NLHashJoinProbeLoopData(NLHashJoinState* state)
+        : _state(state)
+    {
+    }
+
+    NLHashJoinState* getState() const { return _state; }
+
+    const std::vector<NLCarriedColumn>& probeColumns() const { return _probeColumns; }
+    const std::vector<NLCarriedColumn>& buildColumns() const { return _buildColumns; }
+
+    void addProbeColumn(const NLCarriedColumn& column) { _probeColumns.push_back(column); }
+    void addBuildColumn(const NLCarriedColumn& column) { _buildColumns.push_back(column); }
+
+    // The governing limit counter, or null for an unbounded probe. When set, only
+    // getRemaining() matched pairs are laid out; it never mutates the counter (the
+    // following nl.limit_update does).
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    // The probe key chunk and the build key buffer it is matched against, read through
+    // the handlers of their shared chunk type.
+    void setKeyColumns(const Column* key,
+                       const Column* buildKey,
+                       const NLJoinKeyFunctions& keyFunctions,
+                       NLKeyIsMatchableFunction isMatchable) {
+        _key = key;
+        _buildKey = buildKey;
+        _keyFunctions = keyFunctions;
+        _keyIsMatchable = isMatchable;
+    }
+
+    const Column* getKeyColumn() const { return _key; }
+    const Column* getBuildKeyColumn() const { return _buildKey; }
+    NLKeyHashFunction getKeyHash() const { return _keyFunctions._hash; }
+    NLKeyEqualFunction getKeyEqual() const { return _keyFunctions._equal; }
+    NLKeyIsMatchableFunction getKeyIsMatchable() const { return _keyIsMatchable; }
+
+    std::vector<uint64_t>* getHashScratch() { return &_hashScratch; }
+
+    ColumnVector<size_t>* getProbeIndices() { return &_probeIndices; }
+    ColumnVector<size_t>* getBuildIndices() { return &_buildIndices; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    NLHashJoinState* _state {nullptr};
+    std::vector<NLCarriedColumn> _probeColumns;
+    std::vector<NLCarriedColumn> _buildColumns;
+
+    const Column* _key {nullptr};
+    const Column* _buildKey {nullptr};
+    NLJoinKeyFunctions _keyFunctions;
+    NLKeyIsMatchableFunction _keyIsMatchable {nullptr};
+    NLLimitState* _limit {nullptr};
+
+    // This step's key hashes, one per row of the probe chunk
+    std::vector<uint64_t> _hashScratch;
+
+    // This step's matched pairs: output row i reads _probeIndices[i] of the probe chunk
+    // and _buildIndices[i] of the buffers.
+    ColumnVector<size_t> _probeIndices;
+    ColumnVector<size_t> _buildIndices;
+
+    NLStmtContainer _stmts;
+};
+
+// Runtime state of one DISTINCT: the set of serialized row keys already emitted.
+// nl.distinct resets it (once at function scope for a top-level or mid-query
+// DISTINCT), and nl.distinct_filter is the sole reader and mutator - it looks up
+// each incoming row's key and inserts the new ones. The streaming sibling of
+// NLSortState: it filters rows as they arrive rather than accumulating them, so it
+// holds only the keys, not the row values (a survivor is emitted from the incoming
+// chunk it appeared in, never rebuilt).
+class NLDistinctState {
+public:
+    // Empty the seen-set, so DISTINCT starts fresh. Runs each time nl.distinct's
+    // block runs (once at function scope for a top-level / mid-query DISTINCT).
+    void reset() { _seen.clear(); }
+
+    // Record a row's serialized key; returns true if the row is new (not seen
+    // before) and should survive, false if it duplicates an earlier row. The sole
+    // mutator of the set.
+    bool insertIfNew(const std::string& key) { return _seen.insert(key).second; }
+
+private:
+    // One serialized key per distinct row seen so far.
+    std::unordered_set<std::string> _seen;
+};
+
+// nl.distinct data: resets a seen-set to empty each time the block it lives in
+// runs - once at function scope for a top-level DISTINCT. The distinct sibling of
+// NLSortResetData.
+class NLDistinctResetData : public NLFunctionData {
+public:
+    NLDistinctResetData(NLDistinctState* state)
+        : _state(state)
+    {
+    }
+
+    NLDistinctState* getState() const { return _state; }
+
+private:
+    NLDistinctState* _state {nullptr};
+};
+
+// nl.distinct_filter data: the seen-set to look each row up in, and per column its
+// input chunk, the fresh output chunk to fill, the key-append that serializes one
+// of its rows into the row key, and the gather that copies the surviving rows into
+// the output. All columns together form each row's key; the surviving rows are
+// gathered from the incoming chunk (reusing the NLGatherFunction the edge loops
+// use), so no row values are stored. The indices scratch holds this step's
+// surviving row indices and the key scratch is reused per row.
+class NLDistinctFilterData : public NLFunctionData {
+public:
+    struct FilterColumn {
+        const Column* _input {nullptr};
+        Column* _output {nullptr};
+        NLKeyAppendFunction _keyAppend {nullptr};
+        NLGatherFunction _gather {nullptr};
+    };
+
+    NLDistinctFilterData(NLDistinctState* state)
+        : _state(state)
+    {
+    }
+
+    NLDistinctState* getState() const { return _state; }
+
+    const std::vector<FilterColumn>& columns() const { return _columns; }
+
+    void addColumn(const FilterColumn& column) {
+        _columns.push_back(column);
+    }
+
+    ColumnVector<size_t>* getIndices() { return &_indices; }
+    std::string* getKeyScratch() { return &_key; }
+
+private:
+    NLDistinctState* _state {nullptr};
+    std::vector<FilterColumn> _columns;
+
+    // Scratch for this step's surviving row indices, fed to the per-column gather
+    ColumnVector<size_t> _indices;
+
+    // Scratch reused to build each row's key, cleared once per row
+    std::string _key;
+};
+
+class NLFilterData : public NLFunctionData {
+public:
+    struct FilterColumn {
+        const Column* _input {nullptr};
+        Column* _output {nullptr};
+        NLGatherFunction _gather {nullptr};
+    };
+
+    NLFilterData(const Column* mask, NLMaskSurvivorFunction survivors)
+        : _mask(mask),
+        _survivors(survivors)
+    {
+    }
+
+    const Column* getMask() const { return _mask; }
+    NLMaskSurvivorFunction getSurvivors() const { return _survivors; }
+
+    const std::vector<FilterColumn>& columns() const { return _columns; }
+
+    void addColumn(const FilterColumn& column) {
+        _columns.push_back(column);
+    }
+
+    ColumnVector<size_t>* getIndices() { return &_indices; }
+
+private:
+    const Column* _mask {nullptr};
+    NLMaskSurvivorFunction _survivors {nullptr}; // handles nullable vs non-nullable masks
+    std::vector<FilterColumn> _columns;
+
+    // Scratch for this step's surviving row indices, fed to gather
+    ColumnVector<size_t> _indices;
+};
+
+// Type of handle that appends the index of every row whose ID cell names a node a scan
+// would produce, and that node. One per kind of cell an ID is read from.
+using NLFetchNodesFunction = void (*)(const Column* ids,
+                                      const NLExecutionContext* context,
+                                      ColumnVector<size_t>* indices,
+                                      ColumnNodeIDs* nodes);
+
+class NLFetchNodesData : public NLFunctionData {
+public:
+    NLFetchNodesData(const Column* ids, NLFetchNodesFunction fetch, ColumnNodeIDs* nodes)
+        : _ids(ids),
+        _fetch(fetch),
+        _nodes(nodes)
+    {
+    }
+
+    const Column* getIDs() const { return _ids; }
+    NLFetchNodesFunction getFetch() const { return _fetch; }
+    ColumnNodeIDs* getNodes() const { return _nodes; }
+
+    const std::vector<NLFilterData::FilterColumn>& getColumns() const { return _columns; }
+
+    void addColumn(const NLFilterData::FilterColumn& column) {
+        _columns.push_back(column);
+    }
+
+    ColumnVector<size_t>* getIndices() { return &_indices; }
+
+private:
+    const Column* _ids {nullptr};
+    NLFetchNodesFunction _fetch {nullptr};
+    ColumnNodeIDs* _nodes {nullptr};
+    std::vector<NLFilterData::FilterColumn> _columns;
+    ColumnVector<size_t> _indices;
+};
+
+// Type of handle that returns how many rows of a column are non-null. One per
+// column kind / value type, selected during translation the same way the gather
+// and append families are. An ID column has no nulls, so its handle returns the
+// row count; a nullable value column's handle returns its present-value count.
+// This is what nl.count_update adds to the tally each step.
+using NLCountFunction = size_t (*)(const Column* column);
+
+// Runtime state of one COUNT: the running tally of non-null rows seen so far.
+// nl.count resets it (once at function scope for a top-level or mid-query COUNT),
+// nl.count_update is the sole incrementer, and nl.count_result reads the final
+// value to emit the single result row. The counting sibling of NLSortState: it
+// tallies rows as they arrive rather than accumulating them, so it holds only a
+// count, not the row values.
+class NLCountState {
+public:
+    // Zero the tally, so COUNT starts fresh. Runs each time nl.count's block runs
+    // (once at function scope for a top-level / mid-query COUNT).
+    void reset() { _count = 0; }
+
+    // Add this step's non-null row count to the tally. The sole mutator.
+    void add(size_t rows) { _count += rows; }
+
+    // The final tally, read once by nl.count_result after the producing loop.
+    size_t getCount() const { return _count; }
+
+private:
+    size_t _count {0};
+};
+
+// nl.count data: zeroes a tally each time the block it lives in runs - once at
+// function scope for a top-level COUNT. The count sibling of NLSortResetData.
+class NLCountResetData : public NLFunctionData {
+public:
+    NLCountResetData(NLCountState* state)
+        : _state(state)
+    {
+    }
+
+    NLCountState* getState() const { return _state; }
+
+private:
+    NLCountState* _state {nullptr};
+};
+
+// nl.count_update data: the tally to charge, the input chunk to measure, and the
+// count-of-non-null handle that measures it (all rows for an ID chunk, the present
+// values for a nullable value chunk). Runs once per producing-loop step.
+class NLCountUpdateData : public NLFunctionData {
+public:
+    NLCountUpdateData(NLCountState* state, const Column* rows, NLCountFunction count)
+        : _state(state),
+        _rows(rows),
+        _count(count)
+    {
+    }
+
+    NLCountState* getState() const { return _state; }
+    const Column* getRows() const { return _rows; }
+    NLCountFunction getCount() const { return _count; }
+
+private:
+    NLCountState* _state {nullptr};
+    const Column* _rows {nullptr};
+    NLCountFunction _count {nullptr};
+};
+
+// nl.count_result data: the emit step of a COUNT. Holds the tally and the output
+// column to fill with the single result row - an unsigned i64 count column
+// (ColumnVector<uint64_t>). Runs once, after the producing loop, so the tally is
+// final; it materializes the chunk in place, with no body of its own (nl.output
+// consumes it at function scope).
+class NLCountResultData : public NLFunctionData {
+public:
+    NLCountResultData(NLCountState* state, Column* output)
+        : _state(state),
+        _output(output)
+    {
+    }
+
+    NLCountState* getState() const { return _state; }
+    Column* getOutput() const { return _output; }
+
+private:
+    NLCountState* _state {nullptr};
+    Column* _output {nullptr};
+};
+
+// nl.count_scan_rows data: the whole of a COUNT that reads the graph's node counts
+// instead of walking rows. Holds one label set per counted scan and the output column
+// to fill with the single product row - the same unsigned i64 count column
+// NLCountResultData fills. The label sets are owned here so the LabelSetHandle the
+// executor builds each run points at storage that outlives it (this data lives for the
+// whole program); the translator resolves them in place through addLabelSet after
+// allocating the data. An invalid property type ID is a tally over the scanned nodes
+// themselves rather than over the ones holding a property; a valid one narrows the scan
+// _propertyScan indexes and leaves the others whole. _matchable is false when a requested
+// label or the property was absent from the schema, leaving the conjunction unsatisfiable,
+// so the product counts 0.
+class NLCountScanRowsData : public NLFunctionData {
+public:
+    NLCountScanRowsData(Column* output)
+        : _output(output)
+    {
+    }
+
+    Column* getOutput() const { return _output; }
+    std::span<const LabelSet> getLabelSets() const { return _labelSets; }
+    PropertyTypeID getPropertyTypeID() const { return _propertyTypeID; }
+    size_t getPropertyScan() const { return _propertyScan; }
+    bool isMatchable() const { return _matchable; }
+
+    void reserveLabelSets(size_t count) { _labelSets.reserve(count); }
+    void addLabelSet(const LabelSet& labelset) { _labelSets.push_back(labelset); }
+    void setProperty(PropertyTypeID propertyTypeID, size_t propertyScan) {
+        _propertyTypeID = propertyTypeID;
+        _propertyScan = propertyScan;
+    }
+    void markUnmatchable() { _matchable = false; }
+
+private:
+    Column* _output {nullptr};
+    std::vector<LabelSet> _labelSets;
+    PropertyTypeID _propertyTypeID;
+    size_t _propertyScan {0};
+    bool _matchable {true};
+};
+
+// The reduction one nl.aggregate applies. The runtime counterpart of the MLIR
+// storage::AggregateKind: the translator maps the op's kind onto this, and it -
+// with the column value type - selects the reset/update/result handlers below.
+enum class AggregateKind {
+    Sum,
+    Min,
+    Max,
+    Avg,
+    StDev,
+    StDevP,
+};
+
+// Runtime state of one SUM/MIN/MAX/AVG: the running accumulator. The value
+// sibling of NLCountState - where a count holds a tally, this holds the reduced
+// value in a single-row nullable value column (owned elsewhere; a borrowed
+// pointer here), plus a count of the non-null rows folded in (only avg divides by
+// it). nl.aggregate resets it, nl.aggregate_update is the sole folder, and
+// nl.aggregate_result reads it to emit the single result row. The accumulator's
+// element type is fixed by the handlers, so the state itself is type-erased.
+class NLAggregateState {
+public:
+    // The single-row accumulator column (a ColumnOptVector of the accumulator's
+    // primitive), reset by the reset handler and folded into by the update handler.
+    Column* getAccumulator() const { return _accumulator; }
+    void setAccumulator(Column* accumulator) { _accumulator = accumulator; }
+
+    // The number of non-null rows folded in so far, used only by avg and stdev.
+    size_t getCount() const { return _count; }
+    void setCount(size_t count) { _count = count; }
+    void addCount(size_t count) { _count += count; }
+
+    // A min/max accumulator holds one extreme, so a new one is copied into the spare store
+    // and the stores flip at once
+    NLCompactingValueStore& extremeValues() { return _extremeValues; }
+
+private:
+    Column* _accumulator {nullptr};
+    size_t _count {0};
+    NLCompactingValueStore _extremeValues;
+};
+
+// Handlers of one aggregate, selected during translation from the reduction and
+// the column value type (as the count / gather / append families are), so the
+// per-type fan-out lives in one place. Reset re-initializes the accumulator (a
+// present zero for sum/avg, null for min/max) and zeroes the count; update folds
+// a chunk's non-null values into the accumulator; result writes the single
+// reduced row into the output column.
+using NLAggregateResetFunction = void (*)(NLAggregateState* state);
+using NLAggregateUpdateFunction = void (*)(NLAggregateState* state, const Column* input);
+using NLAggregateResultFunction = void (*)(const NLAggregateState* state, Column* output);
+
+// nl.aggregate data: re-initializes an accumulator each time the block it lives in
+// runs - once at function scope for a top-level aggregate. The value sibling of
+// NLCountResetData; the reset handler knows the accumulator's type and kind.
+class NLAggregateResetData : public NLFunctionData {
+public:
+    NLAggregateResetData(NLAggregateState* state, NLAggregateResetFunction reset)
+        : _state(state),
+        _reset(reset)
+    {
+    }
+
+    NLAggregateState* getState() const { return _state; }
+    NLAggregateResetFunction getReset() const { return _reset; }
+
+private:
+    NLAggregateState* _state {nullptr};
+    NLAggregateResetFunction _reset {nullptr};
+};
+
+// nl.aggregate_update data: the accumulator to fold into, the input chunk to
+// reduce, and the fold handler that reduces it (selected from the kind and the
+// input value type). Runs once per producing-loop step. The value sibling of
+// NLCountUpdateData.
+class NLAggregateUpdateData : public NLFunctionData {
+public:
+    NLAggregateUpdateData(NLAggregateState* state, const Column* input, NLAggregateUpdateFunction update)
+        : _state(state),
+        _input(input),
+        _update(update)
+    {
+    }
+
+    NLAggregateState* getState() const { return _state; }
+    const Column* getInput() const { return _input; }
+    NLAggregateUpdateFunction getUpdate() const { return _update; }
+
+private:
+    NLAggregateState* _state {nullptr};
+    const Column* _input {nullptr};
+    NLAggregateUpdateFunction _update {nullptr};
+};
+
+// nl.aggregate_result data: the emit step of an aggregate. Holds the accumulator,
+// the output column to fill with the single result row (a nullable value column),
+// and the emit handler (a copy for sum/min/max, a divide-by-count for avg). Runs
+// once, after the producing loop, so the accumulator is final. The value sibling
+// of NLCountResultData.
+class NLAggregateResultData : public NLFunctionData {
+public:
+    NLAggregateResultData(NLAggregateState* state, Column* output, NLAggregateResultFunction result)
+        : _state(state),
+        _output(output),
+        _result(result)
+    {
+    }
+
+    NLAggregateState* getState() const { return _state; }
+    Column* getOutput() const { return _output; }
+    NLAggregateResultFunction getResult() const { return _result; }
+
+private:
+    NLAggregateState* _state {nullptr};
+    Column* _output {nullptr};
+    NLAggregateResultFunction _result {nullptr};
+};
+
+// The reduction one function of a grouped aggregation applies. The runtime
+// counterpart of the MLIR storage::GroupAggregateKind: the translator maps the
+// op's kind onto this and - with the column value type - selects the grow/fold/
+// emit handlers below. Unlike the scalar AggregateKind it includes Count, since a
+// grouped aggregate tallies each group's rows the same way it reduces their
+// values.
+enum class GroupAggregateKind {
+    Count,
+    Sum,
+    Min,
+    Max,
+    Avg,
+    CountDistinct,
+    SumDistinct,
+    AvgDistinct,
+    CountRows,
+    StDev,
+    StDevP,
+    StDevDistinct,
+    StDevPDistinct,
+    First,
+};
+
+// The (group, value) pairs one DISTINCT aggregate has already charged. A single set
+// covers every group of the aggregate: the group index is prefixed onto the
+// serialized value, so two groups never share an entry. The distinct fold builds one
+// row's key in the scratch, then charges the group only when the pair is new - a
+// tally for count(DISTINCT x), a reduction for sum/avg(DISTINCT x). The grouped
+// sibling of NLDistinctState, which keys whole rows rather than one value per group.
+class NLGroupDistinctTally {
+public:
+    // Start this row's key with the group it belongs to, so the value bytes the fold
+    // appends next are told apart per group.
+    void beginKey(size_t group) {
+        _key.assign(reinterpret_cast<const char*>(&group), sizeof(group));
+    }
+
+    std::string& getKey() { return _key; }
+
+    // Record the key built for this row; true when the (group, value) pair is new,
+    // so the caller charges the group's tally.
+    bool insertIfNew() { return _seen.insert(_key).second; }
+
+    // Drop every pair, so the aggregation starts fresh. Runs with the rest of the
+    // per-group state when nl.group_aggregate_buffer resets.
+    void clear() { _seen.clear(); }
+
+private:
+    std::unordered_set<std::string> _seen;
+    std::string _key;
+};
+
+// Append the values of the given rows of an input chunk onto the tail of a
+// growing key buffer of the same element type. nl.group_aggregate_update calls
+// this with the rows that created a new group this step, so the buffer holds one
+// key value per group in group-creation order. One per column kind / value type,
+// selected during translation the way the gather and append families are.
+using NLGroupKeyGatherFunction = void (*)(const Column* input,
+                                          const std::vector<size_t>& rows,
+                                          Column* buffer,
+                                          NLValueStore& values);
+
+// Grow one aggregate's per-group state to hold groupCount groups, initializing the
+// newly added groups to the reduction's identity - a present zero (sum/avg), a
+// null (min/max) or a zero tally (count). The accumulator column holds the reduced
+// value per group (null for count); counts holds the per-group non-null tally
+// (used by count and avg). One per kind / value type, selected during translation.
+using NLGroupAggregateGrowFunction = void (*)(Column* accumulator,
+                                              std::vector<uint64_t>& counts,
+                                              size_t groupCount);
+
+// Fold this step's chunk into the per-group state: for each input row, reduce its
+// value (or tally it) into the group named by groups[row]. groups is the row ->
+// group-index map nl.group_aggregate_update built for this step. One per kind /
+// value type. The parameters are the union of what any reduction needs, so each fold
+// reads only its own: sum/min/max ignore counts, count ignores the accumulator, only
+// the distinct kinds touch the tally of already-charged (group, value) pairs, and only
+// min/max copy the extremes they keep into values.
+using NLGroupAggregateFoldFunction = void (*)(Column* accumulator,
+                                              std::vector<uint64_t>& counts,
+                                              const Column* input,
+                                              const std::vector<size_t>& groups,
+                                              NLGroupDistinctTally& distinct,
+                                              NLValueStore& values);
+
+// Copy every view a column holds - or only those of @param rows - into @param values, so
+// the store they were copied into before can be emptied
+using NLReownFunction = void (*)(Column* column, NLValueStore& values);
+using NLReownRowsFunction = void (*)(Column* column, const std::vector<size_t>& rows, NLValueStore& values);
+
+// Materialize the reduction of groups [begin, begin + count) into an emit output
+// column: a copy of the accumulator slice (sum/min/max), a per-group divide
+// (avg), or the tally slice (count). Runs once per emit chunk. One per kind /
+// value type.
+using NLGroupAggregateEmitFunction = void (*)(const Column* accumulator,
+                                              const std::vector<uint64_t>& counts,
+                                              size_t begin,
+                                              size_t count,
+                                              Column* output);
+
+// The group table of one grouped aggregation: it maps a serialized grouping-key
+// tuple to a dense group index (0, 1, 2, ... in first-seen order). Each distinct
+// key tuple takes the next index the first time it is seen through assign(); that
+// index is the row the group occupies in every key buffer and accumulator.
+// nl.group_aggregate_update drives it one row at a time and nl.group_aggregate_buffer
+// clears it.
+//
+// This is the single global open-addressing table conceptually; it is a
+// std::unordered_map here (the "simplest correct thing" first cut), reified behind
+// assign() / getGroupCount() so callers never poke the map and a separate group
+// counter in lockstep - and so a future open-addressing rewrite stays local to
+// this class.
+class NLGroupTable {
+public:
+    // The outcome of assigning one row's grouping-key tuple to a group: the dense
+    // group index, and whether this call created the group (the tuple was seen for
+    // the first time). The update gathers a new group's key values from the row
+    // that created it, so it keys off _created.
+    struct Assignment {
+        size_t _index {0};
+        bool _created {false};
+    };
+
+    // Map a serialized grouping-key tuple to its dense group index, creating the
+    // group with the next index the first time the tuple is seen.
+    Assignment assign(const std::string& key);
+
+    // The number of distinct groups seen so far - the dense index the next new
+    // group would take.
+    size_t getGroupCount() const { return _groups.size(); }
+
+    // Drop every group, so the next assign() numbers groups from zero again.
+    void clear();
+
+private:
+    std::unordered_map<std::string, size_t> _groups;
+};
+
+// Runtime state of one grouped aggregation: an NLGroupTable from the serialized
+// grouping-key tuple to a dense group index, the distinct key values per group,
+// and one accumulator per aggregate function. nl.group_aggregate_buffer resets it,
+// nl.group_aggregate_update assigns each row to its group and folds the aggregate
+// inputs, and the nl.for over nl.group_aggregate emits one row per group. The
+// grouped sibling of NLSortState: it keys rows by the grouping tuple and reduces
+// within each group rather than buffering every row for a global reorder.
+//
+// The accumulators are designed row-per-group so a future two-phase merge can
+// combine two tables group by group.
+class NLGroupAggregateState {
+public:
+    // One grouping-key column. The distinct key value per group accumulates in
+    // _buffer (grown as groups appear, in creation order); the update reads the
+    // incoming chunk _input and the emit fills the loop variable _output.
+    // _keyAppend serializes a row into the group key (the DISTINCT serializer),
+    // _gatherAppend copies the new-group rows into _buffer, and _emitCopy copies a
+    // buffer slice into _output at emit.
+    struct KeyColumn {
+        const Column* _input {nullptr};
+        Column* _buffer {nullptr};
+        Column* _output {nullptr};
+        NLKeyAppendFunction _keyAppend {nullptr};
+        NLGroupKeyGatherFunction _gatherAppend {nullptr};
+        NLCopyFunction _emitCopy {nullptr};
+    };
+
+    // One aggregate. The update folds the incoming chunk _input into the per-group
+    // state (_accumulator, one reduced value per group - null for count - and
+    // _counts, one non-null tally per group, used by count and avg); the emit fills
+    // the loop variable _output. _grow/_fold/_emit are baked from the kind and the
+    // value type. _distinct is the tally of a DISTINCT aggregate, left empty by every
+    // other reduction.
+    struct Aggregate {
+        const Column* _input {nullptr};
+        Column* _accumulator {nullptr};
+        Column* _output {nullptr};
+        std::vector<uint64_t> _counts;
+        NLGroupDistinctTally _distinct;
+        NLGroupAggregateGrowFunction _grow {nullptr};
+        NLGroupAggregateFoldFunction _fold {nullptr};
+        NLGroupAggregateEmitFunction _emit {nullptr};
+        NLReownFunction _reown {nullptr};
+    };
+
+    void addKeyColumn(const KeyColumn& key) { _keyColumns.push_back(key); }
+    void addAggregate(const Aggregate& aggregate) { _aggregates.push_back(aggregate); }
+
+    // Mutable so the emit-loop translation can fill in each column's _output after
+    // the update translation set up the rest.
+    std::vector<KeyColumn>& keyColumns() { return _keyColumns; }
+    std::vector<Aggregate>& aggregates() { return _aggregates; }
+
+    NLGroupTable& groupTable() { return _groupTable; }
+
+    // The group keys the key buffers hold, copied in as NLSortState::values' are
+    NLValueStore& keyValues() { return _keyValues; }
+
+    // The extremes the min/max accumulators hold
+    NLValueStore& extremeValues() { return _extremeValues.getActive(); }
+    void compactExtremeValues();
+
+    // Scratch reused per update step: the row key being built, the per-row group
+    // index map, and the incoming rows that created a new group this step.
+    std::string& keyScratch() { return _key; }
+    std::vector<size_t>& groupIndicesScratch() { return _groupIndices; }
+    std::vector<size_t>& newGroupRowsScratch() { return _newGroupRows; }
+
+    // Empty the group table, key buffers, accumulators and tallies, so the
+    // aggregation starts fresh. Runs each time nl.group_aggregate_buffer's block
+    // runs (once at function scope for a top-level grouped RETURN).
+    void reset();
+
+private:
+    std::vector<KeyColumn> _keyColumns;
+    std::vector<Aggregate> _aggregates;
+
+    NLGroupTable _groupTable;
+    NLValueStore _keyValues;
+    NLCompactingValueStore _extremeValues;
+
+    std::string _key;
+    std::vector<size_t> _groupIndices;
+    std::vector<size_t> _newGroupRows;
+};
+
+// nl.group_aggregate_buffer data: resets a grouped accumulator to empty each time
+// the block it lives in runs - once at function scope for a top-level grouped
+// RETURN. The grouped sibling of NLSortResetData.
+class NLGroupAggregateResetData : public NLFunctionData {
+public:
+    NLGroupAggregateResetData(NLGroupAggregateState* state)
+        : _state(state)
+    {
+    }
+
+    NLGroupAggregateState* getState() const { return _state; }
+
+private:
+    NLGroupAggregateState* _state {nullptr};
+};
+
+// nl.group_aggregate_update data: the accumulator to fold this step's chunk into.
+// The key columns and aggregates it reads live on the shared state (their _input
+// chunks are the loop variables refilled each step), so this only names the state.
+// The grouped sibling of NLSortCollectData.
+class NLGroupAggregateUpdateData : public NLFunctionData {
+public:
+    NLGroupAggregateUpdateData(NLGroupAggregateState* state)
+        : _state(state)
+    {
+    }
+
+    NLGroupAggregateState* getState() const { return _state; }
+
+private:
+    NLGroupAggregateState* _state {nullptr};
+};
+
+// nl.for over nl.group_aggregate data: the emit phase of a grouped aggregation.
+// The key buffers, accumulators and emit outputs all live on the shared state, so
+// this holds the state (fully folded by now) and the loop body to run per emit
+// chunk. The grouped sibling of NLSortLoopData.
+class NLGroupAggregateLoopData : public NLFunctionData {
+public:
+    NLGroupAggregateLoopData(NLGroupAggregateState* state)
+        : _state(state)
+    {
+    }
+
+    NLGroupAggregateState* getState() const { return _state; }
+
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    NLGroupAggregateState* _state {nullptr};
+    NLLimitState* _limit {nullptr};
+    NLStmtContainer _stmts;
+};
+
+// Runtime state of one CALL: the live procedure call the nl.procedure statements
+// drive. It owns the data the procedure's alloc callback produced (released by the
+// dealloc callback here) and the ProcedureState the callbacks read - the procedure,
+// the execution context, the step and the finished flag - plus the result columns
+// the yielded return values are bound to, in yield order.
+//
+// Unlike the other accumulators the state being folded into lives inside the
+// procedure, not here: this class only drives the callbacks and knows which columns
+// they write into. The result columns are borrowed - the translator pool-allocates
+// them in the same arena as the loop columns - and are shared by every step, so the
+// procedure refills them in place, chunk after chunk.
+class NLProcedureState {
+public:
+    NLProcedureState(const Procedure* procedure,
+                     ProcedureData* data,
+                     const ProcedureContext* context);
+    ~NLProcedureState();
+
+    NLProcedureState(const NLProcedureState&) = delete;
+    NLProcedureState& operator=(const NLProcedureState&) = delete;
+
+    const Procedure* getProcedure() const { return _procedure; }
+    ProcedureData* getData() const { return _data; }
+
+    // The procedure's own index for each yielded return value, in yield order: a
+    // procedure writes a return value through the slot its declaration order names,
+    // while the query reads the yields in the order it asked for them. Resolved once,
+    // when the call is prepared, so the ops binding columns need no name lookup.
+    const std::vector<size_t>& yieldIndices() const { return _yieldIndices; }
+
+    void addYieldIndex(size_t returnIndex) { _yieldIndices.push_back(returnIndex); }
+
+    // The columns the yielded return values are bound to, parallel to yieldIndices.
+    // Also the loop variables of a drive loop, so a step fills them in place.
+    const std::vector<Column*>& resultColumns() const { return _resultColumns; }
+
+    void addResultColumn(Column* column) { _resultColumns.push_back(column); }
+
+    // Prepare the procedure on its first drive and rewind it - the RESET step - on each
+    // later one, so a procedure that finished the previous chunk of arguments starts
+    // afresh on the next one, dropping whatever per-drive state it kept.
+    //
+    // Preparing here rather than where the handle is bound is what lets a procedure read
+    // its arguments in its prepare step: the producing loop has filled them by the time
+    // its drive loop is entered.
+    void prepareOrResetForNewDrive();
+
+    // Run the procedure's execute callback once, over whatever its input columns
+    // currently hold. Clears the finished flag first, so a procedure that marks
+    // itself finished once it has produced a chunk's rows is still driven again.
+    void execute();
+
+    // True once the procedure has declared it has no more rows to produce, which is
+    // what ends a drive loop.
+    bool isFinished() const { return _procedureState.isFinished(); }
+
+    // The rows the last callback filled. Every result column is row-aligned - one
+    // row of the call per row of each column - so the first one sizes the step.
+    size_t getRowCount() const;
+
+    // The rows of the chunk the procedure was handed this step, read from its first
+    // row-aligned argument column. This is the range the input-row indices a carry set
+    // is replicated through must fall in; zero for a procedure handed no row-aligned
+    // argument, which can carry nothing.
+    size_t getInputRowCount() const;
+
+private:
+    const Procedure* _procedure {nullptr};
+    ProcedureData* _data {nullptr};
+    ProcedureState _procedureState;
+    std::vector<size_t> _yieldIndices;
+
+    // The query's procedure context, with the lists and strings a step builds kept in
+    // buffers of this call's own, emptied at the next step
+    ProcedureContext _context;
+    NLStepBuffers _stepBuffers;
+    std::vector<Column*> _resultColumns;
+    bool _prepared {false};
+
+    // Whether the procedure has run since it was prepared or last rewound, which is
+    // what makes a rewind necessary before the next drive
+    bool _driven {false};
+
+    // The PREPARE step, which lets the procedure build whatever it produces its rows from
+    void prepare();
+
+    // The RESET step, which rewinds the procedure to its first row
+    void reset();
+};
+
+// nl.for over nl.procedure_init data: the drive loop of a row-producing procedure. The
+// loop is reset at entry and then runs the procedure once per step - filling the result
+// columns, which are the loop variables - until it declares itself finished, so one
+// chunk of arguments may be answered with several chunks of rows. The procedure sibling
+// of NLEdgeLoopData: a loop whose chunks come from a callback rather than a graph
+// iterator, but which replicates its carry set exactly the same way.
+//
+// A procedure may emit several rows per input row or none, which would leave a carried
+// column misaligned with what it emitted, so each step rebuilds every carried column
+// through the input-row index the procedure reports per emitted row - the same
+// (input, output, gather) shape, and the same NLGatherFunction, an edge hop uses. The
+// index column is owned here: the translator hands it to the procedure once, and the
+// loop clears it before each step.
+class NLProcedureLoopData : public NLFunctionData {
+public:
+    using CarriedColumns = std::vector<NLCarriedColumn>;
+
+    NLProcedureLoopData(NLProcedureState* state)
+        : _state(state)
+    {
+    }
+
+    NLProcedureState* getState() const { return _state; }
+
+    // The governing limit counter, or null for an unbounded loop. The loop driver
+    // stops once it reaches zero, so a LIMIT ends the drive early instead of running
+    // the procedure out.
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    const CarriedColumns& carriedColumns() const { return _carriedColumns; }
+
+    void addCarriedColumn(const NLCarriedColumn& carried) {
+        _carriedColumns.push_back(carried);
+    }
+
+    ColumnIndices* getIndices() { return &_indices; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    NLProcedureState* _state {nullptr};
+    NLLimitState* _limit {nullptr};
+    CarriedColumns _carriedColumns;
+
+    // One index per row the procedure emitted this step: the input row it came from
+    ColumnIndices _indices;
+
+    NLStmtContainer _stmts;
+};
+
+// Append this step's present values to a collect accumulator's flat value buffer,
+// recording each element's position in its group's list. nl.collect_update calls this
+// after assigning rows to groups; a null value is skipped (Cypher collect ignores
+// nulls). One per value type, selected during translation the way the fold families
+// are.
+using NLCollectFoldFunction = void (*)(Column* values,
+                                       const Column* input,
+                                       const std::vector<size_t>& groups,
+                                       std::vector<std::vector<size_t>>& groupPositions,
+                                       NLGroupDistinctTally& distinct,
+                                       NLValueStore& store);
+
+// Emit a chunk of unwound values (the nl.unwind_collect drain): for each flat-buffer position
+// this chunk covers, write the present value into the nullable value output. One per
+// value type, selected during translation.
+using NLUnwindCollectValueEmitFunction = void (*)(const Column* values,
+                                           const ColumnVector<size_t>* positions,
+                                           Column* output);
+
+// Emit a chunk of per-group lists (the nl.collect drain): for each group in
+// [begin, begin + count), gather its elements from the flat buffer (by its position
+// list) into the list buffer as one contiguous run and store the resulting ListView in
+// the list output. One per value type, selected during translation.
+using NLCollectListEmitFunction = void (*)(const Column* values,
+                                           const std::vector<std::vector<size_t>>& groupPositions,
+                                           size_t begin,
+                                           size_t count,
+                                           ListBuffer<>& listBuffer,
+                                           Column* output);
+
+// Runtime state of one collect: an NLGroupTable from the serialized grouping-key tuple
+// to a dense group index, the distinct key values per group, and - the accumulator - a
+// single flat buffer of collected values plus, per group, the positions of its
+// elements in that buffer. nl.collect_buffer resets it, nl.collect_update assigns each
+// row to its group and appends its value, and the drain (nl.unwind_collect per element, or
+// nl.collect per group) reads it. The list-valued sibling of NLGroupAggregateState: it
+// keeps every value per group rather than reducing them to one.
+//
+// The flat buffer keeps values in global append order; a group's elements are the
+// buffer entries its position list names (not contiguous, since groups interleave). A
+// future drain that needs a contiguous per-group run gathers those positions into a
+// ListBuffer - the stage-then-insert path of docs/UNWIND.md.
+class NLCollectState {
+public:
+    // One grouping-key column - identical to NLGroupAggregateState's: the distinct key
+    // value per group accumulates in _buffer (grown as groups appear), the update reads
+    // the incoming chunk _input, _keyAppend serializes a row into the group key,
+    // _gatherAppend copies new-group rows into _buffer, and the drain fills _output
+    // through _emitCopy.
+    struct KeyColumn {
+        const Column* _input {nullptr};
+        Column* _buffer {nullptr};
+        Column* _output {nullptr};
+        NLKeyAppendFunction _keyAppend {nullptr};
+        NLGroupKeyGatherFunction _gatherAppend {nullptr};
+        NLCopyFunction _emitCopy {nullptr};
+        // Used only by the nl.unwind_collect drain: gather the key buffer by a per-emitted-row
+        // group index, so a group's key value repeats once per collected element.
+        NLGatherFunction _gather {nullptr};
+    };
+
+    // One collected column - Cypher's collect(x). _distinct holds the (group, value) pairs
+    // already charged, so collect(DISTINCT x) takes each value once and a plain collect
+    // leaves it empty; _output is filled either as the per-group list cell or as the
+    // unwound value, which is why the drain carries an emit handler for each.
+    struct ValueColumn {
+        const Column* _input {nullptr};
+        Column* _buffer {nullptr};
+        Column* _output {nullptr};
+        NLCollectFoldFunction _fold {nullptr};
+        NLCollectListEmitFunction _listEmit {nullptr};
+        NLUnwindCollectValueEmitFunction _unwindCollectEmit {nullptr};
+        NLGroupDistinctTally _distinct;
+        std::vector<std::vector<size_t>> _groupPositions;
+    };
+
+    void addKeyColumn(const KeyColumn& key) { _keyColumns.push_back(key); }
+    std::vector<KeyColumn>& keyColumns() { return _keyColumns; }
+
+    NLGroupTable& groupTable() { return _groupTable; }
+
+    void addValueColumn(const ValueColumn& value) { _valueColumns.push_back(value); }
+    std::vector<ValueColumn>& valueColumns() { return _valueColumns; }
+    const std::vector<ValueColumn>& valueColumns() const { return _valueColumns; }
+
+    // An nl.unwind_collect drain reads exactly one collected column, so it names it
+    // rather than indexing the list every caller would otherwise have to bound.
+    ValueColumn& unwoundColumn();
+
+    // The reductions taken over the same groups as the list - Cypher's collect(x) beside
+    // count(y) - each folded and emitted exactly as a grouped aggregation does, since one
+    // accumulator holds the groups both read.
+    void addAggregate(const NLGroupAggregateState::Aggregate& aggregate) { _aggregates.push_back(aggregate); }
+    std::vector<NLGroupAggregateState::Aggregate>& aggregates() { return _aggregates; }
+
+    // The query-scoped list buffer the nl.collect drain materializes per-group runs
+    // into; the ListViews it hands out span it and stay valid for the whole run. Every
+    // collected column shares it, since each run is contiguous per insert.
+    ListBuffer<>& listBuffer() { return _listBuffer; }
+
+    // The group keys and collected values the buffers hold, copied in as
+    // NLSortState::values' are
+    NLValueStore& keyValues() { return _keyValues; }
+    NLValueStore& collectedValues() { return _collectedValues; }
+
+    // The extremes the side min/max accumulators hold, compacted as
+    // NLGroupAggregateState's are
+    NLValueStore& extremeValues() { return _extremeValues.getActive(); }
+    void compactExtremeValues();
+
+    // Scratch reused per update step: the row key being built, the per-row group index
+    // map, and the incoming rows that created a new group this step.
+    std::string& keyScratch() { return _key; }
+    std::vector<size_t>& groupIndicesScratch() { return _groupIndices; }
+    std::vector<size_t>& newGroupRowsScratch() { return _newGroupRows; }
+
+    // Empty the group table, key buffers, value buffers and per-group positions, so the
+    // collect starts fresh. Runs each time nl.collect_buffer's block runs. An ungrouped
+    // collect comes back with its single empty group already created, since that group
+    // does not depend on any row arriving.
+    void reset();
+
+private:
+    std::vector<KeyColumn> _keyColumns;
+
+    std::vector<ValueColumn> _valueColumns;
+
+    ListBuffer<> _listBuffer;
+    NLValueStore _keyValues;
+    NLValueStore _collectedValues;
+    NLCompactingValueStore _extremeValues;
+
+    std::vector<NLGroupAggregateState::Aggregate> _aggregates;
+
+    NLGroupTable _groupTable;
+
+    std::string _key;
+    std::vector<size_t> _groupIndices;
+    std::vector<size_t> _newGroupRows;
+};
+
+// nl.collect_buffer data: resets a collect accumulator to empty each time the block it
+// lives in runs - once at function scope for a top-level collect. The list-valued
+// sibling of NLGroupAggregateResetData.
+class NLCollectResetData : public NLFunctionData {
+public:
+    NLCollectResetData(NLCollectState* state)
+        : _state(state)
+    {
+    }
+
+    NLCollectState* getState() const { return _state; }
+
+private:
+    NLCollectState* _state {nullptr};
+};
+
+// nl.collect_update data: the accumulator to append this step's chunk to. The key
+// columns and the value column it reads live on the shared state (their _input chunks
+// are the loop variables refilled each step), so this only names the state. The
+// list-valued sibling of NLGroupAggregateUpdateData.
+class NLCollectUpdateData : public NLFunctionData {
+public:
+    NLCollectUpdateData(NLCollectState* state)
+        : _state(state)
+    {
+    }
+
+    NLCollectState* getState() const { return _state; }
+
+private:
+    NLCollectState* _state {nullptr};
+};
+
+// nl.for over nl.unwind_collect data: the per-element drain of a collect. The state (fully
+// filled by now) holds the key buffers, flat value buffer, per-group positions and the
+// emit outputs; this holds the state, the loop body, and per-chunk scratch for the
+// group index and value position of each emitted row.
+class NLUnwindCollectLoopData : public NLFunctionData {
+public:
+    NLUnwindCollectLoopData(NLCollectState* state)
+        : _state(state)
+    {
+    }
+
+    NLCollectState* getState() const { return _state; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+    ColumnVector<size_t>* getGroupIndices() { return &_groupIndices; }
+    ColumnVector<size_t>* getPositions() { return &_positions; }
+
+private:
+    NLCollectState* _state {nullptr};
+    NLStmtContainer _stmts;
+
+    // This step's per-row group index (to gather the repeated key values) and value
+    // position (to emit the element), one entry per emitted row.
+    ColumnVector<size_t> _groupIndices;
+    ColumnVector<size_t> _positions;
+};
+
+// nl.for over nl.collect data: the per-group drain of a collect. The key/list outputs
+// and the list buffer live on the shared state, so this holds the state (fully filled
+// by now) and the loop body to run per emit chunk. The list-valued sibling of
+// NLGroupAggregateLoopData.
+class NLCollectLoopData : public NLFunctionData {
+public:
+    NLCollectLoopData(NLCollectState* state)
+        : _state(state)
+    {
+    }
+
+    NLCollectState* getState() const { return _state; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    NLCollectState* _state {nullptr};
+    NLStmtContainer _stmts;
+};
+
+template <typename T>
+struct DjistrakaNode {
+    NodeID id;
+    NodeID prevNode;
+    EdgeID edge;
+    T distance {0};
+};
+
+template <typename T>
+struct HeapMapValues {
+    NodeID prevNode;
+    EdgeID edge;
+    T distance {0};
+};
+
+template <typename T>
+struct DjistrakaNodeComparator {
+    bool operator()(const DjistrakaNode<T> l, const DjistrakaNode<T> r) const {
+        return l.distance > r.distance;
+    }
+};
+
+class NLShortestPathState {
+public:
+    NLShortestPathState(ValueType valueType, PropertyTypeID propertyType)
+        : _valueType(valueType),
+        _propertyType(propertyType)
+    {
+    }
+
+    virtual ~NLShortestPathState();
+
+    ValueType getValueType() const { return _valueType; }
+    PropertyTypeID getPropertyType() const { return _propertyType; }
+
+    std::unordered_set<NodeID>& targets() { return _targetNodes; }
+
+    // Reset the whole accumulator, and seed the frontier with a producing step's source nodes
+    // (each at distance zero). Typed on the weight, so implemented by the templated impl; the
+    // drain reaches the typed frontier through the impl's accessors.
+    virtual void reset() = 0;
+    virtual void addSources(const std::vector<NodeID>& nodes) = 0;
+
+protected:
+    ValueType _valueType {ValueType::Invalid};
+    PropertyTypeID _propertyType;
+    std::unordered_set<NodeID> _targetNodes;
+};
+
+template <SupportedType T>
+class NLShortestPathStateImpl final : public NLShortestPathState {
+public:
+    using EdgePropType = typename T::Primitive;
+    using DjistrakaHeap = std::priority_queue<DjistrakaNode<EdgePropType>,
+                                              std::vector<DjistrakaNode<EdgePropType>>,
+                                              DjistrakaNodeComparator<EdgePropType>>;
+    using DjistrakaValueMap = std::unordered_map<NodeID, HeapMapValues<EdgePropType>>;
+
+    using NLShortestPathState::NLShortestPathState;
+
+    void reset() override {
+        _heap = DjistrakaHeap();
+        _heapValueMap.clear();
+        _targetNodes.clear();
+    }
+
+    void addSources(const std::vector<NodeID>& nodes) override {
+        for (const NodeID val : nodes) {
+            const auto [slot, inserted] = _heapValueMap.insert({
+                val, {NodeID(), EdgeID(), 0}
+            });
+
+            if (inserted) {
+                _heap.push({val, NodeID(), EdgeID(), 0});
+            }
+        }
+    }
+
+    DjistrakaHeap& heap() { return _heap; }
+    DjistrakaValueMap& heapValueMap() { return _heapValueMap; }
+
+private:
+    DjistrakaHeap _heap;
+    DjistrakaValueMap _heapValueMap;
+};
+
+// nl.shortest_path_buffer data: empties the accumulator each time the block it lives
+// in runs - once at function scope
+class NLNodeSetResetData : public NLFunctionData {
+public:
+    NLNodeSetResetData(NLNodeSetState* state)
+        : _state(state)
+    {
+    }
+
+    NLNodeSetState* getState() const { return _state; }
+
+private:
+    NLNodeSetState* _state {nullptr};
+};
+
+class NLNodeSetCollectData : public NLFunctionData {
+public:
+    NLNodeSetCollectData(NLNodeSetState* state, const ColumnNodeIDs* nodes)
+        : _state(state),
+        _nodes(nodes)
+    {
+    }
+
+    NLNodeSetState* getState() const { return _state; }
+    const ColumnNodeIDs* getNodes() const { return _nodes; }
+
+private:
+    NLNodeSetState* _state {nullptr};
+    const ColumnNodeIDs* _nodes {nullptr};
+};
+
+class NLShortestPathResetData : public NLFunctionData {
+public:
+    NLShortestPathResetData(NLShortestPathState* state)
+        : _state(state)
+    {
+    }
+
+    NLShortestPathState* getState() const { return _state; }
+
+private:
+    NLShortestPathState* _state {nullptr};
+};
+
+class NLShortestPathUpdateData : public NLFunctionData {
+public:
+    NLShortestPathUpdateData(NLShortestPathState* state, const ColumnNodeIDs* nodes, bool target)
+        : _state(state),
+        _nodes(nodes),
+        _target(target)
+    {
+    }
+
+    NLShortestPathState* getState() const { return _state; }
+    const ColumnNodeIDs* getNodes() const { return _nodes; }
+    bool isTarget() const { return _target; }
+
+private:
+    NLShortestPathState* _state {nullptr};
+    const ColumnNodeIDs* _nodes {nullptr};
+    bool _target {false};
+};
+
+class NLShortestPathLoopData : public NLFunctionData {
+public:
+    NLShortestPathLoopData(NLShortestPathState* state)
+        : _state(state)
+    {
+    }
+
+    NLShortestPathState* getState() const { return _state; }
+
+    void setDistanceOutput(Column* distance) { _distance = distance; }
+    void setPathOutput(ColumnVector<Path>* path) { _path = path; }
+
+    Column* getDistanceOutput() const { return _distance; }
+    ColumnVector<Path>* getPathOutput() const { return _path; }
+
+    // The scratch the search reuses to expand one popped node's out-edges and read their
+    // weights, allocated once at translation. The edge/node/weight columns are LocalMemory
+    // columns; the index column is plain scratch, as on NLEdgeLoopData / NLSortLoopData.
+    void setExpansionScratch(ColumnNodeIDs* input,
+                             ColumnEdgeIDs* edges,
+                             ColumnNodeIDs* targets,
+                             Column* weights) {
+        _expansionInput = input;
+        _expandedEdges = edges;
+        _expandedTargets = targets;
+        _weightValues = weights;
+    }
+
+    ColumnNodeIDs* getExpansionInput() const { return _expansionInput; }
+    ColumnEdgeIDs* getExpandedEdges() const { return _expandedEdges; }
+    ColumnNodeIDs* getExpandedTargets() const { return _expandedTargets; }
+    Column* getWeightValues() const { return _weightValues; }
+    ColumnVector<size_t>* getExpandedIndices() { return &_expandedIndices; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    NLShortestPathState* _state {nullptr};
+
+    Column* _distance {nullptr};
+    ColumnVector<Path>* _path {nullptr};
+
+    ColumnNodeIDs* _expansionInput {nullptr};
+    ColumnEdgeIDs* _expandedEdges {nullptr};
+    ColumnNodeIDs* _expandedTargets {nullptr};
+    Column* _weightValues {nullptr};
+    ColumnVector<size_t> _expandedIndices;
+
+    NLStmtContainer _stmts;
+};
+
+class NLCreateNodeData : public NLFunctionData {
+public:
+    struct Property {
+        PropertyTypeID _propertyTypeID;
+        const Column* _values {nullptr};
+    };
+
+    NLCreateNodeData(LabelSetHandle labelsetHandle, ColumnNodeIDs* result)
+        : _result(result),
+        _labelsetHandle(labelsetHandle)
+    {
+    }
+
+    LabelSetHandle getLabelSetHandle() const { return _labelsetHandle; }
+    ColumnNodeIDs* getResult() const { return _result; }
+    const std::vector<Property>& properties() const { return _properties; }
+
+    size_t getRowCount() const { return _cardinality ? _cardinality->size() : 1; }
+
+    void addProperty(const Property& property) {
+        _properties.push_back(property);
+    }
+
+    void setCardinality(const Column* cardinality) {
+        _cardinality = cardinality;
+    }
+
+private:
+    std::vector<Property> _properties;
+    ColumnNodeIDs* _result {nullptr};
+    const Column* _cardinality {nullptr};
+    LabelSetHandle _labelsetHandle;
+};
+
+class NLCreateEdgeData : public NLFunctionData {
+public:
+    struct Property {
+        PropertyTypeID _propertyTypeID;
+        const Column* _values {nullptr};
+    };
+
+    NLCreateEdgeData(EdgeTypeID edgeTypeID,
+                     const ColumnNodeIDs* src,
+                     bool srcIsPending,
+                     const ColumnNodeIDs* tgt,
+                     bool tgtIsPending,
+                     ColumnEdgeIDs* result)
+        : _edgeTypeID(edgeTypeID),
+        _src(src),
+        _tgt(tgt),
+        _result(result),
+        _srcIsPending(srcIsPending),
+        _tgtIsPending(tgtIsPending)
+    {
+    }
+
+    EdgeTypeID getEdgeTypeID() const { return _edgeTypeID; }
+
+    const ColumnNodeIDs* getSrc() const { return _src; }
+
+    bool isSrcPending() const { return _srcIsPending; }
+
+    const ColumnNodeIDs* getTgt() const { return _tgt; }
+
+    bool isTgtPending() const { return _tgtIsPending; }
+
+    // Row by row, which endpoints are pending, for a column a merge produced and so
+    // mixed. Null for a column that is pending in every row or in none, which the two
+    // flags above then answer for.
+    const ColumnMask* getSrcPendingMask() const { return _srcPendingMask; }
+    const ColumnMask* getTgtPendingMask() const { return _tgtPendingMask; }
+
+    void setSrcPendingMask(const ColumnMask* mask) { _srcPendingMask = mask; }
+    void setTgtPendingMask(const ColumnMask* mask) { _tgtPendingMask = mask; }
+
+    ColumnEdgeIDs* getResult() const { return _result; }
+
+    const std::vector<Property>& properties() const { return _properties; }
+
+    void addProperty(const Property& property) {
+        _properties.push_back(property);
+    }
+
+private:
+    std::vector<Property> _properties;
+    EdgeTypeID _edgeTypeID;
+    const ColumnNodeIDs* _src {nullptr};
+    const ColumnNodeIDs* _tgt {nullptr};
+    const ColumnMask* _srcPendingMask {nullptr};
+    const ColumnMask* _tgtPendingMask {nullptr};
+    ColumnEdgeIDs* _result {nullptr};
+    bool _srcIsPending {false};
+    bool _tgtIsPending {false};
+};
+
+// Which way a merge pattern's hop points, from the chain node ahead of it to the one
+// behind. The interpreter's copy of the storage-dialect EdgeDirection, set during
+// translation so execution never reaches into MLIR.
+enum class NLMergeDirection {
+    Undirected = 0,
+    Backward,
+    Forward,
+};
+
+// A node or edge one row of a merge bound: an ID the graph holds, or - when pending -
+// an offset into the change's write buffer for an entity this query wrote and has not
+// committed. The two spaces overlap numerically, so the flag is what tells them apart.
+struct NLMergeRef {
+    uint64_t _id {0};
+    bool _pending {false};
+
+    bool operator==(const NLMergeRef& other) const {
+        return _id == other._id && _pending == other._pending;
+    }
+
+    // The two spaces packed into one integer, so a ref can key a map or a set
+    uint64_t asKey() const { return (_id << 1) | static_cast<uint64_t>(_pending); }
+};
+
+// One property constraint a merge pattern's node or hop puts on a row: the property it
+// names and the column the row's asked-for value comes from, with the appender that
+// turns that value into its part of the key the match looks up.
+struct NLMergeProperty {
+    PropertyType _propertyType;
+    const Column* _values {nullptr};
+    NLKeyAppendFunction _keyAppend {nullptr};
+};
+
+// The graph side of that key: the same property, read out of the graph into a scratch
+// column. Its appender keys a fetched (and so nullable) value the way the row's own
+// appender keys the asked-for one, which is what lets the two keys be compared.
+struct NLMergeScanProperty {
+    PropertyType _propertyType;
+    Column* _values {nullptr};
+    NLKeyAppendFunction _keyAppend {nullptr};
+};
+
+using NLMergeScanProperties = std::vector<NLMergeScanProperty>;
+
+// The nodes the graph holds under one chain-node spec, indexed by the spec's property
+// values. Scanned once, on first use, so a merge driven by many rows pays for one pass
+// over its label set rather than a lookup per row. The nodes this query writes, whichever
+// clause writes them, are taken in as they are written, keyed by the same values read
+// back from the write buffer.
+class NLMergeNodeIndex {
+public:
+    NLMergeNodeIndex(const LabelSet& labels,
+                     const LabelSet& writeLabels,
+                     bool matchable,
+                     ColumnNodeIDs* scanNodes);
+    ~NLMergeNodeIndex();
+
+    const LabelSet& getLabels() const { return _labels; }
+    const LabelSet& getWriteLabels() const { return _writeLabels; }
+
+    // False when a label or a key property of the spec is absent from the graph's
+    // schema: no committed node can carry it, so the graph offers no candidate and only
+    // the pending nodes this change wrote can match
+    bool isMatchable() const { return _matchable; }
+
+    bool isBuilt() const { return _built; }
+    void markBuilt() { _built = true; }
+
+    ColumnNodeIDs* getScanNodes() const { return _scanNodes; }
+
+    const std::vector<NLMergeScanProperty>& scanProperties() const { return _scanProperties; }
+    void addScanProperty(const NLMergeScanProperty& property) { _scanProperties.push_back(property); }
+
+    // The spec's key properties in the types they are written with, which is what a
+    // pending node's values are read back through
+    const NLMergeScanProperties& writtenProperties() const { return _writtenProperties; }
+    void addWrittenProperty(const NLMergeScanProperty& property) { _writtenProperties.push_back(property); }
+
+    size_t getNextPendingNode() const { return _nextPendingNode; }
+    void setNextPendingNode(size_t offset) { _nextPendingNode = offset; }
+
+    // How far the index has read the updates to the graph's nodes and to the ones this
+    // query wrote. A node an update reached after the index took it in is keyed again
+    // under what it holds now, and its entries under earlier values stay behind: a lookup
+    // checks such a node against its current values.
+    size_t getNextNodeUpdate() const { return _nextNodeUpdate; }
+    void setNextNodeUpdate(size_t position) { _nextNodeUpdate = position; }
+
+    size_t getNextPendingNodeUpdate() const { return _nextPendingNodeUpdate; }
+    void setNextPendingNodeUpdate(size_t position) { _nextPendingNodeUpdate = position; }
+
+    bool hasChanged(const NLMergeRef& ref) const { return _changedNodes.contains(ref.asKey()); }
+    void markChanged(const NLMergeRef& ref) { _changedNodes.insert(ref.asKey()); }
+
+    void add(const std::string& key, const NLMergeRef& ref) { _byKey[key].push_back(ref); }
+
+    std::span<const NLMergeRef> find(const std::string& key) const;
+
+private:
+    LabelSet _labels;
+    LabelSet _writeLabels;
+    std::vector<NLMergeScanProperty> _scanProperties;
+    NLMergeScanProperties _writtenProperties;
+    std::unordered_map<std::string, std::vector<NLMergeRef>> _byKey;
+    std::unordered_set<uint64_t> _changedNodes;
+    ColumnNodeIDs* _scanNodes {nullptr};
+    size_t _nextPendingNode {0};
+    size_t _nextNodeUpdate {0};
+    size_t _nextPendingNodeUpdate {0};
+    bool _matchable {false};
+    bool _built {false};
+};
+
+// Every edge this change wrote, whichever clause or statement wrote it, under each of the
+// two nodes it joins: a pending edge is in no graph the match reads, so this is where a
+// hop finds it. One log per program, shared by every merge op in it, and taken in from the
+// write buffer as the query writes.
+class NLMergePendingEdges {
+public:
+    struct Entry {
+        NLMergeRef _other;
+        EdgeTypeID _edgeType;
+        uint64_t _offset {0};
+    };
+
+    NLMergePendingEdges();
+    ~NLMergePendingEdges();
+
+    void add(const NLMergeRef& source, const NLMergeRef& target, EdgeTypeID edgeType, uint64_t offset);
+
+    size_t getNextPendingEdge() const { return _nextPendingEdge; }
+    void setNextPendingEdge(size_t offset) { _nextPendingEdge = offset; }
+
+    std::span<const Entry> outOf(const NLMergeRef& node) const;
+    std::span<const Entry> into(const NLMergeRef& node) const;
+
+private:
+    std::unordered_map<uint64_t, std::vector<Entry>> _outgoing;
+    std::unordered_map<uint64_t, std::vector<Entry>> _incoming;
+    size_t _nextPendingEdge {0};
+
+    static std::span<const Entry> lookup(const std::unordered_map<uint64_t, std::vector<Entry>>& edges,
+                                         const NLMergeRef& node);
+};
+
+// nl.merge data: one entry per chain node and one per hop of the pattern, the columns
+// each row's values and bound entities come from, and the chunks the op fills.
+class NLMergeData : public NLFunctionData {
+public:
+    // One node of the chain. A bound node reads its rows from _boundColumn and is never
+    // written; every other one is looked up through _index and, when the pattern is
+    // missing, written under _labelSetHandle with _properties' values. Only a looked-up
+    // node holds output chunks: a bound one's rows come back through the carry set.
+    struct Node {
+        std::vector<NLMergeProperty> _properties;
+
+        const ColumnNodeIDs* _boundColumn {nullptr};
+        const ColumnMask* _boundPending {nullptr};
+        NLMergeNodeIndex* _index {nullptr};
+        LabelSetHandle _labelSetHandle;
+        ColumnNodeIDs* _output {nullptr};
+        ColumnMask* _outputPending {nullptr};
+    };
+
+    // One hop of the chain, joining the node ahead of it to the one behind. The match
+    // edge type is invalid when the graph's schema does not have it, which leaves only
+    // the pending edges to match. The scratch chunks below are what a hop constraining
+    // properties reads its candidates' values through: the graph's in the types the graph
+    // holds them as, the pending ones' in the types they are written with.
+    struct Hop {
+        std::vector<NLMergeProperty> _properties;
+        std::vector<NLMergeScanProperty> _scanProperties;
+        NLMergeScanProperties _writtenProperties;
+
+        EdgeTypeID _matchEdgeType;
+        EdgeTypeID _writeEdgeType;
+        NLMergeDirection _direction {NLMergeDirection::Forward};
+        ColumnNodeIDs* _scanSources {nullptr};
+        ColumnEdgeIDs* _scanEdges {nullptr};
+        ColumnEdgeIDs* _output {nullptr};
+        ColumnMask* _outputPending {nullptr};
+    };
+
+    NLMergeData(NLMergePendingEdges* pendingEdges, ColumnMask* created);
+    ~NLMergeData() override;
+
+    const std::vector<Node>& nodes() const { return _nodes; }
+    const std::vector<Hop>& hops() const { return _hops; }
+    const std::vector<NLCarriedColumn>& carriedColumns() const { return _carriedColumns; }
+
+    std::vector<Node>& nodes() { return _nodes; }
+    std::vector<Hop>& hops() { return _hops; }
+
+    NLMergePendingEdges* getPendingEdges() const { return _pendingEdges; }
+    ColumnMask* getCreated() const { return _created; }
+
+    // The column whose length is the number of rows the op runs over: a chunk some part
+    // of the pattern reads. Null for a pattern reading none, which is the single row a
+    // MERGE standing on its own writes.
+    const Column* getRowCarrier() const { return _rowCarrier; }
+    void setRowCarrier(const Column* rowCarrier) { _rowCarrier = rowCarrier; }
+
+    void addNode(const Node& node) { _nodes.push_back(node); }
+    void addHop(const Hop& hop) { _hops.push_back(hop); }
+    void addCarriedColumn(const NLCarriedColumn& carried) { _carriedColumns.push_back(carried); }
+
+    ColumnVector<size_t>* getIndices() { return &_indices; }
+
+    // The scratch every step of the op works in, allocated once with the op rather than
+    // once per chunk
+    NLMergeWorkingSet* getWorkingSet() const { return _workingSet.get(); }
+
+private:
+    std::vector<Node> _nodes;
+    std::vector<Hop> _hops;
+    std::vector<NLCarriedColumn> _carriedColumns;
+    NLMergePendingEdges* _pendingEdges {nullptr};
+    ColumnMask* _created {nullptr};
+    const Column* _rowCarrier {nullptr};
+    std::unique_ptr<NLMergeWorkingSet> _workingSet;
+
+    // This step's row map, from each emitted row to the input row behind it, fed to the
+    // per-column gather that rebuilds the carry set
+    ColumnVector<size_t> _indices;
+};
+
+class NLSetNodePropertyData : public NLFunctionData {
+public:
+    NLSetNodePropertyData(PropertyTypeID propertyTypeID,
+                          const ColumnNodeIDs* input,
+                          const Column* value)
+        : _input(input),
+        _value(value),
+        _propertyTypeID(propertyTypeID)
+    {
+    }
+
+    PropertyTypeID getPropertyTypeID() const { return _propertyTypeID; }
+    const ColumnNodeIDs* getInput() const { return _input; }
+    const Column* getValue() const { return _value; }
+
+    // The rows whose node this change wrote and has not committed: those are updated in
+    // the write buffer's pending node rather than recorded as an update to a committed
+    // one. Null for an input no merge produced.
+    const ColumnMask* getPending() const { return _pending; }
+    void setPending(const ColumnMask* pending) { _pending = pending; }
+
+    bool isAllPending() const { return _allPending; }
+    void setAllPending(bool allPending) { _allPending = allPending; }
+
+    // The rows the write touches, or null for a write that touches every one: Cypher's
+    // ON CREATE hands over the merge's created mask and ON MATCH its negation.
+    const ColumnMask* getRows() const { return _rows; }
+    void setRows(const ColumnMask* rows) { _rows = rows; }
+
+    // A removal stages a null of the property's own type. Its value column carries no
+    // type to dispatch on, so this is where the type comes from. Invalid when the write
+    // reads its values off the column.
+    ValueType getNullValueType() const { return _nullValueType; }
+    void setNullValueType(ValueType valueType) { _nullValueType = valueType; }
+
+    // A column of list elements carries each row's type in its cell, so the property's own
+    // type is what every cell is checked against and staged as. Invalid for any other column.
+    ValueType getListElementValueType() const { return _listElementValueType; }
+    void setListElementValueType(ValueType valueType) { _listElementValueType = valueType; }
+
+private:
+    const ColumnNodeIDs* _input {nullptr};
+    const Column* _value {nullptr};
+    const ColumnMask* _pending {nullptr};
+    const ColumnMask* _rows {nullptr};
+    PropertyTypeID _propertyTypeID;
+    ValueType _nullValueType {ValueType::Invalid};
+    ValueType _listElementValueType {ValueType::Invalid};
+    bool _allPending {false};
+};
+
+class NLSetEdgePropertyData : public NLFunctionData {
+public:
+    NLSetEdgePropertyData(PropertyTypeID propertyTypeID,
+                          const ColumnEdgeIDs* input,
+                          const Column* value)
+        : _input(input),
+        _value(value),
+        _propertyTypeID(propertyTypeID)
+    {
+    }
+
+    PropertyTypeID getPropertyTypeID() const { return _propertyTypeID; }
+    const ColumnEdgeIDs* getInput() const { return _input; }
+    const Column* getValue() const { return _value; }
+
+    const ColumnMask* getPending() const { return _pending; }
+    void setPending(const ColumnMask* pending) { _pending = pending; }
+
+    bool isAllPending() const { return _allPending; }
+    void setAllPending(bool allPending) { _allPending = allPending; }
+
+    const ColumnMask* getRows() const { return _rows; }
+    void setRows(const ColumnMask* rows) { _rows = rows; }
+
+    // A removal stages a null of the property's own type. Its value column carries no
+    // type to dispatch on, so this is where the type comes from. Invalid when the write
+    // reads its values off the column.
+    ValueType getNullValueType() const { return _nullValueType; }
+    void setNullValueType(ValueType valueType) { _nullValueType = valueType; }
+
+    // A column of list elements carries each row's type in its cell, so the property's own
+    // type is what every cell is checked against and staged as. Invalid for any other column.
+    ValueType getListElementValueType() const { return _listElementValueType; }
+    void setListElementValueType(ValueType valueType) { _listElementValueType = valueType; }
+
+private:
+    const ColumnEdgeIDs* _input {nullptr};
+    const Column* _value {nullptr};
+    const ColumnMask* _pending {nullptr};
+    const ColumnMask* _rows {nullptr};
+    PropertyTypeID _propertyTypeID;
+    ValueType _nullValueType {ValueType::Invalid};
+    ValueType _listElementValueType {ValueType::Invalid};
+    bool _allPending {false};
+};
+
+class NLDeleteNodeData : public NLFunctionData {
+public:
+    NLDeleteNodeData(const ColumnNodeIDs* input, bool detaching, ColumnNodeIDs* committed)
+        : _input(input),
+        _committed(committed),
+        _detaching(detaching)
+    {
+    }
+
+    const ColumnNodeIDs* getInput() const { return _input; }
+    bool isDetaching() const { return _detaching; }
+
+    // The rows naming a node this change wrote and has not committed - a write-buffer
+    // offset rather than an ID the graph holds - or null when no row does. A column a
+    // create produced is such a row throughout, which is what _allPending says.
+    const ColumnMask* getPending() const { return _pending; }
+    void setPending(const ColumnMask* pending) { _pending = pending; }
+
+    bool isAllPending() const { return _allPending; }
+    void setAllPending(bool allPending) { _allPending = allPending; }
+
+    // The scratch the committed rows of a mixed column are gathered into, since the
+    // deletion of those goes through the graph's own IDs
+    ColumnNodeIDs* getCommitted() const { return _committed; }
+
+private:
+    const ColumnNodeIDs* _input {nullptr};
+    const ColumnMask* _pending {nullptr};
+    ColumnNodeIDs* _committed {nullptr};
+    bool _detaching {false};
+    bool _allPending {false};
+};
+
+class NLDeleteEdgeData : public NLFunctionData {
+public:
+    NLDeleteEdgeData(const ColumnEdgeIDs* input, ColumnEdgeIDs* committed)
+        : _input(input),
+        _committed(committed)
+    {
+    }
+
+    // The edge siblings of NLDeleteNodeData's
+    const ColumnMask* getPending() const { return _pending; }
+    void setPending(const ColumnMask* pending) { _pending = pending; }
+
+    bool isAllPending() const { return _allPending; }
+    void setAllPending(bool allPending) { _allPending = allPending; }
+
+    ColumnEdgeIDs* getCommitted() const { return _committed; }
+
+    const ColumnEdgeIDs* getInput() const { return _input; }
+
+private:
+    const ColumnEdgeIDs* _input {nullptr};
+    const ColumnMask* _pending {nullptr};
+    ColumnEdgeIDs* _committed {nullptr};
+    bool _allPending {false};
+};
+
+// nl.output data
+class NLOutputData : public NLFunctionData {
+public:
+    using OutputColumns = std::vector<const Column*>;
+
+    // A path chunk emitted as the list of edge IDs each handle stands for
+    struct PathExpansion {
+        const ColumnVector<PathRef>* _paths {nullptr};
+        ColumnVector<ListView>* _lists {nullptr};
+    };
+
+    const OutputColumns& outputs() const { return _columns; }
+
+    const std::vector<PathExpansion>& pathExpansions() const { return _pathExpansions; }
+
+    // The sink receives the expanded lists; the row count is still read off the handles
+    void addExpandedPathColumn(const ColumnVector<PathRef>* paths,
+                               ColumnVector<ListView>* lists,
+                               bool carriesRows) {
+        _columns.push_back(lists);
+        _pathExpansions.push_back({paths, lists});
+
+        if (carriesRows) {
+            _rowCountColumns.push_back(paths);
+        }
+    }
+
+    const PathTrie* getTrie() const { return _trie; }
+    void setTrie(const PathTrie* trie) { _trie = trie; }
+
+    // Holds the expanded lists of one emission and is emptied before the next
+    QueryListBuffer& pathListBuffer() { return _pathListBuffer; }
+
+    // The columns a step's row count is read off. A constant column holds one value
+    // standing for every row of the step, so it cannot say how many there are: only a
+    // projection made of constants alone is sized by them.
+    const OutputColumns& rowCountColumns() const { return _rowCountColumns.empty() ? _columns : _rowCountColumns; }
+
+    void addOutputColumn(const Column* col, bool carriesRows) {
+        _columns.push_back(col);
+
+        if (carriesRows) {
+            _rowCountColumns.push_back(col);
+        }
+    }
+
+    // The governing limit counter, or null for a limit-oblivious output. When
+    // set (the folded terminal-LIMIT form), output emits only its
+    // getEmitThisStep() prefix; it never mutates the counter.
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    // The governing skip counter, or null for a skip-oblivious output. When set
+    // (the folded terminal-SKIP form), output emits the surviving suffix at
+    // offset getSkipThisStep() for getEmitThisStep() rows; it never mutates the
+    // counter. A folded output carries at most one of limit/skip.
+    NLSkipState* getSkip() const { return _skip; }
+    void setSkip(NLSkipState* skip) { _skip = skip; }
+
+    const Column* getCardinality() const { return _cardinality; }
+
+    void setCardinality(const Column* cardinality) { _cardinality = cardinality; }
+
+private:
+    std::vector<const Column*> _columns;
+    std::vector<const Column*> _rowCountColumns;
+    std::vector<PathExpansion> _pathExpansions;
+    const PathTrie* _trie {nullptr};
+    QueryListBuffer _pathListBuffer;
+    NLLimitState* _limit {nullptr};
+    NLSkipState* _skip {nullptr};
+    // Column which may define the cardinality of the output
+    const Column* _cardinality {nullptr};
+};
+
+// Binary function to execute
+using NLBinaryFn = void (*)(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers* stepBuffers);
+
+class NLBinaryData : public NLFunctionData {
+public:
+    NLBinaryData(const Column* lhs, const Column* rhs, Column* result, NLBinaryFn fn, NLStepBuffers* stepBuffers)
+        : _lhs(lhs),
+        _rhs(rhs),
+        _result(result),
+        _fn(fn),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    const Column* getLhs() const { return _lhs; }
+    const Column* getRhs() const { return _rhs; }
+    Column* getResult() const { return _result; }
+    NLBinaryFn getFn() const { return _fn; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+private:
+    const Column* _lhs {nullptr};
+    const Column* _rhs {nullptr};
+    Column* _result {nullptr};
+    NLBinaryFn _fn {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+};
+
+// Unary function to execute
+using NLUnaryFn = void (*)(Column* result, const Column* operand);
+
+// Unary function to execute, plus operand and result
+class NLUnaryData : public NLFunctionData {
+public:
+    NLUnaryData(const Column* operand, Column* result, NLUnaryFn fn)
+        : _operand(operand),
+        _result(result),
+        _fn(fn)
+    {
+    }
+
+    const Column* getOperand() const { return _operand; }
+    Column* getResult() const { return _result; }
+    NLUnaryFn getFn() const { return _fn; }
+
+private:
+    const Column* _operand {nullptr};
+    Column* _result {nullptr};
+    NLUnaryFn _fn {nullptr};
+};
+
+// Whether row @param row of a CASE branch's condition column holds true. A null
+// condition never does, so its rows fall through to the next branch.
+using NLCaseTestFn = bool (*)(const Column* condition, size_t row);
+
+// Copies row @param valueRow of a CASE branch's value column into row @param resultRow of
+// the result. nl.case reads its values at the row it writes; nl.case_merge reads each at
+// the row its cursor reached, since a value holds only the rows that took its branch.
+using NLCaseWriteFn = void (*)(Column* result, size_t resultRow, const Column* value, size_t valueRow);
+
+// Sizes a CASE result to @param rowCount rows, all absent: the value a row unmatched by
+// every branch of a defaultless CASE holds
+using NLCaseResetFn = void (*)(Column* result, size_t rowCount);
+
+// Read the cell one element column holds at @param row as the value the list buffer
+// stores for it, tagged with the type it is. One per column kind, selected during
+// translation the way the case write families are. The memory is what a column owning its
+// characters copies them into, as the concatenation kernel copies its result.
+using NLListItemReadFunction = ListBuffer<>::ListItemVariant (*)(const Column* input,
+                                                                 size_t row,
+                                                                 NLStepBuffers* stepBuffers);
+
+// How a value is written into one row of a CASE result or an nl.reduce accumulator:
+// through a CASE write where the result is a typed column, or read as a list item and
+// stored as a tagged cell where it is a !storage.any column
+struct NLCellWrite {
+    NLCaseWriteFn _write {nullptr};
+    NLListItemReadFunction _taggedRead {nullptr};
+};
+
+// One CASE, as the rows are walked: per branch the condition to read, the value to take
+// when it holds, and the kernels that read each. The default is what a row matching no
+// branch takes; with none, the reset already left it absent.
+class NLCaseData : public NLFunctionData {
+public:
+    struct Branch {
+        const Column* _condition {nullptr};
+        const Column* _value {nullptr};
+        NLCaseTestFn _test {nullptr};
+        NLCellWrite _write;
+    };
+
+    struct BranchCursor {
+        size_t _conditionRow {0};
+        size_t _valueRow {0};
+    };
+
+    NLCaseData(const Column* cardinality, Column* result, NLCaseResetFn reset, NLStepBuffers* stepBuffers)
+        : _cardinality(cardinality),
+        _result(result),
+        _reset(reset),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    const Column* getCardinality() const { return _cardinality; }
+    Column* getResult() const { return _result; }
+    NLCaseResetFn getReset() const { return _reset; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+    const Column* getDefaultValue() const { return _defaultValue; }
+    const NLCellWrite& getWriteDefault() const { return _writeDefault; }
+
+    const std::vector<Branch>& branches() const { return _branches; }
+    std::vector<BranchCursor>& cursors() { return _cursors; }
+
+    void addBranch(const Branch& branch) {
+        _branches.push_back(branch);
+        _cursors.emplace_back();
+    }
+
+    void setDefault(const Column* defaultValue, const NLCellWrite& writeDefault) {
+        _defaultValue = defaultValue;
+        _writeDefault = writeDefault;
+    }
+
+private:
+    const Column* _cardinality {nullptr};
+    Column* _result {nullptr};
+    NLCaseResetFn _reset {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+    std::vector<Branch> _branches;
+    std::vector<BranchCursor> _cursors;
+    const Column* _defaultValue {nullptr};
+    NLCellWrite _writeDefault;
+};
+
+// Row-wise list build (nl.make_list): row r of the result is the list of row r of every
+// element column, written into the query's list buffer as one contiguous run. Every
+// element column carries rows and they are row-aligned, so the first of them gives the
+// rows this step writes.
+class NLMakeListData : public NLFunctionData {
+public:
+    struct Element {
+        const Column* _column {nullptr};
+        NLListItemReadFunction _read {nullptr};
+    };
+
+    NLMakeListData(Column* result, NLStepBuffers* stepBuffers)
+        : _result(result),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    Column* getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+    const std::vector<Element>& elements() const { return _elements; }
+
+    void addElement(const Element& element) {
+        _elements.push_back(element);
+    }
+
+private:
+    Column* _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+    std::vector<Element> _elements;
+};
+
+using NLStringArgumentRead = std::optional<types::String::Primitive> (*)(const Column* input,
+                                                                        size_t row,
+                                                                        std::string_view functionName);
+
+using NLIntegerArgumentRead = std::optional<types::Int64::Primitive> (*)(const Column* input,
+                                                                        size_t row,
+                                                                        std::string_view functionName);
+
+class NLSubstringData : public NLFunctionData {
+public:
+    struct StringArgument {
+        const Column* _column {nullptr};
+        NLStringArgumentRead _read {nullptr};
+    };
+
+    struct IntegerArgument {
+        const Column* _column {nullptr};
+        NLIntegerArgumentRead _read {nullptr};
+    };
+
+    NLSubstringData(Column* result,
+                    const StringArgument& string,
+                    const IntegerArgument& start,
+                    const IntegerArgument& length)
+        : _result(result),
+        _string(string),
+        _start(start),
+        _length(length)
+    {
+    }
+
+    Column* getResult() const { return _result; }
+
+    const StringArgument& getString() const { return _string; }
+    const IntegerArgument& getStart() const { return _start; }
+    const IntegerArgument& getLength() const { return _length; }
+
+private:
+    Column* _result {nullptr};
+    StringArgument _string;
+    IntegerArgument _start;
+    IntegerArgument _length;
+};
+
+class NLSplitData : public NLFunctionData {
+public:
+    using StringArgument = NLSubstringData::StringArgument;
+
+    NLSplitData(Column* result,
+                NLStepBuffers* stepBuffers,
+                const StringArgument& string,
+                const StringArgument& delimiter)
+        : _result(result),
+        _stepBuffers(stepBuffers),
+        _string(string),
+        _delimiter(delimiter)
+    {
+    }
+
+    Column* getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+    const StringArgument& getString() const { return _string; }
+    const StringArgument& getDelimiter() const { return _delimiter; }
+
+private:
+    Column* _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+    StringArgument _string;
+    StringArgument _delimiter;
+};
+
+class NLStringEndData : public NLFunctionData {
+public:
+    using StringArgument = NLSubstringData::StringArgument;
+    using IntegerArgument = NLSubstringData::IntegerArgument;
+
+    NLStringEndData(Column* result,
+                    const StringArgument& string,
+                    const IntegerArgument& length)
+        : _result(result),
+        _string(string),
+        _length(length)
+    {
+    }
+
+    Column* getResult() const { return _result; }
+
+    const StringArgument& getString() const { return _string; }
+    const IntegerArgument& getLength() const { return _length; }
+
+private:
+    Column* _result {nullptr};
+    StringArgument _string;
+    IntegerArgument _length;
+};
+
+class NLReplaceData : public NLFunctionData {
+public:
+    using StringArgument = NLSubstringData::StringArgument;
+
+    NLReplaceData(Column* result,
+                  NLStepBuffers* stepBuffers,
+                  const StringArgument& string,
+                  const StringArgument& search,
+                  const StringArgument& replacement)
+        : _result(result),
+        _stepBuffers(stepBuffers),
+        _string(string),
+        _search(search),
+        _replacement(replacement)
+    {
+    }
+
+    Column* getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+    const StringArgument& getString() const { return _string; }
+    const StringArgument& getSearch() const { return _search; }
+    const StringArgument& getReplacement() const { return _replacement; }
+
+private:
+    Column* _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+    StringArgument _string;
+    StringArgument _search;
+    StringArgument _replacement;
+};
+
+// Read the cell one value column holds at @param row as the value the map buffer stores
+// for it. The map sibling of NLListItemReadFunction.
+using NLMapValueReadFunction = MapBuffer<>::MapItemVariant (*)(const Column* input,
+                                                              size_t row,
+                                                              NLStepBuffers* stepBuffers);
+
+// Row-wise map build (nl.make_map): row r of the result maps each key to row r of its
+// value column, written into the query's map buffer as one contiguous run.
+class NLMakeMapData : public NLFunctionData {
+public:
+    struct Entry {
+        std::string_view _key;
+        const Column* _column {nullptr};
+        NLMapValueReadFunction _read {nullptr};
+    };
+
+    NLMakeMapData(Column* result, NLStepBuffers* stepBuffers);
+    ~NLMakeMapData() override;
+
+    Column* getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+    const std::vector<Entry>& entries() const { return _entries; }
+
+    void addEntry(const Entry& entry);
+
+private:
+    Column* _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+    std::vector<Entry> _entries;
+};
+
+// What one row of an nl.static_map_key or an nl.dynamic_map_key reads its key in: a map, or
+// the node or the edge whose properties are its keys. Nothing where the row holds none of
+// them.
+using NLKeyedValue = std::variant<std::monostate, MapView, NodeID, EdgeID>;
+
+// The keyed value one column of a map key read holds at @param row. One per column shape,
+// selected during translation.
+using NLKeyedReadFunction = NLKeyedValue (*)(const Column* input, size_t row);
+
+// The key one column of an nl.dynamic_map_key holds at @param row, or nothing where the
+// row holds none. One per string column shape, selected during translation.
+using NLStringReadFunction = std::optional<types::String::Primitive> (*)(const Column* input,
+                                                                        size_t row);
+
+// Row-wise copy of map entries' values into tagged cells (nl.map_entry_value)
+class NLMapEntryValueData : public NLFunctionData {
+public:
+    NLMapEntryValueData(const Column* input, Column* result, NLStepBuffers* stepBuffers)
+        : _input(input),
+        _result(result),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    const Column* getInput() const { return _input; }
+    Column* getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+    std::vector<QueryListBuffer::ListItemVariant>& getItems() { return _items; }
+
+private:
+    const Column* _input {nullptr};
+    Column* _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+    std::vector<QueryListBuffer::ListItemVariant> _items;
+};
+
+// Row-wise map key read (nl.static_map_key): row r of the result views the entry row r's map
+// holds under the key, or the null entry where it holds none.
+class NLStaticMapKeyData : public NLFunctionData {
+public:
+    NLStaticMapKeyData(const Column* input,
+                 Column* result,
+                 NLKeyedReadFunction keyedRead,
+                 std::string_view key,
+                 MapEntryView absent,
+                 NLStepBuffers* stepBuffers)
+        : _input(input),
+        _result(result),
+        _keyedRead(keyedRead),
+        _key(key),
+        _absent(absent),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    const Column* getInput() const { return _input; }
+    Column* getResult() const { return _result; }
+    NLKeyedReadFunction getKeyedRead() const { return _keyedRead; }
+    std::string_view getKey() const { return _key; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+    // The entry a row whose map holds no such key reads: the key the statement reads under,
+    // tagged null. Fixed by the key, so one serves every row of every chunk.
+    MapEntryView getAbsentEntry() const { return _absent; }
+
+private:
+    const Column* _input {nullptr};
+    Column* _result {nullptr};
+    NLKeyedReadFunction _keyedRead {nullptr};
+    std::string_view _key {};
+    MapEntryView _absent;
+    NLStepBuffers* _stepBuffers {nullptr};
+};
+
+// Row-wise map key read (nl.dynamic_map_key): row r of the result views the entry row r's
+// map holds under row r's key, or a null entry where it holds none.
+class NLDynamicMapKeyData : public NLFunctionData {
+public:
+    NLDynamicMapKeyData(const Column* input,
+                        Column* result,
+                        NLKeyedReadFunction keyedRead,
+                        const Column* key,
+                        NLStringReadFunction keyRead,
+                        MapEntryView absent,
+                        NLStepBuffers* stepBuffers)
+        : _input(input),
+        _result(result),
+        _keyedRead(keyedRead),
+        _key(key),
+        _keyRead(keyRead),
+        _absent(absent),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    const Column* getInput() const { return _input; }
+    Column* getResult() const { return _result; }
+    NLKeyedReadFunction getKeyedRead() const { return _keyedRead; }
+    const Column* getKey() const { return _key; }
+    NLStringReadFunction getKeyRead() const { return _keyRead; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+    // The entry a row holding no key reads: no key to name it by, so one keyless null entry
+    // serves every such row. A row whose key the map does not hold is named by that key, so
+    // its entry is written as the row is read.
+    MapEntryView getAbsentEntry() const { return _absent; }
+
+private:
+    const Column* _input {nullptr};
+    Column* _result {nullptr};
+    NLKeyedReadFunction _keyedRead {nullptr};
+    const Column* _key {nullptr};
+    NLStringReadFunction _keyRead {nullptr};
+    MapEntryView _absent;
+    NLStepBuffers* _stepBuffers {nullptr};
+};
+
+
+// Read the bound one column of an nl.range holds at @param row, or nothing where the row
+// has no bound. One per integer column kind, selected during translation the way the list
+// item reads are.
+using NLRangeBoundReadFunction = std::optional<types::Int64::Primitive> (*)(const Column* input,
+                                                                           size_t row);
+
+struct NLRangeBound {
+    const Column* _column {nullptr};
+    NLRangeBoundReadFunction _read {nullptr};
+};
+
+// The list one column of an nl.list_slice holds at @param row, or nothing where the row
+// holds none. One per list column kind, selected during translation.
+using NLListReadFunction = std::optional<ListView> (*)(const Column* input, size_t row);
+
+using NLPercentileReadFunction = std::optional<types::Double::Primitive> (*)(const Column* input, size_t row);
+
+// nl.percentile_cont / nl.percentile_disc data: the list column with the read telling an
+// absent cell from a list, the percentile with the read its number type takes, and the
+// column the step fills.
+class NLPercentileData : public NLFunctionData {
+public:
+    NLPercentileData(const Column* list,
+                     NLListReadFunction listRead,
+                     const Column* percentile,
+                     NLPercentileReadFunction percentileRead,
+                     Column* result)
+        : _list(list),
+        _listRead(listRead),
+        _percentile(percentile),
+        _percentileRead(percentileRead),
+        _result(result)
+    {
+    }
+
+    const Column* getList() const { return _list; }
+    NLListReadFunction getListRead() const { return _listRead; }
+    const Column* getPercentile() const { return _percentile; }
+    NLPercentileReadFunction getPercentileRead() const { return _percentileRead; }
+    Column* getResult() const { return _result; }
+
+private:
+    const Column* _list {nullptr};
+    NLListReadFunction _listRead {nullptr};
+    const Column* _percentile {nullptr};
+    NLPercentileReadFunction _percentileRead {nullptr};
+    Column* _result {nullptr};
+};
+
+// Row-wise list build (nl.range): row r of the result counts from row r of the start to
+// row r of the end by row r of the step, written into the query's list buffer as one
+// contiguous run. The step reads no column where the query gave none, which counts by 1.
+class NLRangeData : public NLFunctionData {
+public:
+    using Bound = NLRangeBound;
+
+    NLRangeData(Column* result,
+                NLStepBuffers* stepBuffers,
+                const Bound& start,
+                const Bound& end,
+                const Bound& step)
+        : _result(result),
+        _stepBuffers(stepBuffers),
+        _start(start),
+        _end(end),
+        _step(step)
+    {
+    }
+
+    Column* getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+    const Bound& getStart() const { return _start; }
+    const Bound& getEnd() const { return _end; }
+    const Bound& getStep() const { return _step; }
+
+private:
+    Column* _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+    Bound _start;
+    Bound _end;
+    Bound _step;
+};
+
+// nl.list_slice data: the per-row read of the run of a list its bounds span. Holds the
+// list column with the read telling an absent cell from a list, each bound with the read
+// its column shape takes - absent where the query gave none - and the column of views the
+// step fills. The elements are the ones the list holds, so nothing is copied.
+class NLListSliceData : public NLFunctionData {
+public:
+    using Bound = NLRangeBound;
+
+    NLListSliceData(const Column* list,
+                    NLListReadFunction listRead,
+                    const Bound& from,
+                    const Bound& to,
+                    Column* result)
+        : _list(list),
+        _listRead(listRead),
+        _from(from),
+        _to(to),
+        _result(result)
+    {
+    }
+
+    const Column* getList() const { return _list; }
+    NLListReadFunction getListRead() const { return _listRead; }
+    const Bound& getFrom() const { return _from; }
+    const Bound& getTo() const { return _to; }
+    Column* getResult() const { return _result; }
+
+private:
+    const Column* _list {nullptr};
+    NLListReadFunction _listRead {nullptr};
+    Bound _from;
+    Bound _to;
+    Column* _result {nullptr};
+};
+
+// The run of each row's range an nl.unwind_range keeps: the slice bounds, absent where the
+// query gave none, and whether the run is counted out backwards.
+struct NLRangeWindowBounds {
+    NLRangeBound _from;
+    NLRangeBound _to;
+    bool _reversed {false};
+};
+
+// nl.unwind_range loop data: the bounds each row is counted out by and the run of it kept,
+// the element chunk a step fills with the next integers, and the carry set gathered by the
+// row each integer came from.
+class NLUnwindRangeLoopData : public NLFunctionData {
+public:
+    using CarriedColumns = std::vector<NLCarriedColumn>;
+
+    NLUnwindRangeLoopData(const NLRangeBound& start,
+                          const NLRangeBound& end,
+                          const NLRangeBound& step,
+                          const NLRangeWindowBounds& window,
+                          Column* elementOutput)
+        : _start(start),
+        _end(end),
+        _step(step),
+        _window(window),
+        _elementOutput(elementOutput)
+    {
+    }
+
+    const NLRangeBound& getStart() const { return _start; }
+    const NLRangeBound& getEnd() const { return _end; }
+    const NLRangeBound& getStep() const { return _step; }
+    const NLRangeWindowBounds& getWindow() const { return _window; }
+    Column* getElementOutput() const { return _elementOutput; }
+
+    const CarriedColumns& carriedColumns() const { return _carriedColumns; }
+
+    void addCarriedColumn(const NLCarriedColumn& carried) {
+        _carriedColumns.push_back(carried);
+    }
+
+    ColumnVector<size_t>* getRows() { return &_rows; }
+
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    NLRangeBound _start;
+    NLRangeBound _end;
+    NLRangeBound _step;
+    NLRangeWindowBounds _window;
+    Column* _elementOutput {nullptr};
+
+    NLLimitState* _limit {nullptr};
+    CarriedColumns _carriedColumns;
+    NLStmtContainer _stmts;
+
+    ColumnVector<size_t> _rows;
+};
+
+// nl.unwind_computed loop data: what an nl.unwind's loop data holds, plus the region
+// computing the source over a run of input rows - its statements, the carried inputs it
+// reads cut to the run, and the rows of the run. The source, and how its cells unwind, are
+// only known once the region is translated. The carried columns are gathered from the
+// whole input chunk, whose rows @param input holds.
+class NLUnwindComputedLoopData : public NLFunctionData {
+public:
+    using CarriedColumns = std::vector<NLCarriedColumn>;
+
+    explicit NLUnwindComputedLoopData(const Column* input)
+        : _input(input)
+    {
+    }
+
+    // @param elementEmit and @param elementOutput are null when the source's cells are
+    // themselves the elements, as on NLUnwindLoopData; they are then gathered through
+    // @param elementCell, which is null where nothing reads them.
+    void setSource(const Column* source,
+                   NLUnwindElementCountFunction elementCount,
+                   NLUnwindElementEmitFunction elementEmit,
+                   Column* elementOutput,
+                   const NLCarriedColumn* elementCell) {
+        _source = source;
+        _elementCount = elementCount;
+        _elementEmit = elementEmit;
+        _elementOutput = elementOutput;
+
+        if (elementCell) {
+            _elementCell.emplace(*elementCell);
+        }
+    }
+
+    size_t getInputRows() const { return _input->size(); }
+    const Column* getSource() const { return _source; }
+    NLUnwindElementCountFunction getElementCountFunc() const { return _elementCount; }
+    NLUnwindElementEmitFunction getElementEmitFunc() const { return _elementEmit; }
+    Column* getElementOutput() const { return _elementOutput; }
+    const NLCarriedColumn* getElementCell() const { return _elementCell ? &*_elementCell : nullptr; }
+
+    const CarriedColumns& sourceArguments() const { return _sourceArguments; }
+
+    void addSourceArgument(const NLCarriedColumn& argument) {
+        _sourceArguments.push_back(argument);
+    }
+
+    const CarriedColumns& carriedColumns() const { return _carriedColumns; }
+
+    void addCarriedColumn(const NLCarriedColumn& carried) {
+        _carriedColumns.push_back(carried);
+    }
+
+    ColumnVector<size_t>* getRunRows() { return &_runRows; }
+    ColumnVector<size_t>* getRows() { return &_rows; }
+    ColumnVector<size_t>* getPositions() { return &_positions; }
+
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getSourceStmts() { return &_sourceStmts; }
+    const NLStmtContainer* getSourceStmts() const { return &_sourceStmts; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    const Column* _input {nullptr};
+    const Column* _source {nullptr};
+    NLUnwindElementCountFunction _elementCount {nullptr};
+    NLUnwindElementEmitFunction _elementEmit {nullptr};
+    Column* _elementOutput {nullptr};
+    std::optional<NLCarriedColumn> _elementCell;
+
+    NLLimitState* _limit {nullptr};
+    CarriedColumns _sourceArguments;
+    CarriedColumns _carriedColumns;
+    NLStmtContainer _sourceStmts;
+    NLStmtContainer _stmts;
+
+    ColumnVector<size_t> _runRows;
+    ColumnVector<size_t> _rows;
+    ColumnVector<size_t> _positions;
+};
+
+// What an op computing over the elements of one row's list holds - nl.list_comprehension
+// and nl.list_predicate. The source column with the handler counting the elements each
+// of its cells contributes, the drain filling the element chunk from them and the one
+// telling a cell holding no list from an empty one; the carry set gathered by each
+// element's source row - the same NLCarriedColumn shape the unwind loop uses; the body
+// computing over the elements; and what that body ends on, the row each element came
+// from and the value it contributes. The scratch columns hold, per element of the current
+// chunk, the source row it came from and the position of the element inside that row's
+// cell; the row tag column holds that same row for the body to cut alongside the elements.
+class NLElementBodyData : public NLFunctionData {
+public:
+    using CarriedColumns = std::vector<NLCarriedColumn>;
+
+    // @param elementEmit and @param elementOutput are null when the source's cells are
+    // themselves the elements, exactly as on NLUnwindLoopData.
+    NLElementBodyData(const Column* source,
+                      NLUnwindElementCountFunction elementCount,
+                      NLUnwindElementEmitFunction elementEmit,
+                      NLCellAbsentFunction cellAbsent,
+                      Column* elementOutput,
+                      ColumnVector<uint64_t>* rowTags)
+        : _source(source),
+        _elementCount(elementCount),
+        _elementEmit(elementEmit),
+        _cellAbsent(cellAbsent),
+        _elementOutput(elementOutput),
+        _rowTags(rowTags)
+    {
+    }
+
+    const Column* getSource() const { return _source; }
+    NLUnwindElementCountFunction getElementCountFunc() const { return _elementCount; }
+    NLUnwindElementEmitFunction getElementEmitFunc() const { return _elementEmit; }
+    NLCellAbsentFunction getCellAbsentFunc() const { return _cellAbsent; }
+    Column* getElementOutput() const { return _elementOutput; }
+    ColumnVector<uint64_t>* getRowTags() const { return _rowTags; }
+
+    const CarriedColumns& carriedColumns() const { return _carriedColumns; }
+
+    void addCarriedColumn(const NLCarriedColumn& carried) {
+        _carriedColumns.push_back(carried);
+    }
+
+    const Column* getYieldedRowTags() const { return _yieldedRowTags; }
+    const Column* getValue() const { return _value; }
+
+    void setYield(const Column* yieldedRowTags, const Column* value) {
+        _yieldedRowTags = yieldedRowTags;
+        _value = value;
+    }
+
+    ColumnVector<size_t>* getRows() { return &_rows; }
+    ColumnVector<size_t>* getPositions() { return &_positions; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    const Column* _source {nullptr};
+    NLUnwindElementCountFunction _elementCount {nullptr};
+    NLUnwindElementEmitFunction _elementEmit {nullptr};
+    NLCellAbsentFunction _cellAbsent {nullptr};
+    Column* _elementOutput {nullptr};
+    ColumnVector<uint64_t>* _rowTags {nullptr};
+
+    const Column* _yieldedRowTags {nullptr};
+    const Column* _value {nullptr};
+
+    CarriedColumns _carriedColumns;
+    NLStmtContainer _stmts;
+
+    ColumnVector<size_t> _rows;
+    ColumnVector<size_t> _positions;
+};
+
+// nl.list_comprehension data: the per-row list build of `[x IN xs WHERE p(x) | f(x)]`.
+// The value each element contributes is read under the read its column shape takes; the
+// staged elements and their per-row counts hold what the whole step gathered, which the
+// lists are built from once every element has been seen.
+class NLListComprehensionData : public NLElementBodyData {
+public:
+    NLListComprehensionData(const Column* source,
+                            NLUnwindElementCountFunction elementCount,
+                            NLUnwindElementEmitFunction elementEmit,
+                            NLCellAbsentFunction cellAbsent,
+                            Column* elementOutput,
+                            ColumnVector<uint64_t>* rowTags,
+                            Column* result,
+                            NLStepBuffers* stepBuffers)
+        : NLElementBodyData(source, elementCount, elementEmit, cellAbsent, elementOutput, rowTags),
+        _result(result),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    Column* getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+    NLListItemReadFunction getValueRead() const { return _valueRead; }
+    void setValueRead(NLListItemReadFunction valueRead) { _valueRead = valueRead; }
+
+    std::vector<ListBuffer<>::ListItemVariant>& stagedElements() { return _stagedElements; }
+
+    // The copies of the staged elements, which the body's later runs would otherwise empty
+    // the buffers of
+    NLValueStore& stagedValues() { return _stagedValues; }
+    std::vector<size_t>& stagedCounts() { return _stagedCounts; }
+
+private:
+    Column* _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+    NLListItemReadFunction _valueRead {nullptr};
+
+    std::vector<ListBuffer<>::ListItemVariant> _stagedElements;
+    NLValueStore _stagedValues;
+    std::vector<size_t> _stagedCounts;
+};
+
+// How many elements of a list a predicate must hold for; the interpreter-side
+// counterpart of the MLIR storage::ListPredicateKind, which the translator maps onto this
+enum class ListPredicateKind {
+    All,
+    Any,
+    None,
+    Single,
+};
+
+// The truth value one element's predicate holds, absent where it is null
+using NLTruthReadFunction = std::optional<bool> (*)(const Column* mask, size_t row);
+
+// nl.list_predicate data: the per-row decision of `all(x IN xs WHERE p(x))` and its
+// siblings. Each element's truth value is read off the yielded mask and tallied into the
+// counts of its row, which decide the row once every element has been seen; the result
+// is a nullable mask.
+class NLListPredicateData : public NLElementBodyData {
+public:
+    NLListPredicateData(const Column* source,
+                        NLUnwindElementCountFunction elementCount,
+                        NLUnwindElementEmitFunction elementEmit,
+                        NLCellAbsentFunction cellAbsent,
+                        Column* elementOutput,
+                        ColumnVector<uint64_t>* rowTags,
+                        Column* result,
+                        ListPredicateKind kind)
+        : NLElementBodyData(source, elementCount, elementEmit, cellAbsent, elementOutput, rowTags),
+        _result(result),
+        _kind(kind)
+    {
+    }
+
+    Column* getResult() const { return _result; }
+    ListPredicateKind getKind() const { return _kind; }
+
+    NLTruthReadFunction getTruthRead() const { return _truthRead; }
+    void setTruthRead(NLTruthReadFunction truthRead) { _truthRead = truthRead; }
+
+    std::vector<size_t>& trueCounts() { return _trueCounts; }
+    std::vector<size_t>& falseCounts() { return _falseCounts; }
+    std::vector<size_t>& nullCounts() { return _nullCounts; }
+
+private:
+    Column* _result {nullptr};
+    ListPredicateKind _kind {ListPredicateKind::All};
+    NLTruthReadFunction _truthRead {nullptr};
+
+    std::vector<size_t> _trueCounts;
+    std::vector<size_t> _falseCounts;
+    std::vector<size_t> _nullCounts;
+};
+
+// nl.reduce data: the per-row fold of `reduce(acc = init, x IN xs | f(acc, x))`. The
+// result column is the accumulator: it is reset, takes the initial value of each row whose
+// source cell holds a list, then the body's value once per element. The body runs once
+// per element position over the rows whose list reaches it; the carried columns gather
+// those rows' cells of the accumulator, of the source where its cells are the elements,
+// and of the carry set.
+class NLReduceData : public NLFunctionData {
+public:
+    using CarriedColumns = std::vector<NLCarriedColumn>;
+
+    NLReduceData(const Column* source,
+                 NLUnwindElementCountFunction elementCount,
+                 NLUnwindElementEmitFunction elementEmit,
+                 NLCellAbsentFunction cellAbsent,
+                 Column* elementOutput,
+                 const Column* initialValue,
+                 Column* result,
+                 NLStepBuffers* stepBuffers)
+        : _source(source),
+        _elementCount(elementCount),
+        _elementEmit(elementEmit),
+        _cellAbsent(cellAbsent),
+        _elementOutput(elementOutput),
+        _initialValue(initialValue),
+        _result(result),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    const Column* getSource() const { return _source; }
+    NLUnwindElementCountFunction getElementCountFunc() const { return _elementCount; }
+    NLUnwindElementEmitFunction getElementEmitFunc() const { return _elementEmit; }
+    NLCellAbsentFunction getCellAbsentFunc() const { return _cellAbsent; }
+    Column* getElementOutput() const { return _elementOutput; }
+    const Column* getInitialValue() const { return _initialValue; }
+    Column* getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+    const CarriedColumns& carriedColumns() const { return _carriedColumns; }
+
+    void addCarriedColumn(const NLCarriedColumn& carried) {
+        _carriedColumns.push_back(carried);
+    }
+
+    const Column* getValue() const { return _value; }
+    void setValue(const Column* value) { _value = value; }
+
+    NLCaseResetFn getReset() const { return _reset; }
+    void setReset(NLCaseResetFn reset) { _reset = reset; }
+
+    const NLCellWrite& getInitialWrite() const { return _initialWrite; }
+    const NLCellWrite& getValueWrite() const { return _valueWrite; }
+
+    void setWrites(const NLCellWrite& initialWrite, const NLCellWrite& valueWrite) {
+        _initialWrite = initialWrite;
+        _valueWrite = valueWrite;
+    }
+
+    ColumnVector<size_t>* getRows() { return &_rows; }
+    ColumnVector<size_t>* getPositions() { return &_positions; }
+
+    std::vector<size_t>& elementCounts() { return _elementCounts; }
+    std::vector<size_t>& reachingRows() { return _reachingRows; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+    // The accumulators, copied in as they are written: the body computing the next one
+    // empties the buffers the last one was built in. A tagged cell is built owned, so only
+    // a typed accumulator of views has its written rows copied.
+    NLCompactingValueStore& accumulatorValues() { return _accumulatorValues; }
+    NLReownFunction getReown() const { return _reown; }
+    NLReownRowsFunction getReownRows() const { return _reownRows; }
+
+    void setReowns(NLReownFunction reown, NLReownRowsFunction reownRows) {
+        _reown = reown;
+        _reownRows = reownRows;
+    }
+
+private:
+    const Column* _source {nullptr};
+    NLUnwindElementCountFunction _elementCount {nullptr};
+    NLUnwindElementEmitFunction _elementEmit {nullptr};
+    NLCellAbsentFunction _cellAbsent {nullptr};
+    Column* _elementOutput {nullptr};
+    const Column* _initialValue {nullptr};
+    Column* _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+    const Column* _value {nullptr};
+    NLCaseResetFn _reset {nullptr};
+    NLCellWrite _initialWrite;
+    NLCellWrite _valueWrite;
+    NLCompactingValueStore _accumulatorValues;
+    NLReownFunction _reown {nullptr};
+    NLReownRowsFunction _reownRows {nullptr};
+
+    CarriedColumns _carriedColumns;
+    NLStmtContainer _stmts;
+
+    ColumnVector<size_t> _rows;
+    ColumnVector<size_t> _positions;
+    std::vector<size_t> _elementCounts;
+    std::vector<size_t> _reachingRows;
+};
+
+using NLUnaryFunctionKernel = void (*)(NLExecutionContext* context,
+                                       Column* result,
+                                       const Column* input,
+                                       NLStepBuffers* stepBuffers);
+
+class NLUnaryFunctionData : public NLFunctionData {
+public:
+    NLUnaryFunctionData(const Column* input,
+                        Column* result,
+                        NLUnaryFunctionKernel kernel,
+                        NLStepBuffers* stepBuffers)
+        : _input(input),
+        _result(result),
+        _kernel(kernel),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    const Column* getInput() const { return _input; }
+    Column* getResult() const { return _result; }
+    NLUnaryFunctionKernel getKernel() const { return _kernel; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+private:
+    const Column* _input {nullptr};
+    Column* _result {nullptr};
+    NLUnaryFunctionKernel _kernel {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+};
+
+// Type of handle that fills a column with a run of null rows - for an ID column an
+// invalid ID, which is how an entity a pattern did not match is spelled. One per column
+// kind, selected during translation the way the gather and append families are.
+using NLFillNullFunction = void (*)(Column* output, size_t rowCount);
+
+// nl.to_nullable data for the null literal's chunk: the result holds one absent value per
+// row of the chunk the null was laid out over, in the type the result's own chunk names
+class NLFillNullData : public NLFunctionData {
+public:
+    NLFillNullData(const Column* rows, Column* output, NLFillNullFunction fill)
+        : _rows(rows),
+        _output(output),
+        _fill(fill)
+    {
+    }
+
+    const Column* getRows() const { return _rows; }
+    Column* getOutput() const { return _output; }
+    NLFillNullFunction getFill() const { return _fill; }
+
+private:
+    const Column* _rows {nullptr};
+    Column* _output {nullptr};
+    NLFillNullFunction _fill {nullptr};
+};
+
+// Runtime state of one OPTIONAL MATCH over one step of the rows its pattern joins onto:
+// that step's own chunks, a matched flag per row of them, and the buffers the matched rows
+// are collected into. The sibling of NLSortState, except that it covers one step rather
+// than the whole relation, so the memory it holds is one step's matches.
+class NLOptionalState {
+public:
+    // One chunk of the step the pattern joins onto, in the order the pattern yields them
+    // back; borrowed, since they are the enclosing loop's own variables.
+    void addInputColumn(const Column* input) { _inputColumns.push_back(input); }
+
+    // One buffer per column the pattern contributes, in yield order.
+    void addMatchedBuffer(Column* buffer) { _buffers.push_back(buffer); }
+
+    const std::vector<const Column*>& inputColumns() const { return _inputColumns; }
+    const std::vector<Column*>& buffers() const { return _buffers; }
+
+    // The rows this step joins onto: the input chunks' row count, and one - the single
+    // empty row a query opening on OPTIONAL MATCH starts from - when there are none.
+    size_t getRowCount() const;
+
+    // The rows the pattern matched, read from the first buffer as a sort reads its own.
+    size_t getMatchedRowCount() const;
+
+    // Empty the buffers and clear every matched flag, so the accumulator covers this step
+    // alone. Runs each time nl.optional_buffer's block runs.
+    void reset();
+
+    void markMatched(size_t row) {
+        bioassert(row < _matched.size(), "Row tag {} is outside the {} rows of the step", row, _matched.size());
+        _matched[row] = true;
+    }
+
+    // The input rows nothing matched, in order. Computed on the first call of a step, so
+    // the drain pays for the sweep once however many chunks it emits.
+    const ColumnVector<size_t>& missedRows();
+
+    // The values the buffers hold, copied in as NLSortState::values' are
+    NLValueStore& values() { return _values; }
+
+private:
+    std::vector<const Column*> _inputColumns;
+    std::vector<Column*> _buffers;
+    NLValueStore _values;
+
+    // One flag per row of this step's input chunks, cleared by the reset and set by the
+    // collect through the row tag.
+    std::vector<bool> _matched;
+
+    ColumnVector<size_t> _missedRows;
+    bool _swept {false};
+};
+
+// nl.optional_buffer data: empties an accumulator and lays the row tag out over this
+// step's input rows, each time the block it lives in runs.
+class NLOptionalResetData : public NLFunctionData {
+public:
+    NLOptionalResetData(NLOptionalState* state, ColumnVector<uint64_t>* tag)
+        : _state(state),
+        _tag(tag)
+    {
+    }
+
+    NLOptionalState* getState() const { return _state; }
+    ColumnVector<uint64_t>* getTag() const { return _tag; }
+
+private:
+    NLOptionalState* _state {nullptr};
+    ColumnVector<uint64_t>* _tag {nullptr};
+};
+
+// nl.optional_collect data: appends the current chunk of every column the pattern
+// contributes to the matching buffer, and marks the input rows the tag names. Each entry
+// pairs the pattern's chunk with the buffer it grows and the append that copies one into
+// the other, as nl.sort_collect's do.
+class NLOptionalCollectData : public NLFunctionData {
+public:
+    NLOptionalCollectData(NLOptionalState* state)
+        : _state(state)
+    {
+    }
+
+    NLOptionalState* getState() const { return _state; }
+
+    // Null when the accumulator has no input column: the step is then the single empty
+    // row, which any collected row marks.
+    const ColumnVector<uint64_t>* getTag() const { return _tag; }
+    void setTag(const ColumnVector<uint64_t>* tag) { _tag = tag; }
+
+    const std::vector<NLSortCollectData::Append>& appends() const { return _appends; }
+
+    void addAppend(const NLSortCollectData::Append& append) { _appends.push_back(append); }
+
+private:
+    NLOptionalState* _state {nullptr};
+    const ColumnVector<uint64_t>* _tag {nullptr};
+    std::vector<NLSortCollectData::Append> _appends;
+};
+
+// Runtime state of one pattern comprehension or COLLECT subquery over one step of the rows
+// it is read on: how many rows that step has, and what its body's rows contributed to each
+// of them. The list-valued sibling of NLOptionalState - both cover one step rather than the
+// whole relation - except that it reduces what the body found to one cell per row instead
+// of re-emitting it as rows.
+class NLRowListsState {
+public:
+    // Drop what the last step staged and size the accumulator to this one. Runs each time
+    // nl.row_lists_buffer's block runs.
+    void reset(size_t rowCount);
+
+    void stage(size_t row, const ListBuffer<>::ListItemVariant& value);
+
+    // One list per row of the step, in row order, built into @param lists: the values that
+    // row's body rows staged, and the empty list for a row the body produced none for.
+    void buildLists(ListBuffer<>& listBuffer, std::vector<ListView>& lists);
+
+private:
+    size_t _rowCount {0};
+
+    // What the body's rows contributed and, row-aligned with it, the row each value belongs
+    // to: they are staged in the order the body walked them, which is not the rows'.
+    std::vector<ListBuffer<>::ListItemVariant> _values;
+    std::vector<size_t> _rows;
+
+    // The copies of the staged values, which the body's later steps would otherwise empty
+    // the buffers of
+    NLValueStore _stagedValues;
+
+    // The values under the row they belong to, where each row's run of them starts and how
+    // far that run has been filled: held here so a step pays for the buffers once rather
+    // than once per build.
+    std::vector<ListBuffer<>::ListItemVariant> _ordered;
+    std::vector<size_t> _starts;
+    std::vector<size_t> _next;
+};
+
+// nl.row_lists_buffer data: empties an accumulator and lays the row tag out over this
+// step's rows, each time the block it lives in runs. The cardinality column is null where
+// nothing is in flight, which is the single empty row.
+class NLRowListsResetData : public NLFunctionData {
+public:
+    NLRowListsResetData(NLRowListsState* state,
+                        const Column* cardinality,
+                        ColumnVector<uint64_t>* tag)
+        : _state(state),
+        _cardinality(cardinality),
+        _tag(tag)
+    {
+    }
+
+    NLRowListsState* getState() const { return _state; }
+    const Column* getCardinality() const { return _cardinality; }
+    ColumnVector<uint64_t>* getTag() const { return _tag; }
+
+private:
+    NLRowListsState* _state {nullptr};
+    const Column* _cardinality {nullptr};
+    ColumnVector<uint64_t>* _tag {nullptr};
+};
+
+// nl.row_lists_collect data: stages what this step of the body's rows contributes, each
+// value under the row its tag names, through the read its column shape takes. The tag is
+// null when the accumulator covers a single row.
+class NLRowListsCollectData : public NLFunctionData {
+public:
+    NLRowListsCollectData(NLRowListsState* state,
+                          const ColumnVector<uint64_t>* tag,
+                          const Column* value,
+                          NLListItemReadFunction valueRead,
+                          NLStepBuffers* stepBuffers)
+        : _state(state),
+        _tag(tag),
+        _value(value),
+        _valueRead(valueRead),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    NLRowListsState* getState() const { return _state; }
+    const ColumnVector<uint64_t>* getTag() const { return _tag; }
+    const Column* getValue() const { return _value; }
+    NLListItemReadFunction getValueRead() const { return _valueRead; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+private:
+    NLRowListsState* _state {nullptr};
+    const ColumnVector<uint64_t>* _tag {nullptr};
+    const Column* _value {nullptr};
+    NLListItemReadFunction _valueRead {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+};
+
+// nl.row_lists_result data: the build phase, writing one list per row of the step into
+// the result column once the body's nest has been walked.
+class NLRowListsResultData : public NLFunctionData {
+public:
+    NLRowListsResultData(NLRowListsState* state,
+                         ColumnVector<ListView>* result,
+                         NLStepBuffers* stepBuffers)
+        : _state(state),
+        _result(result),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    NLRowListsState* getState() const { return _state; }
+    ColumnVector<ListView>* getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+private:
+    NLRowListsState* _state {nullptr};
+    ColumnVector<ListView>* _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+};
+
+// nl.for over nl.optional_drain data: the emit phase of an OPTIONAL MATCH. Holds the
+// accumulator and, per column, the buffer the matched rows are read from, the input chunk
+// a missed row's value is read from - null for a column the pattern binds, which a missed
+// row has no value for - the loop variable to fill, and the gather and null fill that
+// write it. The indices scratch holds the row slice of the current emit step.
+class NLOptionalDrainLoopData : public NLFunctionData {
+public:
+    struct DrainColumn {
+        const Column* _buffer {nullptr};
+        const Column* _input {nullptr};
+        Column* _output {nullptr};
+        NLGatherFunction _gather {nullptr};
+        NLFillNullFunction _fillNull {nullptr};
+    };
+
+    NLOptionalDrainLoopData(NLOptionalState* state)
+        : _state(state)
+    {
+    }
+
+    NLOptionalState* getState() const { return _state; }
+
+    const std::vector<DrainColumn>& columns() const { return _columns; }
+
+    void addColumn(const DrainColumn& column) { _columns.push_back(column); }
+
+    ColumnVector<size_t>* getIndices() { return &_indices; }
+
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    NLOptionalState* _state {nullptr};
+    NLLimitState* _limit {nullptr};
+    std::vector<DrainColumn> _columns;
+    ColumnVector<size_t> _indices;
+    NLStmtContainer _stmts;
+};
+
+// Runtime state of one EXISTS or COUNT subquery over one step of the rows it answers for
+class NLSubqueryExpressionState {
+public:
+    virtual ~NLSubqueryExpressionState();
+
+    // One chunk of the step the subquery answers for; borrowed, since they are the
+    // enclosing loop's own variables.
+    void addInputColumn(const Column* input) { _inputColumns.push_back(input); }
+
+    // The rows this step answers for: the input chunks' row count, and one - the single
+    // empty row a subquery over nothing in flight joins onto - when there are none.
+    size_t getRowCount() const;
+
+    // Clear every answer, so the accumulator covers this step alone. Runs each time the
+    // buffer's block runs.
+    virtual void reset() = 0;
+
+private:
+    std::vector<const Column*> _inputColumns;
+};
+
+class NLExistsState : public NLSubqueryExpressionState {
+public:
+    void reset() override;
+
+    void markMatched(size_t row) {
+        bioassert(row < _matched.size(), "Row tag {} is outside the {} rows of the step", row, _matched.size());
+        _matched[row] = true;
+    }
+
+    const std::vector<bool>& matched() const { return _matched; }
+
+private:
+    // One flag per row of this step's input chunks, cleared by the reset and set by the
+    // mark through the row tag.
+    std::vector<bool> _matched;
+};
+
+// nl.exists_buffer and nl.count_subquery_buffer data: empties an accumulator and lays the
+// row tag out over this step's input rows, each time the block it lives in runs.
+class NLSubqueryExpressionResetData : public NLFunctionData {
+public:
+    NLSubqueryExpressionResetData(NLSubqueryExpressionState* state, ColumnVector<uint64_t>* tag);
+
+    NLSubqueryExpressionState* getState() const { return _state; }
+    ColumnVector<uint64_t>* getTag() const { return _tag; }
+
+private:
+    NLSubqueryExpressionState* _state {nullptr};
+    ColumnVector<uint64_t>* _tag {nullptr};
+};
+
+// nl.exists_mark data: marks the input rows the tag names. An accumulator with no input
+// column is answered for by the columns instead: the step is the single empty row, which
+// this step's rows mark when they hold one at all.
+class NLExistsMarkData : public NLFunctionData {
+public:
+    NLExistsMarkData(NLExistsState* state)
+        : _state(state)
+    {
+    }
+
+    NLExistsState* getState() const { return _state; }
+
+    const ColumnVector<uint64_t>* getTag() const { return _tag; }
+    void setTag(const ColumnVector<uint64_t>* tag) { _tag = tag; }
+
+    const std::vector<const Column*>& columns() const { return _columns; }
+
+    void addColumn(const Column* column) { _columns.push_back(column); }
+
+private:
+    NLExistsState* _state {nullptr};
+    const ColumnVector<uint64_t>* _tag {nullptr};
+    std::vector<const Column*> _columns;
+};
+
+// nl.exists_result data: lays the accumulator's flags out as the boolean chunk the EXISTS
+// stands for, row-aligned with the chunks the accumulator was opened over.
+class NLExistsResultData : public NLFunctionData {
+public:
+    NLExistsResultData(NLExistsState* state, ColumnMask* result)
+        : _state(state),
+        _result(result)
+    {
+    }
+
+    NLExistsState* getState() const { return _state; }
+    ColumnMask* getResult() const { return _result; }
+
+private:
+    NLExistsState* _state {nullptr};
+    ColumnMask* _result {nullptr};
+};
+
+// A count per row of the step
+class NLCountSubqueryState : public NLSubqueryExpressionState {
+public:
+    void reset() override;
+
+    void addRows(size_t rowCount);
+    void addTaggedRows(std::span<const uint64_t> tag);
+
+    const std::vector<uint64_t>& getCounts() const { return _counts; }
+
+private:
+    std::vector<uint64_t> _counts;
+};
+
+// nl.count_subquery_tally data: counts the entries of the tag toward the rows they name,
+// or, with no tag, the rows of @param rows toward the single row the step answers for
+class NLCountSubqueryTallyData : public NLFunctionData {
+public:
+    NLCountSubqueryTallyData(NLCountSubqueryState* state, const ColumnVector<uint64_t>* tag, const Column* rows);
+
+    NLCountSubqueryState* getState() const { return _state; }
+    const ColumnVector<uint64_t>* getTag() const { return _tag; }
+    const Column* getRows() const { return _rows; }
+
+private:
+    NLCountSubqueryState* _state {nullptr};
+    const ColumnVector<uint64_t>* _tag {nullptr};
+    const Column* _rows {nullptr};
+};
+
+class NLCountSubqueryResultData : public NLFunctionData {
+public:
+    NLCountSubqueryResultData(NLCountSubqueryState* state, ColumnVector<uint64_t>* result);
+
+    NLCountSubqueryState* getState() const { return _state; }
+    ColumnVector<uint64_t>* getResult() const { return _result; }
+
+private:
+    NLCountSubqueryState* _state {nullptr};
+    ColumnVector<uint64_t>* _result {nullptr};
+};
+
+// Runtime state of one row accumulator: one growing buffer per column, which every
+// nl.row_collect appends to and each nl.for over an nl.row_drain reads back in collected
+// order. The buffer columns are borrowed: the translator pool-allocates
+// them in the same arena as the loop columns.
+class NLRowState {
+public:
+    void addBuffer(Column* buffer) { _buffers.push_back(buffer); }
+
+    const std::vector<Column*>& buffers() const { return _buffers; }
+    Column* buffer(size_t index) const { return _buffers[index]; }
+
+    size_t getRowCount() const;
+
+    // Clear every buffer; runs each time nl.row_buffer's block runs
+    void reset();
+
+    // The values the buffers hold, copied in as NLSortState::values' are
+    NLValueStore& values() { return _values; }
+
+private:
+    std::vector<Column*> _buffers;
+    NLValueStore _values;
+};
+
+// nl.row_buffer data: resets an accumulator to empty each time its block runs
+class NLRowResetData : public NLFunctionData {
+public:
+    NLRowResetData(NLRowState* state)
+        : _state(state)
+    {
+    }
+
+    NLRowState* getState() const { return _state; }
+
+private:
+    NLRowState* _state {nullptr};
+};
+
+// nl.row_collect data: appends the current chunk of every column to the matching buffer
+// of the accumulator, in NLSortCollectData's append shape
+class NLRowCollectData : public NLFunctionData {
+public:
+    NLRowCollectData(NLRowState* state)
+        : _state(state)
+    {
+    }
+
+    NLRowState* getState() const { return _state; }
+
+    const std::vector<NLSortCollectData::Append>& appends() const { return _appends; }
+
+    void addAppend(const NLSortCollectData::Append& append) {
+        _appends.push_back(append);
+    }
+
+private:
+    NLRowState* _state {nullptr};
+    std::vector<NLSortCollectData::Append> _appends;
+};
+
+// nl.for over nl.row_drain data: the emit phase of a row accumulator, which gathers the
+// collected rows chunk by chunk into the loop variables
+class NLRowLoopData : public NLFunctionData {
+public:
+    NLRowLoopData(NLRowState* state)
+        : _state(state)
+    {
+    }
+
+    NLRowState* getState() const { return _state; }
+
+    const std::vector<NLCarriedColumn>& columns() const { return _columns; }
+
+    void addColumn(const NLCarriedColumn& column) {
+        _columns.push_back(column);
+    }
+
+    ColumnVector<size_t>* getIndices() { return &_indices; }
+
+    NLLimitState* getLimit() const { return _limit; }
+    void setLimit(NLLimitState* limit) { _limit = limit; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+private:
+    NLRowState* _state {nullptr};
+    NLLimitState* _limit {nullptr};
+    std::vector<NLCarriedColumn> _columns;
+    ColumnVector<size_t> _indices;
+    NLStmtContainer _stmts;
+};
+
+class NLProgram {
+public:
+    NLProgram();
+    ~NLProgram();
+
+    NLProgram(const NLProgram&) = delete;
+    NLProgram& operator=(const NLProgram&) = delete;
+
+    template <typename DataType, typename... Args>
+    DataType* allocFunctionData(Args... args) {
+        auto data = std::make_unique<DataType>(args...);
+        DataType* dataPtr = data.get();
+        _functionData.push_back(std::move(data));
+        return dataPtr;
+    }
+
+    // Allocate the buffers one op builds a run's values in, owned by the program
+    NLStepBuffers* allocStepBuffers() {
+        _stepBuffers.push_back(std::make_unique<NLStepBuffers>());
+        return _stepBuffers.back().get();
+    }
+
+    // Allocate one LIMIT's runtime counter, owned by the program; the
+    // statements that reset, charge and read it hold a borrowed pointer.
+    NLLimitState* allocLimitState() {
+        auto state = std::make_unique<NLLimitState>();
+        NLLimitState* statePtr = state.get();
+        _limitStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // Allocate one SKIP's runtime counter, owned by the program; the statements
+    // that reset, charge and read it hold a borrowed pointer. The skip sibling
+    // of allocLimitState.
+    NLSkipState* allocSkipState() {
+        auto state = std::make_unique<NLSkipState>();
+        NLSkipState* statePtr = state.get();
+        _skipStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // Allocate one ORDER BY's runtime accumulator, owned by the program; the
+    // collect, reset and emit statements that share it hold a borrowed pointer.
+    NLSortState* allocSortState() {
+        auto state = std::make_unique<NLSortState>();
+        NLSortState* statePtr = state.get();
+        _sortStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // Allocate one DISTINCT's runtime seen-set, owned by the program; the reset
+    // and filter statements that share it hold a borrowed pointer. The distinct
+    // sibling of allocSortState.
+    NLDistinctState* allocDistinctState() {
+        auto state = std::make_unique<NLDistinctState>();
+        NLDistinctState* statePtr = state.get();
+        _distinctStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // Allocate one hash join's runtime build side, owned by the program; the reset,
+    // collect and probe statements that share it hold a borrowed pointer. The joining
+    // sibling of allocSortState.
+    NLHashJoinState* allocHashJoinState() {
+        auto state = std::make_unique<NLHashJoinState>();
+        NLHashJoinState* statePtr = state.get();
+        _hashJoinStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // Allocate one COUNT's runtime tally, owned by the program; the reset, update
+    // and emit statements that share it hold a borrowed pointer. The count sibling
+    // of allocSortState.
+    NLCountState* allocCountState() {
+        auto state = std::make_unique<NLCountState>();
+        NLCountState* statePtr = state.get();
+        _countStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // Allocate one aggregate's runtime accumulator, owned by the program; the
+    // reset, update and emit statements that share it hold a borrowed pointer. The
+    // value sibling of allocCountState.
+    NLAggregateState* allocAggregateState() {
+        auto state = std::make_unique<NLAggregateState>();
+        NLAggregateState* statePtr = state.get();
+        _aggregateStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // Allocate one grouped aggregation's runtime accumulator, owned by the program;
+    // the reset, update and emit statements that share it hold a borrowed pointer.
+    // The grouped sibling of allocSortState.
+    NLGroupAggregateState* allocGroupAggregateState() {
+        auto state = std::make_unique<NLGroupAggregateState>();
+        NLGroupAggregateState* statePtr = state.get();
+        _groupAggregateStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // Allocate one collect's runtime accumulator, owned by the program; the reset,
+    // update and drain statements that share it hold a borrowed pointer. The
+    // list-valued sibling of allocGroupAggregateState.
+    NLCollectState* allocCollectState() {
+        auto state = std::make_unique<NLCollectState>();
+        NLCollectState* statePtr = state.get();
+        _collectStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    NLNodeSetState* allocNodeSetState() {
+        _nodeSetStates.emplace_back(std::make_unique<NLNodeSetState>());
+
+        return _nodeSetStates.back().get();
+    }
+
+    template <SupportedType T>
+    NLShortestPathState* allocShortestPathState(ValueType valueType, PropertyTypeID propertyType) {
+        _shortestPathStates.emplace_back(
+            std::make_unique<NLShortestPathStateImpl<T>>(valueType, propertyType));
+        NLShortestPathState* ptr = _shortestPathStates.back().get();
+        return ptr;
+    }
+
+    // Allocate one CALL's runtime state, owned by the program; the statements that
+    // prepare and drive the call hold a borrowed pointer. Releasing the
+    // procedure's data is this state's business, so it outlives every statement
+    // naming it.
+    NLProcedureState* allocProcedureState(const Procedure* procedure,
+                                          ProcedureData* data,
+                                          const ProcedureContext* context) {
+        auto state = std::make_unique<NLProcedureState>(procedure, data, context);
+        NLProcedureState* statePtr = state.get();
+        _procedureStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // Allocate one OPTIONAL MATCH's runtime accumulator, owned by the program; the reset,
+    // collect and drain statements that share it hold a borrowed pointer. The pattern
+    // sibling of allocSortState.
+    NLOptionalState* allocOptionalState() {
+        auto state = std::make_unique<NLOptionalState>();
+        NLOptionalState* statePtr = state.get();
+        _optionalStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // Allocate one EXISTS's runtime accumulator, owned by the program; the reset, mark and
+    // result statements that share it hold a borrowed pointer. The semi-join sibling of
+    // allocOptionalState.
+    NLExistsState* allocExistsState() {
+        auto state = std::make_unique<NLExistsState>();
+        NLExistsState* statePtr = state.get();
+        _existsStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    NLCountSubqueryState* allocCountSubqueryState() {
+        auto state = std::make_unique<NLCountSubqueryState>();
+        NLCountSubqueryState* statePtr = state.get();
+        _countSubqueryStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // Allocate one row lists accumulator, owned by the program; the
+    // reset, collect and build statements that share it hold a borrowed pointer.
+    NLRowListsState* allocRowListsState() {
+        auto state = std::make_unique<NLRowListsState>();
+        NLRowListsState* statePtr = state.get();
+        _rowListsStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    NLRowState* allocRowState() {
+        auto state = std::make_unique<NLRowState>();
+        NLRowState* statePtr = state.get();
+        _rowStates.push_back(std::move(state));
+        return statePtr;
+    }
+
+    // The candidate index one chain-node signature already has, or a null pointer for a
+    // signature no chain node of the program has reached yet. Two nodes of the same
+    // labels and key properties look their candidates up in one index, so the label set
+    // is scanned once however many times the query merges the pattern.
+    NLMergeNodeIndex* findMergeNodeIndex(const std::string& signature) const;
+
+    // Adds the index of a signature findMergeNodeIndex found none for, owned by the
+    // program; every chain node of that signature holds a borrowed pointer.
+    NLMergeNodeIndex* addMergeNodeIndex(const std::string& signature,
+                                        const LabelSet& labels,
+                                        const LabelSet& writeLabels,
+                                        bool matchable,
+                                        ColumnNodeIDs* scanNodes);
+
+    // The log of every edge this program wrote, owned by the program and shared by all
+    // of its merges: a pending edge is what a merge's hop extends a candidate with.
+    NLMergePendingEdges* getMergePendingEdges() { return &_mergePendingEdges; }
+
+    NLStmtContainer* getStmts() { return &_stmts; }
+    const NLStmtContainer* getStmts() const { return &_stmts; }
+
+    size_t getChunkSize() const { return _chunkSize; }
+    void setChunkSize(size_t chunkSize) { _chunkSize = chunkSize; }
+
+    std::span<const std::string_view> columnNames() const { return _columnNames; }
+    void setColumnNames(std::span<const std::string_view> names);
+
+    // The output whose columns the result schema is declared from. A union emits one
+    // output per branch, all naming the same columns of the same types, so the first is
+    // the whole result's schema.
+    NLOutputData* getOutputData() const { return _outputData; }
+    void setOutputData(NLOutputData* outputData);
+
+private:
+    size_t _chunkSize {ChunkConfig::CHUNK_SIZE};
+    // The result column names nl.output carried, one per emitted column, or empty when it
+    // named none. The views point into the MLIRContext's uniqued attribute storage, which
+    // outlives the module the names were read from.
+    std::vector<std::string_view> _columnNames;
+    // The first output statement's payload, owned by _functionData; null for a program
+    // that emits nothing.
+    NLOutputData* _outputData {nullptr};
+    std::vector<std::unique_ptr<NLFunctionData>> _functionData;
+    std::vector<std::unique_ptr<NLStepBuffers>> _stepBuffers;
+    std::vector<std::unique_ptr<NLLimitState>> _limitStates;
+    std::vector<std::unique_ptr<NLSkipState>> _skipStates;
+    std::vector<std::unique_ptr<NLSortState>> _sortStates;
+    std::vector<std::unique_ptr<NLHashJoinState>> _hashJoinStates;
+    std::vector<std::unique_ptr<NLDistinctState>> _distinctStates;
+    std::vector<std::unique_ptr<NLCountState>> _countStates;
+    std::vector<std::unique_ptr<NLAggregateState>> _aggregateStates;
+    std::vector<std::unique_ptr<NLGroupAggregateState>> _groupAggregateStates;
+    std::vector<std::unique_ptr<NLCollectState>> _collectStates;
+    std::vector<std::unique_ptr<NLNodeSetState>> _nodeSetStates;
+    std::vector<std::unique_ptr<NLShortestPathState>> _shortestPathStates;
+    std::vector<std::unique_ptr<NLOptionalState>> _optionalStates;
+    std::vector<std::unique_ptr<NLExistsState>> _existsStates;
+    std::vector<std::unique_ptr<NLCountSubqueryState>> _countSubqueryStates;
+    std::vector<std::unique_ptr<NLRowListsState>> _rowListsStates;
+    std::vector<std::unique_ptr<NLRowState>> _rowStates;
+    std::vector<std::unique_ptr<NLProcedureState>> _procedureStates;
+    std::unordered_map<std::string, std::unique_ptr<NLMergeNodeIndex>> _mergeNodeIndexes;
+    NLMergePendingEdges _mergePendingEdges;
+    NLStmtContainer _stmts;
+};
+
+}

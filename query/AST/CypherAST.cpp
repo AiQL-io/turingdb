@@ -1,10 +1,15 @@
 #include "CypherAST.h"
 
+#include <algorithm>
+
+#include "BioAssert.h"
 #include "DiagnosticsManager.h"
 #include "SourceManager.h"
 #include "FunctionInvocation.h"
+#include "Parameter.h"
 #include "Symbol.h"
 #include "SymbolChain.h"
+#include "LabelExpr.h"
 #include "Literal.h"
 #include "QualifiedName.h"
 #include "QuantifiedPath.h"
@@ -17,13 +22,13 @@
 #include "WhereClause.h"
 #include "YieldClause.h"
 #include "YieldItems.h"
-#include "FunctionDecls.h"
 #include "ProcedureLookup.h"
 #include "stmt/Stmt.h"
 #include "stmt/SubStmt.h"
 #include "stmt/StmtContainer.h"
 #include "stmt/OrderByItem.h"
 #include "stmt/SetItem.h"
+#include "ExplainRequest.h"
 #include "QueryCommand.h"
 #include "decl/DeclContext.h"
 #include "decl/VarDecl.h"
@@ -35,14 +40,25 @@ CypherAST::CypherAST(const ProcedureManager* procedures,
                      std::string_view queryString)
     : _sourceManager(new SourceManager(queryString)),
     _diagnosticsManager(new DiagnosticsManager(_sourceManager)),
-    _functionDecls(std::make_unique<FunctionDecls>()),
     _procedureLookup(std::make_unique<ProcedureLookup>(procedures))
 {
+}
+
+ExplainRequest& CypherAST::explainRequest() {
+    if (!_explainRequest) {
+        _explainRequest = std::make_unique<ExplainRequest>();
+    }
+
+    return *_explainRequest;
 }
 
 CypherAST::~CypherAST() {
     delete _sourceManager;
     delete _diagnosticsManager;
+
+    for (Parameter* parameter : _parameters) {
+        delete parameter;
+    }
 
     for (Symbol* symbol : _symbols) {
         delete symbol;
@@ -50,6 +66,10 @@ CypherAST::~CypherAST() {
 
     for (SymbolChain* chain : _symbolChains) {
         delete chain;
+    }
+
+    for (LabelExpr* expr : _labelExprs) {
+        delete expr;
     }
 
     for (QualifiedName* name : _qualifiedNames) {
@@ -120,6 +140,10 @@ CypherAST::~CypherAST() {
         delete query;
     }
 
+    for (QueryCommand* query : _subQueries) {
+        delete query;
+    }
+
     for (DeclContext* ctxt : _declContexts) {
         delete ctxt;
     }
@@ -156,12 +180,20 @@ std::string* CypherAST::createString() {
     return name;
 }
 
+void CypherAST::addParameter(Parameter* parameter) {
+    _parameters.push_back(parameter);
+}
+
 void CypherAST::addSymbol(Symbol* symbol) {
     _symbols.push_back(symbol);
 }
 
 void CypherAST::addSymbolChain(SymbolChain* symbol) {
     _symbolChains.push_back(symbol);
+}
+
+void CypherAST::addLabelExpr(LabelExpr* expr) {
+    _labelExprs.push_back(expr);
 }
 
 void CypherAST::addQualifiedName(QualifiedName* name) {
@@ -234,6 +266,14 @@ void CypherAST::addStmtContainer(StmtContainer* container) {
 
 void CypherAST::addQuery(QueryCommand* query) {
     _queries.push_back(query);
+}
+
+void CypherAST::nestQuery(QueryCommand* query) {
+    const auto findIt = std::find(_queries.begin(), _queries.end(), query);
+    bioassert(findIt != _queries.end(), "Nesting a command the AST does not hold");
+
+    _queries.erase(findIt);
+    _subQueries.push_back(query);
 }
 
 void CypherAST::addDeclContext(DeclContext* ctxt) {

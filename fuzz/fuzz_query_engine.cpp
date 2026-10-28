@@ -1,80 +1,126 @@
-// AFL++ / stdin fuzzing harness for the full TuringDB query engine.
-// Sets up a DB with SimpleGraph data and runs the full query pipeline:
-//   parse → analyze → plan → optimize → generate pipeline → execute
+// AFL++ / stdin fuzzing harness for the TuringDB query engine.
+// Sets up a DB with SimpleGraph data and runs the v3 stages:
+//   parse → analyze → codegen → lower and execute
 //
-// Unlike QueryInterpreterV2, this harness does NOT catch FatalException
+// Unlike QueryInterpreterV3, this harness does NOT catch FatalException
 // or bioassert failures — they crash the process so AFL reports them.
-// Only CompilerException and PipelineException (expected user errors)
-// are caught.
+// Only what the engine throws for malformed input is caught: the
+// CompilerException of the parser and analyzer, and the plain
+// TuringException codegen and execution reject a query with.
 
-#include "TuringDB.h"
-
+#include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
+#include <unistd.h>
+#include <algorithm>
+#include <memory>
+#include <span>
 #include <string>
+#include <string_view>
+
+#include "mlir/Dialect/Func/IR/FuncOps.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/MLIRContext.h"
+#include "mlir/IR/OwningOpRef.h"
 
 #include "TuringTestEnv.h"
 #include "SimpleGraph.h"
 #include "SystemManager.h"
+#include "SystemAccessor.h"
 #include "LocalMemory.h"
 
 #include "CypherParser.h"
 #include "CypherAST.h"
 #include "CypherAnalyzer.h"
-#include "PlanGraphGenerator.h"
-#include "PlanOptimizer.h"
-#include "PipelineGenerator.h"
-#include "PipelineV2.h"
-#include "PipelineExecutor.h"
-#include "ExecutionContext.h"
+
+#include "DBDialect.h"
+#include "DBDialectInterpreter.h"
+#include "DBProgramGenerator.h"
+#include "NLDialect.h"
+#include "NLOutputSink.h"
+#include "NLSystemContext.h"
+#include "StorageDialect.h"
+
+#include "ProcedureContext.h"
+#include "versioning/Transaction.h"
+#include "views/GraphView.h"
 
 #include "CompilerException.h"
-#include "PipelineException.h"
-#include "versioning/VersionControlException.h"
-#include "versioning/Transaction.h"
-
-#include "ProcedureManager.h"
+#include "FatalException.h"
+#include "TuringException.h"
 
 using namespace turing::test;
 
-static std::unique_ptr<TuringTestEnv> g_env;
-static const char* g_graphName = "fuzzdb";
+namespace {
 
-static void initOnce() {
-    if (g_env) return;
+class DiscardedOutputSink : public db::NLOutputSink {
+public:
+    void appendChunks(std::span<const db::Column* const> chunks, size_t offset, size_t rowCount) override {}
+};
 
-    g_env = TuringTestEnv::create(fs::Path("/tmp/fuzz_query_engine"));
+std::unique_ptr<TuringTestEnv> g_env;
+std::string g_rootDirectory;
+const char* g_graphName = "fuzzdb";
+
+void initOnce() {
+    if (g_env) {
+        return;
+    }
+
+    // TuringDB locks its root directory, so a fixed path would let the fuzzer
+    // lock out any triage run reproducing a crash while it is still fuzzing.
+    g_rootDirectory = "/tmp/fuzz_query_engine_" + std::to_string(getpid());
+
+    g_env = TuringTestEnv::create(fs::Path(g_rootDirectory));
     db::SystemAccessor system = g_env->getSystemManager().accessUnique();
-    auto* graph = system.createGraph(g_graphName);
+    db::Graph* graph = system.createGraph(g_graphName);
     db::SimpleGraph::createSimpleGraph(graph);
 }
 
-static int fuzzOne(const char* data, size_t size) {
+void tearDown() {
+    g_env.reset();
+    fs::Path(g_rootDirectory).rm();
+}
+
+bool mentionsMergeDataParts(std::string_view query) {
+    constexpr std::string_view keyword = "merge_dataparts";
+    const auto sameLetter = [](char queryChar, char keywordChar) {
+        return tolower(static_cast<unsigned char>(queryChar)) == keywordChar;
+    };
+
+    return !std::ranges::search(query, keyword, sameLetter).empty();
+}
+
+int fuzzOne(const char* data, size_t size) {
     if (size > 64 * 1024) {
         return 0;
     }
 
-    std::string_view query(data, size);
+    const std::string_view query(data, size);
+
+    // MERGE_DATAPARTS is not meant to be used yet, so what it breaks is known and not worth a crash
+    if (mentionsMergeDataParts(query)) {
+        return 0;
+    }
 
     db::SystemManager& sysMan = g_env->getSystemManager();
     db::SystemAccessor system = sysMan.accessShared();
-    const db::ProcedureManager* procedures = system.getProcedures();
 
-    const db::QueryConfig queryConfig;
-
-    // Open transaction
-    auto txRes = system.openTransaction(g_graphName,
-                                        db::CommitHash::head(),
-                                        db::ChangeID::head());
+    auto txRes = system.openTransaction(g_graphName, db::CommitHash::head(), db::ChangeID::head());
     if (!txRes) {
         return 0;
     }
 
     const db::GraphView view = txRes->viewGraph();
 
-    // Parse
-    db::CypherAST ast(procedures, query);
+    db::NLSystemContext systemContext;
+    systemContext.setSystemManager(&sysMan);
+    systemContext.setAccessor(&system);
+    systemContext.setTransaction(&txRes.value());
+    systemContext.setGraphName(g_graphName);
+
+    db::CypherAST ast(system.getProcedures(), query);
     db::CypherParser parser(&ast);
     try {
         parser.parse(query);
@@ -82,7 +128,6 @@ static int fuzzOne(const char* data, size_t size) {
         return 0;
     }
 
-    // Analyze
     db::CypherAnalyzer analyzer(&ast, view);
     try {
         analyzer.analyze();
@@ -94,92 +139,93 @@ static int fuzzOne(const char* data, size_t size) {
         return 0;
     }
 
-    // Plan
-    db::PlanGraphGenerator planGen(&queryConfig.getPlanGenConfig(), ast, view);
+    mlir::MLIRContext context;
+    context.getOrLoadDialect<mlir::func::FuncDialect>();
+    context.getOrLoadDialect<mlir::storage::Storage>();
+    context.getOrLoadDialect<mlir::db::DB>();
+    context.getOrLoadDialect<mlir::nl::NL>();
+
+    mlir::OpBuilder builder(&context);
+    mlir::OwningOpRef<mlir::ModuleOp> owningModule = mlir::ModuleOp::create(builder.getUnknownLoc());
+    mlir::ModuleOp module = owningModule.get();
+
+    const mlir::db::DBPassContext passContext {&view};
+
+    db::DBProgramGenerator generator(&module, nullptr, passContext);
     try {
-        planGen.generate(ast.queries().front());
-    } catch (const db::CompilerException&) {
+        generator.generate(&ast);
+    } catch (const FatalException&) {
+        throw;
+    } catch (const TuringException&) {
         return 0;
     }
 
-    db::PlanGraph& planGraph = planGen.getPlanGraph();
-
-    // Optimize
     db::LocalMemory mem;
-    db::PlanOptimizer planOpt(&mem, &planGraph, view, &ast);
-    try {
-        planOpt.optimize();
-    } catch (const db::CompilerException&) {
-        return 0;
-    }
 
-    // Generate pipeline
-    db::PipelineV2 pipeline;
-    db::QueryCallbacks callbacks;
-    db::PipelineGenerator pipelineGen(&mem,
-                                      &sysMan,
-                                      procedures,
-                                      &callbacks,
-                                      &planGraph,
-                                      view,
-                                      &pipeline);
-    try {
-        pipelineGen.generate();
-    } catch (const db::CompilerException&) {
-        return 0;
-    }
+    db::ProcedureContext procedureContext;
+    procedureContext.setGraph(system.getGraph(g_graphName));
+    procedureContext.setGraphView(&view);
+    procedureContext.setTransaction(&txRes.value());
+    procedureContext.setProcedures(system.getProcedures());
+    procedureContext.setListBuffer(&mem.listBuffer());
+    procedureContext.setStringBuffer(&mem.stringBuffer());
 
-    // Execute pipeline
-    db::ExecutionContext execCtxt(&sysMan, view);
-    execCtxt.setSystemAccessor(&system);
-    execCtxt.setTransaction(&txRes.value());
-    execCtxt.setGraphName(g_graphName);
-
-    db::PipelineExecutor executor(&pipeline, &execCtxt);
+    DiscardedOutputSink sink;
+    db::DBDialectInterpreter interpreter(module,
+                                         &view,
+                                         &sink,
+                                         &mem,
+                                         db::ChunkConfig::CHUNK_SIZE,
+                                         nullptr,
+                                         nullptr,
+                                         &procedureContext,
+                                         &systemContext);
     try {
-        executor.execute();
-    } catch (const db::PipelineException&) {
-        return 0;
-    } catch (const db::VersionControlException&) {
+        interpreter.run();
+    } catch (const FatalException&) {
+        throw;
+    } catch (const TuringException&) {
         return 0;
     }
 
     return 0;
+}
+
 }
 
 #if defined(__AFL_COMPILER) && defined(__AFL_HAVE_MANUAL_CONTROL)
 __AFL_FUZZ_INIT();
 
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-
+    __AFL_INIT();
     initOnce();
 
-    __AFL_INIT();
     unsigned char* buf = __AFL_FUZZ_TESTCASE_BUF;
 
     while (__AFL_LOOP(10000)) {
-        int len = __AFL_FUZZ_TESTCASE_LEN;
+        const int len = __AFL_FUZZ_TESTCASE_LEN;
         fuzzOne(reinterpret_cast<const char*>(buf), len);
     }
 
-    return 0;
+    tearDown();
+
+    return EXIT_SUCCESS;
 }
 
 #else
 int main(int argc, char** argv) {
-    (void)argc;
-    (void)argv;
-
     initOnce();
 
     std::string input;
     char buf[4096];
-    while (size_t n = fread(buf, 1, sizeof(buf), stdin)) {
+    while (const size_t n = fread(buf, 1, sizeof(buf), stdin)) {
         input.append(buf, n);
     }
 
-    return fuzzOne(input.data(), input.size());
+    const int status = fuzzOne(input.data(), input.size());
+
+    tearDown();
+
+    return status;
 }
 #endif

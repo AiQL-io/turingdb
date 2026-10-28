@@ -3,8 +3,12 @@
 #include <algorithm>
 #include <type_traits>
 
-#include "ListView.h"
 #include "ListElementView.h"
+#include "ListView.h"
+#include "map/MapView.h"
+
+#include "metadata/PropertyNull.h"
+#include "metadata/PropertyType.h"
 
 using namespace db;
 
@@ -94,16 +98,15 @@ ListElementView ListByteBuffer<N>::write(ListBufferTypeTag tag, const T& val) {
 
 template <size_t N>
 void ListByteBuffer<N>::clear() {
-    // Delete all chunks
-    auto* cur = _first;
+    auto* cur = _first->_next;
     while (cur) {
         auto* next = cur->_next;
         delete cur;
         cur = next;
     }
 
-    // Create new first chunk
-    _first = new ByteChunk();
+    _first->_next = nullptr;
+    _first->_size = 0;
     _last = _first;
 }
 
@@ -116,4 +119,10 @@ template ListElementView ListByteBuffer<>::write(ListBufferTypeTag, const types:
 template ListElementView ListByteBuffer<>::write(ListBufferTypeTag, const types::String::Primitive&);
 template ListElementView ListByteBuffer<>::write(ListBufferTypeTag, const types::Embedding::Primitive&);
 template ListElementView ListByteBuffer<>::write(ListBufferTypeTag, const ListView&);
+template ListElementView ListByteBuffer<>::write(ListBufferTypeTag, const PropertyNull&);
+template ListElementView ListByteBuffer<>::write(ListBufferTypeTag, const NodeID&);
+template ListElementView ListByteBuffer<>::write(ListBufferTypeTag, const EdgeID&);
+template ListElementView ListByteBuffer<>::write(ListBufferTypeTag, const types::DateTime::Primitive&);
+template ListElementView ListByteBuffer<>::write(ListBufferTypeTag, const types::Duration::Primitive&);
+template ListElementView ListByteBuffer<>::write(ListBufferTypeTag, const MapView&);
 }

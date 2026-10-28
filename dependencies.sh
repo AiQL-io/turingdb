@@ -127,6 +127,34 @@ rm -f $DEPENDENCIES_DIR/lib/libz.so $DEPENDENCIES_DIR/lib/libz.so.*
 git -C $SOURCE_DIR/external/zlib checkout -- zconf.h 2>/dev/null || true
 
 # ============================================================
+# Build utf8proc from source
+# ============================================================
+echo "Building utf8proc..."
+mkdir -p $BUILD_DIR/utf8proc
+cd $BUILD_DIR/utf8proc
+
+UTF8PROC_CMAKE_ARGS=(
+    -DCMAKE_BUILD_TYPE=Release
+    -DCMAKE_INSTALL_PREFIX=$DEPENDENCIES_DIR
+    -DCMAKE_INSTALL_LIBDIR=lib
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+    -DBUILD_SHARED_LIBS=OFF
+    -DUTF8PROC_ENABLE_TESTING=OFF
+)
+
+if [[ $USE_CLANG -eq 1 ]]; then
+    UTF8PROC_CMAKE_ARGS+=("${CLANG_COMPILER_ARGS[@]}")
+fi
+
+if [[ "$(uname)" == "Linux" ]]; then
+    UTF8PROC_CMAKE_ARGS+=("${LINUX_ARCH_ARGS[@]}")
+fi
+
+cmake "${UTF8PROC_CMAKE_ARGS[@]}" $SOURCE_DIR/external/utf8proc
+cmake --build $BUILD_DIR/utf8proc -j $NUM_JOBS
+cmake --install $BUILD_DIR/utf8proc
+
+# ============================================================
 # Build OpenSSL from source
 # ============================================================
 OPENSSL_VERSION="3.5.5"
@@ -183,6 +211,10 @@ OPENBLAS_CMAKE_ARGS=(
     -DBUILD_SHARED_LIBS=OFF
     -DBUILD_TESTING=OFF
     -DNOFORTRAN=1
+    # NUM_THREADS defaults to the build machine's core count; 1 makes the build
+    # single-threaded, which needs USE_LOCKING to stay safe under concurrent calls.
+    -DNUM_THREADS=1
+    -DUSE_LOCKING=ON
 )
 
 if [[ $USE_CLANG -eq 1 ]]; then
@@ -308,6 +340,18 @@ fi
 if [[ "$(uname)" == "Linux" ]]; then
     ARROW_CMAKE_ARGS+=("${LINUX_ARCH_ARGS[@]}")
 fi
+
+# Arrow downloads its bundled dependencies at configure time unless pointed at local archives.
+ARROW_THIRDPARTY_DIR=$SOURCE_DIR/external/arrow-thirdparty
+export ARROW_BOOST_URL=$ARROW_THIRDPARTY_DIR/boost-1.88.0-cmake.tar.gz
+export ARROW_LZ4_URL=$ARROW_THIRDPARTY_DIR/lz4-v1.10.0.tar.gz
+export ARROW_MIMALLOC_URL=$ARROW_THIRDPARTY_DIR/mimalloc-v3.2.7.tar.gz
+export ARROW_RAPIDJSON_URL=$ARROW_THIRDPARTY_DIR/rapidjson-232389d4f1012dddec4ef84861face2d2ba85709.tar.gz
+export ARROW_SNAPPY_URL=$ARROW_THIRDPARTY_DIR/snappy-1.2.2.tar.gz
+export ARROW_THRIFT_URL=$ARROW_THIRDPARTY_DIR/thrift-0.22.0.tar.gz
+export ARROW_XSIMD_URL=$ARROW_THIRDPARTY_DIR/xsimd-14.0.0.tar.gz
+export ARROW_ZLIB_URL=$ARROW_THIRDPARTY_DIR/zlib-1.3.1.tar.gz
+export ARROW_ZSTD_URL=$ARROW_THIRDPARTY_DIR/zstd-1.5.7.tar.gz
 
 cmake "${ARROW_CMAKE_ARGS[@]}" $ARROW_SRC_DIR/cpp
 cmake --build $BUILD_DIR/arrow -j $NUM_JOBS
@@ -548,3 +592,25 @@ cmake "${LLVM_CMAKE_ARGS[@]}" $LLVM_CMAKE_DIR
 # program cc1plus").
 cmake --build $LLVM_BUILD_DIR -j $NUM_JOBS -t mlir-opt mlir-translate mlir-transform-opt mlir-runner
 cmake --build $LLVM_BUILD_DIR -j $NUM_JOBS -t install
+
+# ============================================================
+# Install Emscripten SDK (toolchain for the wasm decoder)
+# ============================================================
+EMSCRIPTEN_VERSION="5.0.2"
+EMSDK_DIR=$DEPENDENCIES_DIR/emsdk
+
+if [[ ! -d "$EMSDK_DIR" ]]; then
+    echo "Cloning emsdk..."
+    git clone https://github.com/emscripten-core/emsdk.git $EMSDK_DIR
+else
+    # Refresh the release list so a bumped EMSCRIPTEN_VERSION resolves.
+    git -C $EMSDK_DIR pull --ff-only
+fi
+
+echo "Installing Emscripten ${EMSCRIPTEN_VERSION}..."
+$EMSDK_DIR/emsdk install $EMSCRIPTEN_VERSION
+$EMSDK_DIR/emsdk activate $EMSCRIPTEN_VERSION
+
+# The wasm decoder (wasm/) builds against this toolchain:
+#   source external/dependencies/emsdk/emsdk_env.sh
+#   mkdir -p wasm/build && cd wasm/build && emcmake cmake .. && make

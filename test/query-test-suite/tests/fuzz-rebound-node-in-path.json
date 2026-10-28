@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "graph": "simpledb",
+  "query": "MATCH (a)-->(b)-->(b) RETURN id(a) ORDER BY id(a)",
+  "expect": {
+    "result": "id(a)",
+    "resultJson": "{\"header\":{\"column_names\":[\"id(a)\"],\"column_types\":[\"Int64\"]},\"data\":[]}"
+  },
+  "tags": [
+    "fuzz",
+    "crash",
+    "match",
+    "multipath"
+  ],
+  "write-required": false
+}

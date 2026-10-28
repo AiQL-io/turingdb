@@ -25,11 +25,17 @@ void PropertyManager::fillEntityPropertyView(EntityID entityID,
             return;
         }
 
-        const auto* primitive = container.tryGet(entityID);
+        const auto value = container.tryGetWithNull(entityID);
+
+        const bool explicitNull = !value.has_value();
+        if (explicitNull) {
+            view.removeProperty(ptID);
+            return;
+        }
+
+        const auto* primitive = value.value();
         if (primitive) {
-            auto& prop = view._props.emplace_back();
-            prop._id = ptID;
-            prop._value = primitive;
+            view.setProperty(ptID, primitive);
         }
     };
 
@@ -60,6 +66,26 @@ void PropertyManager::fillEntityPropertyView(EntityID entityID,
 
     for (const auto& [ptID, rawContainer] : _embeddings) {
         const auto& container = rawContainer->cast<types::Embedding>();
+        fill(container, ptID);
+    }
+
+    for (const auto& [ptID, rawContainer] : _lists) {
+        const auto& container = rawContainer->cast<types::List>();
+        fill(container, ptID);
+    }
+
+    for (const auto& [ptID, rawContainer] : _dateTimes) {
+        const auto& container = rawContainer->cast<types::DateTime>();
+        fill(container, ptID);
+    }
+
+    for (const auto& [ptID, rawContainer] : _durations) {
+        const auto& container = rawContainer->cast<types::Duration>();
+        fill(container, ptID);
+    }
+
+    for (const auto& [ptID, rawContainer] : _maps) {
+        const auto& container = rawContainer->cast<types::Map>();
         fill(container, ptID);
     }
 

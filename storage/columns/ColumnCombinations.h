@@ -6,6 +6,7 @@
 #include "ColumnMask.h"
 #include "ColumnConst.h"
 #include "TypeUtils.h"
+#include "list/ListElementView.h"
 #include "metadata/PropertyType.h"
 
 namespace db {
@@ -31,7 +32,7 @@ class InternalCombination {
     using InternalResImpl = std::conditional_t<
                                TypeUtils::is_optional_v<InternalT>
                                    || TypeUtils::is_optional_v<InternalU>,
-                               std::optional<AbsInternalRes>,
+                               TypeUtils::wrap_optional_t<AbsInternalRes>,
                                AbsInternalRes>;
 public:
     using type = InternalResImpl;
@@ -60,6 +61,45 @@ template <typename Op, typename T>
 class ColumnCombinationImpl<Op, ColumnVector<T>, ColumnMask> {
 public:
     using ResultColumnType = ColumnVector<T>;
+};
+
+/// A type-erased cell holds no truth value of its own, so comparing a mask against one
+/// answers a mask rather than a column of cells - a nullable one, since the cell may hold a
+/// null or a value of another type
+template <typename Op>
+class ColumnCombinationImpl<Op, ColumnMask, ColumnVector<ListElementView>> {
+public:
+    using ResultColumnType = ColumnOptMask;
+};
+
+template <typename Op>
+class ColumnCombinationImpl<Op, ColumnVector<ListElementView>, ColumnMask> {
+public:
+    using ResultColumnType = ColumnOptMask;
+};
+
+template <typename Op>
+class ColumnCombinationImpl<Op, ColumnMask, ColumnConst<ListElementView>> {
+public:
+    using ResultColumnType = ColumnOptMask;
+};
+
+template <typename Op>
+class ColumnCombinationImpl<Op, ColumnConst<ListElementView>, ColumnMask> {
+public:
+    using ResultColumnType = ColumnOptMask;
+};
+
+template <typename Op>
+class ColumnCombinationImpl<Op, ColumnMask, ColumnVector<std::optional<ListElementView>>> {
+public:
+    using ResultColumnType = ColumnOptMask;
+};
+
+template <typename Op>
+class ColumnCombinationImpl<Op, ColumnVector<std::optional<ListElementView>>, ColumnMask> {
+public:
+    using ResultColumnType = ColumnOptMask;
 };
 
 /// Const and a mask, e.g. MASK && TRUE
@@ -148,7 +188,35 @@ template <typename Op, typename T, typename U>
     requires OptionalPredicate<Op, T, U> && (TypeUtils::is_optional_v<T> || TypeUtils::is_optional_v<U>)
 class ColumnCombinationImpl<Op, ColumnConst<T>, ColumnConst<U>> {
 public:
+    using ResultColumnType = ColumnConst<std::optional<CustomBool>>;
+};
+
+template <typename Op, typename T, typename U>
+    requires NullableResultPredicate<Op, T, U>
+class ColumnCombinationImpl<Op, ColumnVector<T>, ColumnVector<U>> {
+public:
     using ResultColumnType = ColumnOptMask;
+};
+
+template <typename Op, typename T, typename U>
+    requires NullableResultPredicate<Op, T, U>
+class ColumnCombinationImpl<Op, ColumnVector<T>, ColumnConst<U>> {
+public:
+    using ResultColumnType = ColumnOptMask;
+};
+
+template <typename Op, typename T, typename U>
+    requires NullableResultPredicate<Op, T, U>
+class ColumnCombinationImpl<Op, ColumnConst<T>, ColumnVector<U>> {
+public:
+    using ResultColumnType = ColumnOptMask;
+};
+
+template <typename Op, typename T, typename U>
+    requires NullableResultPredicate<Op, T, U>
+class ColumnCombinationImpl<Op, ColumnConst<T>, ColumnConst<U>> {
+public:
+    using ResultColumnType = ColumnConst<std::optional<CustomBool>>;
 };
 
 /*

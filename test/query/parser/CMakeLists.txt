@@ -1,0 +1,1 @@
+add_turing_test(test_query_parser_parenthesized_property_access ParenthesizedPropertyAccessTest.cpp)

@@ -70,6 +70,10 @@ async function runCliJsonResponse(
 
 Bun.serve({
 	port: PORT,
+	// A full run-all invocation shells out to the C++ CLI and streams nothing back
+	// until every test has run, so the connection sits idle far longer than Bun's
+	// 10s default. 255 is the maximum idleTimeout Bun accepts.
+	idleTimeout: 255,
 	async fetch(req) {
 		const { pathname, searchParams } = new URL(req.url);
 
@@ -169,18 +173,6 @@ Bun.serve({
                   );
                 }
 
-                if (pathname === "/api/run-remote") {
-                  const testId = searchParams.get("test");
-                  if (!testId) {
-                    return errorResponse("Missing test parameter", 400);
-                  }
-                  return runCliJsonResponse(
-                      [ "--run-remote", testId ],
-                      "Failed to run remote test",
-                      "Invalid remote run response",
-                  );
-                }
-
                 if (pathname === "/api/run-all") {
 			return runCliJsonResponse(
 				["--run-all"],
@@ -189,19 +181,10 @@ Bun.serve({
 			);
 		}
 
-		if (pathname === "/api/run-all-remote") {
-			return runCliJsonResponse(
-				["--run-all-remote"],
-				"Failed to run all remote tests",
-				"Invalid remote run-all response",
-			);
-		}
-
 		if (pathname === "/api/update" && req.method === "POST") {
 			const body = await req.json().catch(() => null);
-			const hasPlan = typeof body?.plan === "string";
 			const hasResult = typeof body?.result === "string";
-			const hasResultJson = typeof body?.resultJson === "string";
+			const hasMlir = typeof body?.mlir === "string";
 			const hasQuery = typeof body?.query === "string";
 			const hasNewName = typeof body?.newName === "string";
 			const hasTags = Array.isArray(body?.tags);
@@ -212,9 +195,8 @@ Bun.serve({
 				typeof body?.name === "string" ? idToFilename(body.name.trim()) : "";
 			if (
 				!targetName ||
-				(!hasPlan &&
-					!hasResult &&
-					!hasResultJson &&
+				(!hasResult &&
+					!hasMlir &&
 					!hasQuery &&
 					!hasNewName &&
 					!hasTags &&
@@ -235,9 +217,8 @@ Bun.serve({
 				}
 			}
 			const updatedSource = await updateTestFile(sourceTestsDir, targetName, {
-				plan: body.plan,
 				result: body.result,
-				resultJson: body.resultJson,
+				mlir: body.mlir,
 				query: body.query,
 				newName: body.newName,
 				tags: body.tags,
@@ -248,9 +229,8 @@ Bun.serve({
 			let updatedBuild = false;
 			try {
 				updatedBuild = await updateTestFile(sourceTestsDir, targetName, {
-					plan: body.plan,
-					result: body.result,
-					resultJson: body.resultJson,
+						result: body.result,
+					mlir: body.mlir,
 					query: body.query,
 					newName: body.newName,
 					tags: body.tags,

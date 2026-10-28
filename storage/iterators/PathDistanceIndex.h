@@ -1,0 +1,165 @@
+#pragma once
+
+#include <array>
+#include <optional>
+#include <span>
+#include <stdint.h>
+#include <stddef.h>
+#include <vector>
+
+#include "PathExplorationDir.h"
+#include "PathStep.h"
+#include "datapart/EdgeRecord.h"
+#include "metadata/EdgeBranchingCache.h"
+#include "metadata/LabelSet.h"
+#include "views/GraphView.h"
+#include "ID.h"
+
+namespace db {
+
+class EdgeIndexer;
+class PartDirectory;
+class PathHopFilter;
+class Tombstones;
+
+// For every node, the fewest hops to a node carrying the end labels along the exploration
+// direction: one breadth-first search from those nodes over the reverse direction. The
+// distances ignore trail uniqueness and hop predicates, so each is a lower bound on the
+// hops any trail still needs, and pruning by it never drops a valid path.
+class PathDistanceIndex {
+public:
+    static constexpr uint8_t unreachable = 255;
+    static constexpr uint8_t farthest = 254;
+
+    PathDistanceIndex();
+    ~PathDistanceIndex();
+
+    void build(const GraphView& view,
+               const LabelSet& endLabels,
+               PathExplorationDir direction,
+               std::span<const EdgeTypeID> edgeTypes,
+               uint64_t maxHops);
+
+    // The same search from a list of ends, the hops to the nearest of them
+    void build(const GraphView& view,
+               std::span<const NodeID> ends,
+               PathExplorationDir direction,
+               std::span<const EdgeTypeID> edgeTypes,
+               uint64_t maxHops);
+
+    // The same search as the first build, when it costs no more than budgetChecks candidate
+    // checks; otherwise it stops there and leaves the index unbuilt. After an overrun it is
+    // attempted again only for twice that budget, so the attempts waste less than twice the
+    // last budget offered.
+    bool buildWithin(const GraphView& view,
+                     const LabelSet& endLabels,
+                     PathExplorationDir direction,
+                     std::span<const EdgeTypeID> edgeTypes,
+                     uint64_t maxHops,
+                     double budgetChecks);
+
+    bool isBuilt() const { return _built; }
+
+    // Forgets the search, so an index reused for another shape does not answer from it
+    void clear();
+
+    uint8_t getDistance(NodeID node) const;
+    bool isEnd(NodeID node) const { return getDistance(node) == 0; }
+    bool canReachEndWithin(NodeID node, uint64_t hops) const;
+    size_t getReachedCount() const { return _reached; }
+
+    // Sampled with a stride, since no per-type edge count is kept, and memoised on the
+    // parts it was measured on
+    using TypeBranching = EdgeBranching;
+
+    static void sampleBranching(const PartDirectory& parts,
+                                PathExplorationDir direction,
+                                std::span<const EdgeTypeID> edgeTypes,
+                                TypeBranching& branching);
+
+    // What a sample of a walk's own seeds expanded to, level by level, and the ratio the last
+    // measured level grew by. A walk's frontier is not one fan-out held constant: seeds that
+    // die at once hold the early levels down while the region the survivors reach decides
+    // every later one, so no single number stands for both and the levels that were measured
+    // are the estimate rather than a parameter of it.
+    struct SeedExpansion {
+        static constexpr size_t maxLevels = 8;
+
+        std::array<double, maxLevels> _frontierPerSeed {};
+        size_t _levels {0};
+        double _tailFanOut {1.0};
+        double _tailPassRate {1.0};
+    };
+
+    // Expands a sample of the seeds along the walk, one level at a time. What a walk costs
+    // turns on the fan-out of where it starts, and an average over every node carrying the
+    // type misses that by the exponent of the bound.
+    // A hop predicate is applied as the walk applies it, so only the candidates it keeps are
+    // expanded: a predicate that rejects the hubs keeps the walk off the fan-out they carry,
+    // and no pass rate averaged over the graph says which candidates those are.
+    static void sampleSeedExpansion(const PartDirectory& parts,
+                                    std::span<const PathStep> steps,
+                                    std::span<const NodeID> seeds,
+                                    SeedExpansion& expansion);
+
+    static void sampleSeedExpansion(const PartDirectory& parts,
+                                    PathExplorationDir direction,
+                                    std::span<const EdgeTypeID> edgeTypes,
+                                    std::span<const NodeID> seeds,
+                                    SeedExpansion& expansion,
+                                    PathHopFilter* hopFilter = nullptr);
+
+    // The candidate checks one search from each source is expected to make: its frontier is
+    // distinct nodes, so it cannot grow past the nodes the type reaches and holds at the
+    // first level that covers them.
+    static double estimatedSearchChecks(const PartDirectory& parts,
+                                        PathExplorationDir direction,
+                                        std::span<const EdgeTypeID> edgeTypes,
+                                        size_t sourceCount,
+                                        uint64_t maxHops);
+
+    // The candidate checks the unpruned walk is expected to make: the levels the sample
+    // measured as measured, and past them the frontier growing by the last ratio it saw. Its
+    // frontier is partial paths, not nodes - a trail reaches the same node as often as a path
+    // arrives at it - so nothing caps it at the nodes the type carries.
+    // hopPassRate is the share of each level's candidates a hop predicate the sample was not
+    // filtered by lets through: they all cost a check, and the ones that pass are all that
+    // reach the next level, so it shrinks the frontier rather than the candidates.
+    static double estimatedEnumerationChecks(const PartDirectory& parts,
+                                             const SeedExpansion& expansion,
+                                             size_t seedCount,
+                                             uint64_t maxHops,
+                                             double hopPassRate = 1.0);
+
+    // The candidate checks a search from that many sources costs to build: the nodes and edges
+    // it touches, at most the graph, and the distance byte filled for every node
+    static double estimatedBuildChecks(const PartDirectory& parts,
+                                       PathExplorationDir direction,
+                                       std::span<const EdgeTypeID> edgeTypes,
+                                       size_t sourceCount,
+                                       uint64_t maxHops);
+
+private:
+    std::vector<uint8_t> _distances;
+    size_t _reached {0};
+    bool _built {false};
+    double _overrunBudget {0.0};
+    double _leastBuildChecks {0.0};
+
+    void markEnds(std::span<const NodeID> ends);
+    // Whether the search finished within touchBudget nodes and edges touched
+    bool search(const PartDirectory& parts,
+                const Tombstones& tombstones,
+                std::vector<NodeID>& frontier,
+                PathExplorationDir direction,
+                std::span<const EdgeTypeID> edgeTypes,
+                uint64_t maxHops,
+                double touchBudget);
+    void relax(std::span<const EdgeRecord> edges,
+               uint8_t level,
+               std::span<const EdgeTypeID> edgeTypes,
+               const Tombstones* tombstones,
+               std::vector<NodeID>& next);
+};
+
+}

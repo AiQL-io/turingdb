@@ -26,19 +26,70 @@ void Procedure::setDeallocCallback(DeallocCallback cb) {
     _deallocCallback = cb;
 }
 
+void Procedure::buildSignature(std::string& result) const {
+    result.clear();
+    result += _fullName;
+    result += "(";
+
+    bool first = true;
+    for (const NamedProcedureType& argument : _argumentTypes) {
+        if (!first) {
+            result += ", ";
+        }
+
+        result += argument._name;
+        result += " :: ";
+        result += ProcedureTypeName::value(argument._type);
+
+        if (argument._optional) {
+            result += " = null";
+        }
+
+        first = false;
+    }
+
+    result += ") :: (";
+
+    first = true;
+    for (const NamedProcedureType& returnValue : _returnValues) {
+        if (!first) {
+            result += ", ";
+        }
+
+        result += returnValue._name;
+        result += " :: ";
+        result += ProcedureTypeName::value(returnValue._type);
+
+        first = false;
+    }
+
+    result += ")";
+}
+
 void Procedure::addReturnValue(std::string_view name, ProcedureType type) {
     _returnValues.add(name, type);
 }
 
+void Procedure::addNullableReturnValue(std::string_view name, ProcedureType type) {
+    _returnValues.addNullable(name, type);
+}
+
 void Procedure::addArgument(std::string_view name, ProcedureType type) {
-    if (_argumentTypes.requiredCount() < _argumentTypes.size()) {
-        throw ProcedureException("Required arguments must precede optional arguments");
-    }
+    throwIfOptionalArgumentDeclared();
     _argumentTypes.add(name, type);
 }
 
 void Procedure::addOptionalArgument(std::string_view name, ProcedureType type) {
     _argumentTypes.addOptional(name, type);
+}
+
+void Procedure::addConstantArgument(std::string_view name, ProcedureType type) {
+    throwIfOptionalArgumentDeclared();
+    _argumentTypes.addConstant(name, type);
+}
+
+void Procedure::addOptionalConstantArgument(std::string_view name, ProcedureType type) {
+    _argumentTypes.addOptionalConstant(name, type);
 }
 
 size_t Procedure::getRequiredArgumentCount() const {
@@ -52,7 +103,8 @@ size_t Procedure::getReturnValueIndex(std::string_view name) const {
         }
     }
 
-    throw ProcedureException("Column is not returned by the procedure");
+    throw ProcedureException("Procedure '" + _fullName + "' does not return a value named '"
+                             + std::string(name) + "'");
 }
 
 size_t Procedure::getArgumentIndex(std::string_view name) const {
@@ -71,5 +123,21 @@ void Procedure::returnAll(std::vector<YieldItem>& yieldItems) const {
                   "Invalid procedure return type");
 
         yieldItems.emplace_back(item._name);
+    }
+}
+
+bool Procedure::hasRowAlignedArgument() const {
+    for (const NamedProcedureType& argument : _argumentTypes) {
+        if (!argument._constant) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+void Procedure::throwIfOptionalArgumentDeclared() const {
+    if (_argumentTypes.requiredCount() < _argumentTypes.size()) {
+        throw ProcedureException("Required arguments must precede optional arguments");
     }
 }
