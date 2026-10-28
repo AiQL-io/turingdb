@@ -4,9 +4,8 @@ name: Release Image To ECR
 # v3.0.2+aiql.1 builds the wheel, packages the image the deployment runs, smoke-tests it and
 # pushes it to ECR. Docker tags cannot hold "+", so that release is published as 3.0.2-aiql.1.
 #
-# Everything runs on one GitHub-hosted runner, so the job builds the wheel itself instead of
-# calling ci_build.yml: that workflow also builds every unit test binary, about 63 GB, which a
-# hosted runner's disk cannot hold. Tag a commit whose CI Build run is green.
+# The job builds the wheel itself instead of calling ci_build.yml, so a release does not rerun
+# the unit tests and the regress suite. Tag a commit whose CI Build run is green.
 #
 # Repository variables: TURINGDB_ECR_ROLE_ARN (the turingdb_github_actions_role_arn output of
 # the deployment's Terraform), TURINGDB_ECR_REPOSITORY (the repository name, <environment>-turingdb)
