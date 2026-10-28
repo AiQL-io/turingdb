@@ -327,7 +327,7 @@ jobs:
 
     # The bucket is public, so a runner without AWS credentials fetches the file directly.
     - name: Download reactome dataset (GitHub-hosted Linux)
-      if: steps.cache-reactome-github-hosted.outputs.cache-hit == 'false'
+      if: steps.cache-reactome-github-hosted.outputs.cache-hit != 'true'
       run: |
         mkdir -p external/datasets/reactome
         curl -fsSL -o external/datasets/reactome/reactome.jsonl https://turingdb-public.s3.eu-west-2.amazonaws.com/data/reactome.jsonl
