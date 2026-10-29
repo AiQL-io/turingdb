@@ -439,6 +439,7 @@
 %type<db::UnionQuery::Branch> unionSt
 %type<db::UnionQuery::Branch> unionOperand
 %type<std::vector<std::string_view>> explainPassNames
+%type<std::string_view> explainOptionName
 %type<db::LoadGraphQuery*> loadGraph
 %type<db::LoadGMLQuery*> loadGML
 %type<db::LoadParquetQuery*> loadParquet
@@ -592,8 +593,13 @@ explainOptions
     | explainOptions COMMA explainOption
     ;
 
+explainOptionName
+    : ID { $$ = $1; }
+    | AFTER { $$ = $1; }
+    ;
+
 explainOption
-    : ID {
+    : explainOptionName {
         if (!ast->explainRequest().requestStage($1)) {
             std::string message;
             ExplainRequest::describeOptions($1, message);
@@ -601,14 +607,14 @@ explainOption
         }
       }
     | ALL { ast->explainRequest().requestAll(); }
-    | ID ID {
+    | explainOptionName ID {
         if (!ast->explainRequest().requestPass($1, $2)) {
             std::string message;
             ExplainRequest::describeOptions($1, message);
             scanner.syntaxError(@1, message);
         }
       }
-    | ID OBRACK explainPassNames CBRACK {
+    | explainOptionName OBRACK explainPassNames CBRACK {
         ExplainRequest& explain = ast->explainRequest();
 
         for (const std::string_view passName : $3) {
