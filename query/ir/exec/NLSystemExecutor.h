@@ -24,6 +24,7 @@ public:
     static void runChangeCommand(NLExecutionContext* context, NLFunctionData* data);
     static void runCommitChange(NLExecutionContext* context, NLFunctionData* data);
     static void runLoadCommit(NLExecutionContext* context, NLFunctionData* data);
+    static void runSquashCommits(NLExecutionContext* context, NLFunctionData* data);
     static void runMergeDataParts(NLExecutionContext* context, NLFunctionData* data);
 
     static void runS3Connect(NLExecutionContext* context, NLFunctionData* data);

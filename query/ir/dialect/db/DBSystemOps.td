@@ -181,6 +181,27 @@ def CommitChange : SystemOp<"commit"> {
 }
 
 /**
+* SquashCommits
+*/
+def SquashCommits : SystemOp<"squash_commits"> {
+  let summary = "Squash a range of the commit history of the session's graph into one commit";
+  let description = [{
+    `SQUASH COMMITS AFTER "a1b2c3" THROUGH "d4e5f6"`. The commits after the first hash, up to
+    and including the second, become the second: it keeps its hash and holds everything the
+    range wrote. Without `after` the range starts at the first commit, and without
+    `through` it ends at the head. Both hashes are spelled as in the query and parsed at
+    execution. It reports nothing, so no db.output follows it.
+
+      db.squash_commits after "a1b2c3" through "d4e5f6"
+  }];
+
+  let arguments = (ins OptionalAttr<StrAttr>:$base_commit,
+                       OptionalAttr<StrAttr>:$tip_commit);
+
+  let assemblyFormat = "(`after` $base_commit^)? (`through` $tip_commit^)? attr-dict";
+}
+
+/**
 * LoadCommit
 */
 def LoadCommit : SystemOp<"load_commit"> {

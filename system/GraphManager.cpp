@@ -503,3 +503,10 @@ bool GraphManager::hasChanges() const {
 DataPartMergeResult<void> GraphManager::mergeDataParts(Graph* graph, JobSystem& jobSystem) {
     return _changes.mergeDataParts(graph, jobSystem);
 }
+
+SquashHistoryResult<void> GraphManager::squashHistory(Graph* graph,
+                                                      std::optional<CommitHash> base,
+                                                      CommitHash tip,
+                                                      std::vector<CommitHash>& squashed) {
+    return _changes.squashHistory(graph, base, tip, squashed);
+}

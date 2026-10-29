@@ -4,6 +4,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <optional>
 #include <vector>
 
 #include "ChangeManager.h"
@@ -68,6 +69,10 @@ public:
     void listChanges(std::vector<const Change*>& changes, const Graph* graph) const;
     bool hasChanges() const;
     DataPartMergeResult<void> mergeDataParts(Graph* graph, JobSystem& jobSystem);
+    SquashHistoryResult<void> squashHistory(Graph* graph,
+                                            std::optional<CommitHash> base,
+                                            CommitHash tip,
+                                            std::vector<CommitHash>& squashed);
 
 private:
     const TuringConfig* _config {nullptr};

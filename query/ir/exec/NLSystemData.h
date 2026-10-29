@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdint.h>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -179,6 +180,24 @@ public:
 
 private:
     std::string_view _commitHash;
+};
+
+// SQUASH COMMITS: the hashes as the query spelled them, parsed at execution. A missing base
+// starts the range at the first commit and a missing tip ends it at the head.
+class NLSquashCommitsData : public NLFunctionData {
+public:
+    NLSquashCommitsData(std::optional<std::string_view> baseCommit, std::optional<std::string_view> tipCommit)
+        : _baseCommit(baseCommit),
+        _tipCommit(tipCommit)
+    {
+    }
+
+    std::optional<std::string_view> getBaseCommit() const { return _baseCommit; }
+    std::optional<std::string_view> getTipCommit() const { return _tipCommit; }
+
+private:
+    std::optional<std::string_view> _baseCommit;
+    std::optional<std::string_view> _tipCommit;
 };
 
 // S3 CONNECT: the credentials the client is opened with.

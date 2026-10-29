@@ -101,6 +101,7 @@ class LoadGMLQuery;
 class LoadParquetQuery;
 class LoadJsonlQuery;
 class LoadCommitQuery;
+class SquashCommitsQuery;
 class S3ConnectQuery;
 class S3TransferQuery;
 class CommitQuery;
@@ -207,6 +208,7 @@ public:
     friend LoadParquetQuery;
     friend LoadJsonlQuery;
     friend LoadCommitQuery;
+    friend SquashCommitsQuery;
     friend S3ConnectQuery;
     friend S3TransferQuery;
     friend CommitQuery;

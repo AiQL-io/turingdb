@@ -33,6 +33,22 @@ DataPartMergeResult<void> ChangeManager::mergeDataParts(Graph* graph, JobSystem&
     return graph->mergeDataParts(jobSystem);
 }
 
+SquashHistoryResult<void> ChangeManager::squashHistory(Graph* graph,
+                                                       std::optional<CommitHash> base,
+                                                       CommitHash tip,
+                                                       std::vector<CommitHash>& squashed) {
+    std::unique_lock guard(_changesLock);
+
+    std::vector<CommitHash> openChangeBases;
+    for (const auto& [pair, change] : _changes) {
+        if (pair._graph == graph) {
+            openChangeBases.emplace_back(change->baseHash());
+        }
+    }
+
+    return graph->squashHistory(base, tip, openChangeBases, squashed);
+}
+
 ChangeResult<Change*> ChangeManager::getChange(const Graph* graph, ChangeID changeID) {
     std::shared_lock guard(_changesLock);
 

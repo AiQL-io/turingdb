@@ -99,6 +99,18 @@ module {
     return
   }
 
+  // SQUASH COMMITS AFTER "a1b2c3" THROUGH "d4e5f6"
+  func.func @squash_commits() {
+    db.squash_commits after "a1b2c3" through "d4e5f6"
+    return
+  }
+
+  // SQUASH COMMITS: the whole history up to the head
+  func.func @squash_all_commits() {
+    db.squash_commits
+    return
+  }
+
   // LOAD COMMIT "a1b2c3"
   func.func @load_commit() {
     db.load_commit("a1b2c3")

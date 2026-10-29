@@ -112,6 +112,12 @@ DataPartMergeResult<void> SystemAccessor::mergeDataParts(Graph* graph) {
     return _sysMan->mergeDataParts(graph);
 }
 
+SquashHistoryResult<void> SystemAccessor::squashCommits(std::string_view graphName,
+                                                        std::optional<CommitHash> base,
+                                                        CommitHash tip) {
+    return _sysMan->squashCommits(graphName, base, tip);
+}
+
 ChangeResult<Transaction> SystemAccessor::openTransaction(std::string_view graphName,
                                                           CommitHash commitHash,
                                                           ChangeID changeID) {

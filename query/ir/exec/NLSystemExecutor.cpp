@@ -339,6 +339,41 @@ void NLSystemExecutor::runLoadCommit(NLExecutionContext* context, NLFunctionData
     spdlog::info("Commit {} has been loaded", hashText);
 }
 
+void NLSystemExecutor::runSquashCommits(NLExecutionContext* context, NLFunctionData* data) {
+    const NLSquashCommitsData* command = static_cast<NLSquashCommitsData*>(data);
+    SystemAccessor& accessor = requireAccessor(context);
+
+    std::optional<CommitHash> baseHash;
+    if (command->getBaseCommit().has_value()) {
+        const std::string_view hashText = *command->getBaseCommit();
+
+        const auto hash = CommitHash::fromString(hashText);
+        if (!hash) {
+            throw IRException(fmt::format("Invalid commit hash: '{}'", hashText));
+        }
+
+        baseHash = hash.value();
+    }
+
+    CommitHash tipHash = CommitHash::head();
+    if (command->getTipCommit().has_value()) {
+        const std::string_view hashText = *command->getTipCommit();
+
+        const auto hash = CommitHash::fromString(hashText);
+        if (!hash) {
+            throw IRException(fmt::format("Invalid commit hash: '{}'", hashText));
+        }
+
+        tipHash = hash.value();
+    }
+
+    if (const auto result = accessor.squashCommits(requireGraphName(context), baseHash, tipHash); !result) {
+        throw IRException(fmt::format("Failed to squash commits: {}", result.error().fmtMessage()));
+    }
+
+    spdlog::info("Commits have been squashed");
+}
+
 void NLSystemExecutor::runMergeDataParts(NLExecutionContext* context, NLFunctionData* data) {
     SystemAccessor& accessor = requireAccessor(context);
 

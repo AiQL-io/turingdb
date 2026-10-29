@@ -144,6 +144,7 @@ const llvm::StringMap<llvm::StringRef> systemCommandSiblings = {
     {mlir::db::ChangeCommand::getOperationName(),       nl::ChangeCommand::getOperationName()},
     {mlir::db::CommitChange::getOperationName(),        nl::CommitChange::getOperationName()},
     {mlir::db::LoadCommit::getOperationName(),          nl::LoadCommit::getOperationName()},
+    {mlir::db::SquashCommits::getOperationName(),       nl::SquashCommits::getOperationName()},
     {mlir::db::MergeDataParts::getOperationName(),      nl::MergeDataParts::getOperationName()},
     {mlir::db::S3Connect::getOperationName(),           nl::S3Connect::getOperationName()},
     {mlir::db::S3Transfer::getOperationName(),          nl::S3Transfer::getOperationName()},

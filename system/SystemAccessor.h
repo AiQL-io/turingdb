@@ -2,6 +2,7 @@
 
 #include <string>
 #include <string_view>
+#include <optional>
 #include <vector>
 
 #include "Accessor.h"
@@ -13,6 +14,7 @@
 #include "dump/DumpResult.h"
 #include "dump/LoadGraphResult.h"
 #include "mergers/DataPartMergeResult.h"
+#include "versioning/SquashHistoryResult.h"
 
 #include "DateTimeSpec.h"
 #include "DurationSpec.h"
@@ -93,6 +95,11 @@ public:
 
     // DataPart merge
     DataPartMergeResult<void> mergeDataParts(Graph* graph);
+
+    // History squash
+    SquashHistoryResult<void> squashCommits(std::string_view graphName,
+                                            std::optional<CommitHash> base,
+                                            CommitHash tip);
 
     // Transaction open
     ChangeResult<Transaction> openTransaction(std::string_view graphName,

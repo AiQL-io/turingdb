@@ -17,6 +17,7 @@
 #include "versioning/ChangeResult.h"
 
 #include "mergers/DataPartMergeResult.h"
+#include "versioning/SquashHistoryResult.h"
 
 #include "TuringS3Client.h"
 #include "MinioS3ClientWrapper.h"
@@ -131,6 +132,11 @@ private:
 
     // DataPart merge
     DataPartMergeResult<void> mergeDataParts(Graph* graph);
+
+    // History squash
+    SquashHistoryResult<void> squashCommits(std::string_view graphName,
+                                            std::optional<CommitHash> base,
+                                            CommitHash tip);
 
     // Transaction open
     ChangeResult<Transaction> openTransaction(std::string_view graphName,

@@ -38,6 +38,19 @@ DataPartMergeResult<void> Graph::mergeDataParts(JobSystem& jobSystem) {
     return _versionController->mergeDataParts(jobSystem);
 }
 
+SquashHistoryResult<void> Graph::getSquashRange(std::optional<CommitHash> base,
+                                                CommitHash tip,
+                                                std::vector<CommitHash>& range) const {
+    return _versionController->getSquashRange(base, tip, range);
+}
+
+SquashHistoryResult<void> Graph::squashHistory(std::optional<CommitHash> base,
+                                               CommitHash tip,
+                                               std::span<const CommitHash> openChangeBases,
+                                               std::vector<CommitHash>& squashed) {
+    return _versionController->squashHistory(base, tip, openChangeBases, squashed);
+}
+
 CommitHash Graph::getHeadHash() const {
     return _versionController->getHeadHash();
 }

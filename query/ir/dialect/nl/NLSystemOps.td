@@ -150,6 +150,24 @@ def CommitChange : NLSystemOp<"commit"> {
 }
 
 /**
+* SquashCommits
+*/
+def SquashCommits : NLSystemOp<"squash_commits"> {
+  let summary = "Squash a range of the commit history of the session's graph into one commit";
+  let description = [{
+    Imperative counterpart of db.squash_commits. Parses the hashes and squashes the
+    range; produces no chunk.
+
+      nl.squash_commits after "a1b2c3" through "d4e5f6"
+  }];
+
+  let arguments = (ins OptionalAttr<StrAttr>:$base_commit,
+                       OptionalAttr<StrAttr>:$tip_commit);
+
+  let assemblyFormat = "(`after` $base_commit^)? (`through` $tip_commit^)? attr-dict";
+}
+
+/**
 * LoadCommit
 */
 def LoadCommit : NLSystemOp<"load_commit"> {

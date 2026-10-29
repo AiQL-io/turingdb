@@ -97,6 +97,10 @@ enum class DumpErrorType : uint8_t {
 
     COMMIT_HASH_NOT_FOUND,
 
+    CANNOT_COPY_COMMIT,
+    CANNOT_REPLACE_COMMIT,
+    CANNOT_REPLACE_COMMIT_LOG,
+
     _SIZE
 };
 
@@ -171,7 +175,10 @@ using DumpErrorTypeDescription = EnumToString<DumpErrorType>::Create<
     EnumStringPair<DumpErrorType::COULD_NOT_READ_JOURNAL, "Could not read commit journal">,
     EnumStringPair<DumpErrorType::COULD_NOT_READ_TOMBSTONES, "Could not read commit tombstones">,
     EnumStringPair<DumpErrorType::COULD_NOT_READ_VECTOR, "Could not read vector">,
-    EnumStringPair<DumpErrorType::COMMIT_HASH_NOT_FOUND, "Commit hash not found">>;
+    EnumStringPair<DumpErrorType::COMMIT_HASH_NOT_FOUND, "Commit hash not found">,
+    EnumStringPair<DumpErrorType::CANNOT_COPY_COMMIT, "Cannot copy commit directory">,
+    EnumStringPair<DumpErrorType::CANNOT_REPLACE_COMMIT, "Cannot replace commit directory">,
+    EnumStringPair<DumpErrorType::CANNOT_REPLACE_COMMIT_LOG, "Cannot replace commit log">>;
 
 class DumpError {
 public:

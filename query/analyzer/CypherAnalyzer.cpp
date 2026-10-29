@@ -200,6 +200,7 @@ void CypherAnalyzer::analyze() {
             case QueryCommand::Kind::SHOW_EXTENSIONS_QUERY:
             case QueryCommand::Kind::DROP_INDEX_QUERY:
             case QueryCommand::Kind::MERGE_DATAPARTS_QUERY:
+            case QueryCommand::Kind::SQUASH_COMMITS_QUERY:
             break;
 
         }

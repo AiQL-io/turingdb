@@ -1,12 +1,15 @@
 #pragma once
 
+#include <optional>
 #include <unordered_map>
+#include <vector>
 
 #include "mergers/DataPartMergeResult.h"
 #include "versioning/ChangeResult.h"
 #include "versioning/ChangeID.h"
 #include "versioning/Change.h"
 #include "versioning/SubmitMode.h"
+#include "versioning/SquashHistoryResult.h"
 
 #include "RWSpinLock.h"
 
@@ -51,6 +54,11 @@ public:
     ChangeResult<void> deleteChange(ChangeAccessor& access, ChangeID changeID);
 
     DataPartMergeResult<void> mergeDataParts(Graph* grapph, JobSystem& jobSystem);
+
+    SquashHistoryResult<void> squashHistory(Graph* graph,
+                                            std::optional<CommitHash> base,
+                                            CommitHash tip,
+                                            std::vector<CommitHash>& squashed);
 
     void listChanges(std::vector<const Change*>& list, const Graph* graph) const;
     bool hasChanges() const;
