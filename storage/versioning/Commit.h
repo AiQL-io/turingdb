@@ -60,6 +60,7 @@ public:
     const Commit* getPreviousCommit() const { return _prevCommit; }
     void setPreviousCommit(const Commit* prevCommit) { _prevCommit = prevCommit; }
     void setCounts(size_t numNodes, size_t numEdges, size_t numDataParts);
+    void markMergeCommit() { _mergeCommit = true; }
 
 private:
     friend CommitLoader;

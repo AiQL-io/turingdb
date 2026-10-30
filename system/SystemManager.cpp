@@ -248,7 +248,20 @@ bool SystemManager::hasChanges() const {
 }
 
 DataPartMergeResult<void> SystemManager::mergeDataParts(Graph* graph) {
-    return _graphManager.mergeDataParts(graph, _jobSystem);
+    if (auto res = _graphManager.mergeDataParts(graph, _jobSystem); !res) {
+        return res;
+    }
+
+    if (!_config->isSyncedOnDisk()) {
+        return {};
+    }
+
+    if (const auto res = GraphDumper::dump(graph, graph->getPath()); !res) {
+        spdlog::error("Could not write the merged graph {}: {}", graph->getName(), res.error().fmtMessage());
+        return DataPartMergeError::result(DataPartMergeErrorType::COULD_NOT_PERSIST);
+    }
+
+    return {};
 }
 
 SquashHistoryResult<void> SystemManager::squashCommits(std::string_view graphName,
@@ -283,13 +296,20 @@ SquashHistoryResult<void> SystemManager::squashCommits(std::string_view graphNam
         return res;
     }
 
-    if (squashed.empty() || !isSyncedOnDisk) {
+    if (!isSyncedOnDisk) {
         return {};
     }
 
-    const Commit* tipCommit = graph->getVersionController().getCommitSafe(tip);
-    if (const auto res = HistorySquashDumper::dump(*tipCommit, graph->getPath(), squashed); !res) {
-        spdlog::error("Could not write the squashed history of graph {}: {}", graph->getName(), res.error().fmtMessage());
+    if (!squashed.empty()) {
+        const Commit* tipCommit = graph->getVersionController().getCommitSafe(tip);
+        if (const auto res = HistorySquashDumper::dump(*tipCommit, graph->getPath(), squashed); !res) {
+            spdlog::error("Could not write the squashed history of graph {}: {}", graph->getName(), res.error().fmtMessage());
+            return SquashHistoryError::result(SquashHistoryErrorType::COULD_NOT_PERSIST);
+        }
+    }
+
+    if (const auto res = GraphDumper::prune(graph, graph->getPath()); !res) {
+        spdlog::error("Could not prune graph {}: {}", graph->getName(), res.error().fmtMessage());
         return SquashHistoryError::result(SquashHistoryErrorType::COULD_NOT_PERSIST);
     }
 

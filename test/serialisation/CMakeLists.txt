@@ -8,3 +8,6 @@ target_link_libraries(test_squash_submit PRIVATE turing_ir_test_rows_s)
 
 add_turing_test(test_squash_commits SquashCommitsTest.cpp)
 target_link_libraries(test_squash_commits PRIVATE turing_ir_test_rows_s)
+
+add_turing_test(test_compact_dataparts CompactDataPartsTest.cpp)
+target_link_libraries(test_compact_dataparts PRIVATE turing_ir_test_rows_s)

@@ -255,7 +255,7 @@ TEST_F(SquashCommitsTest, aBaseThatIsNotBeforeTheTipIsRejected) {
     EXPECT_EQ(5, countLoadedCommits());
 }
 
-TEST_F(SquashCommitsTest, aRangeHoldingAMergedDataPartCommitIsRejected) {
+TEST_F(SquashCommitsTest, aRangeHoldingAMergedDataPartCommitSquashesIntoOneCommit) {
     ASSERT_TRUE(query("MERGE_DATAPARTS").isOk());
 
     {
@@ -263,9 +263,13 @@ TEST_F(SquashCommitsTest, aRangeHoldingAMergedDataPartCommitIsRejected) {
         _commits.push_back(system.getGraph(_graphName)->getHeadHash());
     }
 
-    // Merging data parts renumbers entity IDs, which a squash must not hide from the commits around it
-    EXPECT_FALSE(squash(1, 5).isOk());
-    EXPECT_EQ(6, countLoadedCommits());
+    const QueryStatus status = squash(1, 5);
+    ASSERT_TRUE(status.isOk()) << status.getError();
+
+    // The first commit and Alice's commit stay; Bob's through the merge become one
+    EXPECT_EQ(3, countLoadedCommits());
+    EXPECT_EQ(3, countCommitDirectories());
+    expectPeople({{"Alice"}, {"Bob"}, {"Carol"}, {"Dave"}});
 }
 
 // The files a squash that crashed leaves behind are made by hand: the squash itself is done

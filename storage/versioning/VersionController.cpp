@@ -30,10 +30,9 @@ using namespace db;
 namespace {
 
 /*
- * Merging data parts renumbers the entities of the graph, so a commit that did it cannot be
- * folded into the commits around it. It is recognised by the data parts it holds: a commit
- * adds its own on top of those of the commit before, while a merge commit holds the merged
- * ones alone, and that is all of its data parts.
+ * A commit that merged data parts is recognised by the data parts it holds: a commit adds its
+ * own on top of those of the commit before, while a merge commit holds the merged ones alone,
+ * and that is all of its data parts.
  */
 bool replacesEarlierDataParts(const Commit& commit, const Commit* previous) {
     if (commit.isMergeCommit()) {
@@ -301,6 +300,9 @@ SquashHistoryResult<void> VersionController::squashHistory(std::optional<CommitH
         return SquashHistoryError::result(SquashHistoryErrorType::COMMIT_NOT_LOADED);
     }
 
+    size_t firstAbsorbedIndex = firstIndex;
+    bool replacesDataParts = false;
+
     for (size_t index = firstIndex; index <= tipIndex; index++) {
         const Commit& commit = *_commits[index];
         const Commit* previous = index > 0 ? _commits[index - 1].get() : nullptr;
@@ -308,7 +310,8 @@ SquashHistoryResult<void> VersionController::squashHistory(std::optional<CommitH
         if (!commit.hasData()) {
             return SquashHistoryError::result(SquashHistoryErrorType::COMMIT_NOT_LOADED);
         } else if (replacesEarlierDataParts(commit, previous)) {
-            return SquashHistoryError::result(SquashHistoryErrorType::RANGE_HAS_MERGE_COMMIT);
+            firstAbsorbedIndex = index;
+            replacesDataParts = true;
         }
     }
 
@@ -331,7 +334,7 @@ SquashHistoryResult<void> VersionController::squashHistory(std::optional<CommitH
     size_t numEdges = tipCommit->getNumEdges();
     size_t numDataParts = tipCommit->data().commitDataparts().size();
 
-    for (size_t index = firstIndex; index < tipIndex; index++) {
+    for (size_t index = firstAbsorbedIndex; index < tipIndex; index++) {
         const Commit& commit = *_commits[index];
 
         historyBuilder.absorbJournal(commit.history());
@@ -344,8 +347,14 @@ SquashHistoryResult<void> VersionController::squashHistory(std::optional<CommitH
     // The data parts of the range are the tail of the cumulative list of the last commit
     const size_t baseDataPartCount = baseCommit ? baseCommit->data().allDataparts().size() : 0;
     const size_t totalDataPartCount = tipHistory.allDataparts().size();
-    bioassert(totalDataPartCount - baseDataPartCount == numDataParts,
-              "squashed data part count mismatch");
+
+    if (replacesDataParts) {
+        numDataParts = totalDataPartCount;
+        tipCommit->markMergeCommit();
+    } else {
+        bioassert(totalDataPartCount - baseDataPartCount == numDataParts,
+                  "squashed data part count mismatch");
+    }
 
     historyBuilder.setCommitDatapartCount(numDataParts);
 
