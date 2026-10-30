@@ -161,6 +161,8 @@ set(storage_sources
         dump/GraphLoader.cpp
         dump/GraphDumper.cpp
         dump/HistorySquashDumper.cpp
+        dump/CommitLogFile.cpp
+        dump/CommitMetaDataLoader.cpp
         dump/DataPartLoader.cpp
         dump/CommitDumper.cpp
         dump/CommitLoader.cpp

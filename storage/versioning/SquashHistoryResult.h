@@ -10,7 +10,6 @@ enum class SquashHistoryErrorType : uint8_t {
     COMMIT_NOT_FOUND,
     RANGE_NOT_ORDERED,
     COMMIT_NOT_LOADED,
-    RANGE_HAS_MERGE_COMMIT,
     BLOCKED_BY_OPEN_CHANGE,
     COULD_NOT_LOAD_COMMITS,
     COULD_NOT_PERSIST,
@@ -22,7 +21,6 @@ using SquashHistoryErrorTypeDescription = EnumToString<SquashHistoryErrorType>::
     EnumStringPair<SquashHistoryErrorType::COMMIT_NOT_FOUND, "Commit does not exist">,
     EnumStringPair<SquashHistoryErrorType::RANGE_NOT_ORDERED, "The commit to squash after must come before the last commit to squash">,
     EnumStringPair<SquashHistoryErrorType::COMMIT_NOT_LOADED, "A commit of the range is not loaded">,
-    EnumStringPair<SquashHistoryErrorType::RANGE_HAS_MERGE_COMMIT, "The range holds a commit made by MERGE_DATAPARTS, which renumbers entity IDs">,
     EnumStringPair<SquashHistoryErrorType::BLOCKED_BY_OPEN_CHANGE, "An open change is based on a commit that would be squashed away">,
     EnumStringPair<SquashHistoryErrorType::COULD_NOT_LOAD_COMMITS, "Could not load the commits of the range from disk">,
     EnumStringPair<SquashHistoryErrorType::COULD_NOT_PERSIST, "The squash was applied in memory but could not be written to disk, so a restart brings the old history back">>;

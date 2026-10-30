@@ -2,6 +2,13 @@
 
 #include <spdlog/spdlog.h>
 
+#include <filesystem>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include "CommitLogFile.h"
+#include "CommitMetaDataLoader.h"
 #include "FileReader.h"
 #include "FileWriter.h"
 #include "Graph.h"
@@ -15,6 +22,87 @@
 #include "GraphInfoLoader.h"
 
 using namespace db;
+
+namespace {
+
+using StdPath = std::filesystem::path;
+
+bool parseDirectoryID(const StdPath& directory, uint64_t& id) {
+    const std::string name = directory.filename().string();
+
+    if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos) {
+        return false;
+    }
+
+    id = std::stoull(name);
+
+    return true;
+}
+
+DumpResult<void> removeUnreferenced(const StdPath& parent, const std::unordered_set<uint64_t>& referenced) {
+    std::error_code error;
+    std::vector<StdPath> unreferenced;
+
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator {parent, error}) {
+        uint64_t id = 0;
+
+        // Names that are not an ID, like the `.squash` leftovers, belong to a recovery
+        if (parseDirectoryID(entry.path(), id) && !referenced.contains(id)) {
+            unreferenced.emplace_back(entry.path());
+        }
+    }
+
+    if (error) {
+        return DumpError::result(DumpErrorType::CANNOT_PRUNE_GRAPH);
+    }
+
+    for (const StdPath& directory : unreferenced) {
+        std::filesystem::remove_all(directory, error);
+
+        if (error) {
+            return DumpError::result(DumpErrorType::CANNOT_PRUNE_GRAPH);
+        }
+    }
+
+    return {};
+}
+
+}
+
+DumpResult<void> GraphDumper::prune(const Graph* graph, const fs::Path& graphDir) {
+    Profile profile("GraphDumper::prune");
+
+    auto lock = graph->_versionController->lock();
+
+    std::vector<uint64_t> commitHashes;
+    if (auto res = CommitLogFile::read(graphDir / "commitlog", commitHashes); !res) {
+        return res;
+    }
+
+    std::unordered_set<uint64_t> referencedCommits;
+    std::unordered_set<uint64_t> referencedDataParts;
+    std::vector<uint64_t> dataPartIDs;
+
+    for (const uint64_t hash : commitHashes) {
+        size_t numCommitDataParts = 0;
+        const fs::Path metadataFile = graphDir / "commits" / std::to_string(hash) / "metadata";
+
+        if (auto res = CommitMetaDataLoader::loadDataPartIDs(metadataFile, numCommitDataParts, dataPartIDs); !res) {
+            return res;
+        }
+
+        referencedCommits.insert(hash);
+        referencedDataParts.insert(dataPartIDs.begin(), dataPartIDs.end());
+    }
+
+    const StdPath graphDirectory {graphDir.get()};
+
+    if (auto res = removeUnreferenced(graphDirectory / "commits", referencedCommits); !res) {
+        return res;
+    }
+
+    return removeUnreferenced(graphDirectory / "dataparts", referencedDataParts);
+}
 
 DumpResult<void> GraphDumper::dump(const Graph* graph, const fs::Path& graphDir) {
     Profile profile("GraphDumper::dump");

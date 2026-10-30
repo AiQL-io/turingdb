@@ -4,6 +4,7 @@
 #include "DataPartLoader.h"
 #include "GraphMetadataLoader.h"
 #include "CommitJournalLoader.h"
+#include "CommitMetaDataLoader.h"
 #include "GraphDumpHelper.h"
 #include "DumpResult.h"
 #include "DumpConfig.h"
@@ -86,37 +87,13 @@ DumpResult<void> CommitLoader::loadData(const fs::Path& commitDir,
 
     // Load metadata
     {
-        const fs::Path metadataFile = commitDir / "metadata";
-
-        auto fileRes = fs::File::open(metadataFile);
-        if (!fileRes) {
-            return DumpError::result(DumpErrorType::CANNOT_OPEN_COMMIT_METADATA,
-                                     fileRes.error());
+        size_t numCommitDataParts = 0;
+        std::vector<uint64_t> dataPartIDs;
+        if (auto res = CommitMetaDataLoader::loadDataPartIDs(commitDir / "metadata", numCommitDataParts, dataPartIDs); !res) {
+            return res;
         }
 
-        fs::FileReader reader;
-        reader.setFile(&fileRes.value());
-
-        reader.read();
-        if (reader.errorOccured()) {
-            return DumpError::result(DumpErrorType::COULD_NOT_READ_COMMIT_METADATA,
-                                     *reader.error());
-        }
-
-        fs::ByteBufferIterator it = reader.iterateBuffer();
-
-        if (auto res = GraphDumpHelper::checkFileHeader(&it); !res) {
-            return res.get_unexpected();
-        }
-
-        //Skip the metadata relating to the number of nodes and edges.
-        it.advance(2*sizeof(uint64_t));
-
-        const size_t numCommitDataParts = it.get<uint64_t>();
-        const size_t numAllDataParts = it.get<uint64_t>();
-
-        for (size_t i = 0; i < numAllDataParts; ++i) {
-            const auto dataPartID = it.get<uint64_t>();
+        for (const uint64_t dataPartID : dataPartIDs) {
             const auto it = partMap.find(DataPartID(dataPartID));
 
             // If the datapart has already been read pass
@@ -142,7 +119,6 @@ DumpResult<void> CommitLoader::loadData(const fs::Path& commitDir,
         }
 
         historyBuilder.setCommitDatapartCount(numCommitDataParts);
-        reader.file().close();
     }
 
     return  {};
