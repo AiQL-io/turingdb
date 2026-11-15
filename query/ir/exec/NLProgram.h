@@ -9,13 +9,15 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
 
-#include "EntityList.h"
+#include "CellTag.h"
 #include "GraphPath.h"
+#include "PathView.h"
 #include "ID.h"
 #include "LocalMemory.h"
 #include "NLHashJoinIndex.h"
@@ -36,12 +38,19 @@
 #include "list/ListView.h"
 #include "map/MapView.h"
 #include "list/PathTrie.h"
+#include "metadata/DateTime.h"
+#include "metadata/Duration.h"
+#include "metadata/Point.h"
 #include "metadata/LabelSet.h"
 #include "metadata/LabelSetHandle.h"
 #include "metadata/PropertyType.h"
+#include "versioning/CommitWriteBuffer.h"
+
+#include "NLWriteProperties.h"
 
 namespace db {
 
+class NLRuntimeProperty;
 class NLExecutionContext;
 class NLFunctionData;
 struct NLMergeWorkingSet;
@@ -50,6 +59,8 @@ class Procedure;
 class ProcedureData;
 class LocalMemory;
 class StringBuffer;
+
+Column* allocOptValueColumn(LocalMemory* memory, ValueType valueType, size_t reserveSize);
 
 // Translation resolves every chunk SSA value
 // to a concrete ColumnVector type through this kind
@@ -75,8 +86,8 @@ enum class NLChunkKind {
     Path,
     DateTime,
     Duration,
+    Point,
     PathRef,
-    EntityList,
 };
 
 // Invoke handler with the column element type a chunk kind stands for, so the families of
@@ -142,7 +153,7 @@ void dispatchChunkKind(NLChunkKind kind, Handler&& handler) {
         break;
 
         case NLChunkKind::Path:
-            return handler.template operator()<Path>();
+            return handler.template operator()<GraphPath>();
         break;
 
         case NLChunkKind::DateTime:
@@ -153,12 +164,12 @@ void dispatchChunkKind(NLChunkKind kind, Handler&& handler) {
             return handler.template operator()<types::Duration::Primitive>();
         break;
 
-        case NLChunkKind::PathRef:
-            return handler.template operator()<PathRef>();
+        case NLChunkKind::Point:
+            return handler.template operator()<types::Point::Primitive>();
         break;
 
-        case NLChunkKind::EntityList:
-            return handler.template operator()<EntityList>();
+        case NLChunkKind::PathRef:
+            return handler.template operator()<PathRef>();
         break;
     }
 
@@ -458,7 +469,7 @@ private:
 // The literal-list sibling of NLConstScanLoopData: streams a fixed ListView one chunk
 // at a time. A homogeneous list fills a nullable value column of _valueType, the shape
 // every value-chunk consumer reads; a heterogeneous list fills a
-// ColumnVector<ListElementView> of tagged scalars, in which case _valueType is unused.
+// ColumnVector<CellView> of tagged scalars, in which case _valueType is unused.
 // The ListView spans the query-scoped ListBuffer, so the elements outlive the loop. A
 // plain source, so a downstream LIMIT can bound it.
 class NLUnwindConstLoopData : public NLFunctionData {
@@ -1095,23 +1106,34 @@ private:
     QueryListBuffer* _listBuffer {nullptr};
 };
 
-// nl.path_length data: the depth of each handle's entry, read without expanding the path
+// nl.path_length data: the depth of each handle's entry divided by the steps of the walk's body,
+// plus the seed when it counts the nodes, read without expanding the path
 class NLPathLengthData : public NLFunctionData {
 public:
-    NLPathLengthData(const ColumnVector<PathRef>* paths, ColumnVector<uint64_t>* output, const PathTrie* trie)
+    NLPathLengthData(const ColumnVector<PathRef>* paths,
+                     ColumnVector<uint64_t>* output,
+                     size_t steps,
+                     bool countsNodes,
+                     const PathTrie* trie)
         : _paths(paths),
         _output(output),
+        _steps(steps),
+        _countsNodes(countsNodes),
         _trie(trie)
     {
     }
 
     const ColumnVector<PathRef>* getPaths() const { return _paths; }
     ColumnVector<uint64_t>* getOutput() const { return _output; }
+    size_t getSteps() const { return _steps; }
+    bool countsNodes() const { return _countsNodes; }
     const PathTrie* getTrie() const { return _trie; }
 
 private:
     const ColumnVector<PathRef>* _paths {nullptr};
     ColumnVector<uint64_t>* _output {nullptr};
+    size_t _steps {1};
+    bool _countsNodes {false};
     const PathTrie* _trie {nullptr};
 };
 
@@ -1123,17 +1145,22 @@ enum class PathElementsKind {
     Length,
 };
 
+// The path one row of a column holds - a path column, or a column of tagged cells - and
+// nothing where that row holds a null
+using NLPathReadFunction = std::optional<PathView> (*)(const Column* paths, size_t row);
+
 // nl.path_elements data: one list of node IDs, one list of edge IDs or one hop count per
-// row, read off the entity sequence of each path and null where that sequence is empty.
-// The paths are entity lists or the bare alternating IDs of a shortest path. The lists
-// are written into the query's list buffer.
+// row, read off each path and null where the path is null. The lists are written into the
+// query's list buffer.
 class NLPathElementsData : public NLFunctionData {
 public:
     NLPathElementsData(const Column* paths,
+                       NLPathReadFunction read,
                        Column* output,
                        PathElementsKind kind,
                        QueryListBuffer* listBuffer)
         : _paths(paths),
+        _read(read),
         _output(output),
         _kind(kind),
         _listBuffer(listBuffer)
@@ -1141,55 +1168,59 @@ public:
     }
 
     const Column* getPaths() const { return _paths; }
+    NLPathReadFunction getRead() const { return _read; }
     Column* getOutput() const { return _output; }
     PathElementsKind getKind() const { return _kind; }
     QueryListBuffer* getListBuffer() const { return _listBuffer; }
 
 private:
     const Column* _paths {nullptr};
+    NLPathReadFunction _read {nullptr};
     Column* _output {nullptr};
     PathElementsKind _kind {PathElementsKind::Nodes};
     QueryListBuffer* _listBuffer {nullptr};
 };
 
-// One entity of a path being built: the column holding it on each row, and which of the
-// three kinds of entity the column carries
-struct NLPathEntity {
+// One step of a path being built, over the columns that hold it on each row. Start opens
+// the path on a node, Hop adds an edge and the node it lands on, Walk adds the hops of a
+// walk taken with the pattern, and ReversedWalk the hops of one taken against it, closing
+// on the node it seeded from.
+struct NLPathStep {
     enum class Kind : uint8_t {
-        Node,
-        Edge,
-        Path,
+        Start,
+        Hop,
+        Walk,
+        ReversedWalk,
     };
 
-    const Column* _column {nullptr};
-    Kind _kind {Kind::Node};
-    // A Path whose walk ran against the pattern, whose hops read back from its far end
-    bool _reversed {false};
+    Kind _kind {Kind::Start};
+    const ColumnNodeIDs* _nodes {nullptr};
+    const ColumnEdgeIDs* _edges {nullptr};
+    const ColumnVector<PathRef>* _walks {nullptr};
 };
 
-// nl.make_path data: one entity sequence per row, appended in operand order. A Path
-// entity contributes the hops its handle stands for, read out of the trie.
+// nl.make_path data: one path per row, built by running its steps in order
 class NLMakePathData : public NLFunctionData {
 public:
-    using PathEntities = std::vector<NLPathEntity>;
+    using PathSteps = std::vector<NLPathStep>;
 
-    NLMakePathData(ColumnVector<EntityList>* output, const PathTrie* trie)
+    NLMakePathData(ColumnVector<GraphPath>* output, const PathTrie* trie)
         : _output(output),
         _trie(trie)
     {
     }
 
-    const PathEntities& entities() const { return _entities; }
-    ColumnVector<EntityList>* getOutput() const { return _output; }
+    const PathSteps& steps() const { return _steps; }
+    ColumnVector<GraphPath>* getOutput() const { return _output; }
     const PathTrie* getTrie() const { return _trie; }
 
-    void addEntity(const NLPathEntity& entity) {
-        _entities.push_back(entity);
+    void addStep(const NLPathStep& step) {
+        _steps.push_back(step);
     }
 
 private:
-    PathEntities _entities;
-    ColumnVector<EntityList>* _output {nullptr};
+    PathSteps _steps;
+    ColumnVector<GraphPath>* _output {nullptr};
     const PathTrie* _trie {nullptr};
 };
 
@@ -1297,7 +1328,7 @@ public:
     Column* getOutput() const { return _output; }
     PropertyTypeID getPropertyTypeID() const { return _propertyTypeID; }
 
-    // The rows holding a write-buffer offset rather than an ID the graph knows, or null
+    // The rows naming an entity this change wrote, by the ID it will commit as, or null
     // for an input no merge produced. Such a row reads its value out of the write buffer.
     // A column a create produced is such a row throughout, which is what _allPending says.
     const ColumnMask* getPending() const { return _pending; }
@@ -1904,12 +1935,9 @@ private:
 // collide by concatenation (e.g. "a"+"b" versus "ab"+"").
 using NLKeyAppendFunction = void (*)(const Column* column, size_t row, std::string& key);
 
-// Type of handle that answers whether one row of a join key column can match at all. One
-// per column kind / value type, selected during translation the same way the key-append
-// family is. Two values the key bytes cannot tell apart from a matchable one are not: a
-// null, for which Cypher gives null rather than true for `=`, and a NaN, which is not
-// equal to itself - and the serializer maps every NaN payload to one canonical NaN, which
-// is what DISTINCT wants and the opposite of what a join does.
+// Type of handle that answers whether one row of a join key column can match at all: whether
+// `=` holds the key equal to itself, which a null, a NaN and a list or map holding a null
+// at any depth do not.
 using NLKeyIsMatchableFunction = bool (*)(const Column* column, size_t row);
 
 // Type of handle that hashes every row of a join key column, one hash per row, for the
@@ -1919,13 +1947,15 @@ using NLKeyIsMatchableFunction = bool (*)(const Column* column, size_t row);
 using NLKeyHashFunction = void (*)(const Column* column, std::vector<uint64_t>& hashes);
 
 // Type of handle that answers whether a probe row's key equals a build row's, both read in
-// place from columns of one chunk type.
+// place from their columns.
 using NLKeyEqualFunction = bool (*)(const Column* probe, size_t probeRow, const Column* build, size_t buildRow);
 
-// The two handlers a join reads a key column through, selected together from its chunk type.
+// The three handlers a join reads a key column through, selected together from its chunk
+// type. The equality compares two columns of that type.
 struct NLJoinKeyFunctions {
     NLKeyHashFunction _hash {nullptr};
     NLKeyEqualFunction _equal {nullptr};
+    NLKeyIsMatchableFunction _isMatchable {nullptr};
 };
 
 // Runtime state of one hash join's build side: the build rows, materialized column by
@@ -1998,19 +2028,17 @@ public:
     // is compared against to find the group already holding it.
     void setKeyColumns(const Column* key,
                        const Column* buildKey,
-                       const NLJoinKeyFunctions& keyFunctions,
-                       NLKeyIsMatchableFunction isMatchable) {
+                       const NLJoinKeyFunctions& keyFunctions) {
         _key = key;
         _buildKey = buildKey;
         _keyFunctions = keyFunctions;
-        _keyIsMatchable = isMatchable;
     }
 
     const Column* getKeyColumn() const { return _key; }
     const Column* getBuildKeyColumn() const { return _buildKey; }
     NLKeyHashFunction getKeyHash() const { return _keyFunctions._hash; }
     NLKeyEqualFunction getKeyEqual() const { return _keyFunctions._equal; }
-    NLKeyIsMatchableFunction getKeyIsMatchable() const { return _keyIsMatchable; }
+    NLKeyIsMatchableFunction getKeyIsMatchable() const { return _keyFunctions._isMatchable; }
 
     std::vector<uint64_t>* getHashScratch() { return &_hashScratch; }
 
@@ -2021,7 +2049,6 @@ private:
     const Column* _key {nullptr};
     const Column* _buildKey {nullptr};
     NLJoinKeyFunctions _keyFunctions;
-    NLKeyIsMatchableFunction _keyIsMatchable {nullptr};
 
     // This step's key hashes, one per row of the collected chunk
     std::vector<uint64_t> _hashScratch;
@@ -2053,23 +2080,21 @@ public:
     NLLimitState* getLimit() const { return _limit; }
     void setLimit(NLLimitState* limit) { _limit = limit; }
 
-    // The probe key chunk and the build key buffer it is matched against, read through
-    // the handlers of their shared chunk type.
+    // The probe key chunk and the build key buffer it is matched against: the hash is the
+    // probe chunk type's, the equality compares that type to the build key's.
     void setKeyColumns(const Column* key,
                        const Column* buildKey,
-                       const NLJoinKeyFunctions& keyFunctions,
-                       NLKeyIsMatchableFunction isMatchable) {
+                       const NLJoinKeyFunctions& keyFunctions) {
         _key = key;
         _buildKey = buildKey;
         _keyFunctions = keyFunctions;
-        _keyIsMatchable = isMatchable;
     }
 
     const Column* getKeyColumn() const { return _key; }
     const Column* getBuildKeyColumn() const { return _buildKey; }
     NLKeyHashFunction getKeyHash() const { return _keyFunctions._hash; }
     NLKeyEqualFunction getKeyEqual() const { return _keyFunctions._equal; }
-    NLKeyIsMatchableFunction getKeyIsMatchable() const { return _keyIsMatchable; }
+    NLKeyIsMatchableFunction getKeyIsMatchable() const { return _keyFunctions._isMatchable; }
 
     std::vector<uint64_t>* getHashScratch() { return &_hashScratch; }
 
@@ -2087,7 +2112,6 @@ private:
     const Column* _key {nullptr};
     const Column* _buildKey {nullptr};
     NLJoinKeyFunctions _keyFunctions;
-    NLKeyIsMatchableFunction _keyIsMatchable {nullptr};
     NLLimitState* _limit {nullptr};
 
     // This step's key hashes, one per row of the probe chunk
@@ -2411,25 +2435,32 @@ public:
     void setCount(size_t count) { _count = count; }
     void addCount(size_t count) { _count += count; }
 
-    // A min/max accumulator holds one extreme, so a new one is copied into the spare store
-    // and the stores flip at once
-    NLCompactingValueStore& extremeValues() { return _extremeValues; }
+    // The exact total of a sum or an average of durations, in microseconds
+    __int128 getDurationTotal() const { return _durationTotal; }
+    void setDurationTotal(__int128 total) { _durationTotal = total; }
+
+    // A min/max or tagged sum accumulator holds one value, so a new one is copied into the
+    // spare store and the stores flip at once
+    NLCompactingValueStore& accumulatorValues() { return _accumulatorValues; }
 
 private:
     Column* _accumulator {nullptr};
     size_t _count {0};
-    NLCompactingValueStore _extremeValues;
+    __int128 _durationTotal {0};
+    NLCompactingValueStore _accumulatorValues;
 };
 
 // Handlers of one aggregate, selected during translation from the reduction and
 // the column value type (as the count / gather / append families are), so the
 // per-type fan-out lives in one place. Reset re-initializes the accumulator (a
-// present zero for sum/avg, null for min/max) and zeroes the count; update folds
+// present zero for a typed sum/avg of numbers, null for min/max and a tagged cell) and
+// zeroes the count and the duration total; update folds
 // a chunk's non-null values into the accumulator; result writes the single
-// reduced row into the output column.
+// reduced row into the output column, building a value it computes - the average of
+// tagged cells - in the step buffers.
 using NLAggregateResetFunction = void (*)(NLAggregateState* state);
 using NLAggregateUpdateFunction = void (*)(NLAggregateState* state, const Column* input);
-using NLAggregateResultFunction = void (*)(const NLAggregateState* state, Column* output);
+using NLAggregateResultFunction = void (*)(const NLAggregateState* state, Column* output, NLStepBuffers* stepBuffers);
 
 // nl.aggregate data: re-initializes an accumulator each time the block it lives in
 // runs - once at function scope for a top-level aggregate. The value sibling of
@@ -2480,21 +2511,27 @@ private:
 // of NLCountResultData.
 class NLAggregateResultData : public NLFunctionData {
 public:
-    NLAggregateResultData(NLAggregateState* state, Column* output, NLAggregateResultFunction result)
+    NLAggregateResultData(NLAggregateState* state,
+                          Column* output,
+                          NLAggregateResultFunction result,
+                          NLStepBuffers* stepBuffers)
         : _state(state),
         _output(output),
-        _result(result)
+        _result(result),
+        _stepBuffers(stepBuffers)
     {
     }
 
     NLAggregateState* getState() const { return _state; }
     Column* getOutput() const { return _output; }
     NLAggregateResultFunction getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
 
 private:
     NLAggregateState* _state {nullptr};
     Column* _output {nullptr};
     NLAggregateResultFunction _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
 };
 
 // The reduction one function of a grouped aggregation applies. The runtime
@@ -2536,6 +2573,9 @@ public:
 
     std::string& getKey() { return _key; }
 
+    void setRowKey(NLKeyAppendFunction appendRowKey) { _appendRowKey = appendRowKey; }
+    void appendRowKey(const Column* input, size_t row) { _appendRowKey(input, row, _key); }
+
     // Record the key built for this row; true when the (group, value) pair is new,
     // so the caller charges the group's tally.
     bool insertIfNew() { return _seen.insert(_key).second; }
@@ -2547,6 +2587,7 @@ public:
 private:
     std::unordered_set<std::string> _seen;
     std::string _key;
+    NLKeyAppendFunction _appendRowKey {nullptr};
 };
 
 // Append the values of the given rows of an input chunk onto the tail of a
@@ -2563,9 +2604,11 @@ using NLGroupKeyGatherFunction = void (*)(const Column* input,
 // newly added groups to the reduction's identity - a present zero (sum/avg), a
 // null (min/max) or a zero tally (count). The accumulator column holds the reduced
 // value per group (null for count); counts holds the per-group non-null tally
-// (used by count and avg). One per kind / value type, selected during translation.
+// (used by count and avg); durationTotals holds the per-group 128-bit total of a sum
+// or an average of durations. One per kind / value type, selected during translation.
 using NLGroupAggregateGrowFunction = void (*)(Column* accumulator,
                                               std::vector<uint64_t>& counts,
+                                              std::vector<__int128>& durationTotals,
                                               size_t groupCount);
 
 // Fold this step's chunk into the per-group state: for each input row, reduce its
@@ -2573,10 +2616,12 @@ using NLGroupAggregateGrowFunction = void (*)(Column* accumulator,
 // group-index map nl.group_aggregate_update built for this step. One per kind /
 // value type. The parameters are the union of what any reduction needs, so each fold
 // reads only its own: sum/min/max ignore counts, count ignores the accumulator, only
-// the distinct kinds touch the tally of already-charged (group, value) pairs, and only
-// min/max copy the extremes they keep into values.
+// sums and averages of durations touch durationTotals, only the distinct kinds touch the
+// tally of already-charged (group, value) pairs, and only min/max and a sum of tagged
+// cells copy the values they keep into values.
 using NLGroupAggregateFoldFunction = void (*)(Column* accumulator,
                                               std::vector<uint64_t>& counts,
+                                              std::vector<__int128>& durationTotals,
                                               const Column* input,
                                               const std::vector<size_t>& groups,
                                               NLGroupDistinctTally& distinct,
@@ -2589,13 +2634,16 @@ using NLReownRowsFunction = void (*)(Column* column, const std::vector<size_t>& 
 
 // Materialize the reduction of groups [begin, begin + count) into an emit output
 // column: a copy of the accumulator slice (sum/min/max), a per-group divide
-// (avg), or the tally slice (count). Runs once per emit chunk. One per kind /
+// (avg), or the tally slice (count). A value it computes - the average of tagged
+// cells - is built in the step buffers. Runs once per emit chunk. One per kind /
 // value type.
 using NLGroupAggregateEmitFunction = void (*)(const Column* accumulator,
                                               const std::vector<uint64_t>& counts,
+                                              const std::vector<__int128>& durationTotals,
                                               size_t begin,
                                               size_t count,
-                                              Column* output);
+                                              Column* output,
+                                              NLStepBuffers* stepBuffers);
 
 // The group table of one grouped aggregation: it maps a serialized grouping-key
 // tuple to a dense group index (0, 1, 2, ... in first-seen order). Each distinct
@@ -2664,7 +2712,8 @@ public:
 
     // One aggregate. The update folds the incoming chunk _input into the per-group
     // state (_accumulator, one reduced value per group - null for count - and
-    // _counts, one non-null tally per group, used by count and avg); the emit fills
+    // _counts, one non-null tally per group, used by count and avg, and _durationTotals,
+    // the 128-bit total per group of a sum or an average of durations); the emit fills
     // the loop variable _output. _grow/_fold/_emit are baked from the kind and the
     // value type. _distinct is the tally of a DISTINCT aggregate, left empty by every
     // other reduction.
@@ -2673,6 +2722,7 @@ public:
         Column* _accumulator {nullptr};
         Column* _output {nullptr};
         std::vector<uint64_t> _counts;
+        std::vector<__int128> _durationTotals;
         NLGroupDistinctTally _distinct;
         NLGroupAggregateGrowFunction _grow {nullptr};
         NLGroupAggregateFoldFunction _fold {nullptr};
@@ -2693,9 +2743,9 @@ public:
     // The group keys the key buffers hold, copied in as NLSortState::values' are
     NLValueStore& keyValues() { return _keyValues; }
 
-    // The extremes the min/max accumulators hold
-    NLValueStore& extremeValues() { return _extremeValues.getActive(); }
-    void compactExtremeValues();
+    // The values the min/max and tagged sum accumulators hold
+    NLValueStore& accumulatorValues() { return _accumulatorValues.getActive(); }
+    void compactAccumulatorValues();
 
     // Scratch reused per update step: the row key being built, the per-row group
     // index map, and the incoming rows that created a new group this step.
@@ -2714,7 +2764,7 @@ private:
 
     NLGroupTable _groupTable;
     NLValueStore _keyValues;
-    NLCompactingValueStore _extremeValues;
+    NLCompactingValueStore _accumulatorValues;
 
     std::string _key;
     std::vector<size_t> _groupIndices;
@@ -2760,12 +2810,14 @@ private:
 // chunk. The grouped sibling of NLSortLoopData.
 class NLGroupAggregateLoopData : public NLFunctionData {
 public:
-    NLGroupAggregateLoopData(NLGroupAggregateState* state)
-        : _state(state)
+    NLGroupAggregateLoopData(NLGroupAggregateState* state, NLStepBuffers* stepBuffers)
+        : _state(state),
+        _stepBuffers(stepBuffers)
     {
     }
 
     NLGroupAggregateState* getState() const { return _state; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
 
     NLLimitState* getLimit() const { return _limit; }
     void setLimit(NLLimitState* limit) { _limit = limit; }
@@ -2775,6 +2827,7 @@ public:
 
 private:
     NLGroupAggregateState* _state {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
     NLLimitState* _limit {nullptr};
     NLStmtContainer _stmts;
 };
@@ -2816,6 +2869,8 @@ public:
     const std::vector<Column*>& resultColumns() const { return _resultColumns; }
 
     void addResultColumn(Column* column) { _resultColumns.push_back(column); }
+
+    void setExecutionContext(const NLExecutionContext* context);
 
     // Prepare the procedure on its first drive and rewind it - the RESET step - on each
     // later one, so a procedure that finished the previous chunk of arguments starts
@@ -3026,10 +3081,10 @@ public:
     NLValueStore& keyValues() { return _keyValues; }
     NLValueStore& collectedValues() { return _collectedValues; }
 
-    // The extremes the side min/max accumulators hold, compacted as
+    // The values the side min/max and tagged sum accumulators hold, compacted as
     // NLGroupAggregateState's are
-    NLValueStore& extremeValues() { return _extremeValues.getActive(); }
-    void compactExtremeValues();
+    NLValueStore& accumulatorValues() { return _accumulatorValues.getActive(); }
+    void compactAccumulatorValues();
 
     // Scratch reused per update step: the row key being built, the per-row group index
     // map, and the incoming rows that created a new group this step.
@@ -3051,7 +3106,7 @@ private:
     ListBuffer<> _listBuffer;
     NLValueStore _keyValues;
     NLValueStore _collectedValues;
-    NLCompactingValueStore _extremeValues;
+    NLCompactingValueStore _accumulatorValues;
 
     std::vector<NLGroupAggregateState::Aggregate> _aggregates;
 
@@ -3130,18 +3185,21 @@ private:
 // NLGroupAggregateLoopData.
 class NLCollectLoopData : public NLFunctionData {
 public:
-    NLCollectLoopData(NLCollectState* state)
-        : _state(state)
+    NLCollectLoopData(NLCollectState* state, NLStepBuffers* stepBuffers)
+        : _state(state),
+        _stepBuffers(stepBuffers)
     {
     }
 
     NLCollectState* getState() const { return _state; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
 
     NLStmtContainer* getStmts() { return &_stmts; }
     const NLStmtContainer* getStmts() const { return &_stmts; }
 
 private:
     NLCollectState* _state {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
     NLStmtContainer _stmts;
 };
 
@@ -3304,10 +3362,10 @@ public:
     NLShortestPathState* getState() const { return _state; }
 
     void setDistanceOutput(Column* distance) { _distance = distance; }
-    void setPathOutput(ColumnVector<Path>* path) { _path = path; }
+    void setPathOutput(ColumnVector<GraphPath>* path) { _path = path; }
 
     Column* getDistanceOutput() const { return _distance; }
-    ColumnVector<Path>* getPathOutput() const { return _path; }
+    ColumnVector<GraphPath>* getPathOutput() const { return _path; }
 
     // The scratch the search reuses to expand one popped node's out-edges and read their
     // weights, allocated once at translation. The edge/node/weight columns are LocalMemory
@@ -3335,7 +3393,7 @@ private:
     NLShortestPathState* _state {nullptr};
 
     Column* _distance {nullptr};
-    ColumnVector<Path>* _path {nullptr};
+    ColumnVector<GraphPath>* _path {nullptr};
 
     ColumnNodeIDs* _expansionInput {nullptr};
     ColumnEdgeIDs* _expandedEdges {nullptr};
@@ -3346,12 +3404,17 @@ private:
     NLStmtContainer _stmts;
 };
 
+// One property a CREATE writes and the column its values come from. A column of tagged
+// cells carries the runtime property that types it as the write runs in place of a type ID.
+struct NLCreatedProperty {
+    PropertyTypeID _propertyTypeID;
+    const Column* _values {nullptr};
+    NLRuntimeProperty* _runtimeProperty {nullptr};
+};
+
 class NLCreateNodeData : public NLFunctionData {
 public:
-    struct Property {
-        PropertyTypeID _propertyTypeID;
-        const Column* _values {nullptr};
-    };
+    using Property = NLCreatedProperty;
 
     NLCreateNodeData(LabelSetHandle labelsetHandle, ColumnNodeIDs* result)
         : _result(result),
@@ -3382,10 +3445,7 @@ private:
 
 class NLCreateEdgeData : public NLFunctionData {
 public:
-    struct Property {
-        PropertyTypeID _propertyTypeID;
-        const Column* _values {nullptr};
-    };
+    using Property = NLCreatedProperty;
 
     NLCreateEdgeData(EdgeTypeID edgeTypeID,
                      const ColumnNodeIDs* src,
@@ -3472,6 +3532,10 @@ struct NLMergeProperty {
     PropertyType _propertyType;
     const Column* _values {nullptr};
     NLKeyAppendFunction _keyAppend {nullptr};
+
+    // Set for a column of tagged cells, whose rows are keyed as the values they are staged
+    // as. The type stays unset until the merge's first chunk holding a value types it.
+    NLRuntimeProperty* _runtimeProperty {nullptr};
 };
 
 // The graph side of that key: the same property, read out of the graph into a scratch
@@ -3517,6 +3581,7 @@ public:
     // The spec's key properties in the types they are written with, which is what a
     // pending node's values are read back through
     const NLMergeScanProperties& writtenProperties() const { return _writtenProperties; }
+    NLMergeScanProperties& writtenProperties() { return _writtenProperties; }
     void addWrittenProperty(const NLMergeScanProperty& property) { _writtenProperties.push_back(property); }
 
     size_t getNextPendingNode() const { return _nextPendingNode; }
@@ -3624,7 +3689,7 @@ public:
         ColumnMask* _outputPending {nullptr};
     };
 
-    NLMergeData(NLMergePendingEdges* pendingEdges, ColumnMask* created);
+    NLMergeData(NLMergePendingEdges* pendingEdges, ColumnMask* created, LocalMemory* memory);
     ~NLMergeData() override;
 
     const std::vector<Node>& nodes() const { return _nodes; }
@@ -3636,6 +3701,8 @@ public:
 
     NLMergePendingEdges* getPendingEdges() const { return _pendingEdges; }
     ColumnMask* getCreated() const { return _created; }
+
+    LocalMemory* getMemory() const { return _memory; }
 
     // The column whose length is the number of rows the op runs over: a chunk some part
     // of the pattern reads. Null for a pattern reading none, which is the single row a
@@ -3659,6 +3726,7 @@ private:
     std::vector<NLCarriedColumn> _carriedColumns;
     NLMergePendingEdges* _pendingEdges {nullptr};
     ColumnMask* _created {nullptr};
+    LocalMemory* _memory {nullptr};
     const Column* _rowCarrier {nullptr};
     std::unique_ptr<NLMergeWorkingSet> _workingSet;
 
@@ -3696,25 +3764,28 @@ public:
     const ColumnMask* getRows() const { return _rows; }
     void setRows(const ColumnMask* rows) { _rows = rows; }
 
-    // A removal stages a null of the property's own type. Its value column carries no
-    // type to dispatch on, so this is where the type comes from. Invalid when the write
-    // reads its values off the column.
-    ValueType getNullValueType() const { return _nullValueType; }
-    void setNullValueType(ValueType valueType) { _nullValueType = valueType; }
+    // A null or a column of tagged cells reaches a property the program types as it runs:
+    // a removal stages a null of the type it has by then, and every cell is checked against
+    // that type and staged as it. Null for a column of a type the write was translated with.
+    NLRuntimeProperty* getRuntimeProperty() const { return _runtimeProperty; }
+    void setRuntimeProperty(NLRuntimeProperty* runtimeProperty) { _runtimeProperty = runtimeProperty; }
 
-    // A column of list elements carries each row's type in its cell, so the property's own
-    // type is what every cell is checked against and staged as. Invalid for any other column.
-    ValueType getListElementValueType() const { return _listElementValueType; }
-    void setListElementValueType(ValueType valueType) { _listElementValueType = valueType; }
+    bool writesNull() const { return _writesNull; }
+    void setWritesNull(bool writesNull) { _writesNull = writesNull; }
+
+    // The rows of this step the write reaches, which alone type and check its cells
+    ColumnMask* getWrittenRows() const { return _writtenRows; }
+    void setWrittenRows(ColumnMask* writtenRows) { _writtenRows = writtenRows; }
 
 private:
     const ColumnNodeIDs* _input {nullptr};
     const Column* _value {nullptr};
     const ColumnMask* _pending {nullptr};
     const ColumnMask* _rows {nullptr};
+    NLRuntimeProperty* _runtimeProperty {nullptr};
+    ColumnMask* _writtenRows {nullptr};
     PropertyTypeID _propertyTypeID;
-    ValueType _nullValueType {ValueType::Invalid};
-    ValueType _listElementValueType {ValueType::Invalid};
+    bool _writesNull {false};
     bool _allPending {false};
 };
 
@@ -3742,27 +3813,86 @@ public:
     const ColumnMask* getRows() const { return _rows; }
     void setRows(const ColumnMask* rows) { _rows = rows; }
 
-    // A removal stages a null of the property's own type. Its value column carries no
-    // type to dispatch on, so this is where the type comes from. Invalid when the write
-    // reads its values off the column.
-    ValueType getNullValueType() const { return _nullValueType; }
-    void setNullValueType(ValueType valueType) { _nullValueType = valueType; }
+    // A null or a column of tagged cells reaches a property the program types as it runs:
+    // a removal stages a null of the type it has by then, and every cell is checked against
+    // that type and staged as it. Null for a column of a type the write was translated with.
+    NLRuntimeProperty* getRuntimeProperty() const { return _runtimeProperty; }
+    void setRuntimeProperty(NLRuntimeProperty* runtimeProperty) { _runtimeProperty = runtimeProperty; }
 
-    // A column of list elements carries each row's type in its cell, so the property's own
-    // type is what every cell is checked against and staged as. Invalid for any other column.
-    ValueType getListElementValueType() const { return _listElementValueType; }
-    void setListElementValueType(ValueType valueType) { _listElementValueType = valueType; }
+    bool writesNull() const { return _writesNull; }
+    void setWritesNull(bool writesNull) { _writesNull = writesNull; }
+
+    // The rows of this step the write reaches, which alone type and check its cells
+    ColumnMask* getWrittenRows() const { return _writtenRows; }
+    void setWrittenRows(ColumnMask* writtenRows) { _writtenRows = writtenRows; }
 
 private:
     const ColumnEdgeIDs* _input {nullptr};
     const Column* _value {nullptr};
     const ColumnMask* _pending {nullptr};
     const ColumnMask* _rows {nullptr};
+    NLRuntimeProperty* _runtimeProperty {nullptr};
+    ColumnMask* _writtenRows {nullptr};
     PropertyTypeID _propertyTypeID;
-    ValueType _nullValueType {ValueType::Invalid};
-    ValueType _listElementValueType {ValueType::Invalid};
+    bool _writesNull {false};
     bool _allPending {false};
 };
+
+template <typename IDColumn>
+class NLSetPropertiesData : public NLFunctionData {
+public:
+    using IDColumnType = IDColumn;
+
+    NLSetPropertiesData(const IDColumn* input, const Column* value, bool replaces)
+        : _input(input),
+        _value(value),
+        _replaces(replaces)
+    {
+    }
+
+    const IDColumn* getInput() const { return _input; }
+    const Column* getValue() const { return _value; }
+    bool getReplaces() const { return _replaces; }
+
+    const ColumnMask* getPending() const { return _pending; }
+    void setPending(const ColumnMask* pending) { _pending = pending; }
+
+    bool isAllPending() const { return _allPending; }
+    void setAllPending(bool allPending) { _allPending = allPending; }
+
+    const ColumnMask* getRows() const { return _rows; }
+    void setRows(const ColumnMask* rows) { _rows = rows; }
+
+    bool writesNull() const { return _writesNull; }
+    void setWritesNull(bool writesNull) { _writesNull = writesNull; }
+
+    std::vector<WrittenMap>& getMaps() { return _maps; }
+    CommitWriteBuffer::UntypedProperties& getMapProperties() { return _mapProperties; }
+    std::vector<StagedRange>& getMapRanges() { return _mapRanges; }
+    CommitWriteBuffer::UntypedProperties& getRemovals() { return _removals; }
+    std::vector<PropertyTypeID>& getHeld() { return _held; }
+    std::vector<ValueType>& getHeldTypes() { return _heldTypes; }
+    std::vector<MapKeyPropertyType>& getKeyTypes() { return _keyTypes; }
+
+private:
+    const IDColumn* _input {nullptr};
+    const Column* _value {nullptr};
+    const ColumnMask* _pending {nullptr};
+    const ColumnMask* _rows {nullptr};
+    bool _allPending {false};
+    bool _replaces {false};
+    bool _writesNull {false};
+    std::vector<WrittenMap> _maps;
+    CommitWriteBuffer::UntypedProperties _mapProperties;
+    std::vector<StagedRange> _mapRanges;
+    CommitWriteBuffer::UntypedProperties _removals;
+    std::vector<PropertyTypeID> _held;
+    std::vector<ValueType> _heldTypes;
+    std::vector<MapKeyPropertyType> _keyTypes;
+};
+
+using NLSetNodePropertiesData = NLSetPropertiesData<ColumnNodeIDs>;
+using NLSetEdgePropertiesData = NLSetPropertiesData<ColumnEdgeIDs>;
 
 class NLDeleteNodeData : public NLFunctionData {
 public:
@@ -4035,6 +4165,32 @@ private:
     NLCellWrite _writeDefault;
 };
 
+// Each row @param nullRows marks takes the next row of @param fill, every other row its own
+using NLFillNullRowsFn = void (*)(Column* result, const Column* value, const ColumnMask* nullRows, const Column* fill);
+
+class NLFillNullsData : public NLFunctionData {
+public:
+    NLFillNullsData(const Column* value,
+                    const ColumnMask* nullRows,
+                    const Column* fill,
+                    Column* result,
+                    NLFillNullRowsFn fillNullRows);
+    ~NLFillNullsData();
+
+    const Column* getValue() const { return _value; }
+    const ColumnMask* getNullRows() const { return _nullRows; }
+    const Column* getFill() const { return _fill; }
+    Column* getResult() const { return _result; }
+    NLFillNullRowsFn getFillNullRows() const { return _fillNullRows; }
+
+private:
+    const Column* _value {nullptr};
+    const ColumnMask* _nullRows {nullptr};
+    const Column* _fill {nullptr};
+    Column* _result {nullptr};
+    NLFillNullRowsFn _fillNullRows {nullptr};
+};
+
 // Row-wise list build (nl.make_list): row r of the result is the list of row r of every
 // element column, written into the query's list buffer as one contiguous run. Every
 // element column carries rows and they are row-aligned, so the first of them gives the
@@ -4067,6 +4223,30 @@ private:
     std::vector<Element> _elements;
 };
 
+// One nl.to_any: the cells of the operand read as list items, and stored as tagged cells
+// in the values of the run that read them
+class NLToAnyData : public NLFunctionData {
+public:
+    NLToAnyData(const Column* operand, Column* result, NLListItemReadFunction read, NLStepBuffers* stepBuffers)
+        : _operand(operand),
+        _result(result),
+        _read(read),
+        _stepBuffers(stepBuffers)
+    {
+    }
+
+    const Column* getOperand() const { return _operand; }
+    Column* getResult() const { return _result; }
+    NLListItemReadFunction getRead() const { return _read; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+private:
+    const Column* _operand {nullptr};
+    Column* _result {nullptr};
+    NLListItemReadFunction _read {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+};
+
 using NLStringArgumentRead = std::optional<types::String::Primitive> (*)(const Column* input,
                                                                         size_t row,
                                                                         std::string_view functionName);
@@ -4074,6 +4254,34 @@ using NLStringArgumentRead = std::optional<types::String::Primitive> (*)(const C
 using NLIntegerArgumentRead = std::optional<types::Int64::Primitive> (*)(const Column* input,
                                                                         size_t row,
                                                                         std::string_view functionName);
+
+using NLPointArgumentRead = std::optional<types::Point::Primitive> (*)(const Column* input,
+                                                                      size_t row,
+                                                                      std::string_view functionName);
+
+// The arguments of point.distance or point.withinBBox, each a column read one point per row
+class NLPointFunctionData : public NLFunctionData {
+public:
+    struct PointArgument {
+        const Column* _column {nullptr};
+        NLPointArgumentRead _read {nullptr};
+    };
+
+    explicit NLPointFunctionData(Column* result)
+        : _result(result)
+    {
+    }
+
+    Column* getResult() const { return _result; }
+
+    const std::vector<PointArgument>& getArguments() const { return _arguments; }
+
+    void addArgument(const PointArgument& argument) { _arguments.push_back(argument); }
+
+private:
+    Column* _result {nullptr};
+    std::vector<PointArgument> _arguments;
+};
 
 class NLSubstringData : public NLFunctionData {
 public:
@@ -4111,18 +4319,28 @@ private:
     IntegerArgument _length;
 };
 
+using NLStringListArgumentRead = bool (*)(const Column* input,
+                                          size_t row,
+                                          std::string_view functionName,
+                                          std::vector<types::String::Primitive>& strings);
+
 class NLSplitData : public NLFunctionData {
 public:
     using StringArgument = NLSubstringData::StringArgument;
 
+    struct DelimitersArgument {
+        const Column* _column {nullptr};
+        NLStringListArgumentRead _read {nullptr};
+    };
+
     NLSplitData(Column* result,
                 NLStepBuffers* stepBuffers,
                 const StringArgument& string,
-                const StringArgument& delimiter)
+                const DelimitersArgument& delimiters)
         : _result(result),
         _stepBuffers(stepBuffers),
         _string(string),
-        _delimiter(delimiter)
+        _delimiters(delimiters)
     {
     }
 
@@ -4130,13 +4348,13 @@ public:
     NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
 
     const StringArgument& getString() const { return _string; }
-    const StringArgument& getDelimiter() const { return _delimiter; }
+    const DelimitersArgument& getDelimiters() const { return _delimiters; }
 
 private:
     Column* _result {nullptr};
     NLStepBuffers* _stepBuffers {nullptr};
     StringArgument _string;
-    StringArgument _delimiter;
+    DelimitersArgument _delimiters;
 };
 
 class NLStringEndData : public NLFunctionData {
@@ -4228,10 +4446,18 @@ private:
     std::vector<Entry> _entries;
 };
 
-// What one row of an nl.static_map_key or an nl.dynamic_map_key reads its key in: a map, or
-// the node or the edge whose properties are its keys. Nothing where the row holds none of
-// them.
-using NLKeyedValue = std::variant<std::monostate, MapView, NodeID, EdgeID>;
+// A row holding a value no key reads into: a number, a string, a boolean, an embedding or a
+// list
+struct NLKeylessValue {
+    explicit NLKeylessValue(CellTag tag);
+
+    CellTag _tag {CellTag::INVALID};
+};
+
+// What one row of an nl.static_map_key or an nl.dynamic_map_key reads its key in: a map, the
+// node or the edge whose properties are its keys, or the instant, the duration or the point
+// whose components are. Nothing where the row holds null.
+using NLKeyedValue = std::variant<std::monostate, MapView, NodeID, EdgeID, DateTime, Duration, Point, NLKeylessValue>;
 
 // The keyed value one column of a map key read holds at @param row. One per column shape,
 // selected during translation.
@@ -4242,43 +4468,25 @@ using NLKeyedReadFunction = NLKeyedValue (*)(const Column* input, size_t row);
 using NLStringReadFunction = std::optional<types::String::Primitive> (*)(const Column* input,
                                                                         size_t row);
 
-// Row-wise copy of map entries' values into tagged cells (nl.map_entry_value)
-class NLMapEntryValueData : public NLFunctionData {
-public:
-    NLMapEntryValueData(const Column* input, Column* result, NLStepBuffers* stepBuffers)
-        : _input(input),
-        _result(result),
-        _stepBuffers(stepBuffers)
-    {
-    }
-
-    const Column* getInput() const { return _input; }
-    Column* getResult() const { return _result; }
-    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
-    std::vector<QueryListBuffer::ListItemVariant>& getItems() { return _items; }
-
-private:
-    const Column* _input {nullptr};
-    Column* _result {nullptr};
-    NLStepBuffers* _stepBuffers {nullptr};
-    std::vector<QueryListBuffer::ListItemVariant> _items;
-};
-
-// Row-wise map key read (nl.static_map_key): row r of the result views the entry row r's map
-// holds under the key, or the null entry where it holds none.
+// Row-wise map key read (nl.static_map_key): row r of the result views the value row r's map
+// holds under the key, or a null cell where it holds none. The components of an instant, a
+// duration and a point the key names are resolved during translation.
 class NLStaticMapKeyData : public NLFunctionData {
 public:
+    // The part the key names of each type with components, as the row's value picks the type
+    using ComponentParts = std::tuple<std::optional<DateTimePart>, std::optional<DurationPart>, std::optional<PointPart>>;
+
     NLStaticMapKeyData(const Column* input,
                  Column* result,
                  NLKeyedReadFunction keyedRead,
                  std::string_view key,
-                 MapEntryView absent,
+                 const ComponentParts& parts,
                  NLStepBuffers* stepBuffers)
         : _input(input),
         _result(result),
         _keyedRead(keyedRead),
         _key(key),
-        _absent(absent),
+        _parts(parts),
         _stepBuffers(stepBuffers)
     {
     }
@@ -4289,21 +4497,20 @@ public:
     std::string_view getKey() const { return _key; }
     NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
 
-    // The entry a row whose map holds no such key reads: the key the statement reads under,
-    // tagged null. Fixed by the key, so one serves every row of every chunk.
-    MapEntryView getAbsentEntry() const { return _absent; }
+    template <typename Part>
+    std::optional<Part> getPart() const { return std::get<std::optional<Part>>(_parts); }
 
 private:
     const Column* _input {nullptr};
     Column* _result {nullptr};
     NLKeyedReadFunction _keyedRead {nullptr};
     std::string_view _key {};
-    MapEntryView _absent;
+    ComponentParts _parts;
     NLStepBuffers* _stepBuffers {nullptr};
 };
 
-// Row-wise map key read (nl.dynamic_map_key): row r of the result views the entry row r's
-// map holds under row r's key, or a null entry where it holds none.
+// Row-wise map key read (nl.dynamic_map_key): row r of the result views the value row r's
+// map holds under row r's key, or a null cell where it holds none.
 class NLDynamicMapKeyData : public NLFunctionData {
 public:
     NLDynamicMapKeyData(const Column* input,
@@ -4311,14 +4518,12 @@ public:
                         NLKeyedReadFunction keyedRead,
                         const Column* key,
                         NLStringReadFunction keyRead,
-                        MapEntryView absent,
                         NLStepBuffers* stepBuffers)
         : _input(input),
         _result(result),
         _keyedRead(keyedRead),
         _key(key),
         _keyRead(keyRead),
-        _absent(absent),
         _stepBuffers(stepBuffers)
     {
     }
@@ -4330,19 +4535,87 @@ public:
     NLStringReadFunction getKeyRead() const { return _keyRead; }
     NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
 
-    // The entry a row holding no key reads: no key to name it by, so one keyless null entry
-    // serves every such row. A row whose key the map does not hold is named by that key, so
-    // its entry is written as the row is read.
-    MapEntryView getAbsentEntry() const { return _absent; }
-
 private:
     const Column* _input {nullptr};
     Column* _result {nullptr};
     NLKeyedReadFunction _keyedRead {nullptr};
     const Column* _key {nullptr};
     NLStringReadFunction _keyRead {nullptr};
-    MapEntryView _absent;
     NLStepBuffers* _stepBuffers {nullptr};
+};
+
+// What one row of an nl.container_index's base holds, as each of its two reads sees it: the
+// list a position reads, and what a key reads into, which is nothing where the row is null
+struct NLContainer {
+    std::optional<ListView> _list;
+    NLKeyedValue _keyed;
+};
+
+using NLContainerReadFunction = NLContainer (*)(const Column* base, size_t row);
+
+struct NLNeitherPositionNorKey {
+    explicit NLNeitherPositionNorKey(CellTag tag);
+
+    CellTag _tag {CellTag::INVALID};
+};
+
+using NLSubscript = std::variant<std::monostate,
+                                 types::Int64::Primitive,
+                                 types::UInt64::Primitive,
+                                 types::String::Primitive,
+                                 NLNeitherPositionNorKey>;
+
+using NLSubscriptReadFunction = NLSubscript (*)(const Column* index, size_t row);
+
+class NLContainerIndexData : public NLFunctionData {
+public:
+    NLContainerIndexData(const Column* base,
+                         NLContainerReadFunction baseRead,
+                         const Column* index,
+                         NLSubscriptReadFunction indexRead,
+                         Column* result,
+                         NLStepBuffers* stepBuffers);
+    ~NLContainerIndexData() override;
+
+    const Column* getBase() const { return _base; }
+    NLContainerReadFunction getBaseRead() const { return _baseRead; }
+    const Column* getIndex() const { return _index; }
+    NLSubscriptReadFunction getIndexRead() const { return _indexRead; }
+    Column* getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+private:
+    const Column* _base {nullptr};
+    NLContainerReadFunction _baseRead {nullptr};
+    const Column* _index {nullptr};
+    NLSubscriptReadFunction _indexRead {nullptr};
+    Column* _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+};
+
+// Row-wise map merge (nl.merge_maps): row r of the result holds every key the operands' maps
+// hold at row r, under the value of the last operand holding it.
+class NLMergeMapsData : public NLFunctionData {
+public:
+    struct Operand {
+        const Column* _column {nullptr};
+        NLKeyedReadFunction _read {nullptr};
+    };
+
+    NLMergeMapsData(Column* result, NLStepBuffers* stepBuffers);
+    ~NLMergeMapsData() override;
+
+    Column* getResult() const { return _result; }
+    NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
+
+    const std::vector<Operand>& getOperands() const { return _operands; }
+
+    void addOperand(const Operand& operand);
+
+private:
+    Column* _result {nullptr};
+    NLStepBuffers* _stepBuffers {nullptr};
+    std::vector<Operand> _operands;
 };
 
 
@@ -4780,31 +5053,31 @@ private:
     std::vector<size_t> _nullCounts;
 };
 
-// nl.reduce data: the per-row fold of `reduce(acc = init, x IN xs | f(acc, x))`. The
-// result column is the accumulator: it is reset, takes the initial value of each row whose
-// source cell holds a list, then the body's value once per element. The body runs once
-// per element position over the rows whose list reaches it; the carried columns gather
-// those rows' cells of the accumulator, of the source where its cells are the elements,
-// and of the carry set.
-class NLReduceData : public NLFunctionData {
+// The per-row fold of `reduce(acc = init, x IN xs | f(acc, x))`, nl.reduce's data and
+// the part of nl.all_reduce's it shares. The accumulator, nl.reduce's result, is reset,
+// takes the initial value of each row whose source cell holds a list, then the body's
+// value once per element. The body runs once per element position over the rows whose
+// list reaches it; the carried columns gather those rows' cells of the accumulator, of
+// the source where its cells are the elements, and of the carry set.
+class NLFoldData : public NLFunctionData {
 public:
     using CarriedColumns = std::vector<NLCarriedColumn>;
 
-    NLReduceData(const Column* source,
-                 NLUnwindElementCountFunction elementCount,
-                 NLUnwindElementEmitFunction elementEmit,
-                 NLCellAbsentFunction cellAbsent,
-                 Column* elementOutput,
-                 const Column* initialValue,
-                 Column* result,
-                 NLStepBuffers* stepBuffers)
+    NLFoldData(const Column* source,
+               NLUnwindElementCountFunction elementCount,
+               NLUnwindElementEmitFunction elementEmit,
+               NLCellAbsentFunction cellAbsent,
+               Column* elementOutput,
+               const Column* initialValue,
+               Column* accumulator,
+               NLStepBuffers* stepBuffers)
         : _source(source),
         _elementCount(elementCount),
         _elementEmit(elementEmit),
         _cellAbsent(cellAbsent),
         _elementOutput(elementOutput),
         _initialValue(initialValue),
-        _result(result),
+        _accumulator(accumulator),
         _stepBuffers(stepBuffers)
     {
     }
@@ -4815,7 +5088,7 @@ public:
     NLCellAbsentFunction getCellAbsentFunc() const { return _cellAbsent; }
     Column* getElementOutput() const { return _elementOutput; }
     const Column* getInitialValue() const { return _initialValue; }
-    Column* getResult() const { return _result; }
+    Column* getAccumulator() const { return _accumulator; }
     NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
 
     const CarriedColumns& carriedColumns() const { return _carriedColumns; }
@@ -4843,6 +5116,7 @@ public:
 
     std::vector<size_t>& elementCounts() { return _elementCounts; }
     std::vector<size_t>& reachingRows() { return _reachingRows; }
+    std::vector<size_t>& endedRows() { return _endedRows; }
 
     NLStmtContainer* getStmts() { return &_stmts; }
     const NLStmtContainer* getStmts() const { return &_stmts; }
@@ -4866,7 +5140,7 @@ private:
     NLCellAbsentFunction _cellAbsent {nullptr};
     Column* _elementOutput {nullptr};
     const Column* _initialValue {nullptr};
-    Column* _result {nullptr};
+    Column* _accumulator {nullptr};
     NLStepBuffers* _stepBuffers {nullptr};
     const Column* _value {nullptr};
     NLCaseResetFn _reset {nullptr};
@@ -4883,6 +5157,65 @@ private:
     ColumnVector<size_t> _positions;
     std::vector<size_t> _elementCounts;
     std::vector<size_t> _reachingRows;
+    std::vector<size_t> _endedRows;
+};
+
+// nl.all_reduce data: nl.reduce's fold, whose accumulator is a column of its own, the
+// predicate run after each step over the accumulators it wrote, and what the predicate
+// answered for each row: false at some step, which ends the row's fold, or null at some
+// step. The predicate reads the body's element and carried chunks; only the accumulator
+// is gathered again.
+class NLAllReduceData : public NLFoldData {
+public:
+    NLAllReduceData(const Column* source,
+                    NLUnwindElementCountFunction elementCount,
+                    NLUnwindElementEmitFunction elementEmit,
+                    NLCellAbsentFunction cellAbsent,
+                    Column* elementOutput,
+                    const Column* initialValue,
+                    Column* accumulator,
+                    NLStepBuffers* stepBuffers,
+                    Column* result)
+        : NLFoldData(source, elementCount, elementEmit, cellAbsent, elementOutput, initialValue, accumulator, stepBuffers),
+        _result(result)
+    {
+    }
+
+    Column* getResult() const { return _result; }
+
+    Column* getTestedAccumulator() const { return _testedAccumulator; }
+    NLGatherFunction getAccumulatorGather() const { return _accumulatorGather; }
+
+    void setTestedAccumulator(Column* testedAccumulator, NLGatherFunction accumulatorGather) {
+        _testedAccumulator = testedAccumulator;
+        _accumulatorGather = accumulatorGather;
+    }
+
+    NLStmtContainer* getPredicateStmts() { return &_predicateStmts; }
+    const NLStmtContainer* getPredicateStmts() const { return &_predicateStmts; }
+
+    const Column* getHolds() const { return _holds; }
+    NLTruthReadFunction getTruthRead() const { return _truthRead; }
+
+    void setHolds(const Column* holds, NLTruthReadFunction truthRead) {
+        _holds = holds;
+        _truthRead = truthRead;
+    }
+
+    std::vector<bool>& failedRows() { return _failedRows; }
+    std::vector<bool>& unknownRows() { return _unknownRows; }
+
+private:
+    Column* _result {nullptr};
+    Column* _testedAccumulator {nullptr};
+    NLGatherFunction _accumulatorGather {nullptr};
+    const Column* _holds {nullptr};
+    NLTruthReadFunction _truthRead {nullptr};
+
+    NLStmtContainer _predicateStmts;
+
+    std::vector<bool> _failedRows;
+    std::vector<bool> _unknownRows;
 };
 
 using NLUnaryFunctionKernel = void (*)(NLExecutionContext* context,
@@ -5102,16 +5435,19 @@ private:
 
 // nl.row_lists_collect data: stages what this step of the body's rows contributes, each
 // value under the row its tag names, through the read its column shape takes. The tag is
-// null when the accumulator covers a single row.
+// null when every value belongs to one row: the one the row chunk holds the position of,
+// or the single row of the step when that is null too.
 class NLRowListsCollectData : public NLFunctionData {
 public:
     NLRowListsCollectData(NLRowListsState* state,
                           const ColumnVector<uint64_t>* tag,
+                          const ColumnVector<uint64_t>* row,
                           const Column* value,
                           NLListItemReadFunction valueRead,
                           NLStepBuffers* stepBuffers)
         : _state(state),
         _tag(tag),
+        _row(row),
         _value(value),
         _valueRead(valueRead),
         _stepBuffers(stepBuffers)
@@ -5120,6 +5456,7 @@ public:
 
     NLRowListsState* getState() const { return _state; }
     const ColumnVector<uint64_t>* getTag() const { return _tag; }
+    const ColumnVector<uint64_t>* getRow() const { return _row; }
     const Column* getValue() const { return _value; }
     NLListItemReadFunction getValueRead() const { return _valueRead; }
     NLStepBuffers* getStepBuffers() const { return _stepBuffers; }
@@ -5127,6 +5464,7 @@ public:
 private:
     NLRowListsState* _state {nullptr};
     const ColumnVector<uint64_t>* _tag {nullptr};
+    const ColumnVector<uint64_t>* _row {nullptr};
     const Column* _value {nullptr};
     NLListItemReadFunction _valueRead {nullptr};
     NLStepBuffers* _stepBuffers {nullptr};
@@ -5249,9 +5587,9 @@ private:
     ColumnVector<uint64_t>* _tag {nullptr};
 };
 
-// nl.exists_mark data: marks the input rows the tag names. An accumulator with no input
-// column is answered for by the columns instead: the step is the single empty row, which
-// this step's rows mark when they hold one at all.
+// nl.exists_mark data: marks the input rows the tag names. With no tag the columns answer
+// for one row instead, which this step's rows mark when they hold one at all: the row the
+// row chunk holds the position of, or the single empty row when that is null too.
 class NLExistsMarkData : public NLFunctionData {
 public:
     NLExistsMarkData(NLExistsState* state)
@@ -5264,6 +5602,9 @@ public:
     const ColumnVector<uint64_t>* getTag() const { return _tag; }
     void setTag(const ColumnVector<uint64_t>* tag) { _tag = tag; }
 
+    const ColumnVector<uint64_t>* getRow() const { return _row; }
+    void setRow(const ColumnVector<uint64_t>* row) { _row = row; }
+
     const std::vector<const Column*>& columns() const { return _columns; }
 
     void addColumn(const Column* column) { _columns.push_back(column); }
@@ -5271,6 +5612,7 @@ public:
 private:
     NLExistsState* _state {nullptr};
     const ColumnVector<uint64_t>* _tag {nullptr};
+    const ColumnVector<uint64_t>* _row {nullptr};
     std::vector<const Column*> _columns;
 };
 
@@ -5297,7 +5639,7 @@ class NLCountSubqueryState : public NLSubqueryExpressionState {
 public:
     void reset() override;
 
-    void addRows(size_t rowCount);
+    void addRows(uint64_t row, size_t rowCount);
     void addTaggedRows(std::span<const uint64_t> tag);
 
     const std::vector<uint64_t>& getCounts() const { return _counts; }
@@ -5307,18 +5649,24 @@ private:
 };
 
 // nl.count_subquery_tally data: counts the entries of the tag toward the rows they name,
-// or, with no tag, the rows of @param rows toward the single row the step answers for
+// or, with no tag, the rows of @param rows toward the one row they answer for: the row
+// @param row holds the position of, or the single row of the step when it is null
 class NLCountSubqueryTallyData : public NLFunctionData {
 public:
-    NLCountSubqueryTallyData(NLCountSubqueryState* state, const ColumnVector<uint64_t>* tag, const Column* rows);
+    NLCountSubqueryTallyData(NLCountSubqueryState* state,
+                             const ColumnVector<uint64_t>* tag,
+                             const ColumnVector<uint64_t>* row,
+                             const Column* rows);
 
     NLCountSubqueryState* getState() const { return _state; }
     const ColumnVector<uint64_t>* getTag() const { return _tag; }
+    const ColumnVector<uint64_t>* getRow() const { return _row; }
     const Column* getRows() const { return _rows; }
 
 private:
     NLCountSubqueryState* _state {nullptr};
     const ColumnVector<uint64_t>* _tag {nullptr};
+    const ColumnVector<uint64_t>* _row {nullptr};
     const Column* _rows {nullptr};
 };
 
@@ -5625,6 +5973,10 @@ public:
     // of its merges: a pending edge is what a merge's hop extends a candidate with.
     NLMergePendingEdges* getMergePendingEdges() { return &_mergePendingEdges; }
 
+    // The property every write of @param name the program types as it runs reaches, owned
+    // by the program
+    NLRuntimeProperty* getRuntimeProperty(std::string_view name);
+
     NLStmtContainer* getStmts() { return &_stmts; }
     const NLStmtContainer* getStmts() const { return &_stmts; }
 
@@ -5669,6 +6021,7 @@ private:
     std::vector<std::unique_ptr<NLRowState>> _rowStates;
     std::vector<std::unique_ptr<NLProcedureState>> _procedureStates;
     std::unordered_map<std::string, std::unique_ptr<NLMergeNodeIndex>> _mergeNodeIndexes;
+    std::unordered_map<std::string, std::unique_ptr<NLRuntimeProperty>> _runtimeProperties;
     NLMergePendingEdges _mergePendingEdges;
     NLStmtContainer _stmts;
 };

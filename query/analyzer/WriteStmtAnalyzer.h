@@ -2,11 +2,16 @@
 
 #include <string_view>
 #include <unordered_set>
+#include <vector>
 
 #include "decl/EvaluatedType.h"
+#include "decl/PatternData.h"
+#include "stmt/SetItem.h"
 #include "views/GraphView.h"
 
 namespace db {
+
+class ParameterExpr;
 
 class CypherAST;
 class VarDecl;
@@ -16,13 +21,15 @@ class Stmt;
 class CreateStmt;
 class MergeStmt;
 class SetStmt;
-class SetItem;
 class RemoveStmt;
 class DeleteStmt;
 class Pattern;
 class PatternElement;
+class EntityPattern;
 class NodePattern;
 class EdgePattern;
+class Expr;
+class MapLiteral;
 
 class WriteStmtAnalyzer {
 public:
@@ -63,7 +70,13 @@ private:
     void analyzeNamedPath(PatternElement* element);
     void analyze(NodePattern* node);
     void analyze(EdgePattern* edge);
+    void analyzePropertyValues(const MapLiteral* properties, const EntityPattern* pattern);
     void analyze(SetItem* item);
+    void analyzePropertiesAssign(SetItem::EntityPropertiesAssign& assign, const SetItem* item);
+    void analyzeMapLiteralProperties(const Expr* value, std::vector<EntityPropertyConstraint>& created);
+    void analyzeMapParameterProperties(ParameterExpr* expr, std::vector<EntityPropertyConstraint>& created);
+    void throwIncompatibleProperty(ValueType propertyType, EvaluatedType writtenType, const Expr* expr) const;
+    void createProperty(std::string_view propertyName, ValueType createdType, Expr* expr, std::vector<EntityPropertyConstraint>& created);
 
     void throwOnEntityWhere(const Pattern* pattern, std::string_view clause) const;
     void throwOnUndirectedEdge(const Pattern* pattern) const;

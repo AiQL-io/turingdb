@@ -108,6 +108,7 @@ DumpResult<void> CommitLoader::loadData(const fs::Path& commitDir,
             auto res = DataPartLoader::load(DataPartID{dataPartID},
                                             partDir,
                                             metadata,
+                                            commit->_data->allDataparts(),
                                             controller);
 
             if (!res) {

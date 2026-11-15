@@ -113,43 +113,14 @@ bool Projection::hasItem(const Expr* key) const {
     return locateItem(key) != _items.end();
 }
 
-bool Projection::hasItemReadingThePropertyOfComponent(const PropertyExpr* component) const {
-    for (const ReturnItem& item : _items) {
-        const Expr* const* itemExpr = std::get_if<Expr*>(&item);
-        const bool readsTheProperty = itemExpr
-                                   && StructuralExpressionComparator::readsThePropertyOfComponent(*itemExpr, component);
-
-        if (readsTheProperty) {
-            return true;
-        }
-    }
-
-    return false;
-}
-
-bool Projection::hasVariableItem(const VarDecl* decl) const {
-    return hasItemDecl(decl, true);
-}
-
 bool Projection::hasItemDecl(const VarDecl* decl) const {
-    return hasItemDecl(decl, false);
-}
-
-bool Projection::hasItemDecl(const VarDecl* decl, bool bareVariablesOnly) const {
     if (!decl) {
         return false;
     }
 
     for (const ReturnItem& item : _items) {
         if (const Expr* const* itemExpr = std::get_if<Expr*>(&item)) {
-            const Expr* projectedExpr = *itemExpr;
-
-            // Only a bare variable returns the variable itself; every other item returns
-            // a value computed from it, which leaves the variable behind
-            const bool isBareVariable = projectedExpr->getKind() == Expr::Kind::SYMBOL;
-            const bool returnsTheDecl = isBareVariable || !bareVariablesOnly;
-
-            if (returnsTheDecl && projectedExpr->getExprVarDecl() == decl) {
+            if ((*itemExpr)->getExprVarDecl() == decl) {
                 return true;
             }
         } else if (std::get<VarDecl*>(item) == decl) {

@@ -253,9 +253,11 @@ def UnwindRange : NLOp<"unwind_range", [Pure, AttrSizedOperandSegments]> {
                 -> !nl.iter<!nl.chunk<!storage.nullable<i64>>, !nl.chunk<!storage.node_id>>
 
     Every bound carries rows - lowering lays a constant one out over them first - and is
-    read as a nullable value chunk. The integers are computed as the chunk is filled, so
-    the iterator holds one chunk of them however many a row spans. `from`, `to` and
-    `reversed` are db.unwind_range's, and the slice bounds are read as its range bounds are.
+    read as a nullable value chunk, or as a chunk of type-erased cells whose integer each
+    row reads out of its cell, raising on any other value. The integers are computed as the
+    chunk is filled, so the iterator holds one chunk of them however many a row spans.
+    `from`, `to` and `reversed` are db.unwind_range's, and the slice bounds are read as its
+    range bounds are.
   }];
 
   let arguments = (ins NLChunk:$start,
@@ -391,51 +393,63 @@ def MakeMap : NLOp<"make_map", [Pure, RowAlignedThroughOperands]> {
 }
 
 /**
+* MergeMaps
+*/
+def MergeMaps : NLOp<"merge_maps", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise merge of the maps of every operand, later keys replacing earlier ones";
+  let description = [{
+    Imperative counterpart of db.merge_maps. Row r of the result holds every key the
+    operands' maps hold at row r, under the value of the last operand holding it, written
+    into the step's map buffer as one contiguous run sorted on key:
+
+      %m = nl.merge_maps(%properties, %entries)
+             : (!nl.chunk<!storage.nullable<!storage.map>>, !nl.chunk<!storage.map>)
+             -> !nl.chunk<!storage.nullable<!storage.map>>
+
+    An operand is a chunk of maps, nullable or not, or of tagged cells. A row where one
+    holds no map gets none, so the result is nullable unless every operand is a plain
+    chunk of maps. Every operand carries rows - lowering lays a constant one out over them
+    first.
+  }];
+
+  let arguments = (ins Variadic<NLChunk>:$maps);
+  let results   = (outs NLChunk:$result);
+  let hasVerifier = 1;
+
+  let extraClassDeclaration = [{
+    static ::mlir::Type resultChunkType(::mlir::MLIRContext* context, ::mlir::TypeRange mapTypes);
+  }];
+
+  let assemblyFormat = "`(` $maps `)` attr-dict `:` functional-type(operands, results)";
+}
+
+/**
 * StaticMapKey
 */
 def StaticMapKey : NLOp<"static_map_key", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise read of one value of a map chunk, by a key fixed at plan time";
   let description = [{
-    Imperative counterpart of db.static_map_key. Row r of the result views the entry row r's map
-    already holds, so the read copies nothing:
+    Imperative counterpart of db.static_map_key. Row r of the result views the value row r's
+    map already holds, a tagged cell, so the read copies nothing:
 
       %v = nl.static_map_key %m key "name"
-             : (!nl.chunk<!storage.nullable<!storage.map>>) -> !nl.chunk<!storage.map_element>
+             : (!nl.chunk<!storage.nullable<!storage.map>>) -> !nl.chunk<!storage.any>
 
     The operand is nullable where a stored property fetched it and plain where a literal
     built it, so both spellings are accepted. It is a chunk of tagged cells where the map
     was itself read out of a list or a map. A cell holding a node or an edge reads that
-    entity's property, written into the step's map buffer as an entry of its own, and a
-    cell holding anything else answers like a row holding none. The result never is a
-    tagged cell: a map value carries its null in its own tag, so a
-    missing key and an absent map both read back as a Null-tagged entry rather than as an
-    absent optional.
+    entity's property, and one holding a datetime or a duration the component the key
+    names, written into the step's map buffer as an entry of its own. A cell holding any
+    other value raises, and so does a datetime or a duration with no such component. The
+    result is never nullable: a cell carries its null in its own tag, so a missing key and
+    a null row both read back as a Null-tagged cell rather than as an absent optional.
   }];
 
   let arguments = (ins NLChunk:$map, StrAttr:$key);
-  let results   = (outs NLMapElementChunk:$result);
+  let results   = (outs NLCellChunk:$result);
   let hasVerifier = 1;
 
   let assemblyFormat = "$map `key` $key attr-dict `:` functional-type(operands, results)";
-}
-
-def MapEntryValue : NLOp<"map_entry_value", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
-  let summary = "Row-wise read of the value each map entry holds, as a tagged cell";
-  let description = [{
-    A value read out of a map rides the entry it views in the map buffer. Where it meets an
-    op reading the tagged cells every value of type any rides - a CASE, a list, an
-    aggregate, NOT or a minus - its value is copied into a cell of its own:
-
-      %c = nl.map_entry_value %v : (!nl.chunk<!storage.map_element>) -> !nl.chunk<!storage.any>
-
-    A Null-tagged entry answers a Null-tagged cell.
-  }];
-
-  let arguments = (ins NLMapElementChunk:$entries);
-  let results   = (outs NLChunk:$result);
-  let hasVerifier = 1;
-
-  let assemblyFormat = "$entries attr-dict `:` functional-type(operands, results)";
 }
 
 /**
@@ -454,9 +468,10 @@ def Range : NLOp<"range", [Pure, RowAlignedThroughOperands]> {
               -> !nl.chunk<!storage.nullable<!storage.list<i64>>>
 
     Every bound carries rows - lowering lays a constant one out over them first - and is
-    read as a nullable value chunk, so a row whose bound is absent gets no list. The step
-    is absent where the query gave none, which counts by 1; a step of 0 is the error the
-    row raises, as is a row spanning more than 100000 integers.
+    read as a nullable value chunk, or as a chunk of type-erased cells whose integer each
+    row reads out of its cell, raising on any other value. A row whose bound is absent gets
+    no list. The step is absent where the query gave none, which counts by 1; a step of 0
+    is the error the row raises, as is a row spanning more than 100000 integers.
   }];
 
   // The step is the only variable-length operand, so MLIR tells it apart from the bounds
@@ -486,8 +501,9 @@ def ListSlice : NLOp<"list_slice", [Pure, RowAlignedThroughOperands, AttrSizedOp
                -> !nl.chunk<!storage.nullable<!storage.list<i64>>>
 
     Each bound carries rows - lowering lays a constant one out over them first - and is
-    read as a nullable value chunk. A bound the query left out is no operand at all, which
-    runs from the start or to the end.
+    read as a nullable value chunk, or as a chunk of type-erased cells whose integer each
+    row reads out of its cell, raising on any other value. A bound the query left out is no
+    operand at all, which runs from the start or to the end.
   }];
 
   let arguments = (ins NLChunk:$list, Optional<NLChunk>:$from, Optional<NLChunk>:$to);
@@ -657,13 +673,77 @@ def Reduce : NLOp<"reduce", [Pure, RowAlignedThroughOperands]> {
 /**
 * ReduceYield
 */
-def ReduceYield : NLOp<"reduce_yield", [Pure, Terminator, HasParent<"Reduce">]> {
-  let summary = "Name the accumulator an nl.reduce's body computed for each element";
+def ReduceYield : NLOp<"reduce_yield", [Pure, Terminator, ParentOneOf<["Reduce", "AllReduce"]>]> {
+  let summary = "Name the accumulator an nl.reduce's or an nl.all_reduce's body computed for each element";
 
   let arguments = (ins NLChunk:$value);
 
   let assemblyFormat = [{
     $value attr-dict `:` qualified(type($value))
+  }];
+}
+
+/**
+* AllReduce
+*/
+def AllReduce : NLOp<"all_reduce", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise decision of whether a predicate holds after every step of a fold over that row's list";
+
+  let description = [{
+    Imperative counterpart of db.all_reduce. Row r of the result is whether the predicate
+    the body yields held after every step of the fold of row r's list:
+
+      %ok = nl.all_reduce(%xs, %zero, {%n}) ({
+        ^bb0(%x: !nl.chunk<!storage.nullable<i64>>,
+             %acc: !nl.chunk<!storage.nullable<i64>>,
+             %nIn: !nl.chunk<!storage.node_id>):
+          %next = nl.add %acc, %x : ...
+          nl.reduce_yield %next : !nl.chunk<!storage.nullable<i64>>
+      }) predicate ({
+        ^bb0(%x: !nl.chunk<!storage.nullable<i64>>,
+             %acc: !nl.chunk<!storage.nullable<i64>>,
+             %nIn: !nl.chunk<!storage.node_id>):
+          %holds = nl.lt %acc, %ten : ...
+          nl.all_reduce_yield %holds : !nl.chunk<!storage.nullable<i1>>
+      }) : (!nl.chunk<!storage.nullable<!storage.list<i64>>>,
+            !nl.chunk<i64>,
+            !nl.chunk<!storage.node_id>)
+        -> !nl.chunk<!storage.nullable<i1>>
+
+    The body runs as nl.reduce's does, once per element position, and its value is
+    written into the accumulator, of the type of the body's accumulator argument. The
+    predicate region then runs over the same rows, its accumulator argument read back
+    from the accumulator just written. A row leaves the fold at the first step whose
+    predicate is false, so the body never runs on its later elements. The result is
+    nullable: a row whose source cell holds no list gets a null, and so does a row with
+    no false step and a null one.
+  }];
+
+  let arguments = (ins NLChunk:$source, NLChunk:$initial_value, Variadic<NLChunk>:$columns_to_filter);
+  let results   = (outs NLChunk:$result);
+
+  // Exactly one block each, the body ending in an nl.reduce_yield and the predicate in an
+  // nl.all_reduce_yield.
+  let regions = (region SizedRegion<1>:$body, SizedRegion<1>:$predicate);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $source `,` $initial_value `,` `{` $columns_to_filter `}` `)` $body `predicate` $predicate attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* AllReduceYield
+*/
+def AllReduceYield : NLOp<"all_reduce_yield", [Pure, Terminator, HasParent<"AllReduce">]> {
+  let summary = "Name whether an nl.all_reduce's predicate holds on the accumulator each element left";
+
+  let arguments = (ins NLChunk:$holds);
+
+  let assemblyFormat = [{
+    $holds attr-dict `:` qualified(type($holds))
   }];
 }
 
@@ -1244,7 +1324,7 @@ def ExpandPath : NLOp<"expand_path", [Pure, RowAlignedThroughOperands]> {
              : (!nl.chunk<!storage.path_ref>, !nl.chunk<!storage.node_id>) -> !nl.chunk<!storage.list<!storage.edge_id>>
   }];
 
-  let arguments = (ins NLChunk:$paths,
+  let arguments = (ins NLPathRefChunk:$paths,
                        Optional<NLNodeIDChunk>:$srcids,
                        PathExpansionKind:$kind,
                        UnitAttr:$reversed,
@@ -1262,18 +1342,22 @@ def ExpandPath : NLOp<"expand_path", [Pure, RowAlignedThroughOperands]> {
 * PathLength
 */
 def PathLength : NLOp<"path_length", [Pure, RowAlignedThroughOperands]> {
-  let summary = "Read the number of edges of each path of a chunk";
+  let summary = "Read the number of edges, or of nodes, of each path of a chunk";
   let description = [{
-    Imperative counterpart of db.path_length: one unsigned count per row.
+    Imperative counterpart of db.path_length: one unsigned count per row, the
+    repetitions of a body of `steps` steps when it is set, and the nodes of the path,
+    one more than its edges, under `nodes`.
 
       %n = nl.path_length(%p) : (!nl.chunk<!storage.path_ref>) -> !nl.chunk<ui64>
+      %n = nl.path_length(%p) steps 2 : (!nl.chunk<!storage.path_ref>) -> !nl.chunk<ui64>
+      %n = nl.path_length(%p) nodes : (!nl.chunk<!storage.path_ref>) -> !nl.chunk<ui64>
   }];
 
-  let arguments = (ins NLChunk:$paths);
+  let arguments = (ins NLPathRefChunk:$paths, OptionalAttr<UI64Attr>:$steps, UnitAttr:$nodes);
   let results   = (outs NLChunk:$result);
 
   let assemblyFormat = [{
-    `(` $paths `)` attr-dict `:` functional-type(operands, results)
+    `(` $paths `)` (`steps` $steps^)? (`nodes` $nodes^)? attr-dict `:` functional-type(operands, results)
   }];
 }
 
@@ -1281,15 +1365,15 @@ def PathLength : NLOp<"path_length", [Pure, RowAlignedThroughOperands]> {
 * MakePath
 */
 def MakePath : NLOp<"make_path", [Pure, RowAlignedThroughOperands]> {
-  let summary = "Build the path of a named pattern element, one entity sequence per row";
+  let summary = "Build the path of a named pattern element, one path per row";
   let description = [{
-    Imperative counterpart of db.make_path: one sequence of graph entities per row, the
-    nodes and edges the element runs through in written order, a path operand expanded
-    into the hops it stands for.
+    Imperative counterpart of db.make_path: one path per row, the nodes and edges the
+    element runs through in written order, a path operand expanded into the hops it
+    stands for.
 
       %p = nl.make_path(%a, %x, %b)
              : (!nl.chunk<!storage.node_id>, !nl.chunk<!storage.edge_id>, !nl.chunk<!storage.node_id>)
-               -> !nl.chunk<!storage.entity_list>
+               -> !nl.chunk<!storage.path>
   }];
 
   let arguments = (ins Variadic<NLChunk>:$entities,
@@ -1299,6 +1383,8 @@ def MakePath : NLOp<"make_path", [Pure, RowAlignedThroughOperands]> {
   let assemblyFormat = [{
     `(` $entities `)` attr-dict `:` functional-type(operands, results)
   }];
+
+  let hasVerifier = 1;
 }
 
 /**
@@ -1308,12 +1394,13 @@ def PathElements : NLOp<"path_elements", [Pure, RowAlignedThroughOperands]> {
   let summary = "Read the nodes, the relationships or the length of each named path of a chunk";
   let description = [{
     Imperative counterpart of db.path_elements: one list of node IDs, one list of edge
-    IDs or one hop count per row, read off the entity sequence nl.make_path laid out
-    or the path nl.shortest_path found, and null on the rows whose sequence is empty -
-    the paths an OPTIONAL MATCH missed.
+    IDs or one hop count per row, read off the path nl.make_path laid out or the path
+    nl.shortest_path found, and null on the rows whose path is null - the paths an
+    OPTIONAL MATCH missed. A chunk of tagged cells reads the path each cell holds, null
+    where it holds a null.
 
       %ns = nl.path_elements(%p) kind nodes
-              : (!nl.chunk<!storage.entity_list>) -> !nl.chunk<!storage.nullable<!storage.list<!storage.node_id>>>
+              : (!nl.chunk<!storage.path>) -> !nl.chunk<!storage.nullable<!storage.list<!storage.node_id>>>
   }];
 
   let arguments = (ins NLChunk:$path, PathElementsKind:$kind);
@@ -1411,9 +1498,9 @@ def GetNodeProperties : NLOp<"get_node_properties", [Pure, RowAlignedThroughOper
   // The node chunk, the property handle and the optional pending mask are all
   // buildable, so their types are omitted; only the nullable value chunk type is
   // spelled, after the colon. `pending` is the mask an nl.merge produced beside its
-  // node chunk: such a row holds a write-buffer offset rather than an ID the graph
-  // knows, so its value is read out of the write buffer rather than off the node the
-  // offset collides with - null there when the write set the property on none.
+  // node chunk: such a row names a node this change wrote by the ID it will commit as,
+  // past every node the graph holds, so its value is read out of the write buffer -
+  // null there when the write set the property on none.
   // `all_pending` says that of every row without a mask, which an nl.create_node's
   // chunk is.
   let arguments = (ins NLNodeIDChunk:$input_nodes,
@@ -1679,7 +1766,9 @@ def EachRow : NLOp<"each_row", [Pure, InferTypeOpAdaptor]> {
 
     This is how a CALL subquery whose body aggregates, sorts, cuts or dedups runs
     once per row in flight: the body's loops nest in this loop and its accumulators
-    are hoisted into its body, so they cover one input row at a time. The columns
+    are hoisted into its body, so they cover one input row at a time. An EXISTS, COUNT
+    or COLLECT body run this way walks its buffer's tag beside the rows, so each step
+    names the row of the step it answers for. The columns
     must be row-aligned with each other, and there must be at least one - the step's
     row count is read from the first. A `limit` on the enclosing nl.for stops the
     walk over the rows once the budget is spent.
@@ -2540,7 +2629,16 @@ def RowConstant : NLOp<"row_constant", [Pure, ConstantResult, SameOperandsAndRes
       %row = nl.range %from, %to : (...) -> !nl.chunk<!storage.nullable<!storage.list<i64>>>
       %list = nl.row_constant %row : !nl.chunk<!storage.nullable<!storage.list<i64>>>
 
-      No row of a step may reach the operand: it is computed from constants alone.
+      A body run once per row reads each row of an nl.each_row step as a constant for the
+      same reason, which is what db.row_constant lowers to:
+
+      %rows = nl.each_row {%p} : {!nl.chunk<!storage.node_id>}
+      nl.for %row in %rows : !nl.iter<!nl.chunk<!storage.node_id>> {
+        %pc = nl.row_constant %row : !nl.chunk<!storage.node_id>
+        ...
+      }
+
+      No row of any other step may reach the operand.
   }];
 
   let arguments = (ins NLChunk:$row);
@@ -2591,8 +2689,9 @@ def ListIndex : NLOp<"list_index", [Pure, ConstantThroughOperands, RowAlignedThr
 
       %n = nl.list_index %ns, %i : (!nl.chunk<!storage.list<!storage.node_id>>, !nl.chunk<i64>) -> !nl.chunk<!storage.node_id>
 
-      A chunk of tagged cells is indexed too - a list read out of a list or out of a map -
-      and a cell holding no list reads back as the absent element.
+      A chunk of tagged cells is indexed too - a list read out of a list or out of a map. A
+      cell holding null reads back as the absent element, and one holding another value
+      raises.
   }];
 
   let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
@@ -2604,26 +2703,53 @@ def ListIndex : NLOp<"list_index", [Pure, ConstantThroughOperands, RowAlignedThr
 def DynamicMapKey : NLOp<"dynamic_map_key", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise read of one value of a map chunk, by a key read per row";
   let description = [{
-    Imperative counterpart of db.dynamic_map_key. Row r of the result views the entry row
-    r's map already holds under row r's key, so the read copies nothing:
+    Imperative counterpart of db.dynamic_map_key. Row r of the result views the value row
+    r's map already holds under row r's key, a tagged cell, so the read copies nothing:
 
       %v = nl.dynamic_map_key %m, %k
              : (!nl.chunk<!storage.nullable<!storage.map>>, !nl.chunk<!storage.string>)
-               -> !nl.chunk<!storage.map_element>
+               -> !nl.chunk<!storage.any>
 
     Either operand is nullable where a stored property fetched it and plain where a literal
     built it, so both spellings are accepted on both. The map operand is a chunk of tagged
     cells where the map was itself read out of a list or a map, and a cell holding a node or
-    an edge reads that entity's property under the key. The result never is: a map
-    value carries its null in its own tag, so a map holding no such key, a row holding no
-    map and a row holding no key all read back as a Null-tagged entry.
+    an edge reads that entity's property under the key. A cell holding any other value
+    raises. The result is never nullable: a cell carries its null in its own tag, so a map
+    holding no such key, a null row and a row holding no key all read back as a
+    Null-tagged cell.
   }];
 
   let arguments = (ins NLChunk:$map, NLChunk:$key);
-  let results   = (outs NLMapElementChunk:$result);
+  let results   = (outs NLCellChunk:$result);
   let hasVerifier = 1;
 
   let assemblyFormat = "$map `,` $key attr-dict `:` functional-type(operands, results)";
+}
+
+def ContainerIndex : NLOp<"container_index", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise read of an element of a list or a value of a map, by an index read per row";
+  let description = [{
+    Imperative counterpart of db.container_index. Row r reads the element row r's list holds
+    at row r's position, as nl.list_index does, or the value row r's map, node or edge holds
+    under row r's key, as nl.dynamic_map_key does:
+
+      %e = nl.container_index %xs, %i
+             : (!nl.chunk<!storage.list<i64>>, !nl.chunk<!storage.any>) -> !nl.chunk<!storage.nullable<i64>>
+
+      %v = nl.container_index %c, %i
+             : (!nl.chunk<!storage.any>, !nl.chunk<!storage.any>) -> !nl.chunk<!storage.any>
+
+    The base is a chunk of lists, of maps or of tagged cells, and the index a chunk of tagged
+    cells, each optionally nullable. A null base or a null index reads null. A position on a
+    value that is no list, a key on a value that is no map, node or edge, and an index that is
+    neither a position nor a key raise.
+  }];
+
+  let arguments = (ins NLChunk:$base, NLChunk:$index);
+  let results   = (outs NLChunk:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$base `,` $index attr-dict `:` functional-type(operands, results)";
 }
 
 def Sub : NLOp<"sub", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
@@ -2702,12 +2828,16 @@ def Eq : NLOp<"eq", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> 
   let summary = "Row-wise equality of two value chunks";
   let description = [{
       %r = nl.eq %x, %y : (!nl.chunk<!storage.nullable<i64>>, !nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i1>>
+
+      Neither operand is the null literal; a test for a null is nl.is_null.
   }];
 
   let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
   let results   = (outs NLChunk:$result);
 
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+
+  let hasVerifier = 1;
 }
 
 def Neq : NLOp<"neq", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
@@ -2720,6 +2850,37 @@ def Neq : NLOp<"neq", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]
   let results   = (outs NLChunk:$result);
 
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+
+  let hasVerifier = 1;
+}
+
+def IsNull : NLOp<"is_null", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise test of whether a chunk holds no value";
+  let description = [{
+      Imperative counterpart of db.is_null, over any chunk as it stands: an absent value, an
+      invalid ID, the null path and a cell holding null are null, and the result never is.
+
+      %r = nl.is_null %x : (!nl.chunk<!storage.nullable<i64>>) -> !nl.chunk<i1>
+  }];
+
+  let arguments = (ins NLChunk:$operand);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
+}
+
+def IsNotNull : NLOp<"is_not_null", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise test of whether a chunk holds a value";
+  let description = [{
+      Imperative counterpart of db.is_not_null, the negation of nl.is_null.
+
+      %r = nl.is_not_null %x : (!nl.chunk<!storage.node_id>) -> !nl.chunk<i1>
+  }];
+
+  let arguments = (ins NLChunk:$operand);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
 }
 
 def Gt : NLOp<"gt", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
@@ -2818,6 +2979,18 @@ def In : NLOp<"in", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> 
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
+def IndexOf : NLOp<"index_of", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Row-wise position of the first element of a list equal to a value, or -1";
+  let description = [{
+      %r = nl.index_of %xs, %x : (!nl.chunk<!storage.list<i64>>, !nl.chunk<i64>) -> !nl.chunk<!storage.nullable<i64>>
+  }];
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
 def And : NLOp<"and", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "Row-wise logical AND of two boolean chunks";
   let description = [{
@@ -2887,6 +3060,44 @@ def ToNullable : NLOp<"to_nullable", [Pure, ConstantThroughOperands, RowAlignedT
   let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
 }
 
+def CheckedCast : NLOp<"checked_cast", [NoMemoryEffect, RowAlignedThroughOperands]> {
+  let summary = "Read the node or the relationship each tagged cell of a chunk holds";
+  let description = [{
+      db.checked_cast lowers to this. A null cell, and every row of a null literal, reads
+      as the invalid ID; a cell holding another value raises.
+
+      %p = nl.checked_cast %v : (!nl.chunk<!storage.any>) -> !nl.chunk<!storage.node_id>
+  }];
+
+  let arguments = (ins NLChunk:$operand);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
+}
+
+def ToAny : NLOp<"to_any", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
+  let summary = "Read a chunk as values of type any";
+  let description = [{
+      The chunk a column takes where its rows hold values of different types, each row
+      keeping the type it has: a scalar, an entity, a list or a map becomes a tagged cell,
+      and a null an absent one. A list chunk read as lists of the type its elements join
+      into - tagged cells, or the one type an empty list's none joins to - keeps the views
+      it holds, whose elements are tagged cells already.
+
+      %r = nl.to_any %x : (!nl.chunk<!storage.nullable<i64>>) -> !nl.chunk<!storage.any>
+      %l = nl.to_any %y : (!nl.chunk<!storage.list<!storage.string>>)
+                          -> !nl.chunk<!storage.list<!storage.any>>
+      %e = nl.to_any %z : (!nl.chunk<!storage.list<none>>)
+                          -> !nl.chunk<!storage.list<!storage.node_id>>
+  }];
+
+  let arguments = (ins NLChunk:$operand);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
+  let hasVerifier = 1;
+}
+
 class NLUnaryFunctionOp<string mnemonic, list<Trait> extraTraits = []>
     : NLOp<mnemonic, !listconcat([Pure, RowAlignedThroughOperands], extraTraits)> {
   let summary = "Apply a unary scalar function row-wise to a value chunk";
@@ -2912,6 +3123,7 @@ def ToFloat : NLUnaryFunctionOp<"to_float", [ConstantThroughOperands]>;
 def ToBoolean : NLUnaryFunctionOp<"to_boolean", [ConstantThroughOperands]>;
 def ToDateTime : NLUnaryFunctionOp<"to_datetime", [ConstantThroughOperands]>;
 def ToDuration : NLUnaryFunctionOp<"to_duration", [ConstantThroughOperands]>;
+def ToPoint : NLUnaryFunctionOp<"to_point", [ConstantThroughOperands]>;
 def ToString : NLUnaryFunctionOp<"to_string", [ConstantThroughOperands]>;
 
 def ToIntegerOrNull : NLUnaryFunctionOp<"to_integer_or_null", [ConstantThroughOperands]>;
@@ -2951,6 +3163,15 @@ def DurationSecondsOfMinute : NLUnaryFunctionOp<"duration_seconds_of_minute", [C
 def DurationMillisecondsOfSecond : NLUnaryFunctionOp<"duration_milliseconds_of_second", [ConstantThroughOperands]>;
 def DurationMicrosecondsOfSecond : NLUnaryFunctionOp<"duration_microseconds_of_second", [ConstantThroughOperands]>;
 
+def PointX : NLUnaryFunctionOp<"point_x", [ConstantThroughOperands]>;
+def PointY : NLUnaryFunctionOp<"point_y", [ConstantThroughOperands]>;
+def PointZ : NLUnaryFunctionOp<"point_z", [ConstantThroughOperands]>;
+def PointLongitude : NLUnaryFunctionOp<"point_longitude", [ConstantThroughOperands]>;
+def PointLatitude : NLUnaryFunctionOp<"point_latitude", [ConstantThroughOperands]>;
+def PointHeight : NLUnaryFunctionOp<"point_height", [ConstantThroughOperands]>;
+def PointCRSName : NLUnaryFunctionOp<"point_crs", [ConstantThroughOperands]>;
+def PointSRID : NLUnaryFunctionOp<"point_srid", [ConstantThroughOperands]>;
+
 def CurrentDateTime : NLOp<"current_datetime", [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
   let summary = "The instant the query runs, as a single-value chunk";
   let description = [{
@@ -2973,6 +3194,7 @@ def CurrentDateTime : NLOp<"current_datetime", [Pure, ConstantThroughOperands, R
 def ElementID : NLUnaryFunctionOp<"element_id", [ConstantThroughOperands]>;
 
 def Size : NLUnaryFunctionOp<"size", [ConstantThroughOperands]>;
+def IsEmpty : NLUnaryFunctionOp<"is_empty", [ConstantThroughOperands]>;
 def CharLength : NLUnaryFunctionOp<"char_length", [ConstantThroughOperands]>;
 def Head : NLUnaryFunctionOp<"head", [ConstantThroughOperands]>;
 def Last : NLUnaryFunctionOp<"last", [ConstantThroughOperands]>;
@@ -3026,7 +3248,7 @@ def Substring : NLOp<"substring", [Pure, RowAlignedThroughOperands]> {
 }
 
 def Split : NLOp<"split", [Pure, RowAlignedThroughOperands]> {
-  let summary = "Row-wise split on delimiter";
+  let summary = "Row-wise split on a delimiter, or on every delimiter of a list";
 
   let arguments = (ins NLChunk:$string, NLChunk:$delimiter);
   let results   = (outs NLChunk:$result);
@@ -3054,6 +3276,24 @@ def Replace : NLOp<"replace", [Pure, RowAlignedThroughOperands]> {
   let results   = (outs NLChunk:$result);
 
   let assemblyFormat = "$string `,` $search `,` $replacement attr-dict `:` functional-type(operands, results)";
+}
+
+def PointDistance : NLOp<"point_distance", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise distance between two points, null across CRSs";
+
+  let arguments = (ins NLChunk:$lhs, NLChunk:$rhs);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
+}
+
+def PointWithinBBox : NLOp<"point_within_bbox", [Pure, RowAlignedThroughOperands]> {
+  let summary = "Row-wise test of a point against a box, null unless the three share a CRS";
+
+  let arguments = (ins NLChunk:$point, NLChunk:$lowerLeft, NLChunk:$upperRight);
+  let results   = (outs NLChunk:$result);
+
+  let assemblyFormat = "$point `,` $lowerLeft `,` $upperRight attr-dict `:` functional-type(operands, results)";
 }
 
 class NLBinaryFunctionOp<string mnemonic> : NLOp<mnemonic, [Pure, ConstantThroughOperands, RowAlignedThroughOperands]> {
@@ -3119,6 +3359,31 @@ def CaseMerge : NLOp<"case_merge", [Pure, RowAlignedWithFirstOperand, AttrSizedO
     `(` `{` $conditions `}` `,` `{` $values `}` (`,` $defaultValue^)? `)`
     attr-dict `:` functional-type(operands, results)
   }];
+}
+
+def FillNulls : NLOp<"fill_nulls", [Pure, RowAlignedWithFirstOperand]> {
+  let summary = "Row-wise fill of the null rows of a chunk, in order, from the rows of another";
+  let description = [{
+      The merge of a lowered db.coalesce. `null_rows` is the mask of the rows of `value`
+      its argument left null, before the value was converted to the coalesce's chunk, and
+      `fill` holds one row per row it marks, in their order. The result holds the row of
+      `value` where the mask does not hold and the next row of `fill` where it does.
+      `value`, `fill` and the result are of one type. The arguments of a coalesce are
+      merged back to front: each one's null rows take the merge of the arguments behind
+      it, which was computed over those rows alone.
+
+      %r = nl.fill_nulls %v, %nulls, %f : (!nl.chunk<!storage.nullable<i64>>,
+                                           !nl.chunk<!storage.bool>,
+                                           !nl.chunk<!storage.nullable<i64>>)
+                                           -> !nl.chunk<!storage.nullable<i64>>
+  }];
+
+  let arguments = (ins NLChunk:$value, NLChunk:$null_rows, NLChunk:$fill);
+  let results   = (outs NLChunk:$result);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = "$value `,` $null_rows `,` $fill attr-dict `:` functional-type(operands, results)";
 }
 
 def IsNotTrue : NLOp<"is_not_true", [Pure, RowAlignedThroughOperands]> {
@@ -3607,6 +3872,56 @@ def SetEdgeProperty : NLOp<"set_edge_property", [AttrSizedOperandSegments]> {
   let hasVerifier = 1;
 }
 
+def SetNodeProperties : NLOp<"set_node_properties", [AttrSizedOperandSegments]> {
+  let summary = "Write each input node's map as its properties in the open transaction's write buffer";
+  let description = [{
+      nl.for %nodes in %scan {
+        nl.set_node_properties %nodes, %maps replaces : !nl.chunk<!storage.map>
+      }
+  }];
+
+  let arguments = (ins NLNodeIDChunk:$input_nodes,
+                       NLChunk:$value,
+                       Optional<NLBoolChunk>:$pending,
+                       Optional<NLBoolChunk>:$rows,
+                       UnitAttr:$all_pending,
+                       UnitAttr:$replaces,
+                       OptionalAttr<DictionaryAttr>:$created_types);
+
+  let assemblyFormat = [{
+    $input_nodes `,` $value (`pending` $pending^)? (`rows` $rows^)?
+    (`all_pending` $all_pending^)? (`replaces` $replaces^)? (`creates` $created_types^)?
+    attr-dict `:` qualified(type($value))
+  }];
+
+  let hasVerifier = 1;
+}
+
+def SetEdgeProperties : NLOp<"set_edge_properties", [AttrSizedOperandSegments]> {
+  let summary = "Write each input edge's map as its properties in the open transaction's write buffer";
+  let description = [{
+      nl.for %s, %e, %t in %edges {
+        nl.set_edge_properties %e, %maps replaces : !nl.chunk<!storage.map>
+      }
+  }];
+
+  let arguments = (ins NLEdgeIDChunk:$input_edges,
+                       NLChunk:$value,
+                       Optional<NLBoolChunk>:$pending,
+                       Optional<NLBoolChunk>:$rows,
+                       UnitAttr:$all_pending,
+                       UnitAttr:$replaces,
+                       OptionalAttr<DictionaryAttr>:$created_types);
+
+  let assemblyFormat = [{
+    $input_edges `,` $value (`pending` $pending^)? (`rows` $rows^)?
+    (`all_pending` $all_pending^)? (`replaces` $replaces^)? (`creates` $created_types^)?
+    attr-dict `:` qualified(type($value))
+  }];
+
+  let hasVerifier = 1;
+}
+
 def DeleteNode : NLOp<"delete_node"> {
   let summary = "Tombstone each input node in the open transaction's write buffer";
   let description = [{
@@ -3870,18 +4185,26 @@ def ExistsMark : NLOp<"exists_mark", [AttrSizedOperandSegments]> {
 
       nl.exists_mark %state, %tag, (%k) : {!nl.chunk<!storage.node_id>}
 
-    The tag is absent when the accumulator has no input column: the step is then the
-    single empty row, which the columns mark when they hold a row at all - which is
-    what they are named for, an untagged mark having nothing else to answer from.
+    The tag is absent when every row the body produced answers for one input row, which
+    the columns mark when they hold a row at all - which is what they are named for, an
+    untagged mark having nothing else to answer from. That row is the one whose position
+    the one-row `row` chunk holds: the row of the step a body run one row at a time is
+    handed, its tag read through nl.each_row. With no `row` it is the single empty row an
+    accumulator with no input column holds.
+
+      nl.exists_mark %state, row %r, (%k) : {!nl.chunk<!storage.node_id>}
   }];
 
   let arguments = (ins NLExistsStateHandle:$state,
                        Optional<NLUInt64Chunk>:$tag,
+                       Optional<NLUInt64Chunk>:$row,
                        Variadic<NLChunk>:$columns);
 
   let assemblyFormat = [{
-    $state `,` ($tag^ `,`)? `(` $columns `)` attr-dict (`:` `{` qualified(type($columns))^ `}`)?
+    $state `,` ($tag^ `,`)? (`row` $row^ `,`)? `(` $columns `)` attr-dict (`:` `{` qualified(type($columns))^ `}`)?
   }];
+
+  let hasVerifier = 1;
 }
 
 /**
@@ -3953,18 +4276,20 @@ def CountSubqueryTally : NLOp<"count_subquery_tally", [AttrSizedOperandSegments]
 
       nl.count_subquery_tally %state, %tag
 
-    A body with no tag answers for a single row - the single empty row, or the one row a
-    body run per row is handed - and adds the row count of `rows` to it instead.
+    A body with no tag answers for a single row and adds the row count of `rows` to it
+    instead: the row whose position the one-row `row` chunk holds - the row of the step a
+    body run one row at a time is handed - or, with no `row`, the single empty row.
 
-      nl.count_subquery_tally %state rows(%k : !nl.chunk<!storage.node_id>)
+      nl.count_subquery_tally %state row %r rows(%k : !nl.chunk<!storage.node_id>)
   }];
 
   let arguments = (ins NLCountSubqueryStateHandle:$state,
                        Optional<NLUInt64Chunk>:$tag,
+                       Optional<NLUInt64Chunk>:$row,
                        Optional<NLChunk>:$rows);
 
   let assemblyFormat = [{
-    $state (`,` $tag^)? (`rows` `(` $rows^ `:` qualified(type($rows)) `)`)? attr-dict
+    $state (`,` $tag^)? (`row` $row^)? (`rows` `(` $rows^ `:` qualified(type($rows)) `)`)? attr-dict
   }];
 
   let hasVerifier = 1;
@@ -4036,7 +4361,7 @@ def RowListsBuffer : NLOp<"row_lists_buffer", [RowAlignedThroughOperands]> {
 */
 // NOT Pure: it stages this step's values in the accumulator, so it must run exactly
 // where it sits (like nl.optional_collect).
-def RowListsCollect : NLOp<"row_lists_collect", []> {
+def RowListsCollect : NLOp<"row_lists_collect", [AttrSizedOperandSegments]> {
   let summary = "Stage what this step of a body's rows contribute to the lists";
 
   let description = [{
@@ -4046,18 +4371,23 @@ def RowListsCollect : NLOp<"row_lists_collect", []> {
 
       nl.row_lists_collect %state, tag %tag, %name : !nl.chunk<!storage.nullable<!storage.string>>
 
-    The tag is absent when the step is a single row: the single empty row where nothing
-    is in flight, or the one row a per-row COLLECT body runs over. Every value belongs to
-    it.
+    The tag is absent when every value belongs to one row: the row whose position the
+    one-row `row` chunk holds - the row of the step a COLLECT body run one row at a time
+    is handed - or, with no `row`, the single empty row where nothing is in flight.
+
+      nl.row_lists_collect %state, row %r, %name : !nl.chunk<!storage.nullable<!storage.string>>
   }];
 
   let arguments = (ins NLRowListsStateHandle:$state,
                        Optional<NLUInt64Chunk>:$tag,
+                       Optional<NLUInt64Chunk>:$row,
                        NLChunk:$value);
 
   let assemblyFormat = [{
-    $state `,` (`tag` $tag^ `,`)? $value attr-dict `:` qualified(type($value))
+    $state `,` (`tag` $tag^ `,`)? (`row` $row^ `,`)? $value attr-dict `:` qualified(type($value))
   }];
+
+  let hasVerifier = 1;
 }
 
 /**

@@ -1,5 +1,7 @@
 #include "CypherError.h"
 
+#include "BioAssert.h"
+
 using namespace db;
 
 namespace {
@@ -19,8 +21,13 @@ std::string_view nextLine(std::string_view& str) {
         return line;
     }
 
-    const auto line = str.substr(0, pos);
+    std::string_view line = str.substr(0, pos);
     str = str.substr(pos + 1, str.size());
+
+    if (line.ends_with('\r')) {
+        line.remove_suffix(1);
+    }
+
     return line;
 }
 
@@ -110,6 +117,8 @@ void CypherError::generateSingleLine(std::string& errorOutput) {
     errorOutput += errLine;
     errorOutput += "\n";
 
+    bioassert(_loc->_beginColumn <= _loc->_endColumn, "An error location ends before it begins");
+
     const LinePatternLocation errLineLoc = {
         ._beginLine = _loc->_beginColumn - 1,
         ._count = _loc->_endColumn - _loc->_beginColumn,
@@ -128,6 +137,8 @@ void CypherError::generateMultiLine(std::string& errorOutput) {
     ignoreLines(_query, firstLineNo - 1);
 
     std::string_view line = nextLine(_query);
+
+    bioassert(_loc->_beginColumn <= line.size() + 1, "An error location begins past the end of its line");
 
     const LinePatternLocation firstLineLoc = {
         ._beginLine = _loc->_beginColumn - 1,
@@ -148,7 +159,7 @@ void CypherError::generateMultiLine(std::string& errorOutput) {
 
     const LinePatternLocation lastLineLoc = {
         ._beginLine = 0,
-        ._count = _loc->_endColumn + 1,
+        ._count = _loc->_endColumn - 1,
     };
 
     errorOutput += errorBars<UP_ERR_CHAR>(lastLineLoc);

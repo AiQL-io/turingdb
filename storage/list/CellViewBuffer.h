@@ -1,0 +1,127 @@
+#pragma once
+
+#include <limits>
+
+#include <stddef.h>
+#include <stdint.h>
+
+#include "CellView.h"
+
+namespace db {
+
+/**
+ * @brief Stores views into elements of a @ref ListByteBuffer. References are permanently
+ * stable.
+ *
+ * @detail Reference stability is guaranteed via storing elements in a linked list of
+ * contiguous chunks.
+ *
+ * @tparam N size (in number of views) of each chunk.
+ */
+template <size_t N = 4096>
+class CellViewBuffer {
+public:
+    /// Allocates the first chunk
+    CellViewBuffer();
+    /// Deallocates all owned chunks
+    ~CellViewBuffer();
+
+    CellViewBuffer(const CellViewBuffer&) = delete;
+    CellViewBuffer(CellViewBuffer&&) = delete;
+    CellViewBuffer& operator=(const CellViewBuffer&) = delete;
+    CellViewBuffer& operator=(CellViewBuffer&&) = delete;
+
+    /**
+     * @brief Ensures that after this call is complete, the current @ref Chunk
+     * contains at least enough free space at the end of the its internal buffer to store
+     * @param numViews @ref CellViews.
+     * @warn Can allocate unbounded amounts of memory; no size check is performed.
+     */
+    void reserveContiguous(size_t numViews);
+
+    /**
+     * @brief Writes the provided @param view to the next free available space in @ref
+     * _last.
+     * @warn Must only be called after an appropriate call to @ref reserveContiguous.
+     * @warn Does not perform bounds checking.
+     */
+    void write(CellView view);
+
+    /**
+     * @brief Reserves space for @param numViews views and commits it (advancing the write
+     * position past the whole region), returning a writable pointer to the first slot.
+     *
+     * Unlike @ref write, which writes at the internal append position, the caller fills the
+     * reserved slots itself through the returned pointer.
+     * @warn Can allocate unbounded amounts of memory; no size check is performed.
+     */
+    CellView* reserveAndCommit(size_t numViews);
+
+    /// Returns a pointer to the next free available slot in the last buffer
+    const CellView* nextPtr() const { return &_last->_buf[_last->_size]; }
+
+    void clear();
+
+private:
+    class Chunk;
+
+    /// Head, Tail pointers of the linked list of chunks
+    Chunk* _first {nullptr};
+    Chunk* _last {nullptr};
+
+    /// Allocates a new chunk, updating @ref _last, with @param capacity views
+    Chunk* allocateNextChunk(size_t capacity);
+
+    static constexpr size_t _viewSize = sizeof(CellView);
+
+    static_assert(N != 0);
+    static_assert(N < std::numeric_limits<int64_t>::max());
+    // A view is exactly one pointer (the tag pointer) on every platform, 32-bit wasm
+    // included; a grown view means the chunk memory math needs revisiting.
+    static_assert(_viewSize == sizeof(std::byte*), "View changed size; class needs updating.");
+};
+
+/**
+ * @brief Internal class to manage the chunks of views of the outer
+ * @ref CellViewBuffer.
+ *
+ * @tparam N size (in number of views) of this chunk's buffer.
+ */
+template <size_t N>
+class CellViewBuffer<N>::Chunk {
+public:
+    friend CellViewBuffer;
+
+    Chunk()
+        : _buf(new CellView[N]),
+        _capacity(N)
+    {
+    }
+
+    explicit Chunk(size_t numViews)
+        : _buf(new CellView[numViews]),
+        _capacity(numViews)
+    {
+    }
+
+    ~Chunk() {
+        delete[] _buf;
+    }
+
+    Chunk(const Chunk&) = delete;
+    Chunk(Chunk&&) = delete;
+    Chunk& operator=(const Chunk&) = delete;
+    Chunk& operator=(Chunk&&) = delete;
+
+    /// Returns true if @ref _buf has at least @param numViews remaining capacity
+    [[nodiscard]] bool canFit(size_t numViews) const;
+
+private:
+    CellView* _buf;
+    /// The number of elements of @ref _buf that have been written to
+    size_t _size {0};
+    size_t _capacity {0};
+    Chunk* _next {nullptr};
+};
+
+}

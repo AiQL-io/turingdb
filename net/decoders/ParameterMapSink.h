@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 #include <deque>
 #include <optional>
 #include <span>
@@ -12,9 +13,8 @@
 #include "TuringSinkColumnContainer.h"
 #include "columns/ColumnConst.h"
 #include "columns/ColumnVector.h"
-#include "list/ListElementView.h"
+#include "CellView.h"
 #include "list/ListView.h"
-#include "map/MapEntryView.h"
 #include "map/MapView.h"
 
 #include "BioAssert.h"
@@ -55,15 +55,17 @@ public:
     using ColumnOptConst = db::ColumnConst<std::optional<T>>;
 
     using ListView = db::ListView;
-    using ListElementView = db::ListElementView;
+    using CellView = db::CellView;
     using MapView = db::MapView;
-    using MapEntryView = db::MapEntryView;
 
     explicit ParameterMapSink(db::ParameterMap* parameters);
     ~ParameterMapSink();
 
     float* allocEmbedding(size_t numFloats);
     static std::span<const float> getEmbeddingView(float* data, size_t numFloats) { return {data, numFloats}; }
+
+    uint64_t* allocPathIDs(size_t idCount);
+    static db::PathView getPathView(uint64_t* ids, size_t idCount) { return db::PathView {ids, idCount}; }
 
     char* allocString(size_t size);
     static std::string_view getStringView(char* data, size_t size) { return {data, size}; }
@@ -72,14 +74,15 @@ public:
     Column* alloc();
 
     db::ListView beginList(size_t elementCount, size_t byteSize);
-    db::ListElementView beginNestedList(size_t elementCount, size_t byteSize);
+    db::CellView beginNestedList(size_t elementCount, size_t byteSize);
 
-    db::ListElementView writeListValue(std::string_view value);
-    db::ListElementView writeListValue(std::span<const float> value);
-    db::ListElementView writeListElementBytes(const char* bytes, size_t byteSize);
+    db::CellView writeListValue(std::string_view value);
+    db::CellView writeListValue(std::span<const float> value);
+    db::CellView writeListValue(db::PathView value);
+    db::CellView writeCellBytes(const char* bytes, size_t byteSize);
 
     db::MapView beginMap(size_t entryCount, size_t byteSize);
-    db::ListElementView beginNestedMap(size_t entryCount, size_t byteSize);
+    db::CellView beginNestedMap(size_t entryCount, size_t byteSize);
 
     void writeMapKey(std::string_view key);
 
@@ -87,8 +90,6 @@ public:
     void writeMapValue(const T& value);
 
     void writeMapValueBytes(const char* bytes, size_t byteSize);
-
-    db::MapEntryView lastMapEntry() const { return {}; }
 
     bool topMapExpectsValue() const { return _frames.back()._keyPending; }
 

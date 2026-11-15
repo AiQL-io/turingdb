@@ -2,8 +2,8 @@
 #include <type_traits>
 
 #include "list/ListBuffer.h"
-#include "list/ListElementView.h"
-#include "list/ListUtils.h"
+#include "CellView.h"
+#include "CellUtils.h"
 
 #include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
@@ -13,7 +13,7 @@ using namespace db;
 int main() {
     ListBuffer buf;
 
-    const auto getT = [&]<typename T>(const ListElementView view) {
+    const auto getT = [&]<typename T>(const CellView view) {
         const T value = view.getAs<T>();
 
         if constexpr (std::is_same_v<T, CustomBool>) {
@@ -24,6 +24,8 @@ int main() {
             spdlog::info("element: {}", "list");
         } else if constexpr (std::is_same_v<T, MapView>) {
             spdlog::info("element: {}", "map");
+        } else if constexpr (std::is_same_v<T, PathView>) {
+            spdlog::info("element: {}", "path");
         } else if constexpr (std::is_same_v<T, PropertyNull>) {
             spdlog::info("element: {}", "null");
         } else if constexpr (std::is_same_v<T, types::DateTime::Primitive>) {
@@ -34,6 +36,11 @@ int main() {
         } else if constexpr (std::is_same_v<T, types::Duration::Primitive>) {
             std::string formatted;
             Duration::format(formatted, value);
+
+            spdlog::info("element: {}", formatted);
+        } else if constexpr (std::is_same_v<T, types::Point::Primitive>) {
+            std::string formatted;
+            Point::format(formatted, value);
 
             spdlog::info("element: {}", formatted);
         } else {
@@ -53,8 +60,8 @@ int main() {
 
         ListView list = buf.insert(listIn);
 
-        for (const ListElementView e : list) {
-            ListTagDispatcher {._tag = e.getTag()}.execute(getT, e);
+        for (const CellView e : list) {
+            CellTagDispatcher {._tag = e.getTag()}.execute(getT, e);
         }
     }
 }

@@ -2,7 +2,6 @@
 
 #include <type_traits>
 
-#include "EntityList.h"
 #include "GraphPath.h"
 #include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
@@ -17,6 +16,7 @@ concept TrivialInternalTypes = std::is_same_v<T, db::types::UInt64::Primitive>
 || std::is_same_v<T, db::types::Bool::Primitive>
 || std::is_same_v<T, db::types::DateTime::Primitive>
 || std::is_same_v<T, db::types::Duration::Primitive>
+|| std::is_same_v<T, db::types::Point::Primitive>
 || std::is_same_v<T, db::ValueType>
 || std::is_same_v<T, db::NodeID>
 || std::is_same_v<T, db::EdgeID>
@@ -27,72 +27,28 @@ concept TrivialInternalTypes = std::is_same_v<T, db::types::UInt64::Primitive>
 || std::is_same_v<T, db::ChangeID>;
 
 template <typename T, typename Sink>
-concept SupportedColumnVectorTypes = std::is_same_v<T, db::types::UInt64::Primitive>
-|| std::is_same_v<T, db::types::Int64::Primitive>
-|| std::is_same_v<T, db::types::Double::Primitive>
-|| std::is_same_v<T, db::types::Bool::Primitive>
-|| std::is_same_v<T, db::types::DateTime::Primitive>
-|| std::is_same_v<T, db::types::Duration::Primitive>
+concept VariableWidthTypes = std::is_same_v<T, db::types::String::Primitive>
 || std::is_same_v<T, db::types::Embedding::Primitive>
-|| std::is_same_v<T, db::ValueType>
-|| std::is_same_v<T, db::NodeID>
-|| std::is_same_v<T, db::EdgeID>
-|| std::is_same_v<T, db::EdgeTypeID>
-|| std::is_same_v<T, db::PropertyTypeID>
-|| std::is_same_v<T, db::LabelID>
-|| std::is_same_v<T, db::LabelSetID>
-|| std::is_same_v<T, db::ChangeID>
-|| std::is_same_v<T, db::Path>
-|| std::is_same_v<T, db::EntityList>
-|| std::is_same_v<T, typename Sink::ListElementView>
 || std::is_same_v<T, typename Sink::ListView>
-|| std::is_same_v<T, typename Sink::MapView>
-|| std::is_same_v<T, typename Sink::MapEntryView>
-|| std::is_same_v<T, db::types::String::Primitive>;
+|| std::is_same_v<T, typename Sink::CellView>
+|| std::is_same_v<T, typename Sink::MapView>;
+
+// A column decodes when Decoders.h has a decoder for its element in its encoding and the sink
+// can hold the column
+template <typename T, typename Sink>
+concept SupportedColumnVectorTypes = (TrivialInternalTypes<T> || VariableWidthTypes<T, Sink> || std::is_same_v<T, db::GraphPath>)
+&& Sink::template holds<typename Sink::template ColumnVector<T>>();
 
 template <typename T, typename Sink>
-concept SupportedColumnOptVectorTypes = std::is_same_v<T, db::types::UInt64::Primitive>
-|| std::is_same_v<T, db::types::Int64::Primitive>
-|| std::is_same_v<T, db::types::Double::Primitive>
-|| std::is_same_v<T, db::types::Bool::Primitive>
-|| std::is_same_v<T, db::types::DateTime::Primitive>
-|| std::is_same_v<T, db::types::Duration::Primitive>
-|| std::is_same_v<T, db::types::Embedding::Primitive>
-|| std::is_same_v<T, db::ValueType>
-|| std::is_same_v<T, db::NodeID>
-|| std::is_same_v<T, db::EdgeID>
-|| std::is_same_v<T, db::EdgeTypeID>
-|| std::is_same_v<T, db::PropertyTypeID>
-|| std::is_same_v<T, db::LabelID>
-|| std::is_same_v<T, typename Sink::ListElementView>
-|| std::is_same_v<T, typename Sink::ListView>
-|| std::is_same_v<T, typename Sink::MapView>
-|| std::is_same_v<T, db::types::String::Primitive>;
+concept SupportedColumnOptVectorTypes = (TrivialInternalTypes<T> || VariableWidthTypes<T, Sink>)
+&& Sink::template holds<typename Sink::template ColumnOptVector<T>>();
 
 template <typename T, typename Sink>
-concept SupportedColumnConstTypes = std::is_same_v<T, db::types::UInt64::Primitive>
-|| std::is_same_v<T, db::types::Int64::Primitive>
-|| std::is_same_v<T, db::types::Double::Primitive>
-|| std::is_same_v<T, db::types::Bool::Primitive>
-|| std::is_same_v<T, db::types::DateTime::Primitive>
-|| std::is_same_v<T, db::types::Duration::Primitive>
-|| std::is_same_v<T, db::types::Embedding::Primitive>
-|| std::is_same_v<T, db::PropertyNull>
-|| std::is_same_v<T, typename Sink::ListView>
-|| std::is_same_v<T, typename Sink::MapView>
-|| std::is_same_v<T, typename Sink::MapEntryView>
-|| std::is_same_v<T, db::types::String::Primitive>;
-//|| std::is_same_v<T, typename Sink::ListElementView> - disabled: no ColumnConst<ListElementView> memory pool
+concept SupportedColumnConstTypes = (TrivialInternalTypes<T> || VariableWidthTypes<T, Sink> || std::is_same_v<T, db::GraphPath> || std::is_same_v<T, db::PropertyNull>)
+&& Sink::template holds<typename Sink::template ColumnConst<T>>();
 
 template <typename T, typename Sink>
-concept SupportedColumnOptConstTypes = std::is_same_v<T, db::types::UInt64::Primitive>
-|| std::is_same_v<T, db::types::Int64::Primitive>
-|| std::is_same_v<T, db::types::Double::Primitive>
-|| std::is_same_v<T, db::types::Bool::Primitive>
-|| std::is_same_v<T, db::types::DateTime::Primitive>
-|| std::is_same_v<T, db::types::Duration::Primitive>
-|| std::is_same_v<T, db::types::Embedding::Primitive>
-|| std::is_same_v<T, typename Sink::ListElementView>
-|| std::is_same_v<T, db::types::String::Primitive>;
+concept SupportedColumnOptConstTypes = (TrivialInternalTypes<T> || VariableWidthTypes<T, Sink> || std::is_same_v<T, db::GraphPath>)
+&& Sink::template holds<typename Sink::template ColumnOptConst<T>>();
 
 }

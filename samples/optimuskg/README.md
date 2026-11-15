@@ -11,7 +11,7 @@ Phenotype, Anatomy, …) and ~21.8M edges across 26 relation types.
 
 - [`uv`](https://docs.astral.sh/uv/) for managing the Python environment.
 - A built turingdb with `turing-parquet` on `PATH` (run `source setup.sh`
-  from the repo root after `make install`).
+  from the repo root after `ninja install`).
 
 ## Run
 
@@ -30,7 +30,7 @@ After import:
 turingdb start -demon -turing-dir ./turingdb.out
 python3 - <<'PY'
 from turingdb import TuringDB
-c = TuringDB(host="http://localhost:6666")
+c = TuringDB(host="localhost")
 c.load_graph("optimuskg")
 c.set_graph("optimuskg")
 print(c.query("MATCH (n:GEN) WHERE n.symbol = 'TSPAN6' RETURN n.id, n.symbol, n.biotype"))

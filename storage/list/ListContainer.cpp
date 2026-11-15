@@ -2,8 +2,8 @@
 
 #include <variant>
 
-#include "ListElementView.h"
-#include "ListUtils.h"
+#include "CellView.h"
+#include "CellUtils.h"
 
 #include "map/MapContainer.h"
 
@@ -23,6 +23,7 @@ ListContainer::ListContainer(ListContainer&& other) noexcept
     : _lists(std::move(other._lists)),
     _strings(std::move(other._strings)),
     _embeddings(std::move(other._embeddings)),
+    _paths(std::move(other._paths)),
     _maps(std::move(other._maps)),
     _views(std::move(other._views))
 {
@@ -32,6 +33,7 @@ ListContainer& ListContainer::operator=(ListContainer&& other) noexcept {
     _lists = std::move(other._lists);
     _strings = std::move(other._strings);
     _embeddings = std::move(other._embeddings);
+    _paths = std::move(other._paths);
     _maps = std::move(other._maps);
     _views = std::move(other._views);
     return *this;
@@ -60,6 +62,9 @@ void ListContainer::clear() {
     _lists->clear();
     _strings->clear();
     _embeddings->clear();
+    if (_paths) {
+        _paths->clear();
+    }
     if (_maps) {
         _maps->clear();
     }
@@ -78,21 +83,21 @@ ListView ListContainer::copy(ListView list) {
     std::vector<ListItemVariant> elements;
     elements.reserve(list.size());
 
-    for (const ListElementView element : list) {
+    for (const CellView element : list) {
         elements.push_back(ownedItem(element));
     }
 
     return insert(elements);
 }
 
-ListElementView ListContainer::copy(ListElementView element) {
+CellView ListContainer::copy(CellView element) {
     const ListItemVariant item = ownedItem(element);
 
     return insert(std::span<const ListItemVariant> {&item, 1}).front();
 }
 
-ListContainer::ListItemVariant ListContainer::ownedItem(ListElementView element) {
-    const auto asVariant = [this]<typename T>(const ListElementView view) -> ListItemVariant {
+ListContainer::ListItemVariant ListContainer::ownedItem(CellView element) {
+    const auto asVariant = [this]<typename T>(const CellView view) -> ListItemVariant {
         if constexpr (std::same_as<T, ListView>) {
             return copy(view.getAs<ListView>());
         } else if constexpr (std::same_as<T, MapView>) {
@@ -102,9 +107,17 @@ ListContainer::ListItemVariant ListContainer::ownedItem(ListElementView element)
         }
     };
 
-    const ListTagDispatcher dispatcher {element.getTag()};
+    const CellTagDispatcher dispatcher {element.getTag()};
 
     return dispatcher.execute(asVariant, element);
+}
+
+ListContainer::PathBuffer& ListContainer::getPaths() {
+    if (!_paths) {
+        _paths = std::make_unique<PathBuffer>();
+    }
+
+    return *_paths;
 }
 
 ListContainer::ListItemVariant ListContainer::own(const ListItemVariant& element) {
@@ -115,6 +128,8 @@ ListContainer::ListItemVariant ListContainer::own(const ListItemVariant& element
             return _strings->insert(value);
         } else if constexpr (std::same_as<T, types::Embedding::Primitive>) {
             return _embeddings->insert(value);
+        } else if constexpr (std::same_as<T, PathView>) {
+            return getPaths().insert(value.getIDs());
         } else {
             return value;
         }

@@ -111,6 +111,15 @@ def Duration : StorageType<"Duration", "duration"> {
     }];
 }
 
+def Point : StorageType<"Point", "point"> {
+    let summary = "A point property value";
+    let description = [{
+        The element type of a chunk holding one location per row - storage's
+        ColumnVector<Point>. It holds x, y and z and the coordinate reference system
+        they are given in.
+    }];
+}
+
 def Nullable : StorageType<"Nullable", "nullable"> {
     let summary = "A nullable property value";
     let description = [{
@@ -118,27 +127,33 @@ def Nullable : StorageType<"Nullable", "nullable"> {
         that may be absent, mirroring storage's ColumnOptVector. The wrapped type
         is the concrete primitive the property resolved to during lowering (f64,
         i64, ...), so a property chunk is fully typed before execution. Missing
-        values are null; no row is dropped.
+        values are null; no row is dropped. A node or an edge is never wrapped: its
+        column holds its own null, the invalid ID.
     }];
     let parameters = (ins "::mlir::Type":$valueType);
     let assemblyFormat = "`<` $valueType `>`";
+    let genVerifyDecl = 1;
 }
 
 def Any : StorageType<"Any", "any"> {
     let summary = "A value of any type, tagged per cell";
     let description = [{
         The element type of a chunk whose rows share no single type - storage's
-        ColumnVector<ListElementView>. Each cell carries its own type tag beside its
+        ColumnVector<CellView>. Each cell carries its own type tag beside its
         value. Produced where Cypher answers a value whose type is known only per row:
-        an element of a heterogeneous list, an UNWIND of one, a reduce accumulator
-        whose updates change type.
+        an element of a heterogeneous list, an UNWIND of one, a value read out of a map,
+        a reduce accumulator whose updates change type.
     }];
 }
 
 def Path : StorageType<"Path", "path"> {
     let summary = "A graph path value";
     let description = [{
-        Chunk representation of ColumnVector<Path>.
+        The element type of a chunk holding one path per row - storage's
+        ColumnVector<GraphPath>. Each cell holds the nodes and the edges the path runs
+        through, in order, so a path reads back as nodes and relationships told apart at
+        output. A path with no node is null. Produced by db.make_path and
+        db.shortest_path.
     }];
 }
 
@@ -154,26 +169,17 @@ def PathRef : StorageType<"PathRef", "path_ref"> {
     }];
 }
 
-def EntityList : StorageType<"EntityList", "entity_list"> {
-    let summary = "A sequence of graph entities";
-    let description = [{
-        The element type of a chunk holding one entity sequence per row - storage's
-        ColumnVector<EntityList>. Each entry carries whether it is a node or an edge
-        beside its ID, so a path reads back as the nodes and the relationships it runs
-        through, told apart at output. Produced by db.make_path.
-    }];
-}
-
 def List : StorageType<"List", "list"> {
     let summary = "A list value";
     let description = [{
         The element type of a chunk holding one list per row - storage's
         ColumnVector<ListView>, per docs/lists.md. Each cell is a ListView: a span
         over the list's elements in the query-scoped ListBuffer, so a row copies in
-        O(1) regardless of list length. The wrapped type is the (homogeneous) element
-        type - `!storage.list<none>` until the element primitive is resolved. It is
-        produced by a collect and drained element-by-element by an unwind, and by a
-        CALL of a procedure yielding a LIST return value.
+        O(1) regardless of list length. The wrapped type is the type every element is
+        read under: `!storage.any` where the elements share none, as in a stored list,
+        and `none` where no element names one, as in `[]`. It is produced by a collect
+        and drained element-by-element by an unwind, and by a CALL of a procedure
+        yielding a LIST return value.
     }];
     let parameters = (ins "::mlir::Type":$elementType);
     let assemblyFormat = "`<` $elementType `>`";
@@ -185,20 +191,6 @@ def Map : StorageType<"Map", "map"> {
         The element type of a chunk holding one map per row - storage's ColumnVector<Map>.
         Each cell is a MapView: a span over contiguous MapEntityViews forming one map.
         }];
-}
-
-def MapElement : StorageType<"MapElement", "map_element"> {
-    let summary = "A single key-tagged scalar value read out of a map";
-    let description = [{
-        The element type of a chunk holding one map entry per row - storage's
-        ColumnVector<MapEntryView>. Each cell views the entry the map already holds: its
-        key, its own MapBufferTypeTag and its value, so a key read copies nothing. Like
-        !storage.any it is a fixed-width scalar rather than a container, and it
-        carries its null in the tag rather than in a !storage.nullable around it, so a
-        row whose map holds no such key - or no map at all - reads back as a Null-tagged
-        entry. Produced by db.static_map_key and db.dynamic_map_key, and only ever passed
-        through or rendered.
-    }];
 }
 
 // One string array per entity of a MERGE pattern: the label set of each chain node,

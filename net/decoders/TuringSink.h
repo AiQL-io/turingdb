@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 #include <optional>
 #include <span>
 #include <string_view>
@@ -12,9 +13,8 @@
 #include "columns/ColumnConst.h"
 #include "columns/ColumnVector.h"
 #include "list/ListBuffer.h"
-#include "list/ListUtils.h"
+#include "CellUtils.h"
 #include "map/MapBuffer.h"
-#include "map/MapUtils.h"
 #include "map/MapView.h"
 #include "metadata/PropertyType.h"
 
@@ -40,12 +40,12 @@ public:
 
     // Container handle types of this family: the decoder writes lists and maps through these.
     using ListView = db::ListView;
-    using ListElementView = db::ListElementView;
+    using CellView = db::CellView;
     using MapView = db::MapView;
-    using MapEntryView = db::MapEntryView;
 
     TuringSink(db::LocalMemory* localMemory,
                ChunkedBuffer<float>* embeddingBuffer,
+               ChunkedBuffer<uint64_t>* pathBuffer,
                db::ListBuffer<>* listBuffer,
                db::MapBuffer<>* mapBuffer);
     ~TuringSink();
@@ -53,49 +53,56 @@ public:
     float* allocEmbedding(size_t numFloats) { return _embeddingBuffer->alloc(numFloats); }
     std::span<const float> getEmbeddingView(float* data, size_t numFloats) { return _embeddingBuffer->getView(data, numFloats); }
 
+    uint64_t* allocPathIDs(size_t idCount) { return _pathBuffer->alloc(idCount); }
+    db::PathView getPathView(uint64_t* ids, size_t idCount) { return db::PathView {_pathBuffer->getView(ids, idCount)}; }
+
     char* allocString(size_t size) { return _stringBuffer->allocUninit(size); }
     static std::string_view getStringView(char* data, size_t size) { return {data, size}; }
 
     template <typename T>
     Column* alloc() { return _localMemory->alloc<T>(); }
 
+    // The server allocates its results from the same pools, so this sink holds every column
+    // the server can send
+    template <typename ColumnT>
+    static consteval bool holds() { return db::LocalMemory::MemoryPools::contains<ColumnT>(); }
+
     // Container builder surface: the decoder reports list and map structure as it comes off
     // the wire. Both kinds are reserved up front and filled through a write cursor, so a
     // container's view is valid from the moment it opens and the parent can be given it
     // before any of its contents land.
     db::ListView beginList(size_t elementCount, size_t byteSize);
-    db::ListElementView beginNestedList(size_t elementCount, size_t byteSize);
+    db::CellView beginNestedList(size_t elementCount, size_t byteSize);
 
-    db::ListElementView writeListValue(std::string_view value) {
-        return listCursor().writeValue<db::types::String::Primitive>(db::TypeToListBufferTag<db::types::String::Primitive>::Tag, value);
+    db::CellView writeListValue(std::string_view value) {
+        return listCursor().writeValue<db::types::String::Primitive>(db::TypeToCellTag<db::types::String::Primitive>::Tag, value);
     }
 
-    db::ListElementView writeListValue(std::span<const float> value) {
-        return listCursor().writeValue<db::types::Embedding::Primitive>(db::TypeToListBufferTag<db::types::Embedding::Primitive>::Tag, value);
+    db::CellView writeListValue(std::span<const float> value) {
+        return listCursor().writeValue<db::types::Embedding::Primitive>(db::TypeToCellTag<db::types::Embedding::Primitive>::Tag, value);
     }
 
-    db::ListElementView writeListElementBytes(const char* bytes, size_t byteSize) {
+    db::CellView writeListValue(db::PathView value) {
+        return listCursor().writeValue<db::PathView>(db::TypeToCellTag<db::PathView>::Tag, value);
+    }
+
+    db::CellView writeCellBytes(const char* bytes, size_t byteSize) {
         return listCursor().writeRaw(bytes, byteSize);
     }
 
     db::MapView beginMap(size_t entryCount, size_t byteSize);
-    db::ListElementView beginNestedMap(size_t entryCount, size_t byteSize);
+    db::CellView beginNestedMap(size_t entryCount, size_t byteSize);
 
     void writeMapKey(std::string_view key) { mapCursor().writeKey(key); }
 
     template <typename T>
     void writeMapValue(const T& value) {
-        _lastMapEntry = mapCursor().writeValue<T>(db::TypeToMapBufferTag<T>::Tag, value);
+        mapCursor().writeValue<T>(db::TypeToCellTag<T>::Tag, value);
     }
 
     void writeMapValueBytes(const char* bytes, size_t byteSize) {
-        _lastMapEntry = mapCursor().writeValueBytes(bytes, byteSize);
+        mapCursor().writeValueBytes(bytes, byteSize);
     }
-
-    // The entry the open map last completed. A map entry column stores one per row, and a
-    // nested container's entry is recorded when it opens rather than when it closes, so
-    // the view is the one to store either way.
-    db::MapEntryView lastMapEntry() const { return _lastMapEntry; }
 
     bool topMapExpectsValue() const { return mapCursor().expectsValue(); }
 
@@ -111,14 +118,13 @@ public:
 private:
     db::LocalMemory* _localMemory {nullptr};
     ChunkedBuffer<float>* _embeddingBuffer {nullptr};
+    ChunkedBuffer<uint64_t>* _pathBuffer {nullptr};
     db::StringBuffer* _stringBuffer {nullptr};
     db::QueryListBuffer* _listBuffer {nullptr};
     db::MapBuffer<>* _mapBuffer {nullptr};
 
     // Front is the column's own (top-level) container; back is the innermost open one.
     NestedContainerCursor::Stack _containerStack;
-
-    db::MapEntryView _lastMapEntry;
 
     db::ListWriteCursor& listCursor() { return _containerStack.back().getList(); }
     db::MapWriteCursor& mapCursor() { return _containerStack.back().getMap(); }

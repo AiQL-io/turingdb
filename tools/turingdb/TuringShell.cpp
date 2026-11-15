@@ -15,7 +15,6 @@
 
 #include <argparse.hpp>
 #include <linenoise.h>
-#include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/base_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -33,7 +32,10 @@
 #include "ShellCompletion.h"
 #include "ShellTable.h"
 #include "LocalMemory.h"
-#include "ParameterJson.h"
+#include "CypherAST.h"
+#include "CypherParser.h"
+#include "ParameterValueReader.h"
+#include "SystemAccessor.h"
 #include "ParameterValue.h"
 
 #include "NLOutputSink.h"
@@ -49,15 +51,14 @@
 #include "dataframe/Dataframe.h"
 #include "dataframe/NamedColumn.h"
 #include "GraphPath.h"
+#include "PathView.h"
 
-#include "map/MapBufferTypeTag.h"
+#include "CellTag.h"
 #include "map/MapEntryView.h"
-#include "map/MapUtils.h"
 #include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
-#include "list/ListBufferTypeTag.h"
-#include "list/ListElementView.h"
-#include "list/ListUtils.h"
+#include "CellView.h"
+#include "CellUtils.h"
 
 #include "versioning/ChangeResult.h"
 #include "versioning/CommitBuilder.h"
@@ -532,45 +533,28 @@ std::string TuringShell::composePrompt() {
              : fmt::format("{}:{}@{}(detached {})> ", basePrompt, _graphName, _changeID, _hash);
 }
 
-void asString(std::string& out, const db::Path& path) {
-    if (path.empty()) {
-        return;
-    }
-
-    const auto reversed = path | std::views::reverse;
-    size_t i = 0;
-    for (auto val : reversed) {
-        if (i % 2 == 0) {
-            // NodeID
-            out += fmt::format("({})", val);
-        } else {
-            // EdgeID
-            out += fmt::format("-[{}]->", val);
+void asString(std::string& out, const db::PathView path) {
+    const std::span<const uint64_t> ids = path.getIDs();
+    for (size_t position = 0; position < ids.size(); position++) {
+        if (position > 0) {
+            out += ", ";
         }
-        ++i;
+
+        if (db::GraphPath::isNodeAt(position)) {
+            out += fmt::format("({})", ids[position]);
+        } else {
+            out += fmt::format("[{}]", ids[position]);
+        }
     }
 }
 
-void asString(std::string& out, const db::EntityList& list) {
-    if (list.empty()) {
+void asString(std::string& out, const db::GraphPath& path) {
+    if (path.isNull()) {
         out += "null";
         return;
     }
 
-    const auto& entries = list.getEntries();
-
-    size_t i = 0;
-    for (const auto& [type, val] : entries) {
-        if (i++ != 0) {
-            out += ", ";
-        }
-
-        if (type == EntityType::Node) {
-            out += fmt::format("({})", val);
-        } else {
-            out += fmt::format("[{}]", val);
-        }
-    }
+    asString(out, db::PathView {path.getIDs()});
 }
 
 void asString(std::string& out, db::ValueType v) {
@@ -583,6 +567,10 @@ void asString(std::string& out, const db::DateTime v) {
 
 void asString(std::string& out, const db::Duration v) {
     db::Duration::format(out, v);
+}
+
+void asString(std::string& out, const db::Point v) {
+    db::Point::format(out, v);
 }
 
 template <int I, int Radix>
@@ -620,10 +608,10 @@ void asString(std::string& out, std::span<const float> embedding) {
     out += "]";
 }
 
-void asString(std::string& out, const ListElementView v);
+void asString(std::string& out, const CellView v);
 
 // Forward declared so the generic and optional overloads below resolve a list or a map to
-// this one, and so the ListElementView overload sees them: an element may be either
+// this one, and so the CellView overload sees them: an element may be either
 void asString(std::string& out, ListView lv);
 void asString(std::string& out, MapView mv);
 
@@ -654,14 +642,14 @@ void asString(std::string& out, const std::optional<T>& value) {
     }
 }
 
-void asString(std::string& out, const ListElementView v) {
-    const auto writeTyped = [&out]<typename T>(const ListElementView ele) {
+void asString(std::string& out, const CellView v) {
+    const auto writeTyped = [&out]<typename T>(const CellView ele) {
         const T typed = ele.getAs<T>();
         asString(out, typed);
     };
 
-    const ListBufferTypeTag tag = v.getTag();
-    ListTagDispatcher writer {._tag = tag};
+    const CellTag tag = v.getTag();
+    CellTagDispatcher writer {._tag = tag};
     writer.execute(writeTyped, v);
 }
 
@@ -673,10 +661,10 @@ void asString(std::string& out, const ListView lv) {
 
     out += '[';
 
-    const ListElementView fst = lv.front();
+    const CellView fst = lv.front();
     asString(out, fst);
 
-    for (const ListElementView ele : lv.elements() | rv::drop(1)) {
+    for (const CellView ele : lv.elements() | rv::drop(1)) {
         out += ", ";
         asString(out, ele);
     }
@@ -684,22 +672,11 @@ void asString(std::string& out, const ListView lv) {
     out += ']';
 }
 
-// The value of one entry, which is what a map value column's cell is. The key is added by
-// entryAsString, for an entry read as a member of its map rather than alone.
-void asString(std::string& out, MapEntryView v) {
-    const auto writeTyped = [&out]<typename T>(const MapEntryView ele) {
-        const T typed = ele.getValueAs<T>();
-        asString(out, typed);
-    };
-
-    dispatchMapEntry(writeTyped, v);
-}
-
 void entryAsString(std::string& out, MapEntryView v) {
     out += v.getKey();
     out += " : ";
 
-    asString(out, v);
+    asString(out, v.getValue());
 }
 
 void asString(std::string& out, const MapView mv) {
@@ -754,6 +731,12 @@ void asString(std::string& out, const ParameterValue& root) {
             break;
             case ValueType::String:
                 out += value.getString();
+            break;
+            case ValueType::Duration:
+                asString(out, value.getDuration());
+            break;
+            case ValueType::DateTime:
+                asString(out, value.getDateTime());
             break;
             case ValueType::List: {
                 const ParameterValue::List& list = value.getList();
@@ -903,6 +886,61 @@ private:
     bool _quiet {false};
 };
 
+// The first cell of what RETURN (<expression>) AS value gave, and its row count, which
+// the caller requires to be one. The local run feeds it as a sink, the remote run from
+// the dataframe it receives.
+class ParameterEvaluation : public NLOutputSink {
+public:
+    explicit ParameterEvaluation(ParameterValue& value)
+        : _value(value)
+    {
+    }
+
+    size_t getRowCount() const { return _rowCount; }
+    const std::string& getError() const { return _error; }
+
+    void appendChunks(std::span<const Column* const> chunks, size_t offset, size_t rowCount) override {
+        take(chunks, offset, rowCount);
+    }
+
+    void take(std::span<const Column* const> columns, size_t offset, size_t rows);
+
+private:
+    ParameterValue& _value;
+    size_t _rowCount {0};
+    std::string _error;
+};
+
+void ParameterEvaluation::take(std::span<const Column* const> columns, size_t offset, size_t rows) {
+    const bool readsTheFirstRow = _rowCount == 0 && rows > 0 && !columns.empty();
+    if (readsTheFirstRow) {
+        try {
+            readParameterValue(columns.front(), offset, _value);
+        } catch (const TuringException& error) {
+            _error = error.what();
+        }
+    }
+
+    _rowCount += rows;
+}
+
+// The text must parse as one whole expression on its own, so the parentheses the shell
+// wraps around it below cannot be closed from inside it; @param endOffset is where the
+// expression ends, ahead of any semicolon or comment the line carries after it
+bool isOneExpression(const std::string& text, const ProcedureManager* procedures, std::string& error, size_t& endOffset) {
+    CypherAST ast(procedures, text);
+
+    try {
+        CypherParser parser(&ast);
+        parser.parseExpression(text, endOffset);
+    } catch (const TuringException& e) {
+        error = e.what();
+        return false;
+    }
+
+    return true;
+}
+
 }
 
 // Cleans double-escaped characters to single-escaped characters
@@ -994,14 +1032,7 @@ void TuringShell::processLine(std::string& line) {
     }
 
     if (!res.isOk()) {
-        if (res.hasErrorMessage()) {
-            std::string errorMsg = res.getError();
-            formatMessage(errorMsg);
-            spdlog::error("{}: {}", QueryStatusDescription::value(res.getStatus()),
-                          errorMsg);
-        } else {
-            spdlog::error("{}", QueryStatusDescription::value(res.getStatus()));
-        }
+        reportQueryStatus(res);
         return;
     }
 
@@ -1042,7 +1073,7 @@ bool TuringShell::processParameterCommand(const std::string& line) {
 
 void TuringShell::setParameter(std::string_view arguments) {
     constexpr std::string_view ARROW = "=>";
-    constexpr std::string_view USAGE = "Usage: :param <name> => <json value>, or :param clear";
+    constexpr std::string_view USAGE = "Usage: :param <name> => <cypher expression>, or :param clear";
 
     std::string trimmed(arguments);
     trim(trimmed);
@@ -1066,19 +1097,81 @@ void TuringShell::setParameter(std::string_view arguments) {
         return;
     }
 
-    ParameterValue value;
-    try {
-        const nlohmann::json json = nlohmann::json::parse(trimmed.substr(arrowPos + ARROW.size()));
-        readJsonParameter(json, value);
-    } catch (const nlohmann::json::exception& e) {
-        spdlog::error("Invalid value for parameter {}: {}", name, e.what());
-        return;
-    } catch (const TuringException& e) {
-        spdlog::error("Invalid value for parameter {}: {}", name, e.what());
+    const std::string text = trimmed.substr(arrowPos + ARROW.size());
+    if (text.find_first_not_of(whiteChars) == std::string::npos) {
+        spdlog::error("No expression for parameter {}. {}", name, USAGE);
         return;
     }
 
-    _parameters.set(name, value);
+    std::string parseError;
+    size_t endOffset = 0;
+    {
+        SystemAccessor system = _turingDB.getSystemManager().accessShared();
+        if (!isOneExpression(text, system.getProcedures(), parseError, endOffset)) {
+            formatMessage(parseError);
+            spdlog::error("{}: {}", QueryStatusDescription::value(QueryStatus::Status::PARSE_ERROR), parseError);
+            return;
+        }
+    }
+
+    ParameterValue value;
+    if (evaluateParameter(fmt::format("RETURN (\n{}\n) AS value", text.substr(0, endOffset)), value)) {
+        _parameters.set(name, value);
+    }
+}
+
+bool TuringShell::evaluateParameter(const std::string& query, ParameterValue& value) {
+    ParameterEvaluation evaluation(value);
+    QueryStatus status;
+
+    if (_remoteConnected) {
+        const auto takeDataframe = [&evaluation](const Dataframe* dataframe) {
+            std::vector<const Column*> columns;
+            for (const NamedColumn* namedColumn : dataframe->cols()) {
+                columns.push_back(namedColumn->getColumn());
+            }
+
+            evaluation.take(columns, 0, dataframe->getLogicalRowCount());
+        };
+
+        try {
+            status = _client.sendQuery(query, takeDataframe, &_parameters);
+        } catch (const TuringException& e) {
+            spdlog::error("Remote query failed: {}", e.what());
+            disconnectRemote();
+            return false;
+        }
+    } else {
+        const QueryState state(_graphName, _mem, &_compilerContext, &_turingDB.getDefaultQueryConfig(), &evaluation, _hash, _changeID, &_parameters);
+        status = _turingDB.query(query, state);
+    }
+
+    if (_mem) {
+        _mem->clear();
+    }
+
+    if (!status.isOk()) {
+        reportQueryStatus(status);
+        return false;
+    } else if (!evaluation.getError().empty()) {
+        spdlog::error("{}", evaluation.getError());
+        return false;
+    } else if (evaluation.getRowCount() != 1) {
+        spdlog::error("A parameter takes one value, and the expression gave {} rows", evaluation.getRowCount());
+        return false;
+    }
+
+    return true;
+}
+
+void TuringShell::reportQueryStatus(const QueryStatus& status) {
+    if (status.hasErrorMessage()) {
+        std::string errorMessage = status.getError();
+        formatMessage(errorMessage);
+        spdlog::error("{}: {}", QueryStatusDescription::value(status.getStatus()), errorMessage);
+    } else {
+        spdlog::error("{}", QueryStatusDescription::value(status.getStatus()));
+    }
 }
 
 void TuringShell::printParameters() const {

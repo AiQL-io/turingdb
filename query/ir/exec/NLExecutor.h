@@ -28,7 +28,7 @@ public:
                NLOutputSink* sink,
                CommitWriteBuffer* writeBuffer = nullptr,
                const NLSystemContext* system = nullptr,
-               const MetadataBuilder* metadataBuilder = nullptr);
+               MetadataBuilder* metadataBuilder = nullptr);
     ~NLExecutor();
 
     void run();
@@ -46,7 +46,7 @@ public:
 
     // The literal-list sibling of runConstScanNodesLoop: stream the loop data's
     // ListView one chunk at a time into its value column - a nullable value column
-    // for a homogeneous list, a ColumnVector<ListElementView> for a heterogeneous one -
+    // for a homogeneous list, a ColumnVector<CellView> for a heterogeneous one -
     // running the body over each slice. A null limit leaves it unbounded.
     static void runUnwindConstLoop(NLExecutionContext* context, NLFunctionData* data);
 
@@ -128,6 +128,7 @@ public:
     // Read the nodes, the relationships or the length of each named path of a chunk
     // (nl.path_elements)
     static void runPathElements(NLExecutionContext* context, NLFunctionData* data);
+    static NLPathReadFunction selectPathRead(const Column* paths);
 
     static void runGetNodeLabelSet(NLExecutionContext* context, NLFunctionData* data);
     static void runGetEdgeTypes(NLExecutionContext* context, NLFunctionData* data);
@@ -340,6 +341,10 @@ public:
 
     static void runSetEdgeProperty(NLExecutionContext* context, NLFunctionData* data);
 
+    static void runSetNodeProperties(NLExecutionContext* context, NLFunctionData* data);
+
+    static void runSetEdgeProperties(NLExecutionContext* context, NLFunctionData* data);
+
     static void runDeleteNode(NLExecutionContext* context, NLFunctionData* data);
 
     static void runDeleteEdge(NLExecutionContext* context, NLFunctionData* data);
@@ -378,18 +383,23 @@ public:
 
     static NLUnaryFn selectNot(const Column* operand, LocalMemory* memory, Column*& result);
 
+    // Whether each row of a column holds no value (nl.is_null) or one (nl.is_not_null), as a
+    // mask; a constant column gives a constant answer
+    template <bool TESTS_NULL>
+    static NLUnaryFn selectNullTest(const Column* operand, LocalMemory* memory, Column*& result);
+
     // Whether each row of a CASE condition is false or null (nl.is_not_true), as a mask
     static NLUnaryFn selectIsNotTrue(const Column* operand, bool untypedNull, LocalMemory* memory, Column*& result);
-    // Read a node, edge or walk handle column as a nullable column of its IDs' integers, an invalid ID
-    // - what an OPTIONAL MATCH leaves - reading as the null. The entity sibling of
+    // Read a node or edge column as a nullable column of its IDs' integers, an invalid ID -
+    // what an OPTIONAL MATCH leaves - reading as the null. The entity sibling of
     // selectToNullable, which reads a scalar value column.
     static NLUnaryFn selectEntityToNullable(NLChunkKind kind, LocalMemory* memory, Column*& result);
 
-    // Read a path column as a nullable column of its entry counts, the empty path an
-    // OPTIONAL MATCH leaves reading as the null
-    static NLUnaryFn selectPathToNullable(LocalMemory* memory, Column*& result);
-
     static NLUnaryFn selectToNullable(ValueType valueType, const Column* operand, LocalMemory* memory, Column*& result);
+
+    // Read the entity of @param kind each tagged cell holds (nl.checked_cast), a null cell
+    // reading as the invalid ID; a cell holding another value raises
+    static NLUnaryFn selectCheckedCast(NLChunkKind kind, const Column* operand, LocalMemory* memory, Column*& result);
 
     // Write each row of a CASE (nl.case): the value of the first branch whose condition
     // holds, the default when none does, and an absent value when there is no default.
@@ -399,9 +409,13 @@ public:
     // condition and value through a cursor over the rows that reached it
     static void runCaseMerge(NLExecutionContext* context, NLFunctionData* data);
 
+    // Write each row of a value, its null rows filled in order from another (nl.fill_nulls)
+    static void runFillNulls(NLExecutionContext* context, NLFunctionData* data);
+
     // Build one list per row (nl.make_list): row r takes the cell each element column
     // holds at r, in operand order, as one contiguous run of the query's list buffer.
     static void runMakeList(NLExecutionContext* context, NLFunctionData* data);
+    static void runToAny(NLExecutionContext* context, NLFunctionData* data);
 
     template <typename Result>
     static void runSubstring(NLExecutionContext* context, NLFunctionData* data);
@@ -411,13 +425,31 @@ public:
     static void runStringEnd(NLExecutionContext* context, NLFunctionData* data);
     template <typename Result>
     static void runReplace(NLExecutionContext* context, NLFunctionData* data);
+    static void runPointDistance(NLExecutionContext* context, NLFunctionData* data);
+    static void runPointWithinBBox(NLExecutionContext* context, NLFunctionData* data);
 
     // Build one map per row (nl.make_map): row r of the result maps each key to what its
     // value column holds at r, as one contiguous run of the query's map buffer.
     static void runMakeMap(NLExecutionContext* context, NLFunctionData* data);
+
+    // Merge the maps of each row (nl.merge_maps), a later operand's entry replacing an
+    // earlier one's under the same key. @tparam Result is a MapView, or an optional one
+    // where an operand may hold no map.
+    template <typename Result>
+    static void runMergeMaps(NLExecutionContext* context, NLFunctionData* data);
+
     static void runStaticMapKey(NLExecutionContext* context, NLFunctionData* data);
-    static void runMapEntryValue(NLExecutionContext* context, NLFunctionData* data);
     static void runDynamicMapKey(NLExecutionContext* context, NLFunctionData* data);
+
+    template <typename Element>
+    static void runContainerIndex(NLExecutionContext* context, NLFunctionData* data);
+
+    static NLHandlerFunction selectCellContainerIndex(bool nullable);
+    static NLHandlerFunction selectEntityContainerIndex(NLChunkKind kind);
+    static NLHandlerFunction selectValueContainerIndex(ValueType valueType);
+
+    static NLContainerReadFunction selectContainerRead(const Column* input);
+    static NLSubscriptReadFunction selectSubscriptRead(const Column* input);
 
     // Build one list per row (nl.range): row r counts from its start bound to its end
     // bound by its step, as one contiguous run of the query's list buffer.
@@ -441,7 +473,9 @@ public:
     static NLStringReadFunction selectStringRead(const Column* input);
 
     static NLStringArgumentRead selectStringArgumentRead(const Column* input);
+    static NLStringListArgumentRead selectStringListArgumentRead(const Column* input);
     static NLIntegerArgumentRead selectIntegerArgumentRead(const Column* input);
+    static NLPointArgumentRead selectPointArgumentRead(const Column* input);
 
     // Build one list per row (nl.list_comprehension): the body runs over the elements of
     // the step's cells, a chunkful at a time, and row r takes the ones it kept of its own
@@ -455,6 +489,10 @@ public:
     // Fold each row's list into one value (nl.reduce): the body runs once per element
     // position over the rows whose list reaches it, reading and replacing their accumulator
     static void runReduce(NLExecutionContext* context, NLFunctionData* data);
+
+    // Decide one truth value per row (nl.all_reduce): the fold runs as nl.reduce's does,
+    // and a row leaves it at the first step whose predicate is false
+    static void runAllReduce(NLExecutionContext* context, NLFunctionData* data);
 
     // Size a type-erased accumulator to the step's rows, every cell a tagged null
     static NLCaseResetFn selectTaggedCellReset();
@@ -480,12 +518,18 @@ public:
                                          bool nullable,
                                          bool untypedNull);
 
-    // The entity siblings of the two above, for a selection whose branches are nodes or
-    // edges: an entity column carries its null in the ID rather than in an optional, so
-    // the reset writes the invalid ID and the write copies the branch's ID across
-    static NLCaseResetFn selectEntityCaseReset(NLChunkKind kind);
+    // The siblings of the two above for a selection whose branches are nodes, edges or
+    // paths: such a column carries its null in a value of its own rather than in an
+    // optional, so the reset writes that null and the write copies the branch's cell across
+    static NLCaseResetFn selectOwnNullCaseReset(NLChunkKind kind);
 
-    static NLCaseWriteFn selectEntityCaseWrite(NLChunkKind kind, bool untypedNull);
+    static NLCaseWriteFn selectOwnNullCaseWrite(NLChunkKind kind, bool untypedNull);
+
+    // Fill the null rows of a nullable value column, of a node, an edge or a path column,
+    // which holds its null in a value of its own, and of a column of tagged cells
+    static NLFillNullRowsFn selectFillNullRows(ValueType valueType);
+    static NLFillNullRowsFn selectOwnNullFillNullRows(NLChunkKind kind);
+    static NLFillNullRowsFn selectTaggedCellFillNullRows();
 
     // Lay a constant chunk's single value out over the driving relation's rows
     // (nl.broadcast_constant), so a fold that walks rows is handed the step's rows
@@ -501,9 +545,9 @@ public:
     static NLUnaryFunctionKernel selectFunction(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 
     // A conversion reads whichever element the argument column holds, so the functor is
-    // picked from that column rather than fixed by the op: the string form named here is
-    // what a column of strings converts through.
-    template <typename StringFunctor>
+    // picked from that column rather than fixed by the op: the functor named here is what
+    // a column of its own ArgType converts through.
+    template <typename Conversion>
     static NLUnaryFunctionKernel selectConversion(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 
     // An OrNull conversion converts a typed column as its strict sibling does, and reads a
@@ -511,15 +555,11 @@ public:
     template <auto StrictSelector, typename TaggedFunctor>
     static NLUnaryFunctionKernel selectOrNull(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 
-    // datetime() reads text or a count of seconds since the epoch, so it picks its functor
-    // from the argument column as a conversion does. It is not selectConversion itself
-    // because no numeric form of the conversion is named by the string one.
-    static NLUnaryFunctionKernel selectDateTimeConversion(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
-    static NLUnaryFunctionKernel selectDurationConversion(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
-
     // size() counts the elements of a list or the characters of a string, so it picks
     // its functor from the argument column as a conversion does.
     static NLUnaryFunctionKernel selectSize(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+
+    static NLUnaryFunctionKernel selectIsEmpty(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 
     static NLUnaryFunctionKernel selectId(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 
@@ -566,8 +606,8 @@ public:
     static NLFillNullFunction selectPlainFillNullFunction(ValueType valueType);
     static NLFillNullFunction selectMaskFillNull();
     static NLFillNullFunction selectOptListFillNull();
-    static NLFillNullFunction selectOptListElementFillNull();
-    static NLFillNullFunction selectListElementFillNull();
+    static NLFillNullFunction selectOptCellFillNull();
+    static NLFillNullFunction selectCellFillNull();
 
     // Gather for a nullable value chunk of this value type (sort emit re-chunk).
     static NLGatherFunction selectOptGatherFunction(ValueType valueType);
@@ -582,7 +622,7 @@ public:
     static NLMaskSurvivorFunction selectMaskSurvivorFunction(bool nullable, bool untypedNull, bool taggedCells);
 
     // The fetch for an nl.fetch_nodes reading its IDs out of nodes, integers or tagged cells
-    static NLFetchNodesFunction selectNodeFetchFunction(bool nullable);
+    static NLFetchNodesFunction selectNodeFetchFunction();
     static NLFetchNodesFunction selectIntegerFetchFunction(ValueType valueType, bool nullable);
     static NLFetchNodesFunction selectTaggedFetchFunction(bool nullable);
 
@@ -669,49 +709,50 @@ public:
     // The list, map and map entry siblings: the constant lays its one view out over the step's rows
     static NLBroadcastConstantFunction selectConstantListBroadcast();
     static NLBroadcastConstantFunction selectConstantMapBroadcast();
-    static NLBroadcastConstantFunction selectConstantMapEntryBroadcast();
+    static NLBroadcastConstantFunction selectConstantCellBroadcast();
+
+    // The node, edge, path and walk siblings, which ride the plain chunk their kind names
+    static NLBroadcastConstantFunction selectConstantPlainBroadcast(NLChunkKind kind, const Column* value);
+
+    // The mask sibling, which lays the boolean of a constant out as flags
+    static NLBroadcastConstantFunction selectConstantMaskBroadcast(const Column* value);
 
     // The tagged-cell sibling: a cell that may be absent carries its own type, so there is
     // no value type to dispatch on
-    static NLBroadcastConstantFunction selectOptListElementBroadcast(const Column* value);
+    static NLBroadcastConstantFunction selectOptCellBroadcast(const Column* value);
 
     // Block-repeat (outer column) and tile (inner column) for a !storage.any chunk: a
     // tagged scalar carries its own type, so there is no value type to dispatch on.
-    static NLBroadcastFunction selectListElementBlockRepeatFunction();
-    static NLBroadcastFunction selectListElementTileFunction();
+    static NLBroadcastFunction selectCellBlockRepeatFunction();
+    static NLBroadcastFunction selectCellTileFunction();
 
     // Sort-accumulator append, emit-phase gather and 3-way compare for a !storage.any
     // chunk, so a heterogeneous unwind can be sorted and its rows re-emitted.
-    static NLAppendFunction selectListElementAppendFunction();
-    static NLGatherFunction selectListElementGatherFunction();
+    static NLAppendFunction selectCellAppendFunction();
+    static NLGatherFunction selectCellGatherFunction();
 
-    static NLAppendFunction selectOptListElementAppendFunction();
-    static NLGatherFunction selectOptListElementGatherFunction();
-    static NLCompareFunction selectListElementCompareFunction();
+    static NLAppendFunction selectOptCellAppendFunction();
+    static NLGatherFunction selectOptCellGatherFunction();
+    static NLCompareFunction selectCellCompareFunction();
 
     // Distinct row key and non-null tally for a !storage.any chunk, so a heterogeneous
     // unwind can be deduped and counted.
-    static NLKeyAppendFunction selectListElementKeyAppendFunction();
-    static NLCountFunction selectListElementCountFunction();
+    static NLKeyAppendFunction selectCellKeyAppendFunction();
+    static NLCountFunction selectCellCountFunction();
 
     // Key-buffer gather-append and emit-phase range copy for a !storage.any chunk, so a
     // heterogeneous unwind's cells can be a grouping key rather than only a counted column.
-    static NLGroupKeyGatherFunction selectListElementGroupKeyGatherFunction();
-    static NLCopyFunction selectListElementCopyFunction();
+    static NLGroupKeyGatherFunction selectCellGroupKeyGatherFunction();
+    static NLCopyFunction selectCellCopyFunction();
 
-    static NLBroadcastFunction selectMapEntryBlockRepeatFunction();
-    static NLBroadcastFunction selectMapEntryTileFunction();
-    static NLAppendFunction selectMapEntryAppendFunction();
-    static NLGatherFunction selectMapEntryGatherFunction();
-    static NLCopyFunction selectMapEntryCopyFunction();
 
-    static NLBroadcastFunction selectOptListElementBlockRepeatFunction();
-    static NLBroadcastFunction selectOptListElementTileFunction();
-    static NLCompareFunction selectOptListElementCompareFunction();
-    static NLKeyAppendFunction selectOptListElementKeyAppendFunction();
-    static NLCountFunction selectOptListElementCountFunction();
-    static NLGroupKeyGatherFunction selectOptListElementGroupKeyGatherFunction();
-    static NLCopyFunction selectOptListElementCopyFunction();
+    static NLBroadcastFunction selectOptCellBlockRepeatFunction();
+    static NLBroadcastFunction selectOptCellTileFunction();
+    static NLCompareFunction selectOptCellCompareFunction();
+    static NLKeyAppendFunction selectOptCellKeyAppendFunction();
+    static NLCountFunction selectOptCellCountFunction();
+    static NLGroupKeyGatherFunction selectOptCellGroupKeyGatherFunction();
+    static NLCopyFunction selectOptCellCopyFunction();
 
     static NLBroadcastFunction selectOptListBlockRepeatFunction();
     static NLBroadcastFunction selectOptListTileFunction();
@@ -758,25 +799,19 @@ public:
     static NLKeyAppendFunction selectOptKeyAppendFunction(ValueType valueType);
     static NLKeyAppendFunction selectOptKeyAppendFunction(NLChunkKind kind);
 
-    // Hash and equality for a join key: an ID chunk of this kind, a nullable value chunk
-    // of this value type, a plain numeric chunk, a type-erased cell. Used by
-    // nl.hash_join_collect to chain a build row under its hash and by nl.hash_join_probe
-    // to find and confirm the build rows a probe row matches. An embedding is a key here,
-    // as `=` compares two vectors, though it is no DISTINCT key.
+    // Hash, equality and match test for a join key: an ID chunk of this kind, a nullable value chunk
+    // of this value type, a plain numeric chunk, a type-erased cell, a mask.
+    // Used by nl.hash_join_collect to chain a build row under its hash and by
+    // nl.hash_join_probe to find and confirm the build rows a probe row matches. Two values
+    // `=` holds equal hash alike whatever chunk holds them, so a probe key of another type
+    // than the build key is confirmed by selectCrossTypeKeyEqualFunction.
     static NLJoinKeyFunctions selectJoinKeyFunctions(NLChunkKind kind);
     static NLJoinKeyFunctions selectOptJoinKeyFunctions(ValueType valueType);
     static NLJoinKeyFunctions selectPlainJoinKeyFunctions(ValueType valueType);
-    static NLJoinKeyFunctions selectListElementJoinKeyFunctions();
-
-    // Per-row test of whether a join key can match. An ID chunk holds neither a null nor
-    // a NaN, so every row of it matches; a nullable value chunk reads its present flag, a
-    // type-erased cell its tag, and a double or embedding column also rejects a NaN, which
-    // no key equals - itself included. Used by nl.hash_join_collect to leave a key
-    // out of the index and by nl.hash_join_probe to leave a probe row unmatched.
-    static NLKeyIsMatchableFunction everyKeyMatchable();
-    static NLKeyIsMatchableFunction selectOptKeyMatchableFunction(ValueType valueType);
-    static NLKeyIsMatchableFunction selectPlainKeyMatchableFunction(ValueType valueType);
-    static NLKeyIsMatchableFunction selectListElementKeyMatchableFunction();
+    static NLJoinKeyFunctions selectCellJoinKeyFunctions();
+    static NLJoinKeyFunctions selectOptCellJoinKeyFunctions();
+    static NLJoinKeyFunctions selectMaskJoinKeyFunctions();
+    static NLKeyEqualFunction selectCrossTypeKeyEqualFunction(const Column* probe, const Column* build);
 
     // Non-null row count for a COUNT. An ID chunk has no null rows, so countAllRows
     // is its handle (the row count); a nullable value chunk of this value type
@@ -799,47 +834,48 @@ public:
     // The reset / fold / emit handlers for one aggregate, selected from the
     // reduction and a value type (the accumulator's for reset/result, the input's
     // for update). Throw for a value type the reduction cannot handle: sum/avg need
-    // a numeric type, min/max an orderable one. Used by the nl.aggregate ops.
+    // a numeric or a duration type, min/max an orderable one. Used by the nl.aggregate
+    // ops.
     static NLAggregateResetFunction selectAggregateReset(AggregateKind kind, ValueType accumulatorType);
     static NLAggregateUpdateFunction selectAggregateUpdate(AggregateKind kind, ValueType inputType);
 
-    // The siblings reading a type-erased input column: sum and avg reduce its numeric
-    // cells into the f64 accumulator, whatever tags they carry, and min/max keep the
-    // winning cell in a tagged cell accumulator, which the reset and result below handle.
+    // The siblings reading a type-erased input column. stdev reduces its numeric cells into
+    // the f64 accumulator. sum, avg and min/max keep a tagged cell accumulator, which the
+    // reset and result below handle.
     static NLAggregateUpdateFunction selectTaggedAggregateUpdate(AggregateKind kind);
     static NLAggregateUpdateFunction selectOptTaggedAggregateUpdate(AggregateKind kind);
     static NLAggregateResetFunction selectTaggedAggregateReset();
-    static NLAggregateResultFunction selectTaggedAggregateResult();
+    static NLAggregateResultFunction selectTaggedAggregateResult(AggregateKind kind);
     static NLAggregateResultFunction selectAggregateResult(AggregateKind kind, ValueType resultType);
 
     // The grouped counterparts, selected for one aggregate of a grouped
     // aggregation. grow initializes a new group to the reduction's identity; fold
     // reduces a chunk's rows into their groups; emit materializes a slice of groups.
     // They throw for a value type the reduction cannot handle, exactly as the scalar
-    // selectors do (sum/avg need numeric, min/max orderable). count and
+    // selectors do (sum/avg need numeric or duration, min/max orderable). count and
     // count_distinct use only the per-group tally, so their grow/emit ignore the
     // value type. count's fold has an all-rows form (count(*) over an ID chunk) and a
     // present-values form (count(x) over a nullable value chunk); count_distinct's
-    // has an ID form and a present-values form the same way, both keyed on the
-    // value's bytes - so, unlike count, an embedding column is rejected.
+    // has a chunk form, keyed as a whole-row DISTINCT keys the row, and a present-values
+    // form keyed on the value's bytes - so, unlike count, an embedding column is rejected.
     static NLGroupAggregateGrowFunction selectGroupAggregateGrow(GroupAggregateKind kind, ValueType accumulatorType);
     static NLGroupAggregateFoldFunction selectGroupAggregateFold(GroupAggregateKind kind, ValueType inputType);
 
     // The siblings reading a type-erased input column, as selectTaggedAggregateUpdate's are
     static NLGroupAggregateFoldFunction selectTaggedGroupAggregateFold(GroupAggregateKind kind);
     static NLGroupAggregateFoldFunction selectOptTaggedGroupAggregateFold(GroupAggregateKind kind);
-    static NLGroupAggregateGrowFunction selectTaggedGroupAggregateGrow();
-    static NLGroupAggregateEmitFunction selectTaggedGroupAggregateEmit();
+    static NLGroupAggregateGrowFunction selectTaggedGroupAggregateGrow(GroupAggregateKind kind);
+    static NLGroupAggregateEmitFunction selectTaggedGroupAggregateEmit(GroupAggregateKind kind);
     static NLGroupAggregateFoldFunction selectGroupCountAllFold();
     static NLGroupAggregateFoldFunction selectGroupCountDistinctFold(ValueType inputType);
     static NLGroupAggregateFoldFunction selectGroupCountDistinctChunkFold(NLChunkKind kind);
 
     // The grouped count / count(DISTINCT) folds of a type-erased column of tagged
     // scalars, the column a heterogeneous UNWIND produces
-    static NLGroupAggregateFoldFunction selectGroupCountListElementFold();
-    static NLGroupAggregateFoldFunction selectGroupCountOptListElementFold();
-    static NLGroupAggregateFoldFunction selectGroupCountDistinctListElementFold();
-    static NLGroupAggregateFoldFunction selectGroupCountDistinctOptListElementFold();
+    static NLGroupAggregateFoldFunction selectGroupCountCellFold();
+    static NLGroupAggregateFoldFunction selectGroupCountOptCellFold();
+    static NLGroupAggregateFoldFunction selectGroupCountDistinctCellFold();
+    static NLGroupAggregateFoldFunction selectGroupCountDistinctOptCellFold();
     static NLGroupAggregateFoldFunction selectGroupCountOptListFold();
     static NLGroupAggregateFoldFunction selectGroupCountDistinctOptListFold();
     static NLGroupAggregateEmitFunction selectGroupAggregateEmit(GroupAggregateKind kind, ValueType resultType);
@@ -879,18 +915,21 @@ public:
     static NLUnwindElementEmitFunction selectListUnwindValueEmit(bool sourceIsNullable, ValueType valueType);
     static NLUnwindElementEmitFunction selectListUnwindNodeEmit(bool sourceIsNullable);
     static NLUnwindElementEmitFunction selectListUnwindEdgeEmit(bool sourceIsNullable);
+    static NLUnwindElementEmitFunction selectListUnwindPathEmit(bool sourceIsNullable);
     static NLUnwindElementEmitFunction selectTaggedUnwindElementEmit();
     static NLUnwindElementEmitFunction selectOptTaggedUnwindElementEmit();
     static NLCollectListEmitFunction selectCollectListEmit(ValueType valueType);
 
     // The reads an nl.make_list takes one element out of a column with: a nullable value
     // column gives the value it holds or a tagged null, an entity the ID it holds or that
-    // same null where an OPTIONAL MATCH left the ID invalid, a nested list the cell it
-    // holds in every row, a type-erased column the cell under the tag it already carries,
-    // and a column owning its characters a copy of them.
+    // same null where an OPTIONAL MATCH left the ID invalid, a path the IDs it runs through
+    // or that null where it holds none, a nested list the cell it holds in every row, a
+    // type-erased column the cell under the tag it already carries, and a column owning its
+    // characters a copy of them.
     static NLListItemReadFunction selectValueListItemRead(ValueType valueType);
     static NLListItemReadFunction selectNodeListItemRead();
     static NLListItemReadFunction selectEdgeListItemRead();
+    static NLListItemReadFunction selectPathListItemRead();
     static NLListItemReadFunction selectNestedListItemRead();
     static NLListItemReadFunction selectNestedMapListItemRead();
     static NLListItemReadFunction selectOptNestedListItemRead();
@@ -901,6 +940,7 @@ public:
     static NLMapValueReadFunction selectValueMapValueRead(ValueType valueType);
     static NLMapValueReadFunction selectNodeMapValueRead();
     static NLMapValueReadFunction selectEdgeMapValueRead();
+    static NLMapValueReadFunction selectPathMapValueRead();
     static NLMapValueReadFunction selectNestedListMapValueRead();
     static NLMapValueReadFunction selectOptNestedListMapValueRead();
     static NLMapValueReadFunction selectNestedMapValueRead();
@@ -910,7 +950,15 @@ public:
     // integer one however the query wrote the bound.
     static NLRangeBoundReadFunction selectRangeBoundRead(ValueType valueType);
 
+    // The read taking a bound out of a column of type-erased cells, which raises on a row
+    // whose cell holds no integer
+    static NLRangeBoundReadFunction selectCellBoundRead(const Column* input);
+
     static NLPercentileReadFunction selectPercentileRead(ValueType valueType);
+
+    // The read taking a percentile out of a column of type-erased cells, which raises on a
+    // row whose cell holds no number
+    static NLPercentileReadFunction selectCellPercentileRead(const Column* input);
 
     // Whether a cell of a list comprehension's source holds no list: a null one where a
     // column carries nulls, a cell tagged null where it carries tagged scalars, and never
@@ -934,10 +982,12 @@ public:
                                                NLCollectFoldFunction& fold,
                                                NLCollectListEmitFunction& listEmit);
 
-    // The handlers a collect of a list column reads: the cells nest into a list of lists.
-    static void selectCollectListHandlers(bool distinctValues,
-                                          NLCollectFoldFunction& fold,
-                                          NLCollectListEmitFunction& listEmit);
+    // The handlers a collect of a list or a map column reads, @tparam Container being a
+    // ListView or a MapView: the cells nest into a list of lists or a list of maps.
+    template <typename Container>
+    static void selectCollectContainerHandlers(bool distinctValues,
+                                               NLCollectFoldFunction& fold,
+                                               NLCollectListEmitFunction& listEmit);
 
     // The handlers a collect of a type-erased column reads: each cell keeps the type its
     // tag names, and a cell tagged null is dropped as Cypher's collect drops a null.
@@ -945,9 +995,17 @@ public:
                                             NLCollectFoldFunction& fold,
                                             NLCollectListEmitFunction& listEmit);
 
-    static void selectCollectOptListHandlers(bool distinctValues,
-                                             NLCollectFoldFunction& fold,
-                                             NLCollectListEmitFunction& listEmit);
+    template <typename Container>
+    static void selectCollectOptContainerHandlers(bool distinctValues,
+                                                  NLCollectFoldFunction& fold,
+                                                  NLCollectListEmitFunction& listEmit);
+
+    // The handlers a collect of a path column reads: each path is buffered as a tagged cell,
+    // and the null path is dropped as an invalid ID is.
+    static void selectCollectPathHandlers(bool distinctValues,
+                                          NLCollectFoldFunction& fold,
+                                          NLCollectListEmitFunction& listEmit);
+
     static void selectCollectOptTaggedHandlers(bool distinctValues,
                                                NLCollectFoldFunction& fold,
                                                NLCollectListEmitFunction& listEmit);

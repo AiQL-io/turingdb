@@ -53,6 +53,8 @@ add_turing_test(test_query_ir_duration_arithmetic DurationArithmeticTest.cpp)
 
 add_turing_test(test_query_ir_duration_of_map DurationOfMapTest.cpp)
 
+add_turing_test(test_query_ir_datetime_of_map DateTimeOfMapTest.cpp)
+
 add_turing_test(test_query_ir_duration_of_map_filter DurationOfMapFilterTest.cpp)
 
 add_turing_test(test_query_ir_duration_of_map_null_count DurationOfMapNullCountTest.cpp)
@@ -66,6 +68,8 @@ add_turing_test(test_query_ir_duration_of_mixed_list_item DurationOfMixedListIte
 add_turing_test(test_query_ir_duration_scaled_by_a_double DurationScaledByADoubleTest.cpp)
 
 add_turing_test(test_query_ir_duration_cell_dividend DurationCellDividendTest.cpp)
+
+add_turing_test(test_query_ir_null_temporal_operand NullTemporalOperandTest.cpp)
 
 add_turing_test(test_query_ir_load_jsonl_duration LoadJsonlDurationTest.cpp)
 target_sources(test_query_ir_load_jsonl_duration PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
@@ -88,3 +92,9 @@ target_compile_definitions(test_query_ir_parquet_duration_logical_type
     PRIVATE PARQUET_TEST_DATA_DIR="${CMAKE_SOURCE_DIR}/test/import/parquet")
 
 add_turing_test(test_query_ir_temporal_cell_arithmetic TemporalCellArithmeticTest.cpp)
+
+add_turing_test(test_query_ir_temporal_cell_type_error TemporalCellTypeErrorTest.cpp)
+
+add_turing_test(test_query_ir_datetime_of_map_with_a_null DateTimeOfMapWithANullTest.cpp)
+
+add_turing_test(test_query_ir_datetime_of_an_epoch_out_of_range DateTimeOfAnEpochOutOfRangeTest.cpp)

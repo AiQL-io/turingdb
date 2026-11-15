@@ -5,8 +5,8 @@
 #include "ColumnConst.h"
 #include "ColumnOptVector.h"
 #include "ColumnKind.h"
-#include "EntityList.h"
-#include "list/ListElementView.h"
+#include "GraphPath.h"
+#include "CellView.h"
 #include "metadata/PropertyType.h"
 #include "versioning/ChangeID.h"
 
@@ -24,7 +24,7 @@ using AllValueTypes = TypeList<
     NodeID,
     EdgeID,
     EntityID,
-    Path,
+    GraphPath,
     LabelID,
     EdgeTypeID,
     PropertyTypeID,
@@ -39,6 +39,7 @@ using AllValueTypes = TypeList<
     types::Embedding::Primitive,
     types::DateTime::Primitive,
     types::Duration::Primitive,
+    types::Point::Primitive,
     std::optional<types::Int64::Primitive>,
     std::optional<types::UInt64::Primitive>,
     std::optional<types::Double::Primitive>,
@@ -47,16 +48,16 @@ using AllValueTypes = TypeList<
     std::optional<types::Embedding::Primitive>,
     std::optional<types::DateTime::Primitive>,
     std::optional<types::Duration::Primitive>,
+    std::optional<types::Point::Primitive>,
     std::optional<NodeID>,
     std::optional<EdgeID>,
     std::string,
     std::optional<std::string>,
     const CommitBuilder*,
     const Change*,
-    EntityList,
     ListView,
     std::optional<ListView>,
-    ListElementView
+    CellView
 >;
 template <ColumnKind::Code K, typename... TypeList>
 struct ColumnTypeFromKindImpl;
@@ -123,7 +124,7 @@ struct ColumnTypeFromKind {
     switch ((col)->getKind()) {                                                          \
         COL_CASE(ColumnVector<NodeID>)                                                   \
         COL_CASE(ColumnVector<EdgeID>)                                                   \
-        COL_CASE(ColumnVector<Path>)                                                     \
+        COL_CASE(ColumnVector<GraphPath>)                                                \
         COL_CASE(ColumnVector<EntityID>)                                                 \
         COL_CASE(ColumnVector<LabelID>)                                                  \
         COL_CASE(ColumnVector<EdgeTypeID>)                                               \
@@ -149,8 +150,7 @@ struct ColumnTypeFromKind {
         COL_CASE(ColumnVector<std::string>)                                              \
         COL_CASE(ColumnVector<const CommitBuilder*>)                                     \
         COL_CASE(ColumnVector<const Change*>)                                            \
-        COL_CASE(ColumnVector<EntityList>)                                               \
-        COL_CASE(ColumnVector<ListElementView>)                                          \
+        COL_CASE(ColumnVector<CellView>)                                          \
                                                                                          \
         default: {                                                                       \
             throw FatalException(fmt::format(                                            \
@@ -187,7 +187,7 @@ struct ColumnTypeFromKind {
         CONST_COL_CASE(ColumnVector<std::string>)                                        \
         CONST_COL_CASE(ColumnVector<const CommitBuilder*>)                               \
         CONST_COL_CASE(ColumnVector<const Change*>)                                      \
-        CONST_COL_CASE(ColumnVector<EntityList>)                                         \
+        CONST_COL_CASE(ColumnVector<GraphPath>)                                          \
                                                                                          \
         default: {                                                                       \
             throw FatalException(fmt::format(                                            \

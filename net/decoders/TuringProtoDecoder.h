@@ -26,6 +26,9 @@ namespace net::proto {
 template <ProtoDecodeSink Sink>
 class TuringProtoDecoder {
 public:
+    static_assert(requires { Sink::template holds<typename Sink::template ColumnVector<uint64_t>>(); },
+                  "A sink that decodes columns says which column types it holds");
+
     TuringProtoDecoder(TuringProtoInBuf* inBuf,
                        Sink* sink,
                        std::vector<DecodedColumnSchema>& columnSchemas);
@@ -88,22 +91,16 @@ decltype(auto) TuringProtoDecoder<Sink>::dispatchColumnType(ColumnInternalKind t
             return fn.template operator()<db::types::String::Primitive>(encoding);
         case ColumnInternalKind::BOOL:
             return fn.template operator()<db::types::Bool::Primitive>(encoding);
-        case ColumnInternalKind::PATH:
-            return fn.template operator()<db::Path>(encoding);
         case ColumnInternalKind::EMBEDDING:
             return fn.template operator()<db::types::Embedding::Primitive>(encoding);
         case ColumnInternalKind::VALUE_TYPE:
             return fn.template operator()<db::ValueType>(encoding);
-        case ColumnInternalKind::ENTITY_LIST:
-            return fn.template operator()<db::EntityList>(encoding);
         case ColumnInternalKind::LIST_VIEW:
             return fn.template operator()<SinkListView<Sink>>(encoding);
         case net::proto::ColumnInternalKind::MAP_VIEW:
             return fn.template operator()<SinkMapView<Sink>>(encoding);
-        case net::proto::ColumnInternalKind::MAP_ENTRY_VIEW:
-            return fn.template operator()<SinkMapEntryView<Sink>>(encoding);
-        case ColumnInternalKind::LIST_ELEMENT_VIEW:
-            return fn.template operator()<SinkListElementView<Sink>>(encoding);
+        case ColumnInternalKind::CELL_VIEW:
+            return fn.template operator()<SinkCellView<Sink>>(encoding);
         case ColumnInternalKind::NODE_ID:
             return fn.template operator()<db::NodeID>(encoding);
         case ColumnInternalKind::EDGE_ID:
@@ -126,6 +123,10 @@ decltype(auto) TuringProtoDecoder<Sink>::dispatchColumnType(ColumnInternalKind t
             return fn.template operator()<db::types::DateTime::Primitive>(encoding);
         case ColumnInternalKind::DURATION:
             return fn.template operator()<db::types::Duration::Primitive>(encoding);
+        case ColumnInternalKind::GRAPH_PATH:
+            return fn.template operator()<db::GraphPath>(encoding);
+        case ColumnInternalKind::POINT:
+            return fn.template operator()<db::types::Point::Primitive>(encoding);
     }
 
     throw TuringException("Unsupported incoming column type");
@@ -356,6 +357,18 @@ void TuringProtoDecoder<Sink>::decodeChunkFooter(SinkColumnContainer<Sink>* cont
     _context._inBuf->readData(&rowCount, sizeof(rowCount));
 
     container->setRowCount(rowCount);
+
+    // A constant null has no bytes, so no CHUNK packet reaches it and it completes here. Any
+    // other column still open, or value still waiting for bytes, has lost bytes.
+    if (rowCount > 0) {
+        decodeIncomingData(container);
+    }
+
+    const bool columnOpen = rowCount > 0 && _context._columnIndex < container->size();
+    const bool valueOpen = _context._bufferState._start != nullptr;
+    if (columnOpen || valueOpen) {
+        throw TuringException("The chunk ended before its columns did");
+    }
 }
 
 template <ProtoDecodeSink Sink>

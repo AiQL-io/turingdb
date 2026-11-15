@@ -4,6 +4,7 @@
 #include <cstring>
 #include <optional>
 #include <span>
+#include <string>
 
 #include "DecodedColumnSchema.h"
 #include "GraphPath.h"
@@ -112,7 +113,7 @@ struct VectorColumnDecoder<SinkListView<Sink>, Sink> {
             }
 
             // Stream this row's list (and any nested children) straight into the reserved space.
-            auto onTopLevelElement = [](size_t, const SinkListElementView<Sink>&) {};
+            auto onTopLevelElement = [](size_t, const SinkCellView<Sink>&) {};
             if (!drainContainerStack(context, sink, onTopLevelElement)) {
                 return false;
             }
@@ -155,7 +156,7 @@ struct VectorColumnDecoder<SinkMapView<Sink>, Sink> {
             }
 
             //we are in the middle of processing a map and should drain the container stack
-            auto onTopLevelElement = [](size_t, const SinkListElementView<Sink>&) {};
+            auto onTopLevelElement = [](size_t, const SinkCellView<Sink>&) {};
             if (!drainContainerStack(context, sink, onTopLevelElement)) {
                 return false;
             }
@@ -168,14 +169,14 @@ struct VectorColumnDecoder<SinkMapView<Sink>, Sink> {
 };
 
 template <ProtoDecodeSink Sink>
-struct VectorColumnDecoder<SinkListElementView<Sink>, Sink> {
-    using T = SinkListElementView<Sink>;
+struct VectorColumnDecoder<SinkCellView<Sink>, Sink> {
+    using T = SinkCellView<Sink>;
 
     static bool decode(DecodeContext* context,
                        Sink* sink,
                        SinkColumnVector<T, Sink>* typedColumn,
                        ProtoColumnState* columnState) {
-        // A ListElementView column has one element per column row, wire-encoded as
+        // A CellView column has one element per column row, wire-encoded as
         // [listByteSize] followed by the elements. Each element is streamed onto the list
         // buffer and its view stored in the corresponding row.
 
@@ -195,57 +196,25 @@ struct VectorColumnDecoder<SinkListElementView<Sink>, Sink> {
         }
 
         // One column row per top-level element; its view is stored in the matching row.
-        auto onTopLevelElement = [typedColumn](size_t index, const SinkListElementView<Sink>& view) {
+        auto onTopLevelElement = [typedColumn](size_t index, const SinkCellView<Sink>& view) {
             typedColumn->data()[index] = view;
         };
         return drainContainerStack(context, sink, onTopLevelElement);
     }
 };
 
-// A MapEntryView column has one entry per column row, wire-encoded as [mapByteSize]
-// followed by the entries, each [keyLen][key][tag][value] as a map's own are. The column
-// is therefore one map of as many entries as it has rows, and each entry's view is stored
-// in the row it came from.
+// A path is [nodeCount][ids], its IDs in path order, nodes and edges alternating: one
+// fewer edge than nodes, or no ID at all for the null path.
 template <ProtoDecodeSink Sink>
-struct VectorColumnDecoder<SinkMapEntryView<Sink>, Sink> {
-    using T = SinkMapEntryView<Sink>;
+struct VectorColumnDecoder<db::GraphPath, Sink> {
+    using T = db::GraphPath;
 
     static bool decode(DecodeContext* context,
                        Sink* sink,
                        SinkColumnVector<T, Sink>* typedColumn,
                        ProtoColumnState* columnState) {
         if (context->_rowIndex == 0) {
-            if (context->_inBuf->readable() < sizeof(WireSize)) {
-                return false;
-            }
-
-            WireSize mapByteSize = 0;
-            context->_inBuf->readData(&mapByteSize, sizeof(mapByteSize));
-
-            sink->beginMap(columnState->getNumRows(), mapByteSize);
             typedColumn->resize(columnState->getNumRows());
-            context->_rowIndex = 1;
-        }
-
-        auto onTopLevelElement = [](size_t, const SinkListElementView<Sink>&) {};
-        auto onTopLevelEntry = [typedColumn](size_t index, const T& view) {
-            typedColumn->data()[index] = view;
-        };
-
-        return drainContainerStack(context, sink, onTopLevelElement, onTopLevelEntry);
-    }
-};
-
-template <ProtoDecodeSink Sink>
-struct VectorColumnDecoder<db::Path, Sink> {
-    using T = db::Path;
-
-    static bool decode(DecodeContext* context,
-                       Sink* sink,
-                       SinkColumnVector<T, Sink>* typedColumn,
-                       ProtoColumnState* columnState) {
-        if (context->_rowIndex == 0) {
-            typedColumn->reserve(columnState->getNumRows());
         }
 
         for (size_t i = 0; context->_rowIndex + i < columnState->getNumRows(); ++i) {
@@ -254,16 +223,16 @@ struct VectorColumnDecoder<db::Path, Sink> {
                 return false;
             }
 
-            WireSize pathByteSize = 0;
-            context->_inBuf->readData(&pathByteSize, sizeof(pathByteSize));
-            const size_t numEntities = checkedElementCount<db::EntityID>(pathByteSize, "path");
+            db::GraphPath& path = (*typedColumn)[context->_rowIndex + i];
+            readPathNodeCount(context, path);
 
-            auto& path = typedColumn->emplace_back(numEntities);
-            if (!readVarLenPayload(context, reinterpret_cast<char*>(path.data()), pathByteSize)) {
+            const std::span<uint64_t> ids = path.getIDs();
+            if (!readVarLenPayload(context, reinterpret_cast<char*>(ids.data()), ids.size_bytes())) {
                 context->_rowIndex += i + 1;
                 return false;
             }
         }
+
         return true;
     }
 };
@@ -299,59 +268,6 @@ struct VectorColumnDecoder<db::types::Embedding::Primitive, Sink> {
                 return false;
             }
         }
-        return true;
-    }
-};
-
-template <ProtoDecodeSink Sink>
-struct VectorColumnDecoder<db::EntityList, Sink> {
-    using T = db::EntityList;
-
-    static bool decode(DecodeContext* context,
-                       Sink* sink,
-                       SinkColumnVector<T, Sink>* typedColumn,
-                       ProtoColumnState* columnState) {
-        if (context->_rowIndex == 0) {
-            typedColumn->resize(columnState->getNumRows());
-        }
-
-        for (size_t i = 0; context->_rowIndex + i < columnState->getNumRows(); ++i) {
-            auto& entityList = (*typedColumn)[context->_rowIndex + i];
-
-            if (!context->_entityListEntryCount.has_value()) {
-                if (context->_inBuf->readable() < sizeof(WireSize)) {
-                    context->_rowIndex += i;
-                    return false;
-                }
-
-                WireSize numberOfEntries = 0;
-                context->_inBuf->readData(&numberOfEntries, sizeof(numberOfEntries));
-                context->_entityListEntryCount = numberOfEntries;
-                entityList.reserve(numberOfEntries);
-            }
-
-            const size_t expectedEntries = *context->_entityListEntryCount;
-
-            while (entityList.size() < expectedEntries) {
-                if (context->_inBuf->readable() < sizeof(db::EntityList::Entry::_type)) {
-                    context->_rowIndex += i;
-                    return false;
-                }
-
-                entityList.add();
-
-                context->_inBuf->readData(&entityList.back()._type, sizeof(db::EntityList::Entry::_type));
-
-                if (context->_inBuf->readable() < sizeof(db::EntityList::Entry::_id)) {
-                    throw TuringException("Entity List Entry can't be broken up across packet/buffer boundaries");
-                }
-
-                context->_inBuf->readData(&entityList.back()._id, sizeof(db::EntityList::Entry::_id));
-            }
-
-            context->_entityListEntryCount.reset();
-        }
-
         return true;
     }
 };
@@ -419,7 +335,7 @@ struct OptionalVectorColumnDecoder<SinkListView<Sink>, Sink> {
                 entry.emplace(sink->beginList(elementCount, listByteSize));
             }
 
-            auto onTopLevelElement = [](size_t, const SinkListElementView<Sink>&) {};
+            auto onTopLevelElement = [](size_t, const SinkCellView<Sink>&) {};
             if (!drainContainerStack(context, sink, onTopLevelElement)) {
                 return false;
             }
@@ -464,7 +380,7 @@ struct OptionalVectorColumnDecoder<SinkMapView<Sink>, Sink> {
                 entry.emplace(sink->beginMap(entryCount, mapByteSize));
             }
 
-            auto onTopLevelElement = [](size_t, const SinkListElementView<Sink>&) {};
+            auto onTopLevelElement = [](size_t, const SinkCellView<Sink>&) {};
             if (!drainContainerStack(context, sink, onTopLevelElement)) {
                 return false;
             }
@@ -477,8 +393,8 @@ struct OptionalVectorColumnDecoder<SinkMapView<Sink>, Sink> {
 };
 
 template <ProtoDecodeSink Sink>
-struct OptionalVectorColumnDecoder<SinkListElementView<Sink>, Sink> {
-    using T = SinkListElementView<Sink>;
+struct OptionalVectorColumnDecoder<SinkCellView<Sink>, Sink> {
+    using T = SinkCellView<Sink>;
 
     static bool decode(DecodeContext* context,
                        Sink* sink,
@@ -500,7 +416,7 @@ struct OptionalVectorColumnDecoder<SinkListElementView<Sink>, Sink> {
         }
 
         const ProtoColumnState::BitMask& mask = columnState->getBitMask();
-        auto onTopLevelElement = [typedColumn, &mask](size_t index, const SinkListElementView<Sink>& view) {
+        auto onTopLevelElement = [typedColumn, &mask](size_t index, const SinkCellView<Sink>& view) {
             if (mask.test(index)) {
                 typedColumn->data()[index] = view;
             }
@@ -636,35 +552,6 @@ struct ConstColumnDecoder<db::types::String::Primitive, Sink> {
 };
 
 template <ProtoDecodeSink Sink>
-struct ConstColumnDecoder<db::Path, Sink> {
-    using T = db::Path;
-
-    template <ConstColumnOf<T, Sink> Column>
-    static bool decode(DecodeContext* context, Sink* sink, Column* typedColumn) {
-        if (context->_inBuf->readable() < sizeof(WireSize)) {
-            return false;
-        }
-
-        WireSize pathByteSize = 0;
-        context->_inBuf->readData(&pathByteSize, sizeof(pathByteSize));
-        const size_t numEntities = checkedElementCount<db::EntityID>(pathByteSize, "path");
-
-        db::Path path(numEntities);
-        char* pathBytes = reinterpret_cast<char*>(path.data());
-
-        // db::Path is a std::vector, so moving it into the column keeps pathBytes valid.
-        typedColumn->set(std::move(path));
-        if (!readVarLenPayload(context, pathBytes, pathByteSize)) {
-            // See the string branch: completing the resume completes the column.
-            ++context->_columnIndex;
-            context->_rowIndex = 0;
-            return false;
-        }
-        return true;
-    }
-};
-
-template <ProtoDecodeSink Sink>
 struct ConstColumnDecoder<db::types::Embedding::Primitive, Sink> {
     using T = db::types::Embedding::Primitive;
 
@@ -715,18 +602,18 @@ struct ConstColumnDecoder<SinkListView<Sink>, Sink> {
             typedColumn->set(sink->beginList(elementCount, listByteSize));
             context->_constListStarted = true;
         }
-        auto onTopLevelElement = [](size_t, const SinkListElementView<Sink>&) {};
+        auto onTopLevelElement = [](size_t, const SinkCellView<Sink>&) {};
         return drainContainerStack(context, sink, onTopLevelElement);
     }
 };
 
 template <ProtoDecodeSink Sink>
-struct ConstColumnDecoder<SinkListElementView<Sink>, Sink> {
-    using T = SinkListElementView<Sink>;
+struct ConstColumnDecoder<SinkCellView<Sink>, Sink> {
+    using T = SinkCellView<Sink>;
 
     template <ConstColumnOf<T, Sink> Column>
     static bool decode(DecodeContext* context, Sink* sink, Column* typedColumn) {
-        // A constant ListElementView is a single element, wire-encoded as [listByteSize] + one
+        // A constant CellView is a single element, wire-encoded as [listByteSize] + one
         // element. Stream it onto the list buffer and set the column to its view.
 
         if (!context->_constListStarted) {
@@ -742,7 +629,7 @@ struct ConstColumnDecoder<SinkListElementView<Sink>, Sink> {
         }
 
         // The constant is the single top-level element; store its view on the column.
-        auto onTopLevelElement = [typedColumn](size_t, const SinkListElementView<Sink>& view) {
+        auto onTopLevelElement = [typedColumn](size_t, const SinkCellView<Sink>& view) {
             typedColumn->set(view);
         };
 
@@ -774,37 +661,33 @@ struct ConstColumnDecoder<SinkMapView<Sink>, Sink> {
             context->_constListStarted = true;
         }
 
-        auto onTopLevelElement = [](size_t, const SinkListElementView<Sink>&) {};
+        auto onTopLevelElement = [](size_t, const SinkCellView<Sink>&) {};
         return drainContainerStack(context, sink, onTopLevelElement);
     }
 };
 
-// A constant map entry column holds one entry, wire-encoded as [mapByteSize] followed by
-// that entry. It opens a one-entry map and takes the view the entry records.
 template <ProtoDecodeSink Sink>
-struct ConstColumnDecoder<SinkMapEntryView<Sink>, Sink> {
-    using T = SinkMapEntryView<Sink>;
+struct ConstColumnDecoder<db::GraphPath, Sink> {
+    using T = db::GraphPath;
 
     template <ConstColumnOf<T, Sink> Column>
     static bool decode(DecodeContext* context, Sink* sink, Column* typedColumn) {
-        if (!context->_constListStarted) {
-            if (context->_inBuf->readable() < sizeof(WireSize)) {
-                return false;
-            }
-
-            WireSize mapByteSize = 0;
-            context->_inBuf->readData(&mapByteSize, sizeof(mapByteSize));
-
-            sink->beginMap(1, mapByteSize);
-            context->_constListStarted = true;
+        if (context->_inBuf->readable() < sizeof(WireSize)) {
+            return false;
         }
 
-        auto onTopLevelElement = [](size_t, const SinkListElementView<Sink>&) {};
-        auto onTopLevelEntry = [typedColumn](size_t, const T& view) {
-            typedColumn->set(view);
-        };
+        db::GraphPath path;
+        readPathNodeCount(context, path);
+        const std::span<uint64_t> ids = path.getIDs();
+        typedColumn->set(std::move(path));
 
-        return drainContainerStack(context, sink, onTopLevelElement, onTopLevelEntry);
+        if (!readVarLenPayload(context, reinterpret_cast<char*>(ids.data()), ids.size_bytes())) {
+            // See the string branch: completing the resume completes the column.
+            ++context->_columnIndex;
+            context->_rowIndex = 0;
+            return false;
+        }
+        return true;
     }
 };
 
@@ -814,6 +697,7 @@ struct ConstColumnDecoder<db::PropertyNull, Sink> {
 
     template <ConstColumnOf<T, Sink> Column>
     static bool decode(DecodeContext* context, Sink* sink, Column* typedColumn) {
+        typedColumn->set(db::PropertyNull {});
         return true;
     }
 };

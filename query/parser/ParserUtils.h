@@ -1,21 +1,23 @@
 #pragma once
 
+#include <optional>
+#include <string_view>
 #include <vector>
 
 #include "expr/Operators.h"
-#include "stmt/CallSubqueryStmt.h"
 #include "SourceLocation.h"
-#include "UnionQuery.h"
 #include "UnicodeNormalForm.h"
 
 namespace db {
 
+class CallSubqueryStmt;
 class CypherAST;
 class EdgePattern;
 class EmbeddingLiteral;
 class EntityTypeExpr;
 class ExistsExpr;
 class Expr;
+class ExprChain;
 class FunctionInvocation;
 class LabelExpr;
 class ListLiteral;
@@ -26,6 +28,9 @@ class Parameter;
 class PatternElement;
 class PropertyExpr;
 class Projection;
+class QualifiedName;
+class QuantifiedPath;
+class RegularQuery;
 class ReturnStmt;
 class SetStmt;
 class SinglePartQuery;
@@ -43,9 +48,14 @@ public:
         SourceLocation _rightOperandLocation;
     };
 
-    // The queries a NEXT chains, in order: each a single query, the branches of a UNION or
-    // those of a WHEN
-    using NextSegments = std::vector<CallSubqueryStmt::Branches>;
+    // What IS tests its left side for: being null, or being in a normal form
+    struct IsTest {
+        std::optional<UnicodeNormalForm> _normalForm;
+        bool _negated {false};
+    };
+
+    // The queries a NEXT chains, in order: each a single query, a UNION or a WHEN
+    using NextSegments = std::vector<RegularQuery*>;
 
     ParserUtils() = delete;
     ~ParserUtils() = delete;
@@ -62,7 +72,7 @@ public:
     // A query that is one CALL and nothing else has no projection of its own, so what the
     // call yields is the result it reports. A subquery body is not such a query: it is a
     // clause of the query around it, and the RETURN it owes is its own
-    static void markStandaloneCall(const SinglePartQuery* query);
+    static void markStandaloneCall(const RegularQuery* query);
 
     // `MATCH (a WHERE p)-[r WHERE q]->(b) WHERE w` filters as `WHERE p AND q AND w`
     static void foldEntityWheres(CypherAST* ast, Pattern* pattern);
@@ -77,17 +87,17 @@ public:
                                           MapLiteral* properties,
                                           WhereClause* where);
 
-    // `{ WHEN ... }` combined by a UNION is `CALL () { WHEN ... } RETURN <its columns>`.
-    // False when a column of the first branch has no name to return it under: a WHEN
-    // combined by a UNION names each column with AS.
-    static bool createWhenOperand(CypherAST* ast,
-                                  const CallSubqueryStmt::Branches& branches,
-                                  const SourceLocation& location,
-                                  UnionQuery::Branch& operand);
+    // The relationship inside `-[...]-`, undirected until the arrows around it set its direction
+    static EdgePattern* createEdgePattern(CypherAST* ast,
+                                          Symbol* symbol,
+                                          LabelExpr* labelExpr,
+                                          QuantifiedPath* range,
+                                          MapLiteral* properties,
+                                          WhereClause* where);
 
     // Whether an item of a segment's RETURN has neither an alias nor a variable to name the
     // column the next segment reads it through
-    static bool returnsUnaliasedItem(const CallSubqueryStmt::Branches& segment);
+    static bool returnsUnaliasedItem(const RegularQuery* segment);
 
     // `a RETURN x NEXT b` is `a WITH x b`. A UNION or a WHEN segment, and one ending on an
     // updating clause that NEXT follows, is a NextSegmentStmt; ending the chain, its
@@ -111,9 +121,19 @@ public:
                                               PatternElement* element,
                                               const SourceLocation& location);
 
+    // `exists(<pattern>)` is the pattern predicate it wraps; null for any other argument
+    static ExistsExpr* findPatternPredicate(Expr* argument);
+
     static PropertyExpr* createParenthesizedPropertyAccess(CypherAST* ast,
                                                            Expr* base,
                                                            Symbol* propertyName);
+
+    // `(n).name` is `n.name`: a variable keeps its PropertyExpr, any other value is looked up
+    static Expr* createPropertyLookup(CypherAST* ast, Expr* base, Symbol* propertyName);
+
+    // `m.a.b.c` is `((m.a).b).c`, as Neo4j parses it: a PropertyExpr reads the first name off
+    // the variable, and each further name is looked up in the value before it
+    static Expr* createPropertyChain(CypherAST* ast, QualifiedName* chain, const SourceLocation& location);
 
     static EntityTypeExpr* createLabelTest(CypherAST* ast, Expr* operand, LabelExpr* labelExpr);
 
@@ -127,6 +147,8 @@ public:
                                    Expr* lhs,
                                    Expr* rhs,
                                    const SourceLocation& location);
+
+    static FunctionInvocation* createInvocation(CypherAST* ast, std::string_view functionName, ExprChain* arguments);
 
     // `normalize(s)` is `normalize(s, NFC)`
     static FunctionInvocation* createNormalizeInvocation(CypherAST* ast, Expr* string, UnicodeNormalForm form);
@@ -162,6 +184,12 @@ public:
                                       Expr* rhs,
                                       const SourceLocation& rhsLocation,
                                       const SourceLocation& chainLocation);
+
+    static Expr* createIsTest(CypherAST* ast,
+                              Expr* operand,
+                              const IsTest& test,
+                              const SourceLocation& testLocation,
+                              const SourceLocation& location);
 
 private:
     static void listExprToFloatVector(const ListLiteral* list, std::vector<float>& out);

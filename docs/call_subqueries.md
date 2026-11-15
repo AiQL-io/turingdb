@@ -401,6 +401,16 @@ it tells no two rows of that invocation apart. The one barrier it stops at is a 
 over no grouping key: carrying the import would key the reduction, and a keyed reduction
 over no row reports no group where a keyless one still reports its single row.
 
+Past that barrier, and past a NEXT segment, the analyzer declares the import again in the
+new scope under the body's own declaration (`CypherAnalyzer::redeclareDroppedImports`)
+and records it on the WITH or the segment. Both barriers only occur in a body run one
+input row at a time, where an import holds one value for the whole run, as Postgres's
+correlated parameter of a subplan does. The code generator reads each argument of such a
+body through a `db.row_constant` at its top, so an import is a constant there: nothing
+carries it, and an op reading it per row has it laid out over its own rows. Each body
+records its constant imports (`_runConstants`), and a barrier binds the ones it declared
+again from there. Tests: `PerRunImportTest.cpp`.
+
 Tested against the 21 examples of Neo4j's CALL subquery manual page on its own dataset.
 Every example whose other features the engine has returns Neo4j's rows, and each example
 the page marks as rejected is rejected. The rest need `CALL (*)`, conditional
@@ -410,6 +420,23 @@ A body that is a UNION always runs one input row at a time. Its codegen is a `db
 with results inside the body, each branch ending in a `db.yield`; the lowering collects
 every branch into one `nl.union_buffer` and the rest of the body lowers into the loop over
 `nl.union_drain`.
+
+The branches of a UNION or a WHEN may return different types in one column. Each row then
+keeps the type its branch returned, as Neo4j answers it: `RETURN 1 AS x UNION ALL RETURN
+2.5 AS x` returns the integer 1 and the float 2.5. The column holds the type the branches
+agree on, a list of tagged cells for lists of different elements, and `!storage.any`
+otherwise. A null takes the type of the other branches, a node or an edge included. The
+lowering picks the type once every branch is lowered (`DBLowering::unionResultType`) and
+converts each branch before the dedup the branches share, a scalar through `nl.to_any`.
+CASE and coalesce follow the same rule (`selectedValueElement`).
+
+A property holds one type, so a value whose type varies per row also has a common type
+(`Expr::getCommonType`): the type all its values convert to without loss, Double for an
+integer beside a float, and Any when there is none. SET, CREATE and MERGE create a property
+with that type, and codegen converts the value to it before the write
+(`DBProgramGenerator::assignedColumn`), as SQL casts a value to the column it is assigned to.
+A value with no common type creates no property. SET writes it to an existing property and
+checks each row against the property's type.
 
 A body can be a WHEN: `CALL (p) { WHEN p.age > 60 THEN { ... } WHEN ... ELSE { ... } }`.
 For each input row the first branch whose predicate is true runs, a null predicate counting
@@ -427,10 +454,17 @@ collect into one `nl.union_buffer`, as a UNION body does. A branch can return an
 MERGE wrote: each branch yields the entity's pending mask, `false` in a branch that did not
 write it. A column one branch created and another did not gets a mask too, `true` in each
 branch that created it. A UNION can combine a WHEN, in braces, with another WHEN or any
-other query: `{ WHEN ... } UNION { WHEN ... }`. The parser writes each braced WHEN as
-`CALL () { WHEN ... } RETURN <its columns>`, which the CALL holding the union hands its
-imports, so the union handles it as any other side. Not done yet: a UNION inside a WHEN
-branch, and WHEN in an EXISTS or COUNT body.
+other query: `{ WHEN ... } UNION { WHEN ... }`, and a WHEN branch can be a UNION or a WHEN.
+
+A body is a `RegularQuery` (`query/AST/RegularQuery.h`): a `SinglePartQuery`, or a
+`UnionQuery` or a `ConditionalQuery` whose branches are regular queries again. The top
+level, a CALL, a NEXT segment, EXISTS, COUNT and COLLECT all hold one, and every `{ }`
+holding a query takes the same ones: a single query, a UNION, a WHEN or a NEXT chain. The analyzer reads a
+body through `analyzeSubqueryBody` and the code generator through `generateSubqueryBody`.
+Each single query of a body, and each WHEN, holds the declarations it imports
+(`RegularQuery::getImportDecls`), and the code generator binds them to the row the body
+runs for. A branch that is a UNION or a WHEN of its own nests its `db.union` or
+`db.conditional` in the region of the branch holding it.
 
 `CALL (*) { ... }` imports every variable in scope: the analyzer fills the import list from
 the scope's named declarations (`CypherAnalyzer::importEveryVariable`), and the body then
@@ -440,6 +474,5 @@ subquery: the rows pass through, and nothing the body declares is visible after 
 body takes updating clauses only, FOREACH included. Tests: `ForeachTest.cpp`,
 `CallSubqueryImportEverythingTest.cpp`.
 
-Still open: the vectorised forms of section 4, an import read below a keyless reduction in
-the body, and trimming inside the region. The scope
+Still open: the vectorised forms of section 4, and trimming inside the region. The scope
 clause alias is settled: the grammar rejects `CALL (t AS teams)`, as Neo4j does.

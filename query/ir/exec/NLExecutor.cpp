@@ -18,6 +18,7 @@
 #include <spdlog/fmt/bundled/format.h>
 #include <llvm/Support/MathExtras.h>
 
+#include "NumberOrder.h"
 #include "TypeUtils.h"
 #include "columns/ContainerKind.h"
 #include "iterators/GetEdgesIterator.h"
@@ -55,9 +56,13 @@
 #include "columns/ColumnOperatorDispatcher.h"
 #include "columns/AllowedKinds.h"
 #include "columns/Functions.h"
+#include "columns/IndexTypeError.h"
 #include "columns/UnaryPredicates.h"
-#include "list/ListElementOrder.h"
-#include "list/ListUtils.h"
+#include "CellOrder.h"
+#include "CellUtils.h"
+#include "IteratedList.h"
+#include "QueryTypeName.h"
+#include "list/ListHash.h"
 #include "map/MapHash.h"
 #include "map/MapUtils.h"
 #include "list/PathTrie.h"
@@ -67,6 +72,7 @@
 #include "reader/GraphReader.h"
 #include "versioning/CommitWriteBuffer.h"
 #include "versioning/PendingAdjacency.h"
+#include "versioning/ScannedNodes.h"
 #include "views/GraphView.h"
 
 #include "CSVParser.h"
@@ -82,10 +88,12 @@
 #include "NLSystemContext.h"
 
 #include "NLProgram.h"
+#include "NLRuntimeProperty.h"
 #include "NLMergeExecutor.h"
 #include "NLPendingEdges.h"
 #include "NLPendingNodes.h"
 #include "NLPropertyValueScan.h"
+#include "NLEntityProperties.h"
 #include "NLWriteProperties.h"
 #include "NLWrittenValues.h"
 #include "NLPropertyFunctions.h"
@@ -101,17 +109,15 @@ using namespace db;
 
 namespace {
 
+// The step row an untagged mark, tally or collect answers for: the position its row chunk
+// holds, or the single row of the step when it has none
+uint64_t untaggedRow(const ColumnVector<uint64_t>* row) {
+    return row ? row->getRaw().front() : 0;
+}
+
 template <typename Handler>
 void dispatchIDChunkKind(NLChunkKind kind, Handler&& handler) {
     switch (kind) {
-        case NLChunkKind::NodeID:
-            return handler.template operator()<NodeID>();
-        break;
-
-        case NLChunkKind::EdgeID:
-            return handler.template operator()<EdgeID>();
-        break;
-
         case NLChunkKind::EdgeTypeID:
             return handler.template operator()<EdgeTypeID>();
         break;
@@ -396,12 +402,12 @@ private:
 };
 
 // Copy a slice of a ListView's tagged scalars straight into a
-// ColumnVector<ListElementView> - the heterogeneous unwind's type-erased column.
+// ColumnVector<CellView> - the heterogeneous unwind's type-erased column.
 void fillListElementChunk(Column* output, const ListView list, size_t offset, size_t rows) {
-    ColumnVector<ListElementView>* typed = static_cast<ColumnVector<ListElementView>*>(output);
-    const std::span<const ListElementView> elements = list.elements();
+    ColumnVector<CellView>* typed = static_cast<ColumnVector<CellView>*>(output);
+    const std::span<const CellView> elements = list.elements();
 
-    std::vector<ListElementView>& raw = typed->getRaw();
+    std::vector<CellView>& raw = typed->getRaw();
     raw.assign(elements.begin() + offset, elements.begin() + offset + rows);
 }
 
@@ -411,7 +417,7 @@ void fillListElementChunk(Column* output, const ListView list, size_t offset, si
 // consumer reads; a null element names no type of its own and rides the column as an
 // absent cell.
 void fillHomogeneousChunk(Column* output, ValueType valueType, const ListView list, size_t offset, size_t rows) {
-    const std::span<const ListElementView> elements = list.elements();
+    const std::span<const CellView> elements = list.elements();
 
     const auto fill = [&]<SupportedType T>() {
         using Primitive = typename T::Primitive;
@@ -421,17 +427,17 @@ void fillHomogeneousChunk(Column* output, ValueType valueType, const ListView li
         std::vector<std::optional<Primitive>>& raw = typed->getRaw();
         raw.resize(rows);
 
-        // ListElementView::getAs reinterprets the element's bytes as the primitive
+        // CellView::getAs reinterprets the element's bytes as the primitive
         // without consulting its type tag, so check the tag against the one the
         // primitive is stored under: a homogeneous unwind whose column type disagrees
         // with its literals would otherwise read a value of the wrong type.
-        constexpr ListBufferTypeTag expectedTag = TypeToListBufferTag<Primitive>::Tag;
+        constexpr CellTag expectedTag = TypeToCellTag<Primitive>::Tag;
 
         for (size_t index = 0; index < rows; index++) {
-            const ListElementView element = elements[offset + index];
-            const ListBufferTypeTag tag = element.getTag();
+            const CellView element = elements[offset + index];
+            const CellTag tag = element.getTag();
 
-            if (tag == ListBufferTypeTag::Null) {
+            if (tag == CellTag::Null) {
                 raw[index] = std::nullopt;
                 continue;
             }
@@ -495,7 +501,7 @@ void unwindListElementEmit(const Column* source,
     const std::vector<size_t>& rowsRaw = rows->getRaw();
     const std::vector<size_t>& positionsRaw = positions->getRaw();
 
-    std::vector<ListElementView>& outputRaw = static_cast<ColumnVector<ListElementView>*>(output)->getRaw();
+    std::vector<CellView>& outputRaw = static_cast<ColumnVector<CellView>*>(output)->getRaw();
     outputRaw.resize(rowsRaw.size());
 
     for (size_t index = 0; index < rowsRaw.size(); index++) {
@@ -520,13 +526,13 @@ void unwindListValueEmit(const Column* source,
     std::vector<std::optional<Primitive>>& outputRaw = static_cast<ColumnOptVector<Primitive>*>(output)->getRaw();
     outputRaw.resize(rowsRaw.size());
 
-    constexpr ListBufferTypeTag expectedTag = TypeToListBufferTag<Primitive>::Tag;
+    constexpr CellTag expectedTag = TypeToCellTag<Primitive>::Tag;
 
     for (size_t index = 0; index < rowsRaw.size(); index++) {
-        const ListElementView element = sourceList(lists, rowsRaw[index]).elements()[positionsRaw[index]];
-        const ListBufferTypeTag tag = element.getTag();
+        const CellView element = sourceList(lists, rowsRaw[index]).elements()[positionsRaw[index]];
+        const CellTag tag = element.getTag();
 
-        if (tag == ListBufferTypeTag::Null) {
+        if (tag == CellTag::Null) {
             outputRaw[index] = std::nullopt;
             continue;
         }
@@ -552,13 +558,13 @@ void unwindListValidIDEmit(const Column* source,
     std::vector<IDType>& outputRaw = static_cast<ColumnVector<IDType>*>(output)->getRaw();
     outputRaw.resize(rowsRaw.size());
 
-    constexpr ListBufferTypeTag expectedTag = TypeToListBufferTag<IDType>::Tag;
+    constexpr CellTag expectedTag = TypeToCellTag<IDType>::Tag;
 
     for (size_t index = 0; index < rowsRaw.size(); index++) {
-        const ListElementView element = sourceList(lists, rowsRaw[index]).elements()[positionsRaw[index]];
-        const ListBufferTypeTag tag = element.getTag();
+        const CellView element = sourceList(lists, rowsRaw[index]).elements()[positionsRaw[index]];
+        const CellTag tag = element.getTag();
 
-        if (tag == ListBufferTypeTag::Null) {
+        if (tag == CellTag::Null) {
             outputRaw[index] = IDType {};
             continue;
         }
@@ -569,30 +575,51 @@ void unwindListValidIDEmit(const Column* source,
     }
 }
 
-// The rows one tagged cell unwinds into: a tagged list its elements, a tagged null none,
-// and any other tagged scalar the single row it is.
-size_t taggedCellRowCount(const ListElementView element) {
-    const ListBufferTypeTag tag = element.getTag();
+// The path sibling of unwindListValidIDEmit: a path column spells a null path as one holding
+// no node, so the tagged null a list holds drains back into one.
+template <typename SourceColumn>
+void unwindListPathEmit(const Column* source,
+                        const ColumnVector<size_t>* rows,
+                        const ColumnVector<size_t>* positions,
+                        Column* output) {
+    const SourceColumn* lists = static_cast<const SourceColumn*>(source);
+    const std::vector<size_t>& rowsRaw = rows->getRaw();
+    const std::vector<size_t>& positionsRaw = positions->getRaw();
 
-    if (tag == ListBufferTypeTag::ListView) {
-        return element.getAs<ListView>().size();
+    std::vector<GraphPath>& outputRaw = static_cast<ColumnVector<GraphPath>*>(output)->getRaw();
+    outputRaw.resize(rowsRaw.size());
+
+    for (size_t index = 0; index < rowsRaw.size(); index++) {
+        const CellView element = sourceList(lists, rowsRaw[index]).elements()[positionsRaw[index]];
+        const CellTag tag = element.getTag();
+
+        if (tag == CellTag::Null) {
+            outputRaw[index].clear();
+            continue;
+        }
+
+        bioassert(tag == CellTag::Path, "Unwound element of a list of paths is not a path.");
+
+        outputRaw[index].assign(element.getAs<PathView>());
     }
-
-    return tag == ListBufferTypeTag::Null ? 0 : 1;
 }
 
-// The element one tagged cell gives up at @param position: that of the list it holds, or
-// the cell itself where it holds anything else.
-ListElementView taggedCellElement(const ListElementView element, size_t position) {
-    if (element.getTag() != ListBufferTypeTag::ListView) {
-        return element;
+template <typename Cell>
+size_t taggedCellRowCount(const Cell& element) {
+    const std::optional<ListView> list = iteratedList(element);
+    if (!list) {
+        return 0;
     }
 
-    return element.getAs<ListView>().elements()[position];
+    return list->size();
+}
+
+CellView taggedCellElement(const CellView& element, size_t position) {
+    return iteratedList(element)->elements()[position];
 }
 
 size_t unwindTaggedElementCount(const Column* source, size_t row) {
-    const auto* elements = static_cast<const ColumnVector<ListElementView>*>(source);
+    const auto* elements = static_cast<const ColumnVector<CellView>*>(source);
 
     return taggedCellRowCount((*elements)[row]);
 }
@@ -600,14 +627,9 @@ size_t unwindTaggedElementCount(const Column* source, size_t row) {
 // The nullable sibling: an absent cell contributes no row, as the tagged null it stands
 // for does.
 size_t unwindOptTaggedElementCount(const Column* source, size_t row) {
-    const auto* elements = static_cast<const ColumnOptVector<ListElementView>*>(source);
-    const std::optional<ListElementView>& element = (*elements)[row];
+    const auto* elements = static_cast<const ColumnOptVector<CellView>*>(source);
 
-    if (!element.has_value()) {
-        return 0;
-    }
-
-    return taggedCellRowCount(*element);
+    return taggedCellRowCount((*elements)[row]);
 }
 
 // Fill the element chunk from a type-erased column: a cell holding a nested list gives up
@@ -616,11 +638,11 @@ void unwindTaggedElementEmit(const Column* source,
                              const ColumnVector<size_t>* rows,
                              const ColumnVector<size_t>* positions,
                              Column* output) {
-    const std::vector<ListElementView>& elements = static_cast<const ColumnVector<ListElementView>*>(source)->getRaw();
+    const std::vector<CellView>& elements = static_cast<const ColumnVector<CellView>*>(source)->getRaw();
     const std::vector<size_t>& rowsRaw = rows->getRaw();
     const std::vector<size_t>& positionsRaw = positions->getRaw();
 
-    std::vector<ListElementView>& outputRaw = static_cast<ColumnVector<ListElementView>*>(output)->getRaw();
+    std::vector<CellView>& outputRaw = static_cast<ColumnVector<CellView>*>(output)->getRaw();
     outputRaw.resize(rowsRaw.size());
 
     for (size_t index = 0; index < rowsRaw.size(); index++) {
@@ -634,12 +656,12 @@ void unwindOptTaggedElementEmit(const Column* source,
                                 const ColumnVector<size_t>* rows,
                                 const ColumnVector<size_t>* positions,
                                 Column* output) {
-    const std::vector<std::optional<ListElementView>>& elements =
-        static_cast<const ColumnOptVector<ListElementView>*>(source)->getRaw();
+    const std::vector<std::optional<CellView>>& elements =
+        static_cast<const ColumnOptVector<CellView>*>(source)->getRaw();
     const std::vector<size_t>& rowsRaw = rows->getRaw();
     const std::vector<size_t>& positionsRaw = positions->getRaw();
 
-    std::vector<ListElementView>& outputRaw = static_cast<ColumnVector<ListElementView>*>(output)->getRaw();
+    std::vector<CellView>& outputRaw = static_cast<ColumnVector<CellView>*>(output)->getRaw();
     outputRaw.resize(rowsRaw.size());
 
     for (size_t index = 0; index < rowsRaw.size(); index++) {
@@ -762,10 +784,10 @@ void applyFunctionOverVector(Functor& functor,
 bool readsTaggedCells(const Column* input) {
     const ColumnKind::Code kind = input->getKind();
 
-    return kind == ColumnVector<ListElementView>::staticKind()
-        || kind == ColumnConst<ListElementView>::staticKind()
-        || kind == ColumnOptVector<ListElementView>::staticKind()
-        || kind == ColumnConst<std::optional<ListElementView>>::staticKind();
+    return kind == ColumnVector<CellView>::staticKind()
+        || kind == ColumnConst<CellView>::staticKind()
+        || kind == ColumnOptVector<CellView>::staticKind()
+        || kind == ColumnConst<std::optional<CellView>>::staticKind();
 }
 
 template <typename Functor>
@@ -847,28 +869,6 @@ NLUnaryFunctionKernel selectTaggedCellFunction(const Column* input, bool inputNu
     if (inputNullable) {
         result = memory->alloc<ColumnVector<Res>>();
         return &functionNullReadingKernel<Functor>;
-    }
-
-    result = memory->alloc<ColumnVector<Res>>();
-    return &functionVectorKernel<Functor>;
-}
-
-// A value read out of a map carries its null in its own tag, so its column is never a
-// nullable one: a row per entry, or the single entry a constant is
-bool readsMapValues(const Column* input) {
-    const ColumnKind::Code kind = input->getKind();
-
-    return kind == ColumnVector<MapEntryView>::staticKind()
-        || kind == ColumnConst<MapEntryView>::staticKind();
-}
-
-template <typename Functor>
-NLUnaryFunctionKernel selectMapValueFunction(const Column* input, LocalMemory* memory, Column*& result) {
-    using Res = typename Functor::ResultType;
-
-    if (input->getContainerKind() == ContainerKind::code<ColumnConst>()) {
-        result = memory->alloc<ColumnConst<Res>>();
-        return &functionConstKernel<Functor>;
     }
 
     result = memory->alloc<ColumnVector<Res>>();
@@ -1200,6 +1200,16 @@ struct BinaryOpTraits<OP_IN> {
 };
 
 template <>
+struct BinaryOpTraits<OP_INDEX_OF> {
+    using Functor = IndexOf;
+
+    template <typename ResCol, typename LhsCol, typename RhsCol>
+    static void exec(ResCol* result, const LhsCol* lhs, const RhsCol* rhs) {
+        BinaryOperators::exec<Functor>(result, lhs, rhs);
+    }
+};
+
+template <>
 struct BinaryOpTraits<OP_FUNC_COSINE_SIMILARITY> {
     using Functor = CosineSimilarityFunction;
 
@@ -1326,36 +1336,27 @@ struct ValueListIndexSelector {
     }
 };
 
-// The entity sibling of applyValueListIndex: an ID column spells a null entity as an
-// invalid ID, so a position past the end - or the tagged null a list holds for an entity
-// an OPTIONAL MATCH did not match - reads back as one rather than as an absent optional.
-template <typename IDType, typename LhsCol, typename RhsCol>
-void applyEntityListIndex(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers*) {
-    const auto& lists = static_cast<const LhsCol*>(lhs)->getRaw();
-    const RhsCol* indices = static_cast<const RhsCol*>(rhs);
-
-    std::vector<IDType>& ids = static_cast<ColumnVector<IDType>*>(result)->getRaw();
-    ids.assign(lists.size(), IDType {});
-
-    for (size_t row = 0; row < lists.size(); row++) {
-        std::optional<IDType> id;
-        if constexpr (std::is_same_v<LhsCol, ColumnOptVector<ListView>>) {
-            if (lists[row].has_value()) {
-                id = ValueListIndex<IDType> {}(*lists[row], (*indices)[row]);
-            }
-        } else {
-            id = ValueListIndex<IDType> {}(lists[row], (*indices)[row]);
-        }
-
-        if (id.has_value()) {
-            ids[row] = *id;
-        }
+// The entity sibling of ValueListIndex: an ID column spells a null entity as an invalid
+// ID, so a position past the end - or the tagged null a list holds for an entity an
+// OPTIONAL MATCH did not match - reads back as one rather than as an absent optional.
+template <typename IDType>
+struct EntityListIndex {
+    template <typename List, typename Index>
+    IDType operator()(const List& list, const Index& index) const {
+        return ValueListIndex<IDType> {}(list, index).value_or(IDType {});
     }
+};
+
+template <typename IDType, typename ResCol, typename LhsCol, typename RhsCol>
+void applyEntityListIndex(Column* result, const Column* lhs, const Column* rhs, NLStepBuffers*) {
+    using Lists = typename InnerTypeHelper<LhsCol>::type;
+    using Indices = typename InnerTypeHelper<RhsCol>::type;
+
+    BinaryOpExecutor<EntityListIndex<IDType>, IDType, Lists, Indices>::apply(static_cast<ResCol*>(result),
+                                                                            static_cast<const LhsCol*>(lhs),
+                                                                            static_cast<const RhsCol*>(rhs));
 }
 
-// A collect over a pattern variable gathers into a plain list column, and nodes() and
-// relationships() read a path into a nullable one: those are the shapes an entity is read
-// out of, and any other leaves the kernel unselected.
 template <typename IDType>
 struct EntityListIndexSelector {
     LocalMemory* _memory {nullptr};
@@ -1364,11 +1365,17 @@ struct EntityListIndexSelector {
 
     template <typename LhsCol, typename RhsCol>
     void operator()(const LhsCol*, const RhsCol*) {
-        constexpr bool readsAListColumn = std::is_same_v<LhsCol, ColumnVector<ListView>>
-                                       || std::is_same_v<LhsCol, ColumnOptVector<ListView>>;
-        if constexpr (readsAListColumn) {
-            _result = _memory->alloc<ColumnVector<IDType>>();
-            _fn = &applyEntityListIndex<IDType, LhsCol, RhsCol>;
+        using Lists = typename InnerTypeHelper<LhsCol>::type;
+        using Indices = typename InnerTypeHelper<RhsCol>::type;
+
+        constexpr bool readsAList = std::is_same_v<TypeUtils::unwrap_optional_t<Lists>, ListView>;
+        constexpr bool readsConstants = std::is_same_v<LhsCol, ColumnConst<Lists>>
+                                     && std::is_same_v<RhsCol, ColumnConst<Indices>>;
+        using ResCol = std::conditional_t<readsConstants, ColumnConst<IDType>, ColumnVector<IDType>>;
+
+        if constexpr (readsAList) {
+            _result = _memory->alloc<ResCol>();
+            _fn = &applyEntityListIndex<IDType, ResCol, LhsCol, RhsCol>;
         }
     }
 };
@@ -1496,24 +1503,26 @@ void collectNoSurvivors(const Column*, ColumnVector<size_t>*) {
 }
 
 // The truth value a type-erased cell holds: its boolean, or null where it holds a null
-std::optional<bool> cellTruth(ListElementView cell) {
-    switch (cell.getTag()) {
-        case ListBufferTypeTag::Bool:
+std::optional<bool> cellTruth(CellView cell) {
+    const CellTag tag = cell.getTag();
+
+    switch (tag) {
+        case CellTag::Bool:
             return static_cast<bool>(cell.getAs<types::Bool::Primitive>());
         break;
 
-        case ListBufferTypeTag::Null:
+        case CellTag::Null:
             return std::nullopt;
         break;
 
         default:
-            throw IRException("A condition reads a value that is not a boolean");
+            throw IRException(fmt::format("A condition must be a boolean, not '{}'", queryTypeName(tag)));
         break;
     }
 }
 
 void collectTaggedCellSurvivors(const Column* mask, ColumnVector<size_t>* indices) {
-    const std::vector<ListElementView>& cells = static_cast<const ColumnVector<ListElementView>*>(mask)->getRaw();
+    const std::vector<CellView>& cells = static_cast<const ColumnVector<CellView>*>(mask)->getRaw();
     std::vector<size_t>& survivingRaw = indices->getRaw();
 
     for (size_t row = 0; row < cells.size(); row++) {
@@ -1524,8 +1533,8 @@ void collectTaggedCellSurvivors(const Column* mask, ColumnVector<size_t>* indice
 }
 
 void collectOptTaggedCellSurvivors(const Column* mask, ColumnVector<size_t>* indices) {
-    const std::vector<std::optional<ListElementView>>& cells =
-        static_cast<const ColumnOptVector<ListElementView>*>(mask)->getRaw();
+    const std::vector<std::optional<CellView>>& cells =
+        static_cast<const ColumnOptVector<CellView>*>(mask)->getRaw();
     std::vector<size_t>& survivingRaw = indices->getRaw();
 
     for (size_t row = 0; row < cells.size(); row++) {
@@ -1551,17 +1560,17 @@ std::optional<NodeID> namedNode(types::UInt64::Primitive id) {
     return NodeID(id);
 }
 
-std::optional<NodeID> namedNode(ListElementView cell) {
+std::optional<NodeID> namedNode(CellView cell) {
     switch (cell.getTag()) {
-        case ListBufferTypeTag::Int:
+        case CellTag::Int:
             return namedNode(cell.getAs<types::Int64::Primitive>());
         break;
 
-        case ListBufferTypeTag::UInt:
+        case CellTag::UInt:
             return namedNode(cell.getAs<types::UInt64::Primitive>());
         break;
 
-        case ListBufferTypeTag::NodeID:
+        case CellTag::NodeID:
             return cell.getAs<NodeID>();
         break;
 
@@ -1580,46 +1589,13 @@ std::optional<NodeID> namedNode(const std::optional<Cell>& cell) {
     return namedNode(*cell);
 }
 
-// The nodes a node scan produces: the ones the view holds and did not delete, and the ones
-// the running query created and did not delete
-class ScannedNodes {
-public:
-    explicit ScannedNodes(const NLExecutionContext* context)
-        : _reader(context->getView()->read()),
-        _writeBuffer(context->getWriteBuffer()),
-        _committedCount(committedNodeCount(context->getView())),
-        _firstQueryNode(context->getFirstQueryNode()),
-        _pendingCount(_writeBuffer ? _writeBuffer->numPendingNodes() : 0)
-    {
-    }
-
-    bool contains(NodeID node) const {
-        const uint64_t id = node.getValue();
-        if (id < _committedCount) {
-            return !_reader.nodeIsDeleted(node);
-        }
-
-        const uint64_t offset = id - _committedCount;
-        const bool createdByThisQuery = offset >= _firstQueryNode && offset < _pendingCount;
-
-        return createdByThisQuery && !_writeBuffer->deletedPendingNodes().contains(offset);
-    }
-
-private:
-    const GraphReader _reader;
-    const CommitWriteBuffer* _writeBuffer {nullptr};
-    size_t _committedCount {0};
-    size_t _firstQueryNode {0};
-    size_t _pendingCount {0};
-};
-
 template <typename Cell>
 void fetchNamedNodes(const Column* ids, const NLExecutionContext* context, ColumnVector<size_t>* indices, ColumnNodeIDs* nodes) {
     const std::vector<Cell>& cells = static_cast<const ColumnVector<Cell>*>(ids)->getRaw();
     std::vector<size_t>& rows = indices->getRaw();
     std::vector<NodeID>& fetched = nodes->getRaw();
 
-    const ScannedNodes scanned(context);
+    const ScannedNodes scanned(*context->getView(), context->getWriteBuffer(), context->getFirstQueryNode());
 
     for (size_t row = 0; row < cells.size(); row++) {
         const std::optional<NodeID> node = namedNode(cells[row]);
@@ -1656,33 +1632,33 @@ std::optional<CustomBool> negatedTruth(const auto& cell) {
 }
 
 void applyNotOnTaggedCells(Column* result, const Column* operand) {
-    const std::vector<ListElementView>& operandRaw = static_cast<const ColumnVector<ListElementView>*>(operand)->getRaw();
+    const std::vector<CellView>& operandRaw = static_cast<const ColumnVector<CellView>*>(operand)->getRaw();
     std::vector<std::optional<CustomBool>>& resultRaw = static_cast<ColumnOptMask*>(result)->getRaw();
 
     resultRaw.resize(operandRaw.size());
-    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](ListElementView cell) {
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](CellView cell) {
         return negatedTruth(cell);
     });
 }
 
 void applyNotOnOptTaggedCells(Column* result, const Column* operand) {
-    const std::vector<std::optional<ListElementView>>& operandRaw =
-        static_cast<const ColumnOptVector<ListElementView>*>(operand)->getRaw();
+    const std::vector<std::optional<CellView>>& operandRaw =
+        static_cast<const ColumnOptVector<CellView>*>(operand)->getRaw();
     std::vector<std::optional<CustomBool>>& resultRaw = static_cast<ColumnOptMask*>(result)->getRaw();
 
     resultRaw.resize(operandRaw.size());
-    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](const std::optional<ListElementView>& cell) {
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](const std::optional<CellView>& cell) {
         return negatedTruth(cell);
     });
 }
 
 void applyNotOnConstTaggedCell(Column* result, const Column* operand) {
-    const ListElementView cell = static_cast<const ColumnConst<ListElementView>*>(operand)->getRaw();
+    const CellView cell = static_cast<const ColumnConst<CellView>*>(operand)->getRaw();
     static_cast<ColumnConst<std::optional<CustomBool>>*>(result)->set(negatedTruth(cell));
 }
 
 void applyNotOnOptConstTaggedCell(Column* result, const Column* operand) {
-    const std::optional<ListElementView>& cell = static_cast<const ColumnConst<std::optional<ListElementView>>*>(operand)->getRaw();
+    const std::optional<CellView>& cell = static_cast<const ColumnConst<std::optional<CellView>>*>(operand)->getRaw();
     static_cast<ColumnConst<std::optional<CustomBool>>*>(result)->set(negatedTruth(cell));
 }
 
@@ -1819,18 +1795,38 @@ void broadcastNullColumn(const Column* value, size_t rowCount, Column* output) {
     outputRaw.assign(rowCount, std::optional<int64_t> {});
 }
 
-// The view sibling of broadcastConstantColumn: a list, a map or a map entry is a view over
-// the query's buffers and carries no absence of its own, so the rows are a plain column of
-// that one view.
-template <typename View>
-void broadcastConstantViewColumn(const Column* value, size_t rowCount, Column* output) {
-    const ColumnConst<View>* typedValue = static_cast<const ColumnConst<View>*>(value);
-    ColumnVector<View>* typedOutput = static_cast<ColumnVector<View>*>(output);
+// The plain sibling of broadcastConstantColumn: a list, a map, a map entry, a node, an edge
+// or a path carries no absence of its own as a value does, so the rows are a plain column
+// of the one element the constant holds.
+template <typename Element>
+void broadcastConstantPlainColumn(const Column* value, size_t rowCount, Column* output) {
+    const ColumnConst<Element>* typedValue = static_cast<const ColumnConst<Element>*>(value);
+    ColumnVector<Element>* typedOutput = static_cast<ColumnVector<Element>*>(output);
 
     auto& outputRaw = typedOutput->getRaw();
     outputRaw.resize(rowCount);
 
     std::fill_n(outputRaw.begin(), rowCount, typedValue->getRaw());
+}
+
+// The mask sibling of broadcastConstantPlainColumn: a mask holds its rows as flags, and
+// its constant as the boolean every row carries
+void broadcastConstantMaskColumn(const Column* value, size_t rowCount, Column* output) {
+    const auto* typedValue = static_cast<const ColumnConst<types::Bool::Primitive>*>(value);
+    ColumnMask* typedOutput = static_cast<ColumnMask*>(output);
+
+    auto& outputRaw = typedOutput->getRaw();
+    outputRaw.resize(rowCount);
+
+    std::fill_n(outputRaw.begin(), rowCount, ColumnMask::Bool_t(typedValue->getRaw()._boolean));
+}
+
+// The one row of a mask, held as the boolean constant it stands for
+void readSingleMaskRowAsConstant(Column* result, const Column* row) {
+    const std::vector<ColumnMask::Bool_t>& rowRaw = static_cast<const ColumnMask*>(row)->getRaw();
+    bioassert(rowRaw.size() == 1, "A computation over constants did not write a single row.");
+
+    static_cast<ColumnConst<types::Bool::Primitive>*>(result)->set(types::Bool::Primitive(rowRaw.front()));
 }
 
 // The one row a computation over constants wrote, held as the constant it stands for
@@ -1998,20 +1994,49 @@ void entityToNullableColumn(Column* result, const Column* operand) {
     }
 }
 
-// A path an OPTIONAL MATCH did not match is empty, where any other holds at least the node
-// it starts on, so the empty path is the null and every other reads as its entry count
-void pathToNullableColumn(Column* result, const Column* operand) {
-    const std::vector<EntityList>& paths = static_cast<const ColumnVector<EntityList>*>(operand)->getRaw();
-    auto& nullables = static_cast<ColumnOptVector<types::UInt64::Primitive>*>(result)->getRaw();
+template <typename ID>
+ID checkedEntity(const CellView cell) {
+    const CellTag tag = cell.getTag();
 
-    nullables.resize(paths.size());
-    for (size_t row = 0; row < paths.size(); row++) {
-        if (paths[row].empty()) {
-            nullables[row] = std::nullopt;
-        } else {
-            nullables[row] = paths[row].size();
-        }
+    if (tag == TypeToCellTag<ID>::Tag) {
+        return cell.getAs<ID>();
+    } else if (tag == CellTag::Null) {
+        return ID {};
     }
+
+    constexpr std::string_view ENTITY = std::is_same_v<ID, NodeID> ? "a node" : "a relationship";
+    throw IRException(fmt::format("A pattern reads {}, not '{}'", ENTITY, queryTypeName(tag)));
+}
+
+template <typename ID>
+ID checkedEntity(const std::optional<CellView>& cell) {
+    return cell ? checkedEntity<ID>(*cell) : ID {};
+}
+
+template <typename ID, typename Cell>
+void checkedCastColumn(Column* result, const Column* operand) {
+    const std::vector<Cell>& cells = static_cast<const ColumnVector<Cell>*>(operand)->getRaw();
+    std::vector<ID>& ids = static_cast<ColumnVector<ID>*>(result)->getRaw();
+
+    ids.resize(cells.size());
+    std::transform(cells.begin(), cells.end(), ids.begin(), [](const Cell& cell) {
+        return checkedEntity<ID>(cell);
+    });
+}
+
+template <typename ID>
+NLUnaryFn selectCheckedCastOf(const Column* operand, LocalMemory* memory, Column*& result) {
+    const ColumnKind::Code kind = operand->getKind();
+
+    if (kind == ColumnVector<CellView>::staticKind()) {
+        result = memory->alloc<ColumnVector<ID>>();
+        return &checkedCastColumn<ID, CellView>;
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
+        result = memory->alloc<ColumnVector<ID>>();
+        return &checkedCastColumn<ID, std::optional<CellView>>;
+    }
+
+    throw IRException("A pattern reads its node or relationship out of a column of tagged cells laid out over its rows");
 }
 
 template <typename Primitive>
@@ -2088,22 +2113,22 @@ void applyIsNotTrueOnBoolColumn(Column* result, const Column* operand) {
 }
 
 void applyIsNotTrueOnTaggedCells(Column* result, const Column* operand) {
-    const std::vector<ListElementView>& operandRaw = static_cast<const ColumnVector<ListElementView>*>(operand)->getRaw();
+    const std::vector<CellView>& operandRaw = static_cast<const ColumnVector<CellView>*>(operand)->getRaw();
     std::vector<ColumnMask::Bool_t>& resultRaw = static_cast<ColumnMask*>(result)->getRaw();
 
     resultRaw.resize(operandRaw.size());
-    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](ListElementView cell) {
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](CellView cell) {
         return ColumnMask::Bool_t {!cellTruth(cell).value_or(false)};
     });
 }
 
 void applyIsNotTrueOnOptTaggedCells(Column* result, const Column* operand) {
-    const std::vector<std::optional<ListElementView>>& operandRaw =
-        static_cast<const ColumnOptVector<ListElementView>*>(operand)->getRaw();
+    const std::vector<std::optional<CellView>>& operandRaw =
+        static_cast<const ColumnOptVector<CellView>*>(operand)->getRaw();
     std::vector<ColumnMask::Bool_t>& resultRaw = static_cast<ColumnMask*>(result)->getRaw();
 
     resultRaw.resize(operandRaw.size());
-    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](std::optional<ListElementView> cell) {
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](std::optional<CellView> cell) {
         return ColumnMask::Bool_t {!(cell.has_value() && cellTruth(*cell).value_or(false))};
     });
 }
@@ -2111,6 +2136,58 @@ void applyIsNotTrueOnOptTaggedCells(Column* result, const Column* operand) {
 void applyIsNotTrueOnNull(Column* result, const Column* operand) {
     static_cast<ColumnMask*>(result)->getRaw().assign(operand->size(), ColumnMask::Bool_t {true});
 }
+
+template <typename ElementType, bool TESTS_NULL>
+void applyNullTestOnVector(Column* result, const Column* operand) {
+    const std::vector<ElementType>& operandRaw = static_cast<const ColumnVector<ElementType>*>(operand)->getRaw();
+    std::vector<ColumnMask::Bool_t>& resultRaw = static_cast<ColumnMask*>(result)->getRaw();
+
+    resultRaw.resize(operandRaw.size());
+    std::transform(operandRaw.begin(), operandRaw.end(), resultRaw.begin(), [](const ElementType& value) {
+        return ColumnMask::Bool_t {holdsAValue(value) != TESTS_NULL};
+    });
+}
+
+template <typename ElementType, bool TESTS_NULL>
+void applyNullTestOnConst(Column* result, const Column* operand) {
+    const ElementType& value = static_cast<const ColumnConst<ElementType>*>(operand)->getRaw();
+    static_cast<ColumnConst<CustomBool>*>(result)->set(CustomBool {holdsAValue(value) != TESTS_NULL});
+}
+
+// A mask holds a truth value on every row
+template <bool TESTS_NULL>
+void applyNullTestOnMask(Column* result, const Column* operand) {
+    static_cast<ColumnMask*>(result)->getRaw().assign(operand->size(), ColumnMask::Bool_t {!TESTS_NULL});
+}
+
+template <bool TESTS_NULL>
+struct NullTestSelector {
+    LocalMemory* _memory {nullptr};
+    NLUnaryFn _fn {nullptr};
+    Column* _result {nullptr};
+
+    void operator()(const ColumnMask* operand) {
+        _result = _memory->alloc<ColumnMask>();
+        _fn = &applyNullTestOnMask<TESTS_NULL>;
+    }
+
+    template <typename ElementType>
+    void operator()(const ColumnVector<ElementType>* operand) {
+        _result = _memory->alloc<ColumnMask>();
+        _fn = &applyNullTestOnVector<ElementType, TESTS_NULL>;
+    }
+
+    template <typename ElementType>
+    void operator()(const ColumnConst<ElementType>* operand) {
+        _result = _memory->alloc<ColumnConst<CustomBool>>();
+        _fn = &applyNullTestOnConst<ElementType, TESTS_NULL>;
+    }
+
+    template <typename ElementType>
+    void operator()(const ColumnSet<ElementType>* operand) {
+        throw IRException("A set column holds no rows to test for null");
+    }
+};
 
 std::optional<bool> readMaskTruth(const Column* mask, size_t row) {
     return static_cast<bool>(static_cast<const ColumnMask*>(mask)->getRaw()[row]);
@@ -2130,11 +2207,11 @@ std::optional<bool> readNullTruth(const Column* mask, size_t row) {
 }
 
 std::optional<bool> readTaggedCellTruth(const Column* cells, size_t row) {
-    return cellTruth(static_cast<const ColumnVector<ListElementView>*>(cells)->getRaw()[row]);
+    return cellTruth(static_cast<const ColumnVector<CellView>*>(cells)->getRaw()[row]);
 }
 
 std::optional<bool> readOptTaggedCellTruth(const Column* cells, size_t row) {
-    const std::optional<ListElementView>& cell = static_cast<const ColumnOptVector<ListElementView>*>(cells)->getRaw()[row];
+    const std::optional<CellView>& cell = static_cast<const ColumnOptVector<CellView>*>(cells)->getRaw()[row];
     if (!cell.has_value()) {
         return std::nullopt;
     }
@@ -2150,45 +2227,74 @@ bool caseTestOptTaggedCell(const Column* condition, size_t row) {
     return readOptTaggedCellTruth(condition, row).value_or(false);
 }
 
-EntityID pathEntityAt(const EntityList& path, size_t index) {
-    return path.getEntries()[index]._id;
-}
-
-EntityID pathEntityAt(const Path& path, size_t index) {
-    return path[index];
-}
-
-// The entities of one kind a path runs through, in the order the path holds them. A path
-// alternates node and edge from its first node, so they are every other entry from @param first
-template <typename IDType, typename PathType>
-ListView listPathEntities(const PathType& path, size_t first, ListBufferTypeTag tag, QueryListBuffer& buffer) {
-    const size_t count = (path.size() - first + 1) / 2;
+template <typename IDType>
+ListView listPathEntities(const PathView path,
+                          size_t count,
+                          IDType (PathView::*readEntity)(size_t) const,
+                          CellTag tag,
+                          QueryListBuffer& buffer) {
     ListWriteCursor cursor = buffer.reserveList(count, count * sizeof(IDType));
 
     for (size_t index = 0; index < count; index++) {
-        cursor.writeValueAt(index, tag, IDType(pathEntityAt(path, first + 2 * index).getValue()));
+        cursor.writeValueAt(index, tag, (path.*readEntity)(index));
     }
 
     return cursor.getView();
 }
 
-// A path an OPTIONAL MATCH missed is an empty sequence; every path found runs
-// through at least one node
-template <typename PathType>
-void readPathElements(const std::vector<PathType>& paths,
+std::optional<PathView> columnPath(const Column* paths, size_t row) {
+    const GraphPath& path = (*static_cast<const ColumnVector<GraphPath>*>(paths))[row];
+    if (path.isNull()) {
+        return std::nullopt;
+    }
+
+    return PathView {path.getIDs()};
+}
+
+// The path a tagged cell holds, or nothing where it holds a null. Anything else is a path
+// function applied to something that is no path, which only the cell's tag tells per row.
+std::optional<PathView> taggedPath(const CellView cell) {
+    const CellTag tag = cell.getTag();
+
+    if (tag == CellTag::Path) {
+        return cell.getAs<PathView>();
+    } else if (tag == CellTag::Null) {
+        return std::nullopt;
+    }
+
+    throw IRException(fmt::format("nodes(), relationships() and length() read a path, not '{}'", queryTypeName(tag)));
+}
+
+std::optional<PathView> taggedColumnPath(const Column* paths, size_t row) {
+    return taggedPath((*static_cast<const ColumnVector<CellView>*>(paths))[row]);
+}
+
+std::optional<PathView> optTaggedColumnPath(const Column* paths, size_t row) {
+    const std::optional<CellView>& cell = (*static_cast<const ColumnOptVector<CellView>*>(paths))[row];
+    if (!cell.has_value()) {
+        return std::nullopt;
+    }
+
+    return taggedPath(*cell);
+}
+
+void readPathElements(const Column* paths,
+                      NLPathReadFunction read,
                       PathElementsKind kind,
                       Column* output,
                       QueryListBuffer& listBuffer) {
+    const size_t rowCount = paths->size();
+
     if (kind == PathElementsKind::Length) {
         std::vector<std::optional<uint64_t>>& lengths = static_cast<ColumnOptVector<uint64_t>*>(output)->getRaw();
-        lengths.resize(paths.size());
+        lengths.resize(rowCount);
 
-        for (size_t row = 0; row < paths.size(); row++) {
-            const PathType& path = paths[row];
-            if (path.empty()) {
+        for (size_t row = 0; row < rowCount; row++) {
+            const std::optional<PathView> path = read(paths, row);
+            if (!path) {
                 lengths[row] = std::nullopt;
             } else {
-                lengths[row] = path.size() / 2;
+                lengths[row] = path->getLength();
             }
         }
 
@@ -2196,16 +2302,16 @@ void readPathElements(const std::vector<PathType>& paths,
     }
 
     std::vector<std::optional<ListView>>& lists = static_cast<ColumnOptVector<ListView>*>(output)->getRaw();
-    lists.resize(paths.size());
+    lists.resize(rowCount);
 
-    for (size_t row = 0; row < paths.size(); row++) {
-        const PathType& path = paths[row];
-        if (path.empty()) {
+    for (size_t row = 0; row < rowCount; row++) {
+        const std::optional<PathView> path = read(paths, row);
+        if (!path) {
             lists[row] = std::nullopt;
         } else if (kind == PathElementsKind::Nodes) {
-            lists[row] = listPathEntities<NodeID>(path, 0, ListBufferTypeTag::NodeID, listBuffer);
+            lists[row] = listPathEntities(*path, path->getNodeCount(), &PathView::getNode, CellTag::NodeID, listBuffer);
         } else {
-            lists[row] = listPathEntities<EdgeID>(path, 1, ListBufferTypeTag::EdgeID, listBuffer);
+            lists[row] = listPathEntities(*path, path->getLength(), &PathView::getEdge, CellTag::EdgeID, listBuffer);
         }
     }
 }
@@ -2346,19 +2452,19 @@ void caseWriteNull(Column* result, size_t resultRow, const Column* value, size_t
     static_cast<ColumnOptVector<Primitive>*>(result)->getRaw()[resultRow] = std::nullopt;
 }
 
-template <typename ID>
-void caseWriteNullEntity(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
-    static_cast<ColumnVector<ID>*>(result)->getRaw()[resultRow] = ID {};
+template <typename Element>
+void caseWriteOwnNull(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
+    static_cast<ColumnVector<Element>*>(result)->getRaw()[resultRow] = Element {};
 }
 
 void caseWriteNullTaggedCell(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
-    static_cast<ColumnVector<ListElementView>*>(result)->getRaw()[resultRow] = ListElementView::nullElement();
+    static_cast<ColumnVector<CellView>*>(result)->getRaw()[resultRow] = CellView::nullElement();
 }
 
-template <typename ID>
-void caseWriteEntityCell(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
-    std::vector<ID>& results = static_cast<ColumnVector<ID>*>(result)->getRaw();
-    results[resultRow] = static_cast<const ColumnVector<ID>*>(value)->getRaw()[valueRow];
+template <typename Element>
+void caseWriteOwnNullCell(Column* result, size_t resultRow, const Column* value, size_t valueRow) {
+    std::vector<Element>& results = static_cast<ColumnVector<Element>*>(result)->getRaw();
+    results[resultRow] = static_cast<const ColumnVector<Element>*>(value)->getRaw()[valueRow];
 }
 
 void writeCell(Column* result,
@@ -2374,12 +2480,146 @@ void writeCell(Column* result,
     }
 
     ListBuffer<>::ListItemVariant item = write._taggedRead(value, valueRow, stepBuffers);
-    static_cast<ColumnVector<ListElementView>*>(result)->getRaw()[resultRow] = values.ownCell(item);
+    static_cast<ColumnVector<CellView>*>(result)->getRaw()[resultRow] = values.ownCell(item);
+}
+
+template <typename Element>
+void fillNullRows(Column* result, const Column* value, const ColumnMask* nullRows, const Column* fill) {
+    const std::vector<Element>& values = static_cast<const ColumnVector<Element>*>(value)->getRaw();
+    const std::vector<ColumnMask::Bool_t>& nulls = nullRows->getRaw();
+    const std::vector<Element>& fills = static_cast<const ColumnVector<Element>*>(fill)->getRaw();
+    std::vector<Element>& results = static_cast<ColumnVector<Element>*>(result)->getRaw();
+
+    bioassert(nulls.size() == values.size(), "A value's null rows are marked over other rows than its own.");
+
+    results.resize(values.size());
+
+    const auto isNull = [](ColumnMask::Bool_t row) {
+        return static_cast<bool>(row);
+    };
+
+    size_t row = 0;
+    auto fillIt = fills.begin();
+    auto resultIt = results.begin();
+
+    while (row < values.size()) {
+        const size_t nullStart = static_cast<size_t>(std::find_if(nulls.begin() + row, nulls.end(), isNull) - nulls.begin());
+        resultIt = std::copy(values.begin() + row, values.begin() + nullStart, resultIt);
+
+        const size_t nullEnd = static_cast<size_t>(std::find_if_not(nulls.begin() + nullStart, nulls.end(), isNull) - nulls.begin());
+        const size_t nullCount = nullEnd - nullStart;
+        const size_t fillsLeft = static_cast<size_t>(fills.end() - fillIt);
+        bioassert(nullCount <= fillsLeft, "A value has more null rows than the rows filling them.");
+
+        resultIt = std::copy_n(fillIt, nullCount, resultIt);
+        fillIt += nullCount;
+        row = nullEnd;
+    }
+
+    bioassert(fillIt == fills.end(), "A value has fewer null rows than the rows filling them.");
+}
+
+// Folds each row's list into the accumulator, the body running once per element position
+// over the rows whose list reaches it. @param testStep runs after each chunk of rows a step
+// folded has its accumulators written, and hands back the rows whose fold ends there.
+template <typename TestStep>
+void foldElements(NLExecutionContext* context, NLFoldData* fold, TestStep testStep) {
+    const Column* source = fold->getSource();
+    const NLUnwindElementCountFunction elementCount = fold->getElementCountFunc();
+    const NLUnwindElementEmitFunction elementEmit = fold->getElementEmitFunc();
+    const NLCellAbsentFunction cellAbsent = fold->getCellAbsentFunc();
+    const Column* initialValue = fold->getInitialValue();
+    const Column* value = fold->getValue();
+    const NLStmtContainer* body = fold->getStmts();
+    Column* accumulator = fold->getAccumulator();
+    NLStepBuffers* const memory = fold->getStepBuffers();
+    memory->clear();
+    NLCompactingValueStore& accumulatorValues = fold->accumulatorValues();
+    const NLReownFunction reown = fold->getReown();
+    const NLReownRowsFunction reownRows = fold->getReownRows();
+
+    const size_t sourceRows = source->size();
+    const size_t chunkSize = context->getChunkSize();
+
+    const auto write = [&](const NLCellWrite& rowWrite, size_t row, const Column* written, size_t writtenRow) {
+        writeCell(accumulator, row, rowWrite, written, writtenRow, memory, accumulatorValues.getActive());
+    };
+
+    accumulatorValues.clear();
+    fold->getReset()(accumulator, sourceRows);
+
+    std::vector<size_t>& elementCounts = fold->elementCounts();
+    std::vector<size_t>& reachingRows = fold->reachingRows();
+    std::vector<size_t>& endedRows = fold->endedRows();
+    elementCounts.assign(sourceRows, 0);
+    reachingRows.clear();
+
+    // A row whose cell holds no list keeps the null the reset left it, as Cypher reads
+    // `reduce(s = 0, x IN null | s + x)`
+    for (size_t row = 0; row < sourceRows; row++) {
+        if (cellAbsent(source, row)) {
+            continue;
+        }
+
+        write(fold->getInitialWrite(), row, initialValue, row);
+
+        elementCounts[row] = elementCount(source, row);
+        if (elementCounts[row] > 0) {
+            reachingRows.push_back(row);
+        }
+    }
+
+    std::vector<size_t>& rowsRaw = fold->getRows()->getRaw();
+    std::vector<size_t>& positionsRaw = fold->getPositions()->getRaw();
+
+    for (size_t position = 0; !reachingRows.empty(); position++) {
+        for (size_t first = 0; first < reachingRows.size(); first += chunkSize) {
+            const size_t last = std::min(first + chunkSize, reachingRows.size());
+            rowsRaw.assign(reachingRows.begin() + first, reachingRows.begin() + last);
+
+            if (elementEmit) {
+                positionsRaw.assign(rowsRaw.size(), position);
+                elementEmit(source, fold->getRows(), fold->getPositions(), fold->getElementOutput());
+            }
+
+            for (const NLCarriedColumn& carriedColumn : fold->carriedColumns()) {
+                const auto gatherFunc = carriedColumn.getGatherFunc();
+                gatherFunc(carriedColumn.getInput(), fold->getRows(), carriedColumn.getOutput());
+            }
+
+            runBody(context, body);
+
+            bioassert(value->size() == rowsRaw.size(),
+                      "Yielded accumulator of a fold is not row-aligned with its elements.");
+
+            for (size_t index = 0; index < rowsRaw.size(); index++) {
+                write(fold->getValueWrite(), rowsRaw[index], value, index);
+            }
+
+            if (reownRows) {
+                reownRows(accumulator, rowsRaw, accumulatorValues.getActive());
+            }
+
+            endedRows.clear();
+            testStep(endedRows);
+
+            for (const size_t row : endedRows) {
+                elementCounts[row] = position + 1;
+            }
+        }
+
+        std::erase_if(reachingRows, [&](size_t row) { return elementCounts[row] == position + 1; });
+
+        if (reown && !reachingRows.empty() && accumulatorValues.needsCompaction(sourceRows)) {
+            reown(accumulator, accumulatorValues.getSpare());
+            accumulatorValues.flip();
+        }
+    }
 }
 
 void resetTaggedCells(Column* result, size_t rowCount) {
-    std::vector<ListElementView>& results = static_cast<ColumnVector<ListElementView>*>(result)->getRaw();
-    results.assign(rowCount, ListElementView::nullElement());
+    std::vector<CellView>& results = static_cast<ColumnVector<CellView>*>(result)->getRaw();
+    results.assign(rowCount, CellView::nullElement());
 }
 
 template <typename Primitive>
@@ -2388,19 +2628,20 @@ void caseResetColumn(Column* result, size_t rowCount) {
     results.assign(rowCount, std::optional<Primitive> {});
 }
 
-// A default-constructed ID is the invalid one, which is how an entity column spells an
-// absent row: the reset leaves every row null, as the optional one above does
-template <typename ID>
-void caseResetEntityColumn(Column* result, size_t rowCount) {
-    std::vector<ID>& results = static_cast<ColumnVector<ID>*>(result)->getRaw();
-    results.assign(rowCount, ID {});
+// A default-constructed ID is the invalid one and a default-constructed path the one with
+// no node, which is how those columns spell an absent row: the reset leaves every row null,
+// as the optional one above does
+template <typename Element>
+void caseResetOwnNullColumn(Column* result, size_t rowCount) {
+    std::vector<Element>& results = static_cast<ColumnVector<Element>*>(result)->getRaw();
+    results.assign(rowCount, Element {});
 }
 
 // 3-way compare two rows of a type-erased column of tagged scalars. Cells need not share
 // a type, so a pair of different types compares by the order those types sort in; nulls
 // tie and sort after every value, as they do in a nullable value column.
-int compareListElementColumn(const Column* column, size_t a, size_t b) {
-    const auto& raw = static_cast<const ColumnVector<ListElementView>*>(column)->getRaw();
+int compareCellColumn(const Column* column, size_t a, size_t b) {
+    const auto& raw = static_cast<const ColumnVector<CellView>*>(column)->getRaw();
     const std::strong_ordering order = raw[a] <=> raw[b];
 
     if (order == std::strong_ordering::less) {
@@ -2412,12 +2653,12 @@ int compareListElementColumn(const Column* column, size_t a, size_t b) {
     return 0;
 }
 
-int compareOptListElementColumn(const Column* column, size_t a, size_t b) {
-    const std::vector<std::optional<ListElementView>>& raw =
-        static_cast<const ColumnOptVector<ListElementView>*>(column)->getRaw();
+int compareOptCellColumn(const Column* column, size_t a, size_t b) {
+    const std::vector<std::optional<CellView>>& raw =
+        static_cast<const ColumnOptVector<CellView>*>(column)->getRaw();
 
-    const auto isNull = [](const std::optional<ListElementView>& element) {
-        return !element.has_value() || element->getTag() == ListBufferTypeTag::Null;
+    const auto isNull = [](const std::optional<CellView>& element) {
+        return !element.has_value() || element->getTag() == CellTag::Null;
     };
 
     const bool aNull = isNull(raw[a]);
@@ -2559,7 +2800,14 @@ void distinctKeyAppendOptColumn(const Column* column, size_t row, std::string& k
     distinctAppendValueBytes(key, *value);
 }
 
-void distinctAppendElementBytes(std::string& key, ListElementView element);
+void distinctAppendElementBytes(std::string& key, CellView element);
+
+// The count fixes how many IDs follow it, so they need no separator.
+void distinctAppendPathBytes(std::string& key, std::span<const uint64_t> ids) {
+    const size_t idCount = ids.size();
+    key.append(reinterpret_cast<const char*>(&idCount), sizeof(idCount));
+    key.append(reinterpret_cast<const char*>(ids.data()), ids.size_bytes());
+}
 
 // Serialize a nested list into the row key as its length then its elements, so a list
 // never keys the same as the concatenation of its neighbours.
@@ -2567,7 +2815,7 @@ void distinctAppendListBytes(std::string& key, const ListView list) {
     const size_t size = list.size();
     key.append(reinterpret_cast<const char*>(&size), sizeof(size));
 
-    for (const ListElementView element : list) {
+    for (const CellView element : list) {
         distinctAppendElementBytes(key, element);
     }
 }
@@ -2585,7 +2833,7 @@ void distinctAppendValueBytes(std::string& key, const ListView value) {
 // A number keys under the Int tag whenever it holds one, so 1, 1.0 and a small unsigned 1
 // all key alike - which is what makes the key agree with numeric equality.
 void distinctAppendIntegerKey(std::string& key, const types::Int64::Primitive value) {
-    key.push_back(static_cast<char>(ListBufferTypeTag::Int));
+    key.push_back(static_cast<char>(CellTag::Int));
     distinctAppendValueBytes(key, value);
 }
 
@@ -2599,7 +2847,7 @@ void distinctAppendNumberKey(std::string& key, const types::UInt64::Primitive va
         return;
     }
 
-    key.push_back(static_cast<char>(ListBufferTypeTag::UInt));
+    key.push_back(static_cast<char>(CellTag::UInt));
     distinctAppendValueBytes(key, value);
 }
 
@@ -2616,22 +2864,22 @@ void distinctAppendNumberKey(std::string& key, const types::Double::Primitive va
     } else if (holdsAnUnsigned) {
         distinctAppendNumberKey(key, static_cast<types::UInt64::Primitive>(value));
     } else {
-        key.push_back(static_cast<char>(ListBufferTypeTag::Double));
+        key.push_back(static_cast<char>(CellTag::Double));
         distinctAppendValueBytes(key, value);
     }
 }
 
-void distinctAppendNumberBytes(std::string& key, const ListElementView element) {
+void distinctAppendNumberBytes(std::string& key, const CellView element) {
     switch (element.getTag()) {
-        case ListBufferTypeTag::Int:
+        case CellTag::Int:
             return distinctAppendNumberKey(key, element.getAs<types::Int64::Primitive>());
         break;
 
-        case ListBufferTypeTag::UInt:
+        case CellTag::UInt:
             return distinctAppendNumberKey(key, element.getAs<types::UInt64::Primitive>());
         break;
 
-        case ListBufferTypeTag::Double:
+        case CellTag::Double:
             return distinctAppendNumberKey(key, element.getAs<types::Double::Primitive>());
         break;
 
@@ -2639,97 +2887,6 @@ void distinctAppendNumberBytes(std::string& key, const ListElementView element) 
             bioassert(false, "Keying a non-numeric element as a number");
         break;
     }
-}
-
-// Serialize one tagged scalar into the row key: its tag, then its value's bytes. Cells of
-// two types never collide because the tag leads, and a null is the tag alone, so all
-// nulls dedup together as they do in a nullable value column.
-void distinctAppendMapBytes(std::string& key, MapView map);
-
-// Serialize one map value into the row key the way a list element is serialized: a number
-// normalised first, then the tag and the value's bytes.
-void distinctAppendMapValueBytes(std::string& key, const MapEntryView entry) {
-    const MapBufferTypeTag tag = entry.getValueTag();
-
-    switch (tag) {
-        case MapBufferTypeTag::Int:
-            distinctAppendNumberKey(key, entry.getValueAs<types::Int64::Primitive>());
-            return;
-        break;
-
-        case MapBufferTypeTag::UInt:
-            distinctAppendNumberKey(key, entry.getValueAs<types::UInt64::Primitive>());
-            return;
-        break;
-
-        case MapBufferTypeTag::Double:
-            distinctAppendNumberKey(key, entry.getValueAs<types::Double::Primitive>());
-            return;
-        break;
-
-        case MapBufferTypeTag::Bool:
-            key.push_back(static_cast<char>(ListBufferTypeTag::Bool));
-            distinctAppendValueBytes(key, static_cast<bool>(entry.getValueAs<types::Bool::Primitive>()));
-            return;
-        break;
-
-        case MapBufferTypeTag::String:
-            key.push_back(static_cast<char>(ListBufferTypeTag::String));
-            distinctAppendValueBytes(key, entry.getValueAs<types::String::Primitive>());
-            return;
-        break;
-
-        case MapBufferTypeTag::ListView:
-            key.push_back(static_cast<char>(ListBufferTypeTag::ListView));
-            distinctAppendListBytes(key, entry.getValueAs<ListView>());
-            return;
-        break;
-
-        case MapBufferTypeTag::MapView:
-            key.push_back(static_cast<char>(ListBufferTypeTag::MapView));
-            distinctAppendMapBytes(key, entry.getValueAs<MapView>());
-            return;
-        break;
-
-        case MapBufferTypeTag::Null:
-            key.push_back(static_cast<char>(ListBufferTypeTag::Null));
-            return;
-        break;
-
-        case MapBufferTypeTag::NodeID:
-            key.push_back(static_cast<char>(ListBufferTypeTag::NodeID));
-            distinctAppendValueBytes(key, entry.getValueAs<NodeID>().getValue());
-            return;
-        break;
-
-        case MapBufferTypeTag::EdgeID:
-            key.push_back(static_cast<char>(ListBufferTypeTag::EdgeID));
-            distinctAppendValueBytes(key, entry.getValueAs<EdgeID>().getValue());
-            return;
-        break;
-
-        case MapBufferTypeTag::DateTime:
-            key.push_back(static_cast<char>(ListBufferTypeTag::DateTime));
-            distinctAppendValueBytes(key, entry.getValueAs<types::DateTime::Primitive>().getMicroseconds());
-            return;
-        break;
-
-        case MapBufferTypeTag::Duration:
-            key.push_back(static_cast<char>(ListBufferTypeTag::Duration));
-            distinctAppendValueBytes(key, entry.getValueAs<types::Duration::Primitive>().getMicroseconds());
-            return;
-        break;
-
-        case MapBufferTypeTag::Embedding:
-            throw IRException("cannot dedup by an embedding map value");
-        break;
-
-        case MapBufferTypeTag::INVALID:
-            throw IRException("cannot dedup by an untagged map value");
-        break;
-    }
-
-    bioassert(false, "Unknown MapBufferTypeTag");
 }
 
 // Serialize a map into the row key as its size, then each entry's key length, key bytes and
@@ -2744,155 +2901,166 @@ void distinctAppendMapBytes(std::string& key, const MapView map) {
         key.append(reinterpret_cast<const char*>(&keySize), sizeof(keySize));
         key.append(entryKey);
 
-        distinctAppendMapValueBytes(key, entry);
+        distinctAppendElementBytes(key, entry.getValue());
     }
 }
 
-void distinctAppendElementBytes(std::string& key, const ListElementView element) {
-    const ListBufferTypeTag tag = element.getTag();
+// The map sibling of the ListView overload: a map keys by its entries, not by its span
+void distinctAppendValueBytes(std::string& key, const MapView value) {
+    distinctAppendMapBytes(key, value);
+}
+
+// Serialize one tagged scalar into the row key: its tag, then its value's bytes. Cells of
+// two types never collide because the tag leads, and a null is the tag alone, so all
+// nulls dedup together as they do in a nullable value column.
+void distinctAppendElementBytes(std::string& key, const CellView element) {
+    const CellTag tag = element.getTag();
 
     switch (tag) {
-        case ListBufferTypeTag::Int:
-        case ListBufferTypeTag::UInt:
-        case ListBufferTypeTag::Double:
+        case CellTag::Int:
+        case CellTag::UInt:
+        case CellTag::Double:
             return distinctAppendNumberBytes(key, element);
         break;
 
-        case ListBufferTypeTag::Bool:
+        case CellTag::Bool:
             key.push_back(static_cast<char>(tag));
             distinctAppendValueBytes(key, static_cast<bool>(element.getAs<types::Bool::Primitive>()));
             return;
         break;
 
-        case ListBufferTypeTag::String:
+        case CellTag::String:
             key.push_back(static_cast<char>(tag));
             distinctAppendValueBytes(key, element.getAs<types::String::Primitive>());
             return;
         break;
 
-        case ListBufferTypeTag::ListView:
+        case CellTag::ListView:
             key.push_back(static_cast<char>(tag));
             distinctAppendListBytes(key, element.getAs<ListView>());
             return;
         break;
 
-        case ListBufferTypeTag::Null:
+        case CellTag::Null:
             key.push_back(static_cast<char>(tag));
             return;
         break;
 
-        case ListBufferTypeTag::NodeID:
+        case CellTag::NodeID:
             key.push_back(static_cast<char>(tag));
             distinctAppendValueBytes(key, element.getAs<NodeID>().getValue());
             return;
         break;
 
-        case ListBufferTypeTag::EdgeID:
+        case CellTag::EdgeID:
             key.push_back(static_cast<char>(tag));
             distinctAppendValueBytes(key, element.getAs<EdgeID>().getValue());
             return;
         break;
 
-        case ListBufferTypeTag::DateTime:
+        case CellTag::DateTime:
             key.push_back(static_cast<char>(tag));
             distinctAppendValueBytes(key, element.getAs<types::DateTime::Primitive>().getMicroseconds());
             return;
         break;
 
-        case ListBufferTypeTag::Duration:
+        case CellTag::Duration:
             key.push_back(static_cast<char>(tag));
             distinctAppendValueBytes(key, element.getAs<types::Duration::Primitive>().getMicroseconds());
             return;
         break;
 
-        case ListBufferTypeTag::Embedding:
+        case CellTag::Point:
+            key.push_back(static_cast<char>(tag));
+            distinctAppendValueBytes(key, element.getAs<types::Point::Primitive>());
+            return;
+        break;
+
+        case CellTag::Embedding:
             throw IRException("cannot dedup by an embedding element");
         break;
 
-        case ListBufferTypeTag::MapView:
+        case CellTag::MapView:
             key.push_back(static_cast<char>(tag));
             distinctAppendMapBytes(key, element.getAs<MapView>());
             return;
         break;
 
-        case ListBufferTypeTag::INVALID:
+        case CellTag::Path:
+            key.push_back(static_cast<char>(tag));
+            distinctAppendPathBytes(key, element.getAs<PathView>().getIDs());
+            return;
+        break;
+
+        case CellTag::INVALID:
             throw IRException("cannot dedup by an untagged element");
         break;
     }
 
-    bioassert(false, "Unknown ListBufferTypeTag");
+    bioassert(false, "Unknown CellTag");
 }
 
-// A chunk of this kind holds neither a null nor a NaN - an ID column, a plainly-held
-// value of any other type - so every row of it carries a key a join can match on.
+// A chunk of this kind holds neither a null nor a NaN - an ID column, a mask - so every
+// row of it carries a key a join can match on.
 bool everyRowMatchable(const Column* column, size_t row) {
     return true;
 }
 
-// Whether one row of a nullable value column carries a key a join can match. A null does
-// not: `=` against a null gives null, and the filter this join replaces kept only the
-// true rows.
+template <typename ElementType>
+bool keyValuesEqual(const ElementType& probe, const ElementType& build) {
+    return probe == build;
+}
+
+bool keyValuesEqual(types::Embedding::Primitive probe, types::Embedding::Primitive build) {
+    return EmbeddingEqual {}(probe, build);
+}
+
+// == is equivalence on these, under which two nulls agree, so the join asks `=` itself
+template <typename ElementType>
+    requires std::same_as<ElementType, ListView>
+          || std::same_as<ElementType, MapView>
+          || std::same_as<ElementType, CellView>
+bool keyValuesEqual(const ElementType& probe, const ElementType& build) {
+    const std::optional<CustomBool> equal = Eq {}(probe, build);
+
+    return equal.has_value() && equal->_boolean;
+}
+
+// A key no other key equals is one that does not equal itself: a null, a NaN, a list or
+// map holding a null at any depth
+template <typename ElementType>
+bool keyValueIsMatchable(const ElementType& value) {
+    return keyValuesEqual(value, value);
+}
+
+template <typename ElementType>
+bool columnRowMatchable(const Column* column, size_t row) {
+    const auto& raw = static_cast<const ColumnVector<ElementType>*>(column)->getRaw();
+
+    return keyValueIsMatchable(raw[row]);
+}
+
 template <typename Primitive>
 bool optColumnRowMatchable(const Column* column, size_t row) {
     const auto& raw = static_cast<const ColumnVector<std::optional<Primitive>>*>(column)->getRaw();
+    const std::optional<Primitive>& value = raw[row];
 
-    return raw[row].has_value();
-}
-
-// The double sibling, which rejects a NaN as well: NaN = NaN is false, so a NaN key
-// matches nothing - not even another NaN. The key bytes cannot say so, since the
-// serializer maps every NaN payload to one canonical NaN so that DISTINCT groups them.
-bool optDoubleColumnRowMatchable(const Column* column, size_t row) {
-    const auto& raw = static_cast<const ColumnVector<std::optional<types::Double::Primitive>>*>(column)->getRaw();
-    const std::optional<types::Double::Primitive>& value = raw[row];
-
-    return value.has_value() && !std::isnan(*value);
-}
-
-// The plainly-held double sibling: no row of such a column is null, so only a NaN keeps
-// one out of the join.
-bool plainDoubleColumnRowMatchable(const Column* column, size_t row) {
-    const auto& raw = static_cast<const ColumnVector<types::Double::Primitive>*>(column)->getRaw();
-
-    return !std::isnan(raw[row]);
-}
-
-// Whether one row of a nullable embedding column carries a key a join can match. A null
-// does not, and neither does a vector holding a NaN: TuringEqual compares two embeddings
-// element by element, so such a row equals nothing - not even itself.
-bool optEmbeddingColumnRowMatchable(const Column* column, size_t row) {
-    const auto& raw = static_cast<const ColumnVector<std::optional<types::Embedding::Primitive>>*>(column)->getRaw();
-    const std::optional<types::Embedding::Primitive>& embedding = raw[row];
-    if (!embedding.has_value()) {
-        return false;
-    }
-
-    const auto isNaN = [](float value) { return std::isnan(value); };
-
-    return std::none_of(embedding->begin(), embedding->end(), isNaN);
-}
-
-// Whether one row of a type-erased column of tagged scalars carries a matchable key - the
-// cell's own tag says whether it is null, where a nullable column has a present flag.
-bool listElementColumnRowMatchable(const Column* column, size_t row) {
-    const auto& raw = static_cast<const ColumnVector<ListElementView>*>(column)->getRaw();
-
-    return raw[row].getTag() != ListBufferTypeTag::Null;
+    return value.has_value() && keyValueIsMatchable(*value);
 }
 
 // Serialize one row of a type-erased column of tagged scalars into the row key.
-void distinctKeyAppendListElementColumn(const Column* column, size_t row, std::string& key) {
-    const auto& raw = static_cast<const ColumnVector<ListElementView>*>(column)->getRaw();
+void distinctKeyAppendCellColumn(const Column* column, size_t row, std::string& key) {
+    const auto& raw = static_cast<const ColumnVector<CellView>*>(column)->getRaw();
     distinctAppendElementBytes(key, raw[row]);
 }
 
-void distinctKeyAppendOptListElementColumn(const Column* column, size_t row, std::string& key) {
-    const std::vector<std::optional<ListElementView>>& raw =
-        static_cast<const ColumnOptVector<ListElementView>*>(column)->getRaw();
-    const std::optional<ListElementView>& element = raw[row];
+void distinctKeyAppendOptCellColumn(const Column* column, size_t row, std::string& key) {
+    const std::vector<std::optional<CellView>>& raw =
+        static_cast<const ColumnOptVector<CellView>*>(column)->getRaw();
+    const std::optional<CellView>& element = raw[row];
 
     if (!element.has_value()) {
-        key.push_back(static_cast<char>(ListBufferTypeTag::Null));
+        key.push_back(static_cast<char>(CellTag::Null));
         return;
     }
 
@@ -2911,18 +3079,10 @@ void distinctKeyAppendMapColumn(const Column* column, size_t row, std::string& k
     distinctAppendMapBytes(key, raw[row]);
 }
 
-// A null path is an empty one, so it keys as length 0, apart from every path
-void distinctKeyAppendEntityListColumn(const Column* column, size_t row, std::string& key) {
-    const std::vector<EntityList>& raw = static_cast<const ColumnVector<EntityList>*>(column)->getRaw();
-    const EntityList& path = raw[row];
-
-    const size_t size = path.size();
-    key.append(reinterpret_cast<const char*>(&size), sizeof(size));
-
-    for (const EntityList::Entry& entry : path) {
-        key.push_back(static_cast<char>(entry._type));
-        distinctAppendValueBytes(key, entry._id.getValue());
-    }
+// The null path has no ID, so it keys as count 0, apart from every path.
+void distinctKeyAppendPathColumn(const Column* column, size_t row, std::string& key) {
+    const std::vector<GraphPath>& raw = static_cast<const ColumnVector<GraphPath>*>(column)->getRaw();
+    distinctAppendPathBytes(key, raw[row].getIDs());
 }
 
 void distinctKeyAppendOptListColumn(const Column* column, size_t row, std::string& key) {
@@ -2931,7 +3091,7 @@ void distinctKeyAppendOptListColumn(const Column* column, size_t row, std::strin
     const std::optional<ListView>& list = raw[row];
 
     if (!list.has_value()) {
-        key.push_back(static_cast<char>(ListBufferTypeTag::Null));
+        key.push_back(static_cast<char>(CellTag::Null));
         return;
     }
 
@@ -2944,7 +3104,7 @@ void distinctKeyAppendOptMapColumn(const Column* column, size_t row, std::string
     const std::optional<MapView>& map = raw[row];
 
     if (!map.has_value()) {
-        key.push_back(static_cast<char>(ListBufferTypeTag::Null));
+        key.push_back(static_cast<char>(CellTag::Null));
         return;
     }
 
@@ -2985,10 +3145,24 @@ uint64_t hashKeyValue(types::Duration::Primitive value) {
     return mixKeyBits(static_cast<uint64_t>(value.getMicroseconds()));
 }
 
-// -0.0 hashes as +0.0, the one value it equals; a NaN never reaches a lookup
+uint64_t hashKeyValue(types::Point::Primitive value) {
+    return mixKeyBits(std::hash<types::Point::Primitive> {}(value));
+}
+
+// The two keys of a join need not share a type, so two values `=` holds equal hash alike
+// whatever they are held as: a double holding a whole number hashes as that integer. -0.0
+// hashes as +0.0, the one value it equals; a NaN never reaches a lookup.
 uint64_t hashKeyValue(double value) {
-    const double normalized = (value == 0.0) ? 0.0 : value;
-    return mixKeyBits(std::bit_cast<uint64_t>(normalized));
+    types::Int64::Primitive integer = 0;
+    types::UInt64::Primitive unsignedInteger = 0;
+
+    if (convertNumberExactly(value, integer)) {
+        return hashKeyValue(integer);
+    } else if (convertNumberExactly(value, unsignedInteger)) {
+        return hashKeyValue(unsignedInteger);
+    }
+
+    return mixKeyBits(std::bit_cast<uint64_t>(value));
 }
 
 uint64_t hashKeyValue(std::string_view value) {
@@ -3008,6 +3182,90 @@ uint64_t hashKeyValue(types::Embedding::Primitive embedding) {
     }
 
     return hash;
+}
+
+uint64_t hashKeyValue(ListView list) {
+    return mixKeyBits(hashList(list));
+}
+
+uint64_t hashKeyValue(PathView path) {
+    const std::span<const uint64_t> ids = path.getIDs();
+    uint64_t hash = mixKeyBits(ids.size());
+
+    for (const uint64_t id : ids) {
+        hash = mixKeyBits(hash ^ id);
+    }
+
+    return hash;
+}
+
+// A tagged cell hashes as its value does in a column of that value's type
+uint64_t hashKeyValue(CellView cell) {
+    switch (cell.getTag()) {
+        case CellTag::Int:
+            return hashKeyValue(cell.getAs<types::Int64::Primitive>());
+        break;
+
+        case CellTag::UInt:
+            return hashKeyValue(cell.getAs<types::UInt64::Primitive>());
+        break;
+
+        case CellTag::Double:
+            return hashKeyValue(cell.getAs<types::Double::Primitive>());
+        break;
+
+        case CellTag::Bool:
+            return hashKeyValue(cell.getAs<types::Bool::Primitive>());
+        break;
+
+        case CellTag::String:
+            return hashKeyValue(cell.getAs<types::String::Primitive>());
+        break;
+
+        case CellTag::Embedding:
+            return hashKeyValue(cell.getAs<types::Embedding::Primitive>());
+        break;
+
+        case CellTag::ListView:
+            return hashKeyValue(cell.getAs<ListView>());
+        break;
+
+        case CellTag::MapView:
+            return hashKeyValue(cell.getAs<MapView>());
+        break;
+
+        case CellTag::NodeID:
+            return hashKeyValue(cell.getAs<NodeID>());
+        break;
+
+        case CellTag::EdgeID:
+            return hashKeyValue(cell.getAs<EdgeID>());
+        break;
+
+        case CellTag::DateTime:
+            return hashKeyValue(cell.getAs<types::DateTime::Primitive>());
+        break;
+
+        case CellTag::Duration:
+            return hashKeyValue(cell.getAs<types::Duration::Primitive>());
+        break;
+
+        case CellTag::Point:
+            return hashKeyValue(cell.getAs<types::Point::Primitive>());
+        break;
+
+        case CellTag::Path:
+            return hashKeyValue(cell.getAs<PathView>());
+        break;
+
+        case CellTag::Null:
+        case CellTag::INVALID:
+            return 0;
+        break;
+    }
+
+    bioassert(false, "Unknown CellTag");
+    return 0;
 }
 
 template <typename ElementType>
@@ -3030,57 +3288,13 @@ void hashOptKeyColumn(const Column* column, std::vector<uint64_t>& hashes) {
     });
 }
 
-// A tagged scalar hashes through the bytes DISTINCT keys it by, so an integer and a float
-// holding one value hash alike, as they compare equal
-void hashListElementKeyColumn(const Column* column, std::vector<uint64_t>& hashes) {
-    const auto& raw = static_cast<const ColumnVector<ListElementView>*>(column)->getRaw();
+void hashMaskKeyColumn(const Column* column, std::vector<uint64_t>& hashes) {
+    const auto& raw = static_cast<const ColumnMask*>(column)->getRaw();
     hashes.resize(raw.size());
 
-    std::string bytes;
-    std::transform(raw.begin(), raw.end(), hashes.begin(), [&bytes](const ListElementView element) {
-        bytes.clear();
-        distinctAppendElementBytes(bytes, element);
-        return hashKeyValue(std::string_view(bytes));
+    std::transform(raw.begin(), raw.end(), hashes.begin(), [](ColumnMask::Bool_t value) {
+        return hashKeyValue(static_cast<bool>(value));
     });
-}
-
-void hashListKeyColumn(const Column* column, std::vector<uint64_t>& hashes) {
-    const auto& raw = static_cast<const ColumnVector<ListView>*>(column)->getRaw();
-    hashes.resize(raw.size());
-
-    std::string bytes;
-    std::transform(raw.begin(), raw.end(), hashes.begin(), [&bytes](const ListView list) {
-        bytes.clear();
-        distinctAppendListBytes(bytes, list);
-        return hashKeyValue(std::string_view(bytes));
-    });
-}
-
-// The nullable sibling, for a list read out of a property: an absent list hashes to the
-// zero a null key takes everywhere else, and a present one hashes as a plain column's does.
-void hashOptListKeyColumn(const Column* column, std::vector<uint64_t>& hashes) {
-    const auto& raw = static_cast<const ColumnOptVector<ListView>*>(column)->getRaw();
-    hashes.resize(raw.size());
-
-    std::string bytes;
-    std::transform(raw.begin(), raw.end(), hashes.begin(), [&bytes](const std::optional<ListView>& list) {
-        if (!list.has_value()) {
-            return uint64_t {0};
-        }
-
-        bytes.clear();
-        distinctAppendListBytes(bytes, *list);
-        return hashKeyValue(std::string_view(bytes));
-    });
-}
-
-template <typename ElementType>
-bool keyValuesEqual(const ElementType& probe, const ElementType& build) {
-    return probe == build;
-}
-
-bool keyValuesEqual(types::Embedding::Primitive probe, types::Embedding::Primitive build) {
-    return EmbeddingEqual {}(probe, build);
 }
 
 template <typename ElementType>
@@ -3101,18 +3315,50 @@ bool keyEqualOptColumn(const Column* probe, size_t probeRow, const Column* build
 
 template <typename ElementType>
 NLJoinKeyFunctions joinKeyFunctions() {
-    return {&hashKeyColumn<ElementType>, &keyEqualColumn<ElementType>};
+    return {&hashKeyColumn<ElementType>, &keyEqualColumn<ElementType>, &columnRowMatchable<ElementType>};
 }
 
 template <typename Primitive>
 NLJoinKeyFunctions optJoinKeyFunctions() {
-    return {&hashOptKeyColumn<Primitive>, &keyEqualOptColumn<Primitive>};
+    return {&hashOptKeyColumn<Primitive>, &keyEqualOptColumn<Primitive>, &optColumnRowMatchable<Primitive>};
 }
 
-template <>
-NLJoinKeyFunctions optJoinKeyFunctions<ListView>() {
-    return {&hashOptListKeyColumn, &keyEqualOptColumn<ListView>};
+bool keyEqualMaskColumn(const Column* probe, size_t probeRow, const Column* build, size_t buildRow) {
+    const auto& probeRaw = static_cast<const ColumnMask*>(probe)->getRaw();
+    const auto& buildRaw = static_cast<const ColumnMask*>(build)->getRaw();
+
+    return static_cast<bool>(probeRaw[probeRow]) == static_cast<bool>(buildRaw[buildRow]);
 }
+
+// A probe key and a build key of two types, compared by the `=` of the filter the join
+// replaces: an unknown answer matches nothing, as the filter kept only the true rows
+template <typename ProbeColumn, typename BuildColumn>
+bool keyEqualAcrossTypes(const Column* probe, size_t probeRow, const Column* build, size_t buildRow) {
+    const auto& probeRaw = static_cast<const ProbeColumn*>(probe)->getRaw();
+    const auto& buildRaw = static_cast<const BuildColumn*>(build)->getRaw();
+
+    const auto equal = Eq {}(probeRaw[probeRow], buildRaw[buildRow]);
+    if constexpr (TypeUtils::is_optional_v<std::decay_t<decltype(equal)>>) {
+        return equal.has_value() && equal->_boolean;
+    } else {
+        return static_cast<bool>(equal);
+    }
+}
+
+template <typename KeyColumn>
+concept RowKeyColumn = std::same_as<KeyColumn, ColumnMask>
+                    || std::same_as<KeyColumn, ColumnVector<typename KeyColumn::ValueType>>;
+
+struct CrossTypeKeyEqualSelector {
+    NLKeyEqualFunction _equal {nullptr};
+
+    template <typename ProbeColumn, typename BuildColumn>
+    void operator()(const ProbeColumn*, const BuildColumn*) {
+        if constexpr (RowKeyColumn<ProbeColumn> && RowKeyColumn<BuildColumn>) {
+            _equal = &keyEqualAcrossTypes<ProbeColumn, BuildColumn>;
+        }
+    }
+};
 
 // The group of build rows carrying a key, or noRow when no indexed row carries it. One
 // bucket chains the groups of every key that falls in it, so a group's key is confirmed
@@ -3137,18 +3383,18 @@ size_t findKeyGroup(const NLHashJoinIndex& index,
 // Count the non-null cells of a type-erased column of tagged scalars, so count(x) over a
 // heterogeneous unwind charges the same rows a nullable value column would.
 size_t countNonNullElementsColumn(const Column* column) {
-    const auto& raw = static_cast<const ColumnVector<ListElementView>*>(column)->getRaw();
-    return std::count_if(raw.begin(), raw.end(), [](const ListElementView element) {
-        return element.getTag() != ListBufferTypeTag::Null;
+    const auto& raw = static_cast<const ColumnVector<CellView>*>(column)->getRaw();
+    return std::count_if(raw.begin(), raw.end(), [](const CellView element) {
+        return element.getTag() != CellTag::Null;
     });
 }
 
 size_t countPresentElementsColumn(const Column* column) {
-    const std::vector<std::optional<ListElementView>>& raw =
-        static_cast<const ColumnOptVector<ListElementView>*>(column)->getRaw();
+    const std::vector<std::optional<CellView>>& raw =
+        static_cast<const ColumnOptVector<CellView>*>(column)->getRaw();
 
-    return std::count_if(raw.begin(), raw.end(), [](const std::optional<ListElementView>& element) {
-        return element.has_value() && element->getTag() != ListBufferTypeTag::Null;
+    return std::count_if(raw.begin(), raw.end(), [](const std::optional<CellView>& element) {
+        return element.has_value() && element->getTag() != CellTag::Null;
     });
 }
 
@@ -3173,9 +3419,9 @@ size_t countValidIDs(const Column* column) {
 }
 
 size_t countPresentPaths(const Column* column) {
-    const std::vector<EntityList>& raw = static_cast<const ColumnVector<EntityList>*>(column)->getRaw();
+    const std::vector<GraphPath>& raw = static_cast<const ColumnVector<GraphPath>*>(column)->getRaw();
 
-    return std::ranges::count_if(raw, [](const EntityList& path) { return !path.empty(); });
+    return std::ranges::count_if(raw, [](const GraphPath& path) { return !path.isNull(); });
 }
 
 // Count the present (non-null) values of a nullable value column - a
@@ -3199,14 +3445,23 @@ void aggregateResetZero(NLAggregateState* state) {
     state->setCount(0);
 }
 
-// Reset a min/max accumulator to null: with no non-null row seen yet there is no
-// extreme, and an all-null (or empty) input reduces to null, matching Cypher.
+// Reset a min/max or tagged accumulator to null: with no non-null row seen yet there is
+// no extreme, and an all-null (or empty) input reduces to null, matching Cypher.
 template <typename Primitive>
 void aggregateResetNull(NLAggregateState* state) {
     auto* accumulator = static_cast<ColumnOptVector<Primitive>*>(state->getAccumulator());
     accumulator->getRaw().assign(1, std::nullopt);
     state->setCount(0);
-    state->extremeValues().clear();
+    state->setDurationTotal(0);
+    state->accumulatorValues().clear();
+}
+
+// A sum or an average of durations keeps its total in the state, not in the accumulator,
+// which holds no slot
+void aggregateResetDurationTotal(NLAggregateState* state) {
+    state->getAccumulator()->clear();
+    state->setCount(0);
+    state->setDurationTotal(0);
 }
 
 // Add two aggregate values with defined overflow. A signed integer sum wraps in
@@ -3220,6 +3475,72 @@ Primitive numericAdd(Primitive accumulator, Primitive value) {
         return static_cast<Primitive>(static_cast<Unsigned>(accumulator) + static_cast<Unsigned>(value));
     } else {
         return accumulator + value;
+    }
+}
+
+// A number sums as an f64 and a point keeps its running mean. A duration's total is the
+// state's 128-bit one.
+template <typename Primitive>
+using AverageTotal = std::conditional_t<std::is_same_v<Primitive, types::Duration::Primitive>
+                                            || std::is_same_v<Primitive, types::Point::Primitive>,
+                                        Primitive,
+                                        types::Double::Primitive>;
+
+// @param count is how many values @param total already holds, which a running mean needs
+template <typename Primitive>
+AverageTotal<Primitive> addToAverageTotal(AverageTotal<Primitive> total, Primitive value, uint64_t count) {
+    if constexpr (std::is_same_v<Primitive, types::Point::Primitive>) {
+        return Point::addToMean(total, count, value);
+    } else {
+        return total + static_cast<types::Double::Primitive>(value);
+    }
+}
+
+types::Double::Primitive averageOf(types::Double::Primitive total, uint64_t count) {
+    return total / static_cast<types::Double::Primitive>(count);
+}
+
+// The mean of durations is within their range, so it is a duration. A mean finer than a
+// microsecond truncates toward zero, as a duration divided by an integer does.
+types::Duration::Primitive averageOf(__int128 total, uint64_t count) {
+    return types::Duration::Primitive(static_cast<int64_t>(total / static_cast<__int128>(count)));
+}
+
+// A sum of durations is a 128-bit count of microseconds until it is emitted, so a total
+// that passes the range of a duration and comes back answers in every row order
+types::Duration::Primitive durationOfTotal(__int128 total) {
+    const bool outsideTheRange = total > std::numeric_limits<int64_t>::max()
+                              || total < std::numeric_limits<int64_t>::min();
+
+    if (outsideTheRange) {
+        throw IRException("Duration overflow");
+    }
+
+    return types::Duration::Primitive(static_cast<int64_t>(total));
+}
+
+types::Point::Primitive averageOf(types::Point::Primitive mean, uint64_t count) {
+    return mean;
+}
+
+template <typename Select>
+void dispatchAverageTotal(ValueType totalType, Select&& select) {
+    switch (totalType) {
+        case ValueType::Double:
+            select.template operator()<types::Double::Primitive>();
+        break;
+
+        case ValueType::Duration:
+            select.template operator()<types::Duration::Primitive>();
+        break;
+
+        case ValueType::Point:
+            select.template operator()<types::Point::Primitive>();
+        break;
+
+        default:
+            throw IRException("avg answers a double, a duration or a point");
+        break;
     }
 }
 
@@ -3241,15 +3562,32 @@ void aggregateUpdateSum(NLAggregateState* state, const Column* input) {
     current = running;
 }
 
-std::optional<ListElementView> presentCell(const ListElementView element) {
-    if (element.getTag() == ListBufferTypeTag::Null) {
+// Fold a chunk's present durations into the state's 128-bit total, counting them for avg
+void aggregateUpdateDurationTotal(NLAggregateState* state, const Column* input) {
+    const auto& inputRaw = static_cast<const ColumnOptVector<types::Duration::Primitive>*>(input)->getRaw();
+
+    __int128 total = state->getDurationTotal();
+    size_t seen = 0;
+    for (const std::optional<types::Duration::Primitive>& value : inputRaw) {
+        if (value.has_value()) {
+            total += value->getMicroseconds();
+            seen++;
+        }
+    }
+
+    state->setDurationTotal(total);
+    state->addCount(seen);
+}
+
+std::optional<CellView> presentCell(const CellView element) {
+    if (element.getTag() == CellTag::Null) {
         return std::nullopt;
     }
 
     return element;
 }
 
-std::optional<ListElementView> presentCell(const std::optional<ListElementView>& element) {
+std::optional<CellView> presentCell(const std::optional<CellView>& element) {
     if (!element.has_value()) {
         return std::nullopt;
     }
@@ -3295,31 +3633,33 @@ void aggregateUpdateMinMax(NLAggregateState* state, const Column* input) {
     }
 
     if (replaced) {
-        NLCompactingValueStore& extremes = state->extremeValues();
+        NLCompactingValueStore& extremes = state->accumulatorValues();
         current = extremes.getSpare().ownElement(*current);
         extremes.flip();
     }
 }
 
-// The number a tagged cell holds, whatever numeric type its tag names. A reduction over
+// The number a tagged cell holds, whatever numeric type its tag names. A deviation over
 // a type-erased column is defined over numbers only, so any other tag is a query error -
 // the check the static column types make for a typed column, made per row here.
-double taggedNumericValue(const ListElementView element) {
-    switch (element.getTag()) {
-        case ListBufferTypeTag::Int:
+double taggedNumericValue(const CellView element) {
+    const CellTag tag = element.getTag();
+
+    switch (tag) {
+        case CellTag::Int:
             return static_cast<double>(element.getAs<types::Int64::Primitive>());
         break;
 
-        case ListBufferTypeTag::UInt:
+        case CellTag::UInt:
             return static_cast<double>(element.getAs<types::UInt64::Primitive>());
         break;
 
-        case ListBufferTypeTag::Double:
+        case CellTag::Double:
             return element.getAs<types::Double::Primitive>();
         break;
 
         default:
-            throw IRException("sum/avg/stdev over type-erased cells requires a numeric column");
+            throw IRException(fmt::format("stDev() and stDevP() read numbers, not '{}'", queryTypeName(tag)));
         break;
     }
 }
@@ -3335,7 +3675,7 @@ double numberOf(const Primitive& value) {
     return static_cast<double>(value);
 }
 
-double numberOf(const ListElementView element) {
+double numberOf(const CellView element) {
     return taggedNumericValue(element);
 }
 
@@ -3393,7 +3733,7 @@ void aggregateUpdateDeviation(NLAggregateState* state, const Column* input) {
 }
 
 template <bool Population>
-void aggregateResultDeviation(const NLAggregateState* state, Column* output) {
+void aggregateResultDeviation(const NLAggregateState* state, Column* output, NLStepBuffers* stepBuffers) {
     const auto& slots = static_cast<const ColumnOptVector<double>*>(state->getAccumulator())->getRaw();
     auto& outputRaw = static_cast<ColumnOptVector<double>*>(output)->getRaw();
 
@@ -3402,6 +3742,7 @@ void aggregateResultDeviation(const NLAggregateState* state, Column* output) {
 
 void groupGrowDeviation(Column* accumulator,
                         std::vector<uint64_t>& counts,
+                        std::vector<__int128>& durationTotals,
                         size_t groupCount) {
     auto& raw = static_cast<ColumnOptVector<double>*>(accumulator)->getRaw();
     raw.resize(groupCount * DEVIATION_SLOT_COUNT, std::optional<double>(0.0));
@@ -3412,6 +3753,7 @@ void groupGrowDeviation(Column* accumulator,
 template <typename Cell, bool Distinct>
 void groupFoldDeviation(Column* accumulator,
                         std::vector<uint64_t>& counts,
+                        std::vector<__int128>& durationTotals,
                         const Column* input,
                         const std::vector<size_t>& groups,
                         NLGroupDistinctTally& distinct,
@@ -3430,7 +3772,7 @@ void groupFoldDeviation(Column* accumulator,
         if constexpr (Distinct) {
             distinct.beginKey(group);
 
-            if constexpr (std::is_same_v<Cell, ListElementView> || std::is_same_v<Cell, std::optional<ListElementView>>) {
+            if constexpr (std::is_same_v<Cell, CellView> || std::is_same_v<Cell, std::optional<CellView>>) {
                 distinctAppendElementBytes(distinct.getKey(), *value);
             } else {
                 distinctAppendValueBytes(distinct.getKey(), *value);
@@ -3456,9 +3798,11 @@ void groupFoldDeviation(Column* accumulator,
 template <bool Population>
 void groupEmitDeviation(const Column* accumulator,
                         const std::vector<uint64_t>& counts,
+                        const std::vector<__int128>& durationTotals,
                         size_t begin,
                         size_t count,
-                        Column* output) {
+                        Column* output,
+                        NLStepBuffers* stepBuffers) {
     const auto& raw = static_cast<const ColumnOptVector<double>*>(accumulator)->getRaw();
     auto& outputRaw = static_cast<ColumnOptVector<double>*>(output)->getRaw();
     outputRaw.resize(count);
@@ -3518,45 +3862,245 @@ NLAggregateUpdateFunction selectDeviationUpdate(ValueType inputType) {
     return nullptr;
 }
 
-// Fold a chunk of tagged cells into a running f64 sum, counting the ones folded so avg
-// reads the same accumulator. A cell tagged null is skipped, as a null value column row
-// is. Mixed numeric tags are what makes a column type-erased, and Cypher sums those to a
-// float, so the accumulator is an f64 whichever tags turn up.
-template <typename Cell, bool CountsRows>
-void aggregateUpdateNumericTagged(NLAggregateState* state, const Column* input) {
-    auto* accumulator = static_cast<ColumnOptVector<double>*>(state->getAccumulator());
-    std::optional<double>& current = accumulator->getRaw().front();
+constexpr std::byte INTEGER_ZERO_CELL[sizeof(CellTag) + sizeof(types::Int64::Primitive)] {
+    static_cast<std::byte>(CellTag::Int),
+};
+
+constexpr std::byte DURATION_ZERO_CELL[sizeof(CellTag) + sizeof(types::Duration::Primitive)] {
+    static_cast<std::byte>(CellTag::Duration),
+};
+
+// The running sum of tagged cells, as Cypher adds them: an integer while every number
+// summed is one, a float from the first float on, a duration over durations, and the
+// running mean of the points an average reads. A null sum has summed nothing yet. Integers
+// wrap as a typed column's sum does. The sum is its cell plus a 128-bit total of
+// microseconds: durations add into the total, and the cell of a duration sum is PT0S, so
+// its tag still names what the sum holds.
+class NLTaggedSum {
+public:
+    NLTaggedSum(const std::optional<CellView>& sum, __int128 durationTotal)
+        : _durationTotal(durationTotal)
+    {
+        if (!sum.has_value()) {
+            return;
+        }
+
+        if (sum->getTag() == CellTag::Point) {
+            _tag = CellTag::Point;
+            _point = sum->getAs<types::Point::Primitive>();
+        } else {
+            add(*sum);
+        }
+    }
+
+    void add(CellView value) {
+        const CellTag tag = value.getTag();
+
+        switch (tag) {
+            case CellTag::Int:
+                addInteger(tag, value.getAs<types::Int64::Primitive>());
+            break;
+
+            case CellTag::UInt:
+                addInteger(tag, static_cast<types::Int64::Primitive>(value.getAs<types::UInt64::Primitive>()));
+            break;
+
+            case CellTag::Double:
+                addReal(tag, value.getAs<types::Double::Primitive>());
+            break;
+
+            case CellTag::Duration:
+                addDuration(value.getAs<types::Duration::Primitive>());
+            break;
+
+            default:
+                throw IRException(fmt::format("sum() and avg() read numbers or durations, not '{}'", queryTypeName(tag)));
+            break;
+        }
+    }
+
+    // An average reads every number as a float, as it does over a typed column. @param count
+    // is how many cells the average already holds, which the running mean of points needs.
+    void addToAverage(CellView value, uint64_t count) {
+        const CellTag tag = value.getTag();
+        const bool isNumber = tag == CellTag::Int || tag == CellTag::UInt || tag == CellTag::Double;
+
+        if (isNumber) {
+            addReal(tag, taggedNumericValue(value));
+        } else if (tag == CellTag::Point) {
+            addPoint(value.getAs<types::Point::Primitive>(), count);
+        } else {
+            add(value);
+        }
+    }
+
+    std::optional<CellView> own(NLValueStore& values) const {
+        ListBuffer<>::ListItemVariant item {_integer};
+
+        if (_tag == CellTag::Null) {
+            return std::nullopt;
+        } else if (_tag == CellTag::Duration) {
+            return CellView {DURATION_ZERO_CELL};
+        } else if (_tag == CellTag::Double) {
+            item = _real;
+        } else if (_tag == CellTag::Point) {
+            item = _point;
+        }
+
+        return values.ownCell(item);
+    }
+
+    __int128 getDurationTotal() const { return _durationTotal; }
+
+    CellView sum(QueryListBuffer& cells) const {
+        if (_tag == CellTag::Null) {
+            return CellView {INTEGER_ZERO_CELL};
+        } else if (_tag == CellTag::Duration) {
+            return stagedCell(&cells, durationOfTotal(_durationTotal));
+        } else if (_tag == CellTag::Double) {
+            return stagedCell(&cells, _real);
+        }
+
+        return stagedCell(&cells, _integer);
+    }
+
+    std::optional<CellView> average(uint64_t count, QueryListBuffer& cells) const {
+        if (_tag == CellTag::Null) {
+            return std::nullopt;
+        } else if (_tag == CellTag::Duration) {
+            return stagedCell(&cells, averageOf(_durationTotal, count));
+        } else if (_tag == CellTag::Point) {
+            return stagedCell(&cells, _point);
+        }
+
+        bioassert(_tag == CellTag::Double, "An average sums its numbers as floats");
+
+        return stagedCell(&cells, averageOf(_real, count));
+    }
+
+private:
+    CellTag _tag {CellTag::Null};
+    types::Int64::Primitive _integer {0};
+    types::Double::Primitive _real {0.0};
+    __int128 _durationTotal {0};
+    types::Point::Primitive _point {};
+
+    // Numbers sum together, and a duration or a point only with its own kind
+    static CellTag sumKind(CellTag tag) {
+        const bool sumsAlone = tag == CellTag::Duration || tag == CellTag::Point;
+        return sumsAlone ? tag : CellTag::Double;
+    }
+
+    void throwIfMixing(CellTag tag) const {
+        const bool summedAny = _tag != CellTag::Null;
+        const bool mixes = sumKind(_tag) != sumKind(tag);
+
+        if (summedAny && mixes) {
+            throw IRException(fmt::format("sum() and avg() cannot add '{}' to a sum of '{}'",
+                                          queryTypeName(tag),
+                                          queryTypeName(_tag)));
+        }
+    }
+
+    void addInteger(CellTag tag, types::Int64::Primitive value) {
+        throwIfMixing(tag);
+
+        if (_tag == CellTag::Double) {
+            _real += static_cast<types::Double::Primitive>(value);
+        } else {
+            _tag = CellTag::Int;
+            _integer = numericAdd(_integer, value);
+        }
+    }
+
+    void addReal(CellTag tag, types::Double::Primitive value) {
+        throwIfMixing(tag);
+
+        if (_tag != CellTag::Double) {
+            _tag = CellTag::Double;
+            _real = static_cast<types::Double::Primitive>(_integer);
+        }
+
+        _real += value;
+    }
+
+    void addDuration(types::Duration::Primitive value) {
+        throwIfMixing(CellTag::Duration);
+
+        _tag = CellTag::Duration;
+        _durationTotal += value.getMicroseconds();
+    }
+
+    void addPoint(types::Point::Primitive value, uint64_t count) {
+        throwIfMixing(CellTag::Point);
+
+        _tag = CellTag::Point;
+        _point = Point::addToMean(_point, count, value);
+    }
+};
+
+// Fold a chunk of tagged cells into the running sum of a sum or an average, which is
+// copied into the spare store once per chunk, as a min/max extreme is, and count the
+// cells folded. A cell tagged null is skipped, as a null value column row is.
+template <typename Cell, bool Averages>
+void aggregateUpdateTaggedSum(NLAggregateState* state, const Column* input) {
+    auto* accumulator = static_cast<ColumnOptVector<CellView>*>(state->getAccumulator());
+    std::optional<CellView>& current = accumulator->getRaw().front();
     const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
 
-    double running = current.value();
-    size_t seen = 0;
+    NLTaggedSum sum(current, state->getDurationTotal());
+    size_t added = 0;
 
     for (const Cell& cell : inputRaw) {
-        const std::optional<ListElementView> element = presentCell(cell);
-        if (!element) {
+        const std::optional<CellView> value = presentCell(cell);
+        if (!value) {
             continue;
         }
 
-        running += taggedNumericValue(*element);
-        seen++;
+        if constexpr (Averages) {
+            sum.addToAverage(*value, state->getCount() + added);
+        } else {
+            sum.add(*value);
+        }
+
+        added++;
     }
 
-    current = running;
+    if (added > 0) {
+        NLCompactingValueStore& values = state->accumulatorValues();
+        current = sum.own(values.getSpare());
+        values.flip();
 
-    if constexpr (CountsRows) {
-        state->addCount(seen);
+        state->setDurationTotal(sum.getDurationTotal());
+        state->addCount(added);
     }
+}
+
+void aggregateResultTaggedSum(const NLAggregateState* state, Column* output, NLStepBuffers* stepBuffers) {
+    const auto* accumulator = static_cast<const ColumnOptVector<CellView>*>(state->getAccumulator());
+    const NLTaggedSum sum(accumulator->getRaw().front(), state->getDurationTotal());
+    auto& outputRaw = static_cast<ColumnOptVector<CellView>*>(output)->getRaw();
+
+    outputRaw.assign(1, sum.sum(stepBuffers->listBuffer()));
+}
+
+void aggregateResultTaggedAvg(const NLAggregateState* state, Column* output, NLStepBuffers* stepBuffers) {
+    const auto* accumulator = static_cast<const ColumnOptVector<CellView>*>(state->getAccumulator());
+    const NLTaggedSum sum(accumulator->getRaw().front(), state->getDurationTotal());
+    auto& outputRaw = static_cast<ColumnOptVector<CellView>*>(output)->getRaw();
+
+    outputRaw.assign(1, sum.average(state->getCount(), stepBuffers->listBuffer()));
 }
 
 template <typename Cell>
 NLAggregateUpdateFunction taggedAggregateUpdateFor(AggregateKind kind) {
     switch (kind) {
         case AggregateKind::Sum:
-            return &aggregateUpdateNumericTagged<Cell, /*CountsRows=*/false>;
+            return &aggregateUpdateTaggedSum<Cell, /*Averages=*/false>;
         break;
 
         case AggregateKind::Avg:
-            return &aggregateUpdateNumericTagged<Cell, /*CountsRows=*/true>;
+            return &aggregateUpdateTaggedSum<Cell, /*Averages=*/true>;
         break;
 
         case AggregateKind::StDev:
@@ -3565,11 +4109,11 @@ NLAggregateUpdateFunction taggedAggregateUpdateFor(AggregateKind kind) {
         break;
 
         case AggregateKind::Min:
-            return &aggregateUpdateMinMax<ListElementView, /*IsMax=*/false, Cell>;
+            return &aggregateUpdateMinMax<CellView, /*IsMax=*/false, Cell>;
         break;
 
         case AggregateKind::Max:
-            return &aggregateUpdateMinMax<ListElementView, /*IsMax=*/true, Cell>;
+            return &aggregateUpdateMinMax<CellView, /*IsMax=*/true, Cell>;
         break;
     }
 
@@ -3577,20 +4121,22 @@ NLAggregateUpdateFunction taggedAggregateUpdateFor(AggregateKind kind) {
     return nullptr;
 }
 
-// Fold a chunk's present values into an avg accumulator: a running f64 sum plus a
-// count of the non-null rows (the input primitive is widened to f64). avg divides
-// the two at the emit step, so both are accumulated here.
+// Fold a chunk's present values into an avg accumulator: a running total plus a
+// count of the non-null rows (each number widened to f64). avg divides the two at the
+// emit step, so both are accumulated here.
 template <typename Primitive>
 void aggregateUpdateAvg(NLAggregateState* state, const Column* input) {
-    auto* accumulator = static_cast<ColumnOptVector<double>*>(state->getAccumulator());
-    std::optional<double>& current = accumulator->getRaw().front();
+    using Total = AverageTotal<Primitive>;
+
+    auto* accumulator = static_cast<ColumnOptVector<Total>*>(state->getAccumulator());
+    std::optional<Total>& current = accumulator->getRaw().front();
     const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
 
-    double running = current.value();
+    Total running = current.value();
     size_t seen = 0;
     for (const std::optional<Primitive>& value : inputRaw) {
         if (value.has_value()) {
-            running += static_cast<double>(*value);
+            running = addToAverageTotal(running, *value, state->getCount() + seen);
             seen++;
         }
     }
@@ -3603,32 +4149,49 @@ void aggregateUpdateAvg(NLAggregateState* state, const Column* input) {
 // the result's own type, so copy its single row into the output (a present sum,
 // or the extreme / null for min/max).
 template <typename Primitive>
-void aggregateResultCopy(const NLAggregateState* state, Column* output) {
+void aggregateResultCopy(const NLAggregateState* state, Column* output, NLStepBuffers* stepBuffers) {
     const auto* accumulator = static_cast<const ColumnOptVector<Primitive>*>(state->getAccumulator());
     auto* typedOutput = static_cast<ColumnOptVector<Primitive>*>(output);
     typedOutput->getRaw().assign(1, accumulator->getRaw().front());
 }
 
-// Emit an avg result: divide the running f64 sum by the non-null count. With no
+// Emit an avg result: divide the running total by the non-null count. With no
 // non-null row the average is null (division is undefined), matching Cypher.
-void aggregateResultAvg(const NLAggregateState* state, Column* output) {
-    const auto* accumulator = static_cast<const ColumnOptVector<double>*>(state->getAccumulator());
-    auto* typedOutput = static_cast<ColumnOptVector<double>*>(output);
-    std::vector<std::optional<double>>& outputRaw = typedOutput->getRaw();
+template <typename Total>
+void aggregateResultAvg(const NLAggregateState* state, Column* output, NLStepBuffers* stepBuffers) {
+    const auto* accumulator = static_cast<const ColumnOptVector<Total>*>(state->getAccumulator());
+    auto* typedOutput = static_cast<ColumnOptVector<Total>*>(output);
+    std::vector<std::optional<Total>>& outputRaw = typedOutput->getRaw();
     const size_t count = state->getCount();
 
     if (count == 0) {
         outputRaw.assign(1, std::nullopt);
     } else {
-        const double average = accumulator->getRaw().front().value() / static_cast<double>(count);
-        outputRaw.assign(1, std::optional<double>(average));
+        outputRaw.assign(1, std::optional<Total>(averageOf(accumulator->getRaw().front().value(), count)));
+    }
+}
+
+void aggregateResultDurationSum(const NLAggregateState* state, Column* output, NLStepBuffers* stepBuffers) {
+    auto& outputRaw = static_cast<ColumnOptVector<types::Duration::Primitive>*>(output)->getRaw();
+
+    outputRaw.assign(1, durationOfTotal(state->getDurationTotal()));
+}
+
+void aggregateResultDurationAverage(const NLAggregateState* state, Column* output, NLStepBuffers* stepBuffers) {
+    auto& outputRaw = static_cast<ColumnOptVector<types::Duration::Primitive>*>(output)->getRaw();
+    const size_t count = state->getCount();
+
+    if (count == 0) {
+        outputRaw.assign(1, std::nullopt);
+    } else {
+        outputRaw.assign(1, averageOf(state->getDurationTotal(), count));
     }
 }
 
 // The fold handler for a sum over a column of this value type. sum adds the
-// values, so only a numeric column is valid - a string or bool sum is rejected
-// (which also keeps aggregateUpdateSum from being instantiated for a type whose
-// operator+= would not compile).
+// values, so only a numeric or a duration column is valid - a string or bool sum is
+// rejected (which also keeps aggregateUpdateSum from being instantiated for a type
+// whose operator+= would not compile).
 NLAggregateUpdateFunction selectSumUpdate(ValueType inputType) {
     switch (inputType) {
         case ValueType::Int64:
@@ -3643,8 +4206,12 @@ NLAggregateUpdateFunction selectSumUpdate(ValueType inputType) {
             return &aggregateUpdateSum<types::Double::Primitive>;
         break;
 
+        case ValueType::Duration:
+            return &aggregateUpdateDurationTotal;
+        break;
+
         default:
-            throw IRException("sum requires a numeric column");
+            throw IRException("sum requires a numeric or a duration column");
         break;
     }
 
@@ -3652,7 +4219,8 @@ NLAggregateUpdateFunction selectSumUpdate(ValueType inputType) {
 }
 
 // The fold handler for an avg over a column of this value type. avg widens each
-// value to f64, so - like sum - only a numeric column is valid.
+// number to f64 and sums durations as durations, so - like sum - only a numeric or a
+// duration column is valid.
 NLAggregateUpdateFunction selectAvgUpdate(ValueType inputType) {
     switch (inputType) {
         case ValueType::Int64:
@@ -3667,8 +4235,16 @@ NLAggregateUpdateFunction selectAvgUpdate(ValueType inputType) {
             return &aggregateUpdateAvg<types::Double::Primitive>;
         break;
 
+        case ValueType::Duration:
+            return &aggregateUpdateDurationTotal;
+        break;
+
+        case ValueType::Point:
+            return &aggregateUpdateAvg<types::Point::Primitive>;
+        break;
+
         default:
-            throw IRException("avg requires a numeric column");
+            throw IRException("avg requires a numeric, a duration or a point column");
         break;
     }
 
@@ -3708,6 +4284,10 @@ NLAggregateUpdateFunction selectMinMaxUpdate(ValueType inputType) {
 
         case ValueType::Duration:
             return &aggregateUpdateMinMax<types::Duration::Primitive, IsMax>;
+        break;
+
+        case ValueType::Point:
+            return &aggregateUpdateMinMax<types::Point::Primitive, IsMax>;
         break;
 
         case ValueType::List:
@@ -3765,6 +4345,7 @@ void reownColumnRows(Column* column, const std::vector<size_t>& rows, NLValueSto
 template <typename Primitive>
 void groupGrowZero(Column* accumulator,
                    std::vector<uint64_t>& counts,
+                   std::vector<__int128>& durationTotals,
                    size_t groupCount) {
     auto& raw = static_cast<ColumnOptVector<Primitive>*>(accumulator)->getRaw();
     raw.resize(groupCount, std::optional<Primitive>(Primitive {}));
@@ -3776,20 +4357,23 @@ void groupGrowZero(Column* accumulator,
 template <typename Primitive>
 void groupGrowNull(Column* accumulator,
                    std::vector<uint64_t>& counts,
+                   std::vector<__int128>& durationTotals,
                    size_t groupCount) {
     auto& raw = static_cast<ColumnOptVector<Primitive>*>(accumulator)->getRaw();
     raw.resize(groupCount);
 }
 
-// Grow an avg accumulator to groupCount groups: a running f64 sum initialized to a
+// Grow an avg accumulator to groupCount groups: a running total initialized to a
 // present zero plus the per-group non-null tally zeroed for new groups. avg is the
 // only value reduction carried as (sum, count), so it is the only one that grows the
 // counts vector besides count itself.
+template <typename Total>
 void groupGrowAvg(Column* accumulator,
                   std::vector<uint64_t>& counts,
+                  std::vector<__int128>& durationTotals,
                   size_t groupCount) {
-    auto& raw = static_cast<ColumnOptVector<double>*>(accumulator)->getRaw();
-    raw.resize(groupCount, std::optional<double>(0.0));
+    auto& raw = static_cast<ColumnOptVector<Total>*>(accumulator)->getRaw();
+    raw.resize(groupCount, std::optional<Total>(Total {}));
     counts.resize(groupCount, 0);
 }
 
@@ -3797,6 +4381,7 @@ void groupGrowAvg(Column* accumulator,
 // keeps no reduced value, so there is no accumulator column to grow.
 void groupGrowCount(Column* accumulator,
                     std::vector<uint64_t>& counts,
+                    std::vector<__int128>& durationTotals,
                     size_t groupCount) {
     counts.resize(groupCount, 0);
 }
@@ -3806,6 +4391,7 @@ void groupGrowCount(Column* accumulator,
 template <typename Primitive>
 void groupFoldSum(Column* accumulator,
                   std::vector<uint64_t>& counts,
+                  std::vector<__int128>& durationTotals,
                   const Column* input,
                   const std::vector<size_t>& groups,
                   NLGroupDistinctTally& distinct,
@@ -3828,6 +4414,7 @@ void groupFoldSum(Column* accumulator,
 template <typename Primitive>
 void groupFoldSumDistinct(Column* accumulator,
                           std::vector<uint64_t>& counts,
+                          std::vector<__int128>& durationTotals,
                           const Column* input,
                           const std::vector<size_t>& groups,
                           NLGroupDistinctTally& distinct,
@@ -3855,22 +4442,51 @@ void groupFoldSumDistinct(Column* accumulator,
     }
 }
 
-// Fold a group's tagged cells into its running f64 sum, tallying the ones folded so avg
-// divides by the same count. The type-erased sibling of groupFoldSum / groupFoldAvg: the
-// cells carry a type each, so the number each holds is read by its tag.
-template <typename Cell, bool CountsRows, bool Distinct>
-void groupFoldNumericTagged(Column* accumulator,
+// Grow a sum or an average of tagged cells: a null cell, a zero duration total and, for an
+// average, a zero tally per new group
+template <bool Averages>
+void groupGrowTaggedSum(Column* accumulator,
+                        std::vector<uint64_t>& counts,
+                        std::vector<__int128>& durationTotals,
+                        size_t groupCount) {
+    auto& raw = static_cast<ColumnOptVector<CellView>*>(accumulator)->getRaw();
+    raw.resize(groupCount);
+    durationTotals.resize(groupCount, 0);
+
+    if constexpr (Averages) {
+        counts.resize(groupCount, 0);
+    }
+}
+
+// Grow a sum or an average of durations: their totals live in durationTotals, so the
+// accumulator holds no slot
+template <bool Averages>
+void groupGrowDurationTotal(Column* accumulator,
                             std::vector<uint64_t>& counts,
+                            std::vector<__int128>& durationTotals,
+                            size_t groupCount) {
+    durationTotals.resize(groupCount, 0);
+
+    if constexpr (Averages) {
+        counts.resize(groupCount, 0);
+    }
+}
+
+// Fold a chunk's present durations into per-group 128-bit totals, once per distinct value
+// of a group for sum(DISTINCT x) and avg(DISTINCT x), tallying the ones an average folds
+template <bool Distinct, bool Averages>
+void groupFoldDurationTotal(Column* accumulator,
+                            std::vector<uint64_t>& counts,
+                            std::vector<__int128>& durationTotals,
                             const Column* input,
                             const std::vector<size_t>& groups,
                             NLGroupDistinctTally& distinct,
                             NLValueStore& values) {
-    auto& raw = static_cast<ColumnOptVector<double>*>(accumulator)->getRaw();
-    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnOptVector<types::Duration::Primitive>*>(input)->getRaw();
 
     for (size_t row = 0; row < inputRaw.size(); row++) {
-        const std::optional<ListElementView> element = presentCell(inputRaw[row]);
-        if (!element) {
+        const std::optional<types::Duration::Primitive>& value = inputRaw[row];
+        if (!value.has_value()) {
             continue;
         }
 
@@ -3878,19 +4494,65 @@ void groupFoldNumericTagged(Column* accumulator,
 
         if constexpr (Distinct) {
             distinct.beginKey(group);
-            distinctAppendElementBytes(distinct.getKey(), *element);
+            distinctAppendValueBytes(distinct.getKey(), *value);
 
             if (!distinct.insertIfNew()) {
                 continue;
             }
         }
 
-        std::optional<double>& running = raw[group];
-        running = running.value() + taggedNumericValue(*element);
+        durationTotals[group] += value->getMicroseconds();
 
-        if constexpr (CountsRows) {
+        if constexpr (Averages) {
             counts[group]++;
         }
+    }
+}
+
+// Fold a group's tagged cells into its running sum, tallying the ones an average folds.
+// The type-erased sibling of groupFoldSum and groupFoldAvg: a group's sum is a cell copied
+// into @param values at each cell it folds, compacted as the min/max extremes are.
+template <typename Cell, bool Distinct, bool Averages>
+void groupFoldTaggedSum(Column* accumulator,
+                        std::vector<uint64_t>& counts,
+                        std::vector<__int128>& durationTotals,
+                        const Column* input,
+                        const std::vector<size_t>& groups,
+                        NLGroupDistinctTally& distinct,
+                        NLValueStore& values) {
+    auto& raw = static_cast<ColumnOptVector<CellView>*>(accumulator)->getRaw();
+    const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const std::optional<CellView> value = presentCell(inputRaw[row]);
+        if (!value) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        if constexpr (Distinct) {
+            distinct.beginKey(group);
+            distinctAppendElementBytes(distinct.getKey(), *value);
+
+            if (!distinct.insertIfNew()) {
+                continue;
+            }
+        }
+
+        std::optional<CellView>& running = raw[group];
+        __int128& durationTotal = durationTotals[group];
+        NLTaggedSum sum(running, durationTotal);
+
+        if constexpr (Averages) {
+            sum.addToAverage(*value, counts[group]);
+            counts[group]++;
+        } else {
+            sum.add(*value);
+        }
+
+        running = sum.own(values);
+        durationTotal = sum.getDurationTotal();
     }
 }
 
@@ -3900,6 +4562,7 @@ void groupFoldNumericTagged(Column* accumulator,
 template <typename Primitive, bool IsMax, typename Cell = std::optional<Primitive>>
 void groupFoldMinMax(Column* accumulator,
                      std::vector<uint64_t>& counts,
+                     std::vector<__int128>& durationTotals,
                      const Column* input,
                      const std::vector<size_t>& groups,
                      NLGroupDistinctTally& distinct,
@@ -3925,6 +4588,7 @@ void groupFoldMinMax(Column* accumulator,
 template <typename Primitive, typename Cell = std::optional<Primitive>>
 void groupFoldFirst(Column* accumulator,
                     std::vector<uint64_t>& counts,
+                    std::vector<__int128>& durationTotals,
                     const Column* input,
                     const std::vector<size_t>& groups,
                     NLGroupDistinctTally& distinct,
@@ -3949,19 +4613,19 @@ template <typename Cell>
 NLGroupAggregateFoldFunction taggedGroupAggregateFoldFor(GroupAggregateKind kind) {
     switch (kind) {
         case GroupAggregateKind::Sum:
-            return &groupFoldNumericTagged<Cell, /*CountsRows=*/false, /*Distinct=*/false>;
+            return &groupFoldTaggedSum<Cell, /*Distinct=*/false, /*Averages=*/false>;
         break;
 
         case GroupAggregateKind::SumDistinct:
-            return &groupFoldNumericTagged<Cell, /*CountsRows=*/false, /*Distinct=*/true>;
+            return &groupFoldTaggedSum<Cell, /*Distinct=*/true, /*Averages=*/false>;
         break;
 
         case GroupAggregateKind::Avg:
-            return &groupFoldNumericTagged<Cell, /*CountsRows=*/true, /*Distinct=*/false>;
+            return &groupFoldTaggedSum<Cell, /*Distinct=*/false, /*Averages=*/true>;
         break;
 
         case GroupAggregateKind::AvgDistinct:
-            return &groupFoldNumericTagged<Cell, /*CountsRows=*/true, /*Distinct=*/true>;
+            return &groupFoldTaggedSum<Cell, /*Distinct=*/true, /*Averages=*/true>;
         break;
 
         case GroupAggregateKind::StDev:
@@ -3975,15 +4639,15 @@ NLGroupAggregateFoldFunction taggedGroupAggregateFoldFor(GroupAggregateKind kind
         break;
 
         case GroupAggregateKind::Min:
-            return &groupFoldMinMax<ListElementView, /*IsMax=*/false, Cell>;
+            return &groupFoldMinMax<CellView, /*IsMax=*/false, Cell>;
         break;
 
         case GroupAggregateKind::Max:
-            return &groupFoldMinMax<ListElementView, /*IsMax=*/true, Cell>;
+            return &groupFoldMinMax<CellView, /*IsMax=*/true, Cell>;
         break;
 
         case GroupAggregateKind::First:
-            return &groupFoldFirst<ListElementView, Cell>;
+            return &groupFoldFirst<CellView, Cell>;
         break;
 
         case GroupAggregateKind::Count:
@@ -3997,25 +4661,28 @@ NLGroupAggregateFoldFunction taggedGroupAggregateFoldFor(GroupAggregateKind kind
     return nullptr;
 }
 
-// Fold a chunk's present values into per-group avg accumulators: a running f64 sum
-// (the accumulator, widened from the input) plus the per-group non-null count. avg
+// Fold a chunk's present values into per-group avg accumulators: a running total
+// (the accumulator, a number widened to f64) plus the per-group non-null count. avg
 // divides the two at the emit step.
 template <typename Primitive>
 void groupFoldAvg(Column* accumulator,
                   std::vector<uint64_t>& counts,
+                  std::vector<__int128>& durationTotals,
                   const Column* input,
                   const std::vector<size_t>& groups,
                   NLGroupDistinctTally& distinct,
                   NLValueStore& values) {
-    auto& raw = static_cast<ColumnOptVector<double>*>(accumulator)->getRaw();
+    using Total = AverageTotal<Primitive>;
+
+    auto& raw = static_cast<ColumnOptVector<Total>*>(accumulator)->getRaw();
     const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
 
     for (size_t row = 0; row < inputRaw.size(); row++) {
         const std::optional<Primitive>& value = inputRaw[row];
         if (value.has_value()) {
             const size_t group = groups[row];
-            std::optional<double>& running = raw[group];
-            running = running.value() + static_cast<double>(*value);
+            std::optional<Total>& running = raw[group];
+            running = addToAverageTotal(running.value(), *value, counts[group]);
             counts[group]++;
         }
     }
@@ -4027,11 +4694,14 @@ void groupFoldAvg(Column* accumulator,
 template <typename Primitive>
 void groupFoldAvgDistinct(Column* accumulator,
                           std::vector<uint64_t>& counts,
+                          std::vector<__int128>& durationTotals,
                           const Column* input,
                           const std::vector<size_t>& groups,
                           NLGroupDistinctTally& distinct,
                           NLValueStore& values) {
-    auto& raw = static_cast<ColumnOptVector<double>*>(accumulator)->getRaw();
+    using Total = AverageTotal<Primitive>;
+
+    auto& raw = static_cast<ColumnOptVector<Total>*>(accumulator)->getRaw();
     const auto& inputRaw = static_cast<const ColumnOptVector<Primitive>*>(input)->getRaw();
 
     for (size_t row = 0; row < inputRaw.size(); row++) {
@@ -4049,8 +4719,8 @@ void groupFoldAvgDistinct(Column* accumulator,
             continue;
         }
 
-        std::optional<double>& running = raw[group];
-        running = running.value() + static_cast<double>(*value);
+        std::optional<Total>& running = raw[group];
+        running = addToAverageTotal(running.value(), *value, counts[group]);
         counts[group]++;
     }
 }
@@ -4059,6 +4729,7 @@ void groupFoldAvgDistinct(Column* accumulator,
 // charges its group regardless of value, so the input values are never read.
 void groupFoldCountAll(Column* accumulator,
                        std::vector<uint64_t>& counts,
+                       std::vector<__int128>& durationTotals,
                        const Column* input,
                        const std::vector<size_t>& groups,
                        NLGroupDistinctTally& distinct,
@@ -4073,6 +4744,7 @@ void groupFoldCountAll(Column* accumulator,
 template <typename Primitive>
 void groupFoldCountPresent(Column* accumulator,
                            std::vector<uint64_t>& counts,
+                           std::vector<__int128>& durationTotals,
                            const Column* input,
                            const std::vector<size_t>& groups,
                            NLGroupDistinctTally& distinct,
@@ -4091,6 +4763,7 @@ void groupFoldCountPresent(Column* accumulator,
 template <typename ID>
 void groupFoldCountValidID(Column* accumulator,
                            std::vector<uint64_t>& counts,
+                           std::vector<__int128>& durationTotals,
                            const Column* input,
                            const std::vector<size_t>& groups,
                            NLGroupDistinctTally& distinct,
@@ -4106,64 +4779,58 @@ void groupFoldCountValidID(Column* accumulator,
 
 void groupFoldCountPresentPath(Column* accumulator,
                                std::vector<uint64_t>& counts,
+                               std::vector<__int128>& durationTotals,
                                const Column* input,
                                const std::vector<size_t>& groups,
                                NLGroupDistinctTally& distinct,
                                NLValueStore& values) {
-    const std::vector<EntityList>& inputRaw = static_cast<const ColumnVector<EntityList>*>(input)->getRaw();
+    const std::vector<GraphPath>& inputRaw = static_cast<const ColumnVector<GraphPath>*>(input)->getRaw();
 
     for (size_t row = 0; row < inputRaw.size(); row++) {
-        if (!inputRaw[row].empty()) {
+        if (!inputRaw[row].isNull()) {
             counts[groups[row]]++;
         }
     }
 }
 
-// Tally each group's distinct IDs (count(DISTINCT n) over a node/edge column): an
-// invalid ID is a null, which count(DISTINCT x) does not charge, so only the valid ones
-// are keyed.
+// A row of a chunk an expression or a procedure filled is never null. An ID or a path is
+// null on the rows an OPTIONAL MATCH missed.
 template <typename ElementType>
-void groupFoldCountDistinctID(Column* accumulator,
-                              std::vector<uint64_t>& counts,
-                              const Column* input,
-                              const std::vector<size_t>& groups,
-                              NLGroupDistinctTally& distinct,
-                              NLValueStore& values) {
-    const auto& inputRaw = static_cast<const ColumnVector<ElementType>*>(input)->getRaw();
+bool presentChunkRow(const ElementType& value) {
+    return true;
+}
+
+template <IntegralType T, int tag>
+bool presentChunkRow(const ID<T, tag>& id) {
+    return id.isValid();
+}
+
+bool presentChunkRow(const GraphPath& path) {
+    return !path.isNull();
+}
+
+// Tally each group's distinct present values of a chunk. The tally keys a row the way a
+// whole-row DISTINCT keys it, so two rows count once exactly when DISTINCT would fold
+// them together.
+template <typename ElementType>
+void groupFoldCountDistinctChunk(Column* accumulator,
+                                 std::vector<uint64_t>& counts,
+                                 std::vector<__int128>& durationTotals,
+                                 const Column* input,
+                                 const std::vector<size_t>& groups,
+                                 NLGroupDistinctTally& distinct,
+                                 NLValueStore& values) {
+    const std::vector<ElementType>& inputRaw = static_cast<const ColumnVector<ElementType>*>(input)->getRaw();
 
     for (size_t row = 0; row < inputRaw.size(); row++) {
-        if (!inputRaw[row].isValid()) {
+        if (!presentChunkRow(inputRaw[row])) {
             continue;
         }
 
         const size_t group = groups[row];
 
         distinct.beginKey(group);
-        distinctAppendValueBytes(distinct.getKey(), inputRaw[row].getValue());
-
-        if (distinct.insertIfNew()) {
-            counts[group]++;
-        }
-    }
-}
-
-// Tally each group's distinct values over a chunk holding them plainly - a column a
-// procedure yielded. No row of such a chunk is null, so every row is charged the first
-// time its value is seen in its group; the ID sibling keys on the ID's integer instead.
-template <typename ElementType>
-void groupFoldCountDistinctValue(Column* accumulator,
-                                 std::vector<uint64_t>& counts,
-                                 const Column* input,
-                                 const std::vector<size_t>& groups,
-                                 NLGroupDistinctTally& distinct,
-                                 NLValueStore& values) {
-    const auto& inputRaw = static_cast<const ColumnVector<ElementType>*>(input)->getRaw();
-
-    for (size_t row = 0; row < inputRaw.size(); row++) {
-        const size_t group = groups[row];
-
-        distinct.beginKey(group);
-        distinctAppendValueBytes(distinct.getKey(), inputRaw[row]);
+        distinct.appendRowKey(input, row);
 
         if (distinct.insertIfNew()) {
             counts[group]++;
@@ -4178,6 +4845,7 @@ void groupFoldCountDistinctValue(Column* accumulator,
 template <typename Primitive>
 void groupFoldCountDistinctPresent(Column* accumulator,
                                    std::vector<uint64_t>& counts,
+                                   std::vector<__int128>& durationTotals,
                                    const Column* input,
                                    const std::vector<size_t>& groups,
                                    NLGroupDistinctTally& distinct,
@@ -4205,8 +4873,9 @@ void groupFoldCountDistinctPresent(Column* accumulator,
 // grouped count(x) over a heterogeneous unwind charges the same rows a nullable value
 // column would.
 template <typename Cell>
-void groupFoldCountPresentListElement(Column* accumulator,
+void groupFoldCountPresentCell(Column* accumulator,
                                       std::vector<uint64_t>& counts,
+                                      std::vector<__int128>& durationTotals,
                                       const Column* input,
                                       const std::vector<size_t>& groups,
                                       NLGroupDistinctTally& distinct,
@@ -4224,8 +4893,9 @@ void groupFoldCountPresentListElement(Column* accumulator,
 // The key carries the tag as well as the value, so cells of different types are told
 // apart the way a whole-row DISTINCT tells them apart.
 template <typename Cell>
-void groupFoldCountDistinctListElement(Column* accumulator,
+void groupFoldCountDistinctCell(Column* accumulator,
                                        std::vector<uint64_t>& counts,
+                                       std::vector<__int128>& durationTotals,
                                        const Column* input,
                                        const std::vector<size_t>& groups,
                                        NLGroupDistinctTally& distinct,
@@ -4233,7 +4903,7 @@ void groupFoldCountDistinctListElement(Column* accumulator,
     const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
 
     for (size_t row = 0; row < inputRaw.size(); row++) {
-        const std::optional<ListElementView> element = presentCell(inputRaw[row]);
+        const std::optional<CellView> element = presentCell(inputRaw[row]);
         if (!element) {
             continue;
         }
@@ -4253,6 +4923,7 @@ void groupFoldCountDistinctListElement(Column* accumulator,
 // view, so two rows count once when their lists are equal.
 void groupFoldCountDistinctPresentList(Column* accumulator,
                                        std::vector<uint64_t>& counts,
+                                       std::vector<__int128>& durationTotals,
                                        const Column* input,
                                        const std::vector<size_t>& groups,
                                        NLGroupDistinctTally& distinct,
@@ -4276,28 +4947,9 @@ void groupFoldCountDistinctPresentList(Column* accumulator,
     }
 }
 
-void groupFoldCountDistinctList(Column* accumulator,
-                                std::vector<uint64_t>& counts,
-                                const Column* input,
-                                const std::vector<size_t>& groups,
-                                NLGroupDistinctTally& distinct,
-                                NLValueStore& values) {
-    const auto& inputRaw = static_cast<const ColumnVector<ListView>*>(input)->getRaw();
-
-    for (size_t row = 0; row < inputRaw.size(); row++) {
-        const size_t group = groups[row];
-
-        distinct.beginKey(group);
-        distinctAppendListBytes(distinct.getKey(), inputRaw[row]);
-
-        if (distinct.insertIfNew()) {
-            counts[group]++;
-        }
-    }
-}
-
 void groupFoldCountDistinctPresentMap(Column* accumulator,
                                       std::vector<uint64_t>& counts,
+                                      std::vector<__int128>& durationTotals,
                                       const Column* input,
                                       const std::vector<size_t>& groups,
                                       NLGroupDistinctTally& distinct,
@@ -4524,71 +5176,137 @@ void collectValidIDFoldDistinct(Column* values,
     }
 }
 
+// The path sibling of collectValidIDFold: the path an OPTIONAL MATCH left where its pattern
+// missed holds no node, which is how a null path is spelled, so it is dropped. A kept path is
+// copied into the store as a tagged cell, so its lists emit as a type-erased collect's do.
+void collectPathFold(Column* values,
+                     const Column* input,
+                     const std::vector<size_t>& groups,
+                     std::vector<std::vector<size_t>>& groupPositions,
+                     NLGroupDistinctTally& distinct,
+                     NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<CellView>*>(values)->getRaw();
+    const std::vector<GraphPath>& inputRaw = static_cast<const ColumnVector<GraphPath>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const GraphPath& path = inputRaw[row];
+        if (path.isNull()) {
+            continue;
+        }
+
+        ListBuffer<>::ListItemVariant item {PathView {path.getIDs()}};
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(store.ownCell(item));
+        groupPositions[groups[row]].push_back(position);
+    }
+}
+
+void collectPathFoldDistinct(Column* values,
+                             const Column* input,
+                             const std::vector<size_t>& groups,
+                             std::vector<std::vector<size_t>>& groupPositions,
+                             NLGroupDistinctTally& distinct,
+                             NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<CellView>*>(values)->getRaw();
+    const std::vector<GraphPath>& inputRaw = static_cast<const ColumnVector<GraphPath>*>(input)->getRaw();
+
+    for (size_t row = 0; row < inputRaw.size(); row++) {
+        const GraphPath& path = inputRaw[row];
+        if (path.isNull()) {
+            continue;
+        }
+
+        const size_t group = groups[row];
+
+        distinct.beginKey(group);
+        distinctAppendPathBytes(distinct.getKey(), path.getIDs());
+
+        if (!distinct.insertIfNew()) {
+            continue;
+        }
+
+        ListBuffer<>::ListItemVariant item {PathView {path.getIDs()}};
+
+        const size_t position = valuesRaw.size();
+        valuesRaw.push_back(store.ownCell(item));
+        groupPositions[group].push_back(position);
+    }
+}
+
 // The list- or map-buffer value a tagged cell holds, read back as the type its tag names, so
 // a collect of type-erased cells buffers each one under the type it came in with.
 template <typename Item>
-Item taggedItem(const ListElementView element) {
-    const ListBufferTypeTag tag = element.getTag();
+Item taggedItem(const CellView element) {
+    const CellTag tag = element.getTag();
 
     switch (tag) {
-        case ListBufferTypeTag::Int:
+        case CellTag::Int:
             return Item {element.getAs<types::Int64::Primitive>()};
         break;
 
-        case ListBufferTypeTag::UInt:
+        case CellTag::UInt:
             return Item {element.getAs<types::UInt64::Primitive>()};
         break;
 
-        case ListBufferTypeTag::Double:
+        case CellTag::Double:
             return Item {element.getAs<types::Double::Primitive>()};
         break;
 
-        case ListBufferTypeTag::Bool:
+        case CellTag::Bool:
             return Item {element.getAs<types::Bool::Primitive>()};
         break;
 
-        case ListBufferTypeTag::String:
+        case CellTag::String:
             return Item {element.getAs<types::String::Primitive>()};
         break;
 
-        case ListBufferTypeTag::Embedding:
+        case CellTag::Embedding:
             return Item {element.getAs<types::Embedding::Primitive>()};
         break;
 
-        case ListBufferTypeTag::ListView:
+        case CellTag::ListView:
             return Item {element.getAs<ListView>()};
         break;
 
-        case ListBufferTypeTag::Null:
+        case CellTag::Null:
             return Item {element.getAs<PropertyNull>()};
         break;
 
-        case ListBufferTypeTag::NodeID:
+        case CellTag::NodeID:
             return Item {element.getAs<NodeID>()};
         break;
 
-        case ListBufferTypeTag::EdgeID:
+        case CellTag::EdgeID:
             return Item {element.getAs<EdgeID>()};
         break;
 
-        case ListBufferTypeTag::DateTime:
+        case CellTag::DateTime:
             return Item {element.getAs<types::DateTime::Primitive>()};
         break;
 
-        case ListBufferTypeTag::Duration:
+        case CellTag::Duration:
             return Item {element.getAs<types::Duration::Primitive>()};
         break;
 
-        case ListBufferTypeTag::MapView:
+        case CellTag::Point:
+            return Item {element.getAs<types::Point::Primitive>()};
+        break;
+
+        case CellTag::MapView:
             return Item {element.getAs<MapView>()};
         break;
 
-        case ListBufferTypeTag::INVALID:
+        case CellTag::Path:
+            return Item {element.getAs<PathView>()};
+        break;
+
+        case CellTag::INVALID:
             throw IRException("cannot collect an untagged element");
         break;
     }
 
-    throw IRException("Unknown ListBufferTypeTag");
+    throw IRException("Unknown CellTag");
 }
 
 // The type-erased sibling of collectFold: a tagged cell is there in every row, but one
@@ -4600,11 +5318,11 @@ void collectTaggedFold(Column* values,
                        std::vector<std::vector<size_t>>& groupPositions,
                        NLGroupDistinctTally& distinct,
                        NLValueStore& store) {
-    auto& valuesRaw = static_cast<ColumnVector<ListElementView>*>(values)->getRaw();
+    auto& valuesRaw = static_cast<ColumnVector<CellView>*>(values)->getRaw();
     const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
 
     for (size_t row = 0; row < inputRaw.size(); row++) {
-        const std::optional<ListElementView> element = presentCell(inputRaw[row]);
+        const std::optional<CellView> element = presentCell(inputRaw[row]);
         if (!element) {
             continue;
         }
@@ -4624,11 +5342,11 @@ void collectTaggedFoldDistinct(Column* values,
                                std::vector<std::vector<size_t>>& groupPositions,
                                NLGroupDistinctTally& distinct,
                                NLValueStore& store) {
-    auto& valuesRaw = static_cast<ColumnVector<ListElementView>*>(values)->getRaw();
+    auto& valuesRaw = static_cast<ColumnVector<CellView>*>(values)->getRaw();
     const std::vector<Cell>& inputRaw = static_cast<const ColumnVector<Cell>*>(input)->getRaw();
 
     for (size_t row = 0; row < inputRaw.size(); row++) {
-        const std::optional<ListElementView> element = presentCell(inputRaw[row]);
+        const std::optional<CellView> element = presentCell(inputRaw[row]);
         if (!element) {
             continue;
         }
@@ -4656,7 +5374,7 @@ void collectTaggedListEmit(const Column* values,
                            size_t count,
                            ListBuffer<>& listBuffer,
                            Column* output) {
-    const auto& valuesRaw = static_cast<const ColumnVector<ListElementView>*>(values)->getRaw();
+    const auto& valuesRaw = static_cast<const ColumnVector<CellView>*>(values)->getRaw();
     auto& outputRaw = static_cast<ColumnVector<ListView>*>(output)->getRaw();
 
     outputRaw.clear();
@@ -4676,23 +5394,24 @@ void collectTaggedListEmit(const Column* values,
     }
 }
 
-// The list sibling of collectValidIDFoldDistinct: two cells are the same value when their
-// elements are, so a cell keys by the list serialized element by element rather than by
-// the ListView's own span, which two equal lists never share.
-void collectListFoldDistinct(Column* values,
-                             const Column* input,
-                             const std::vector<size_t>& groups,
-                             std::vector<std::vector<size_t>>& groupPositions,
-                             NLGroupDistinctTally& distinct,
-                             NLValueStore& store) {
-    auto& valuesRaw = static_cast<ColumnVector<ListView>*>(values)->getRaw();
-    const auto& inputRaw = static_cast<const ColumnVector<ListView>*>(input)->getRaw();
+// The list and map sibling of collectValidIDFoldDistinct: two cells are the same value
+// when their elements are, so a cell keys by the container serialized element by element
+// rather than by its view's own span, which two equal containers never share.
+template <typename Container>
+void collectContainerFoldDistinct(Column* values,
+                                  const Column* input,
+                                  const std::vector<size_t>& groups,
+                                  std::vector<std::vector<size_t>>& groupPositions,
+                                  NLGroupDistinctTally& distinct,
+                                  NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<Container>*>(values)->getRaw();
+    const auto& inputRaw = static_cast<const ColumnVector<Container>*>(input)->getRaw();
 
     for (size_t row = 0; row < inputRaw.size(); row++) {
         const size_t group = groups[row];
 
         distinct.beginKey(group);
-        distinctAppendListBytes(distinct.getKey(), inputRaw[row]);
+        distinctAppendValueBytes(distinct.getKey(), inputRaw[row]);
 
         if (!distinct.insertIfNew()) {
             continue;
@@ -4704,58 +5423,60 @@ void collectListFoldDistinct(Column* values,
     }
 }
 
-// The nullable siblings of collectCellFold and collectListFoldDistinct for a list chunk: a
-// row an OPTIONAL MATCH left with no list is dropped, as collectFold drops an absent
-// optional, so the buffer they fill is a plain list column either way.
-void collectOptListFold(Column* values,
-                        const Column* input,
-                        const std::vector<size_t>& groups,
-                        std::vector<std::vector<size_t>>& groupPositions,
-                        NLGroupDistinctTally& distinct,
-                        NLValueStore& store) {
-    auto& valuesRaw = static_cast<ColumnVector<ListView>*>(values)->getRaw();
-    const std::vector<std::optional<ListView>>& inputRaw =
-        static_cast<const ColumnOptVector<ListView>*>(input)->getRaw();
+// The nullable siblings of collectCellFold and collectContainerFoldDistinct for a list or a
+// map chunk: a row an OPTIONAL MATCH left with no container is dropped, as collectFold drops
+// an absent optional, so the buffer they fill is a plain container column either way.
+template <typename Container>
+void collectOptContainerFold(Column* values,
+                             const Column* input,
+                             const std::vector<size_t>& groups,
+                             std::vector<std::vector<size_t>>& groupPositions,
+                             NLGroupDistinctTally& distinct,
+                             NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<Container>*>(values)->getRaw();
+    const std::vector<std::optional<Container>>& inputRaw =
+        static_cast<const ColumnOptVector<Container>*>(input)->getRaw();
 
     for (size_t row = 0; row < inputRaw.size(); row++) {
-        const std::optional<ListView>& list = inputRaw[row];
-        if (!list.has_value()) {
+        const std::optional<Container>& container = inputRaw[row];
+        if (!container.has_value()) {
             continue;
         }
 
         const size_t position = valuesRaw.size();
-        valuesRaw.push_back(store.ownElement(*list));
+        valuesRaw.push_back(store.ownElement(*container));
         groupPositions[groups[row]].push_back(position);
     }
 }
 
-void collectOptListFoldDistinct(Column* values,
-                                const Column* input,
-                                const std::vector<size_t>& groups,
-                                std::vector<std::vector<size_t>>& groupPositions,
-                                NLGroupDistinctTally& distinct,
-                                NLValueStore& store) {
-    auto& valuesRaw = static_cast<ColumnVector<ListView>*>(values)->getRaw();
-    const std::vector<std::optional<ListView>>& inputRaw =
-        static_cast<const ColumnOptVector<ListView>*>(input)->getRaw();
+template <typename Container>
+void collectOptContainerFoldDistinct(Column* values,
+                                     const Column* input,
+                                     const std::vector<size_t>& groups,
+                                     std::vector<std::vector<size_t>>& groupPositions,
+                                     NLGroupDistinctTally& distinct,
+                                     NLValueStore& store) {
+    auto& valuesRaw = static_cast<ColumnVector<Container>*>(values)->getRaw();
+    const std::vector<std::optional<Container>>& inputRaw =
+        static_cast<const ColumnOptVector<Container>*>(input)->getRaw();
 
     for (size_t row = 0; row < inputRaw.size(); row++) {
-        const std::optional<ListView>& list = inputRaw[row];
-        if (!list.has_value()) {
+        const std::optional<Container>& container = inputRaw[row];
+        if (!container.has_value()) {
             continue;
         }
 
         const size_t group = groups[row];
 
         distinct.beginKey(group);
-        distinctAppendListBytes(distinct.getKey(), *list);
+        distinctAppendValueBytes(distinct.getKey(), *container);
 
         if (!distinct.insertIfNew()) {
             continue;
         }
 
         const size_t position = valuesRaw.size();
-        valuesRaw.push_back(store.ownElement(*list));
+        valuesRaw.push_back(store.ownElement(*container));
         groupPositions[group].push_back(position);
     }
 }
@@ -4827,16 +5548,16 @@ bool absentValueCell(const Column* source, size_t row) {
 // A cell of a type-erased column carries its own tag, so the null is the one that tag
 // names rather than a cell the column does not hold.
 bool absentTaggedCell(const Column* source, size_t row) {
-    const ListElementView element = (*static_cast<const ColumnVector<ListElementView>*>(source))[row];
+    const CellView& element = (*static_cast<const ColumnVector<CellView>*>(source))[row];
 
-    return element.getTag() == ListBufferTypeTag::Null;
+    return !iteratedList(element);
 }
 
 bool absentOptTaggedCell(const Column* source, size_t row) {
-    const std::optional<ListElementView>& element =
-        (*static_cast<const ColumnOptVector<ListElementView>*>(source))[row];
+    const std::optional<CellView>& element =
+        (*static_cast<const ColumnOptVector<CellView>*>(source))[row];
 
-    return !element.has_value() || element->getTag() == ListBufferTypeTag::Null;
+    return !iteratedList(element);
 }
 
 // Read one cell of a nullable value column as the value it contributes to a list or a map:
@@ -4881,43 +5602,50 @@ NLKeyedValue mapRead(const Column* input, size_t row) {
     return *map;
 }
 
-// The map, the node or the edge a type-erased cell holds, nothing where it holds anything
-// else
-NLKeyedValue readKeyedCell(const ListElementView cell) {
-    switch (cell.getTag()) {
-        case ListBufferTypeTag::MapView:
+NLKeyedValue readKeyedCell(const CellView cell) {
+    const CellTag tag = cell.getTag();
+
+    switch (tag) {
+        case CellTag::MapView:
             return cell.getAs<MapView>();
         break;
-        case ListBufferTypeTag::NodeID:
+        case CellTag::NodeID:
             return cell.getAs<NodeID>();
         break;
-        case ListBufferTypeTag::EdgeID:
+        case CellTag::EdgeID:
             return cell.getAs<EdgeID>();
         break;
-        default:
+        case CellTag::DateTime:
+            return cell.getAs<DateTime>();
+        break;
+        case CellTag::Duration:
+            return cell.getAs<Duration>();
+        break;
+        case CellTag::Point:
+            return cell.getAs<Point>();
+        break;
+        case CellTag::Null:
             return std::monostate {};
         break;
-    }
-}
-
-NLKeyedValue readKeyedCell(const MapEntryView entry) {
-    switch (entry.getValueTag()) {
-        case MapBufferTypeTag::MapView:
-            return entry.getValueAs<MapView>();
+        case CellTag::Int:
+        case CellTag::UInt:
+        case CellTag::Double:
+        case CellTag::Bool:
+        case CellTag::String:
+        case CellTag::Embedding:
+        case CellTag::ListView:
+        case CellTag::Path:
+            return NLKeylessValue {tag};
         break;
-        case MapBufferTypeTag::NodeID:
-            return entry.getValueAs<NodeID>();
-        break;
-        case MapBufferTypeTag::EdgeID:
-            return entry.getValueAs<EdgeID>();
-        break;
-        default:
-            return std::monostate {};
+        case CellTag::INVALID:
+            throw IRException("a map key read reads an untagged cell");
         break;
     }
+
+    throw IRException("Unknown CellTag");
 }
 
-NLKeyedValue readKeyedCell(const std::optional<ListElementView>& cell) {
+NLKeyedValue readKeyedCell(const std::optional<CellView>& cell) {
     if (!cell) {
         return std::monostate {};
     }
@@ -4932,45 +5660,108 @@ NLKeyedValue readTaggedKeyed(const Column* input, size_t row) {
     return readKeyedCell((*static_cast<const ColumnT*>(input))[row]);
 }
 
-// The value a map entry holds, as the item a list cell is written from
-QueryListBuffer::ListItemVariant entryItem(const MapEntryView entry) {
-    const auto read = []<typename T>(const MapEntryView view) -> QueryListBuffer::ListItemVariant {
-        if constexpr (std::is_same_v<T, PropertyNull>) {
-            return PropertyNull {};
+template <typename Held>
+CellTag heldTag(const Held& held) {
+    const auto tagOf = []<typename Value>(const Value& value) {
+        if constexpr (std::is_same_v<Value, std::monostate>) {
+            return CellTag::Null;
+        } else if constexpr (std::is_same_v<Value, NLKeylessValue> || std::is_same_v<Value, NLNeitherPositionNorKey>) {
+            return value._tag;
         } else {
-            return view.getValueAs<T>();
+            return TypeToCellTag<Value>::Tag;
         }
     };
 
-    return dispatchMapEntry(read, entry);
+    return std::visit(tagOf, held);
 }
 
 // The entry @param keyed holds under @param key: the one its map holds, or its node's or
 // edge's property, written into @param mapBuffer as a map of that one entry. False where
-// it holds no such entry.
+// it holds null or no such entry, and raises where it holds a value with no entries.
 bool findKeyedEntry(const NLKeyedValue& keyed,
                     std::string_view key,
                     NLEntityProperties& properties,
                     MapBuffer<>& mapBuffer,
                     MapEntryView& entry) {
-    MapBuffer<>::MapKeyValuePair property;
+    MapBuffer<>::MapKeyValuePair property {.key = key};
 
-    if (const MapView* map = std::get_if<MapView>(&keyed)) {
+    if (std::holds_alternative<std::monostate>(keyed)) {
+        return false;
+    } else if (const MapView* map = std::get_if<MapView>(&keyed)) {
         return findMapEntry(*map, key, entry);
     } else if (const NodeID* node = std::get_if<NodeID>(&keyed)) {
-        if (!properties.readEntry(*node, key, property)) {
+        if (!properties.readValue(*node, key, property.value)) {
             return false;
         }
     } else if (const EdgeID* edge = std::get_if<EdgeID>(&keyed)) {
-        if (!properties.readEntry(*edge, key, property)) {
+        if (!properties.readValue(*edge, key, property.value)) {
             return false;
         }
     } else {
-        return false;
+        throwIndexTypeError(heldTag(keyed), CellTag::String);
     }
 
     entry = mapBuffer.insert(std::span<const MapBuffer<>::MapKeyValuePair> {&property, 1}).front();
     return true;
+}
+
+MapBuffer<>::MapItemVariant mapItemOf(int64_t component) {
+    return component;
+}
+
+MapBuffer<>::MapItemVariant mapItemOf(const Point::Component& component) {
+    return std::visit([](auto value) -> MapBuffer<>::MapItemVariant { return value; }, component);
+}
+
+// The component @param part names of @param value, written into @param mapBuffer as the
+// value of a map of one entry, as an entity's property is
+template <typename Owner, typename Part>
+CellView componentCell(Owner value,
+                       std::optional<Part> part,
+                       std::string_view key,
+                       std::string_view ownerName,
+                       MapBuffer<>& mapBuffer) {
+    if (!part) {
+        throw IRException(fmt::format("'{}' is not a component of a {}", key, ownerName));
+    }
+
+    const MapBuffer<>::MapKeyValuePair component {
+        .key = key,
+        .value = mapItemOf(Owner::component(value, *part)),
+    };
+
+    const MapView map = mapBuffer.insert(std::span<const MapBuffer<>::MapKeyValuePair> {&component, 1});
+
+    return map.front().getValue();
+}
+
+// The value a property read finds in @param keyed: a key of its map, a property of its node
+// or edge, or a component of its instant, duration or point. Null where it holds null or no
+// such key.
+CellView readStaticKey(const NLKeyedValue& keyed,
+                       const NLStaticMapKeyData* mapKey,
+                       NLEntityProperties& properties,
+                       MapBuffer<>& mapBuffer) {
+    const std::string_view key = mapKey->getKey();
+
+    if (const DateTime* instant = std::get_if<DateTime>(&keyed)) {
+        return componentCell(*instant, mapKey->getPart<DateTimePart>(), key, "datetime", mapBuffer);
+    } else if (const Duration* duration = std::get_if<Duration>(&keyed)) {
+        return componentCell(*duration, mapKey->getPart<DurationPart>(), key, "duration", mapBuffer);
+    } else if (const Point* point = std::get_if<Point>(&keyed)) {
+        return componentCell(*point, mapKey->getPart<PointPart>(), key, "point", mapBuffer);
+    } else if (const NLKeylessValue* keyless = std::get_if<NLKeylessValue>(&keyed)) {
+        throw IRException(fmt::format("Type mismatch: a value of type '{}' has no property '{}'",
+                                      queryTypeName(keyless->_tag),
+                                      key));
+    }
+
+    MapEntryView entry;
+    if (!findKeyedEntry(keyed, key, properties, mapBuffer, entry)) {
+        return CellView::nullElement();
+    }
+
+    return entry.getValue();
 }
 
 // The key one column of a dynamic map key read holds at @param row, or nothing where the
@@ -4988,12 +5779,80 @@ std::optional<types::String::Primitive> stringValueArgument(const Column* input,
 template <typename ColumnT>
 std::optional<types::String::Primitive> cellStringArgument(const Column* input, size_t row, std::string_view functionName) {
     const auto* col = static_cast<const ColumnT*>(input);
-    const std::optional<ListElementView> cell = col->operator[](row);
+    const std::optional<CellView> cell = col->operator[](row);
     if (!cell.has_value()) {
         return std::nullopt;
     }
 
     return cellString(*cell, functionName);
+}
+
+bool listStrings(const ListView list, std::string_view functionName, std::vector<types::String::Primitive>& strings) {
+    for (const CellView element : list) {
+        const std::optional<types::String::Primitive> string = cellString(element, functionName);
+        if (!string.has_value()) {
+            return false;
+        }
+
+        strings.push_back(*string);
+    }
+
+    return true;
+}
+
+template <typename ColumnT>
+bool stringAsStringListArgument(const Column* input,
+                                size_t row,
+                                std::string_view,
+                                std::vector<types::String::Primitive>& strings) {
+    strings.clear();
+
+    const std::optional<types::String::Primitive> string = (*static_cast<const ColumnT*>(input))[row];
+    if (!string.has_value()) {
+        return false;
+    }
+
+    strings.push_back(*string);
+
+    return true;
+}
+
+template <typename ColumnT>
+bool listAsStringListArgument(const Column* input,
+                              size_t row,
+                              std::string_view functionName,
+                              std::vector<types::String::Primitive>& strings) {
+    strings.clear();
+
+    const std::optional<ListView> list = (*static_cast<const ColumnT*>(input))[row];
+
+    return list.has_value() && listStrings(*list, functionName, strings);
+}
+
+template <typename ColumnT>
+bool cellAsStringListArgument(const Column* input,
+                              size_t row,
+                              std::string_view functionName,
+                              std::vector<types::String::Primitive>& strings) {
+    strings.clear();
+
+    const std::optional<CellView> cell = (*static_cast<const ColumnT*>(input))[row];
+    if (!cell.has_value()) {
+        return false;
+    }
+
+    const CellTag tag = cell->getTag();
+
+    if (tag == CellTag::String) {
+        strings.push_back(cell->getAs<types::String::Primitive>());
+        return true;
+    } else if (tag == CellTag::ListView) {
+        return listStrings(cell->getAs<ListView>(), functionName, strings);
+    } else if (tag == CellTag::Null) {
+        return false;
+    }
+
+    throwCellTypeError(functionName, "a string or a list of strings", tag);
 }
 
 std::optional<types::Int64::Primitive> integerValueArgument(const Column* input, size_t row, std::string_view) {
@@ -5011,8 +5870,30 @@ std::optional<types::Int64::Primitive> unsignedValueArgument(const Column* input
 }
 
 template <typename ColumnT>
+std::optional<types::Point::Primitive> pointValueArgument(const Column* input, size_t row, std::string_view) {
+    return (*static_cast<const ColumnT*>(input))[row];
+}
+
+template <typename ColumnT>
+std::optional<types::Point::Primitive> cellPointArgument(const Column* input, size_t row, std::string_view functionName) {
+    const std::optional<CellView> cell = (*static_cast<const ColumnT*>(input))[row];
+    if (!cell.has_value()) {
+        return std::nullopt;
+    }
+
+    const CellTag tag = cell->getTag();
+    if (tag == CellTag::Point) {
+        return cell->getAs<types::Point::Primitive>();
+    } else if (tag == CellTag::Null) {
+        return std::nullopt;
+    }
+
+    throwCellTypeError(functionName, "a point", tag);
+}
+
+template <typename ColumnT>
 std::optional<types::Int64::Primitive> cellIntegerArgument(const Column* input, size_t row, std::string_view functionName) {
-    const std::optional<ListElementView> cell = (*static_cast<const ColumnT*>(input))[row];
+    const std::optional<CellView> cell = (*static_cast<const ColumnT*>(input))[row];
     if (!cell.has_value()) {
         return std::nullopt;
     }
@@ -5025,22 +5906,23 @@ std::optional<types::String::Primitive> nullStringRead(const Column*, size_t) {
     return std::nullopt;
 }
 
-// The list a type-erased cell holds, absent where the cell holds anything else
-std::optional<ListView> cellListRead(const ListElementView cell) {
-    if (cell.getTag() != ListBufferTypeTag::ListView) {
+std::optional<ListView> cellListRead(const CellView cell) {
+    if (holdsNull(cell)) {
         return std::nullopt;
+    } else if (holdsAList(cell)) {
+        return operandList(cell);
     }
 
-    return cell.getAs<ListView>();
+    throw IRException(fmt::format("A list slice or a percentile reads a list, not '{}'", queryTypeName(cell.getTag())));
 }
 
 std::optional<ListView> taggedListRead(const Column* input, size_t row) {
-    return cellListRead((*static_cast<const ColumnVector<ListElementView>*>(input))[row]);
+    return cellListRead((*static_cast<const ColumnVector<CellView>*>(input))[row]);
 }
 
 std::optional<ListView> optTaggedListRead(const Column* input, size_t row) {
-    const std::optional<ListElementView>& cell =
-        (*static_cast<const ColumnOptVector<ListElementView>*>(input))[row];
+    const std::optional<CellView>& cell =
+        (*static_cast<const ColumnOptVector<CellView>*>(input))[row];
 
     if (!cell) {
         return std::nullopt;
@@ -5050,18 +5932,148 @@ std::optional<ListView> optTaggedListRead(const Column* input, size_t row) {
 }
 
 std::optional<ListView> constTaggedListRead(const Column* input, size_t) {
-    return cellListRead(static_cast<const ColumnConst<ListElementView>*>(input)->getRaw());
+    return cellListRead(static_cast<const ColumnConst<CellView>*>(input)->getRaw());
 }
 
 std::optional<ListView> optConstTaggedListRead(const Column* input, size_t) {
-    const std::optional<ListElementView>& cell =
-        static_cast<const ColumnConst<std::optional<ListElementView>>*>(input)->getRaw();
+    const std::optional<CellView>& cell =
+        static_cast<const ColumnConst<std::optional<CellView>>*>(input)->getRaw();
 
     if (!cell) {
         return std::nullopt;
     }
 
     return cellListRead(*cell);
+}
+
+template <typename ColumnT>
+NLContainer listContainer(const Column* input, size_t row) {
+    const std::optional<ListView> list = (*static_cast<const ColumnT*>(input))[row];
+    if (!list) {
+        return NLContainer {};
+    }
+
+    return NLContainer {._list = list, ._keyed = NLKeylessValue {CellTag::ListView}};
+}
+
+template <typename ColumnT>
+NLContainer mapContainer(const Column* input, size_t row) {
+    return NLContainer {._keyed = mapRead<ColumnT>(input, row)};
+}
+
+template <typename ColumnT>
+NLContainer cellContainer(const Column* input, size_t row) {
+    const std::optional<CellView> cell = (*static_cast<const ColumnT*>(input))[row];
+    if (!holdsAList(cell)) {
+        return NLContainer {._keyed = readKeyedCell(cell)};
+    }
+
+    return NLContainer {._list = operandList(cell), ._keyed = NLKeylessValue {CellTag::ListView}};
+}
+
+NLSubscript subscriptOf(const CellView cell) {
+    const CellTag tag = cell.getTag();
+
+    switch (tag) {
+        case CellTag::Int:
+            return cell.getAs<types::Int64::Primitive>();
+        break;
+        case CellTag::UInt:
+            return cell.getAs<types::UInt64::Primitive>();
+        break;
+        case CellTag::String:
+            return cell.getAs<types::String::Primitive>();
+        break;
+        case CellTag::Null:
+            return std::monostate {};
+        break;
+        case CellTag::Double:
+        case CellTag::Bool:
+        case CellTag::Embedding:
+        case CellTag::ListView:
+        case CellTag::NodeID:
+        case CellTag::EdgeID:
+        case CellTag::DateTime:
+        case CellTag::MapView:
+        case CellTag::Duration:
+        case CellTag::Path:
+        case CellTag::Point:
+            return NLNeitherPositionNorKey {tag};
+        break;
+        case CellTag::INVALID:
+            throw IRException("an index reads an untagged cell");
+        break;
+    }
+
+    throw IRException("Unknown CellTag");
+}
+
+template <typename ColumnT>
+NLSubscript readSubscript(const Column* input, size_t row) {
+    const std::optional<CellView> cell = (*static_cast<const ColumnT*>(input))[row];
+    if (!cell) {
+        return std::monostate {};
+    }
+
+    return subscriptOf(*cell);
+}
+
+// A constant stands for every row of the other operand, which a WHERE may have left empty
+size_t pairedRowCount(const Column* lhs, const Column* rhs) {
+    const bool lhsIsConstant = lhs->getContainerKind() == ContainerKind::code<ColumnConst>();
+    const bool rhsIsConstant = rhs->getContainerKind() == ContainerKind::code<ColumnConst>();
+
+    if (lhsIsConstant && rhsIsConstant) {
+        return 1;
+    } else if (lhsIsConstant) {
+        return rhs->size();
+    } else if (rhsIsConstant) {
+        return lhs->size();
+    }
+
+    bioassert(lhs->size() == rhs->size(), "The two operands of a row-wise read are not row-aligned.");
+
+    return lhs->size();
+}
+
+std::optional<CellView> readContainerElement(const NLContainer& container,
+                                             const NLSubscript& subscript,
+                                             NLEntityProperties& properties,
+                                             MapBuffer<>& mapBuffer) {
+    const bool readsANull = std::holds_alternative<std::monostate>(subscript)
+                         || std::holds_alternative<std::monostate>(container._keyed);
+    const bool readsAPositionOfAList = container._list.has_value()
+                                    && !std::holds_alternative<NLNeitherPositionNorKey>(subscript);
+
+    if (readsANull) {
+        return std::nullopt;
+    } else if (const types::String::Primitive* key = std::get_if<types::String::Primitive>(&subscript)) {
+        MapEntryView entry;
+        if (!findKeyedEntry(container._keyed, *key, properties, mapBuffer, entry)) {
+            return std::nullopt;
+        }
+
+        return entry.getValue();
+    } else if (!readsAPositionOfAList) {
+        throwIndexTypeError(heldTag(container._keyed), heldTag(subscript));
+    } else if (const types::Int64::Primitive* position = std::get_if<types::Int64::Primitive>(&subscript)) {
+        return ListIndexImpl {}(*container._list, *position);
+    }
+
+    return ListIndexImpl {}(*container._list, std::get<types::UInt64::Primitive>(subscript));
+}
+
+template <typename Element>
+Element containerIndexResult(const std::optional<CellView>& element) {
+    if constexpr (std::is_same_v<Element, CellView>) {
+        return element.value_or(CellView::nullElement());
+    } else if constexpr (std::is_same_v<Element, std::optional<CellView>>) {
+        return element;
+    } else if constexpr (TypeUtils::is_optional_v<Element>) {
+        return ValueListIndexImpl<typename Element::value_type>::elementValue(element);
+    } else {
+        return ValueListIndexImpl<Element>::elementValue(element).value_or(Element {});
+    }
 }
 
 template <typename Primitive>
@@ -5074,6 +6086,48 @@ std::optional<types::Int64::Primitive> rangeBound(const Column* input, size_t ro
     return static_cast<types::Int64::Primitive>(*cell);
 }
 
+std::optional<types::Int64::Primitive> cellBound(const std::optional<CellView>& cell) {
+    if (!cell.has_value() || cell->getTag() == CellTag::Null) {
+        return std::nullopt;
+    } else if (cellHoldsAnInteger(*cell)) {
+        return cellInteger(*cell);
+    }
+
+    throw IRException(fmt::format("A range or a list slice reads an integer bound, not '{}'", queryTypeName(cell->getTag())));
+}
+
+template <typename Result, Result (*ReadCell)(const std::optional<CellView>&), typename ColumnT>
+Result readCellRow(const Column* input, size_t row) {
+    return ReadCell((*static_cast<const ColumnT*>(input))[row]);
+}
+
+template <typename Result, Result (*ReadCell)(const std::optional<CellView>&), typename ColumnT>
+Result readConstCell(const Column* input, size_t) {
+    return ReadCell(static_cast<const ColumnT*>(input)->getRaw());
+}
+
+template <typename Result>
+using CellRowRead = Result (*)(const Column* input, size_t row);
+
+// The read @param ReadCell makes of a row of a column of type-erased cells, in whichever of
+// the four layouts the column holds them; null for a column of another kind
+template <typename Result, Result (*ReadCell)(const std::optional<CellView>&)>
+CellRowRead<Result> selectCellRowRead(const Column* input) {
+    const ColumnKind::Code kind = input->getKind();
+
+    if (kind == ColumnVector<CellView>::staticKind()) {
+        return &readCellRow<Result, ReadCell, ColumnVector<CellView>>;
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
+        return &readCellRow<Result, ReadCell, ColumnOptVector<CellView>>;
+    } else if (kind == ColumnConst<CellView>::staticKind()) {
+        return &readConstCell<Result, ReadCell, ColumnConst<CellView>>;
+    } else if (kind == ColumnConst<std::optional<CellView>>::staticKind()) {
+        return &readConstCell<Result, ReadCell, ColumnConst<std::optional<CellView>>>;
+    }
+
+    return nullptr;
+}
+
 template <typename Primitive>
 std::optional<types::Double::Primitive> percentileArgument(const Column* input, size_t row) {
     const std::optional<Primitive>& cell = (*static_cast<const ColumnOptVector<Primitive>*>(input))[row];
@@ -5084,21 +6138,35 @@ std::optional<types::Double::Primitive> percentileArgument(const Column* input, 
     return static_cast<types::Double::Primitive>(*cell);
 }
 
+std::optional<types::Double::Primitive> cellPercentile(const std::optional<CellView>& cell) {
+    if (!cell.has_value() || cell->getTag() == CellTag::Null) {
+        return std::nullopt;
+    }
+
+    const std::optional<types::Double::Primitive> number = cellNumber(*cell);
+    if (!number) {
+        throw IRException(fmt::format("percentileCont() and percentileDisc() take a percentile between 0.0 and 1.0, not '{}'",
+                                      queryTypeName(cell->getTag())));
+    }
+
+    return number;
+}
+
 // The numbers one row's list holds, sorted. A percentile is taken of numbers alone, so any
 // other element is the error the row raises.
-void sortListNumbers(const ListView list, std::vector<ListElementView>& numbers, std::string_view functionName) {
+void sortListNumbers(const ListView list, std::vector<CellView>& numbers, std::string_view functionName) {
     numbers.clear();
 
-    for (const ListElementView element : list) {
-        const ListBufferTypeTag tag = element.getTag();
-        const bool isNumber = tag == ListBufferTypeTag::Int
-                           || tag == ListBufferTypeTag::UInt
-                           || tag == ListBufferTypeTag::Double;
+    for (const CellView element : list) {
+        const CellTag tag = element.getTag();
+        const bool isNumber = tag == CellTag::Int
+                           || tag == CellTag::UInt
+                           || tag == CellTag::Double;
 
-        if (tag == ListBufferTypeTag::Null) {
+        if (tag == CellTag::Null) {
             continue;
         } else if (!isNumber) {
-            throw IRException(fmt::format("{}() takes the percentile of numbers only", functionName));
+            throw IRException(fmt::format("{}() takes the percentile of numbers, not '{}'", functionName, queryTypeName(tag)));
         }
 
         numbers.push_back(element);
@@ -5116,7 +6184,7 @@ void throwIfNotAPercentile(double percentile, std::string_view functionName) {
 
 // The value at the percentile's position among the sorted numbers, interpolated between
 // the two around it where the position falls between them
-double continuousPercentile(const std::vector<ListElementView>& sorted, double percentile) {
+double continuousPercentile(const std::vector<CellView>& sorted, double percentile) {
     const double position = percentile * static_cast<double>(sorted.size() - 1);
     const size_t below = static_cast<size_t>(position);
     const size_t above = static_cast<size_t>(std::ceil(position));
@@ -5140,16 +6208,16 @@ size_t discretePercentilePosition(size_t count, double percentile) {
 
 template <typename Result>
 Result absentPercentile() {
-    if constexpr (std::is_same_v<Result, ListElementView>) {
-        return ListElementView::nullElement();
+    if constexpr (std::is_same_v<Result, CellView>) {
+        return CellView::nullElement();
     } else {
         return std::nullopt;
     }
 }
 
 template <typename Result>
-Result percentileElement(const ListElementView element) {
-    if constexpr (std::is_same_v<Result, ListElementView>) {
+Result percentileElement(const CellView element) {
+    if constexpr (std::is_same_v<Result, CellView>) {
         return element;
     } else {
         return element.getAs<typename Result::value_type>();
@@ -5172,7 +6240,7 @@ void runPercentileRows(const NLPercentileData* data, std::string_view functionNa
     std::vector<Result>& outputRaw = static_cast<ColumnVector<Result>*>(data->getResult())->getRaw();
     outputRaw.resize(rowCount);
 
-    std::vector<ListElementView> numbers;
+    std::vector<CellView> numbers;
 
     for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
         const std::optional<ListView> values = listRead(list, rowIndex);
@@ -5227,19 +6295,32 @@ Item validIDItem(const Column* input, size_t row, NLStepBuffers*) {
     return Item {id};
 }
 
+// The path sibling of validIDItem: the path an OPTIONAL MATCH left where its pattern missed
+// holds no node, and is stored as the tagged null. A kept path views the IDs its column holds
+// for the step, as a string element views the characters of its column.
+template <typename Item>
+Item pathItem(const Column* input, size_t row, NLStepBuffers*) {
+    const GraphPath& path = (*static_cast<const ColumnVector<GraphPath>*>(input))[row];
+    if (path.isNull()) {
+        return Item {PropertyNull {}};
+    }
+
+    return Item {PathView {path.getIDs()}};
+}
+
 // The sibling of valueItem for a type-erased column: the cell already carries the tag its
 // value is stored under, so it is stored as the type that tag names.
 template <typename Item>
 Item taggedColumnItem(const Column* input, size_t row, NLStepBuffers*) {
-    return taggedItem<Item>((*static_cast<const ColumnVector<ListElementView>*>(input))[row]);
+    return taggedItem<Item>((*static_cast<const ColumnVector<CellView>*>(input))[row]);
 }
 
 // The nullable sibling of taggedColumnItem: a column an OPTIONAL MATCH padded, or one an
 // index read off a list, has no cell in every row.
 template <typename Item>
 Item optTaggedColumnItem(const Column* input, size_t row, NLStepBuffers*) {
-    const std::optional<ListElementView>& element =
-        (*static_cast<const ColumnOptVector<ListElementView>*>(input))[row];
+    const std::optional<CellView>& element =
+        (*static_cast<const ColumnOptVector<CellView>*>(input))[row];
     if (!element.has_value()) {
         return Item {PropertyNull {}};
     }
@@ -5271,23 +6352,28 @@ void selectCollectOptIDHandlers(bool distinctValues,
 template <typename Primitive>
 void groupEmitCopy(const Column* accumulator,
                    const std::vector<uint64_t>& counts,
+                   const std::vector<__int128>& durationTotals,
                    size_t begin,
                    size_t count,
-                   Column* output) {
+                   Column* output,
+                   NLStepBuffers* stepBuffers) {
     const auto& raw = static_cast<const ColumnOptVector<Primitive>*>(accumulator)->getRaw();
     auto& outputRaw = static_cast<ColumnOptVector<Primitive>*>(output)->getRaw();
     outputRaw.assign(raw.begin() + begin, raw.begin() + begin + count);
 }
 
-// Emit an avg slice: divide each group's running f64 sum by its non-null count. A
+// Emit an avg slice: divide each group's running total by its non-null count. A
 // group with no non-null row (count zero) averages to null, matching Cypher.
+template <typename Total>
 void groupEmitAvg(const Column* accumulator,
                   const std::vector<uint64_t>& counts,
+                  const std::vector<__int128>& durationTotals,
                   size_t begin,
                   size_t count,
-                  Column* output) {
-    const auto& raw = static_cast<const ColumnOptVector<double>*>(accumulator)->getRaw();
-    auto& outputRaw = static_cast<ColumnOptVector<double>*>(output)->getRaw();
+                  Column* output,
+                  NLStepBuffers* stepBuffers) {
+    const auto& raw = static_cast<const ColumnOptVector<Total>*>(accumulator)->getRaw();
+    auto& outputRaw = static_cast<ColumnOptVector<Total>*>(output)->getRaw();
     outputRaw.resize(count);
 
     for (size_t index = 0; index < count; index++) {
@@ -5295,8 +6381,83 @@ void groupEmitAvg(const Column* accumulator,
         if (counts[group] == 0) {
             outputRaw[index] = std::nullopt;
         } else {
-            outputRaw[index] = std::optional<double>(raw[group].value() / static_cast<double>(counts[group]));
+            outputRaw[index] = std::optional<Total>(averageOf(raw[group].value(), counts[group]));
         }
+    }
+}
+
+void groupEmitDurationSum(const Column* accumulator,
+                          const std::vector<uint64_t>& counts,
+                          const std::vector<__int128>& durationTotals,
+                          size_t begin,
+                          size_t count,
+                          Column* output,
+                          NLStepBuffers* stepBuffers) {
+    auto& outputRaw = static_cast<ColumnOptVector<types::Duration::Primitive>*>(output)->getRaw();
+    outputRaw.resize(count);
+
+    for (size_t index = 0; index < count; index++) {
+        outputRaw[index] = durationOfTotal(durationTotals[begin + index]);
+    }
+}
+
+void groupEmitDurationAverage(const Column* accumulator,
+                              const std::vector<uint64_t>& counts,
+                              const std::vector<__int128>& durationTotals,
+                              size_t begin,
+                              size_t count,
+                              Column* output,
+                              NLStepBuffers* stepBuffers) {
+    auto& outputRaw = static_cast<ColumnOptVector<types::Duration::Primitive>*>(output)->getRaw();
+    outputRaw.resize(count);
+
+    for (size_t index = 0; index < count; index++) {
+        const size_t group = begin + index;
+        if (counts[group] == 0) {
+            outputRaw[index] = std::nullopt;
+        } else {
+            outputRaw[index] = averageOf(durationTotals[group], counts[group]);
+        }
+    }
+}
+
+void groupEmitTaggedSum(const Column* accumulator,
+                        const std::vector<uint64_t>& counts,
+                        const std::vector<__int128>& durationTotals,
+                        size_t begin,
+                        size_t count,
+                        Column* output,
+                        NLStepBuffers* stepBuffers) {
+    const auto& raw = static_cast<const ColumnOptVector<CellView>*>(accumulator)->getRaw();
+    auto& outputRaw = static_cast<ColumnOptVector<CellView>*>(output)->getRaw();
+    QueryListBuffer& cells = stepBuffers->listBuffer();
+    outputRaw.resize(count);
+
+    for (size_t index = 0; index < count; index++) {
+        const size_t group = begin + index;
+        const NLTaggedSum sum(raw[group], durationTotals[group]);
+
+        outputRaw[index] = sum.sum(cells);
+    }
+}
+
+void groupEmitTaggedAvg(const Column* accumulator,
+                        const std::vector<uint64_t>& counts,
+                        const std::vector<__int128>& durationTotals,
+                        size_t begin,
+                        size_t count,
+                        Column* output,
+                        NLStepBuffers* stepBuffers) {
+    const auto& raw = static_cast<const ColumnOptVector<CellView>*>(accumulator)->getRaw();
+    auto& outputRaw = static_cast<ColumnOptVector<CellView>*>(output)->getRaw();
+    QueryListBuffer& cells = stepBuffers->listBuffer();
+    outputRaw.resize(count);
+
+    for (size_t index = 0; index < count; index++) {
+        const size_t group = begin + index;
+        const NLTaggedSum sum(raw[group], durationTotals[group]);
+
+        outputRaw[index] = sum.average(counts[group], cells);
     }
 }
 
@@ -5304,15 +6465,18 @@ void groupEmitAvg(const Column* accumulator,
 // tallies of groups [begin, begin + count) into the ui64 output.
 void groupEmitCount(const Column* accumulator,
                     const std::vector<uint64_t>& counts,
+                    const std::vector<__int128>& durationTotals,
                     size_t begin,
                     size_t count,
-                    Column* output) {
+                    Column* output,
+                    NLStepBuffers* stepBuffers) {
     auto& outputRaw = static_cast<ColumnVector<uint64_t>*>(output)->getRaw();
     outputRaw.assign(counts.begin() + begin, counts.begin() + begin + count);
 }
 
 // The grouped sum fold for a column of this value type. sum adds the values, so
-// only a numeric column is valid - the same restriction as the scalar selectSumUpdate.
+// only a numeric or a duration column is valid - the same restriction as the scalar
+// selectSumUpdate.
 NLGroupAggregateFoldFunction selectGroupSumFold(ValueType inputType) {
     switch (inputType) {
         case ValueType::Int64:
@@ -5327,16 +6491,20 @@ NLGroupAggregateFoldFunction selectGroupSumFold(ValueType inputType) {
             return &groupFoldSum<types::Double::Primitive>;
         break;
 
+        case ValueType::Duration:
+            return &groupFoldDurationTotal</*Distinct=*/false, /*Averages=*/false>;
+        break;
+
         default:
-            throw IRException("sum requires a numeric column");
+            throw IRException("sum requires a numeric or a duration column");
         break;
     }
 
     return nullptr;
 }
 
-// The grouped sum(DISTINCT x) fold for a column of this value type: sum's numeric
-// domain, reduced over each group's distinct values.
+// The grouped sum(DISTINCT x) fold for a column of this value type: sum's domain,
+// reduced over each group's distinct values.
 NLGroupAggregateFoldFunction selectGroupSumDistinctFold(ValueType inputType) {
     switch (inputType) {
         case ValueType::Int64:
@@ -5351,16 +6519,21 @@ NLGroupAggregateFoldFunction selectGroupSumDistinctFold(ValueType inputType) {
             return &groupFoldSumDistinct<types::Double::Primitive>;
         break;
 
+        case ValueType::Duration:
+            return &groupFoldDurationTotal</*Distinct=*/true, /*Averages=*/false>;
+        break;
+
         default:
-            throw IRException("sum requires a numeric column");
+            throw IRException("sum requires a numeric or a duration column");
         break;
     }
 
     return nullptr;
 }
 
-// The grouped avg fold for a column of this value type. avg widens each value to
-// f64, so - like sum - only a numeric column is valid.
+// The grouped avg fold for a column of this value type. avg widens each number to
+// f64 and sums durations as durations, so - like sum - only a numeric or a duration
+// column is valid.
 NLGroupAggregateFoldFunction selectGroupAvgFold(ValueType inputType) {
     switch (inputType) {
         case ValueType::Int64:
@@ -5375,16 +6548,24 @@ NLGroupAggregateFoldFunction selectGroupAvgFold(ValueType inputType) {
             return &groupFoldAvg<types::Double::Primitive>;
         break;
 
+        case ValueType::Duration:
+            return &groupFoldDurationTotal</*Distinct=*/false, /*Averages=*/true>;
+        break;
+
+        case ValueType::Point:
+            return &groupFoldAvg<types::Point::Primitive>;
+        break;
+
         default:
-            throw IRException("avg requires a numeric column");
+            throw IRException("avg requires a numeric, a duration or a point column");
         break;
     }
 
     return nullptr;
 }
 
-// The grouped avg(DISTINCT x) fold for a column of this value type: avg's numeric
-// domain, averaged over each group's distinct values.
+// The grouped avg(DISTINCT x) fold for a column of this value type: avg's domain,
+// averaged over each group's distinct values.
 NLGroupAggregateFoldFunction selectGroupAvgDistinctFold(ValueType inputType) {
     switch (inputType) {
         case ValueType::Int64:
@@ -5399,8 +6580,16 @@ NLGroupAggregateFoldFunction selectGroupAvgDistinctFold(ValueType inputType) {
             return &groupFoldAvgDistinct<types::Double::Primitive>;
         break;
 
+        case ValueType::Duration:
+            return &groupFoldDurationTotal</*Distinct=*/true, /*Averages=*/true>;
+        break;
+
+        case ValueType::Point:
+            return &groupFoldAvgDistinct<types::Point::Primitive>;
+        break;
+
         default:
-            throw IRException("avg requires a numeric column");
+            throw IRException("avg requires a numeric, a duration or a point column");
         break;
     }
 
@@ -5439,6 +6628,10 @@ NLGroupAggregateFoldFunction selectGroupMinMaxFold(ValueType inputType) {
 
         case ValueType::Duration:
             return &groupFoldMinMax<types::Duration::Primitive, IsMax>;
+        break;
+
+        case ValueType::Point:
+            return &groupFoldMinMax<types::Point::Primitive, IsMax>;
         break;
 
         case ValueType::List:
@@ -5487,6 +6680,10 @@ NLGroupAggregateFoldFunction selectGroupFirstFold(ValueType inputType) {
 
         case ValueType::Duration:
             return &groupFoldFirst<types::Duration::Primitive>;
+        break;
+
+        case ValueType::Point:
+            return &groupFoldFirst<types::Point::Primitive>;
         break;
 
         case ValueType::List:
@@ -5680,8 +6877,221 @@ void setPendingProperty(CommitWriteBuffer::UntypedProperties& properties,
     properties.push_back(property);
 }
 
-bool writeTouchesRow(const ColumnMask* rows, size_t row) {
-    return !rows || (*rows)[row];
+template <TypedInternalID IDT>
+bool setWritesRow(const ColumnMask* rows, IDT entity, size_t row) {
+    return writeTouchesRow(rows, row) && entity.isValid();
+}
+
+template <typename IDColumn>
+void markWrittenRows(const IDColumn* entities, const ColumnMask* rows, ColumnMask& written) {
+    const auto& raw = entities->getRaw();
+    written.resize(raw.size());
+
+    for (size_t row = 0; row < raw.size(); row++) {
+        written[row] = setWritesRow(rows, raw[row], row);
+    }
+}
+
+// Stages the values a SET writes in @param buffer and answers the property it writes them
+// to: invalid where it writes nothing
+template <typename SetData>
+PropertyTypeID stageSetProperty(MetadataBuilder* metadataBuilder,
+                                SetData* setData,
+                                size_t rowCount,
+                                CommitWriteBuffer::UntypedProperties& buffer) {
+    NLRuntimeProperty* runtimeProperty = setData->getRuntimeProperty();
+    const PropertyTypeID propertyTypeID = setData->getPropertyTypeID();
+    const Column* values = setData->getValue();
+
+    if (!runtimeProperty) {
+        extractColumnProperties(values, rowCount, propertyTypeID, buffer);
+        return propertyTypeID;
+    } else if (setData->writesNull()) {
+        const bool staged = runtimeProperty->stageNulls(metadataBuilder, rowCount, buffer);
+        return staged ? runtimeProperty->getType()._id : PropertyTypeID {};
+    }
+
+    ColumnMask* written = setData->getWrittenRows();
+    markWrittenRows(setData->getInput(), setData->getRows(), *written);
+
+    const bool staged = runtimeProperty->stage(metadataBuilder, values, rowCount, written, buffer);
+
+    return staged ? runtimeProperty->getType()._id : PropertyTypeID {};
+}
+
+// False for a chunk of nulls held in cells reaching a property with no type, which writes
+// it nothing
+bool stageCreatedProperty(MetadataBuilder* metadataBuilder,
+                          const NLCreatedProperty& property,
+                          size_t rowCount,
+                          CommitWriteBuffer::UntypedProperties& buffer) {
+    if (property._runtimeProperty) {
+        return property._runtimeProperty->stage(metadataBuilder, property._values, rowCount, nullptr, buffer);
+    }
+
+    extractColumnProperties(property._values, rowCount, property._propertyTypeID, buffer);
+
+    return true;
+}
+
+bool isSameMap(const WrittenMap& lhs, const WrittenMap& rhs) {
+    const bool holdsAnotherKind = lhs._tag != rhs._tag || lhs._map.has_value() != rhs._map.has_value();
+
+    if (holdsAnotherKind) {
+        return false;
+    } else if (!lhs._map) {
+        return true;
+    }
+
+    const std::span<const MapEntryView> lhsEntries = lhs._map->entries();
+    const std::span<const MapEntryView> rhsEntries = rhs._map->entries();
+
+    return lhsEntries.data() == rhsEntries.data() && lhsEntries.size() == rhsEntries.size();
+}
+
+template <typename IDs, typename Visit>
+void visitWrittenMapRows(const std::vector<WrittenMap>& maps,
+                         const ColumnMask* rows,
+                         const IDs& raw,
+                         size_t rowCount,
+                         Visit visit) {
+    const WrittenMap* previousMap = nullptr;
+
+    for (size_t row = 0; row < rowCount; row++) {
+        if (!setWritesRow(rows, raw[row], row)) {
+            continue;
+        }
+
+        const bool holdsAnotherMap = !previousMap || !isSameMap(*previousMap, maps[row]);
+        visit(row, holdsAnotherMap);
+
+        previousMap = &maps[row];
+    }
+}
+
+template <typename IDColumn>
+void runSetProperties(NLExecutionContext* context, NLFunctionData* data) {
+    constexpr bool WRITES_NODES = std::is_same_v<IDColumn, ColumnNodeIDs>;
+
+    NLSetPropertiesData<IDColumn>* setData = static_cast<NLSetPropertiesData<IDColumn>*>(data);
+    CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
+    bioassert(writeBuffer, "A properties write requires an active write transaction");
+
+    const IDColumn* entities = setData->getInput();
+    const size_t rowCount = entities->size();
+
+    std::vector<WrittenMap>& maps = setData->getMaps();
+    if (setData->writesNull()) {
+        maps.assign(rowCount, WrittenMap {std::nullopt, CellTag::Null});
+    } else {
+        extractWrittenMaps(setData->getValue(), rowCount, maps);
+    }
+
+    const GraphView* view = context->getView();
+    MetadataBuilder* metadataBuilder = context->getMetadataBuilder();
+    const ColumnMask* rows = setData->getRows();
+    const bool replaces = setData->getReplaces();
+    const auto& raw = entities->getRaw();
+
+    std::vector<MapKeyPropertyType>& keyTypes = setData->getKeyTypes();
+    std::vector<MapKeyCreatedType> createdTypes;
+
+    forgetUntypedMapKeys(keyTypes);
+    visitWrittenMapRows(maps, rows, raw, rowCount, [&](size_t row, bool holdsAnotherMap) {
+        if (holdsAnotherMap) {
+            widenCreatedMapKeyTypes(maps[row], view, metadataBuilder, keyTypes, createdTypes);
+        }
+    });
+
+    for (const MapKeyCreatedType& created : createdTypes) {
+        metadataBuilder->getOrCreatePropertyType(created._key, created._type);
+    }
+
+    CommitWriteBuffer::UntypedProperties& mapProperties = setData->getMapProperties();
+    std::vector<StagedRange>& mapRanges = setData->getMapRanges();
+
+    mapProperties.clear();
+    mapRanges.assign(rowCount, StagedRange {});
+
+    StagedRange stagedRange;
+
+    forgetUntypedMapKeys(keyTypes);
+    visitWrittenMapRows(maps, rows, raw, rowCount, [&](size_t row, bool holdsAnotherMap) {
+        if (holdsAnotherMap) {
+            const size_t begin = mapProperties.size();
+            stageMapProperties(maps[row], view, metadataBuilder, keyTypes, mapProperties);
+
+            stagedRange = StagedRange {begin, mapProperties.size()};
+        }
+
+        mapRanges[row] = stagedRange;
+    });
+
+    const size_t firstPendingID = WRITES_NODES ? committedNodeCount(view) : committedEdgeCount(view);
+    const size_t pendingCount = WRITES_NODES ? writeBuffer->numPendingNodes() : writeBuffer->numPendingEdges();
+    const PendingRows pendingRows(setData->getPending(), setData->isAllPending(), firstPendingID, pendingCount);
+    NLWrittenValues& written = context->getWrittenValues();
+
+    std::optional<NLEntityProperties> heldProperties;
+    if (replaces) {
+        heldProperties.emplace(context, nullptr);
+    }
+
+    CommitWriteBuffer::UntypedProperties& removals = setData->getRemovals();
+    std::vector<PropertyTypeID>& held = setData->getHeld();
+    std::vector<ValueType>& heldTypes = setData->getHeldTypes();
+
+    for (size_t row = 0; row < rowCount; row++) {
+        if (!setWritesRow(rows, raw[row], row)) {
+            continue;
+        }
+
+        const StagedRange& range = mapRanges[row];
+        const std::span<CommitWriteBuffer::UntypedProperty> writes {mapProperties.begin() + range._begin,
+                                                                    mapProperties.begin() + range._end};
+
+        removals.clear();
+        if (replaces) {
+            heldProperties->readIDs(raw[row], held);
+            stageRemovals(held, writes, view, metadataBuilder, heldTypes, removals);
+        }
+
+        const uint64_t id = raw[row].getValue();
+
+        if (pendingRows.has(row, id)) {
+            const size_t offset = id - firstPendingID;
+
+            if constexpr (WRITES_NODES) {
+                CommitWriteBuffer::PendingNode& node = writeBuffer->getPendingNode(offset);
+                const auto writeProperty = [&](const CommitWriteBuffer::UntypedProperty& property) {
+                    setPendingProperty(node.properties, property);
+                    written.addPendingNodeUpdate(offset, property.propertyID);
+                };
+
+                std::ranges::for_each(writes, writeProperty);
+                std::ranges::for_each(removals, writeProperty);
+            } else {
+                CommitWriteBuffer::PendingEdge& edge = writeBuffer->getPendingEdge(offset);
+                const auto writeProperty = [&](const CommitWriteBuffer::UntypedProperty& property) {
+                    setPendingProperty(edge.properties, property);
+                };
+
+                std::ranges::for_each(writes, writeProperty);
+                std::ranges::for_each(removals, writeProperty);
+            }
+        } else {
+            const auto writeProperty = [&](CommitWriteBuffer::UntypedProperty& property) {
+                if constexpr (WRITES_NODES) {
+                    writeBuffer->addNodeUpdate(raw[row], property);
+                } else {
+                    writeBuffer->addEdgeUpdate(raw[row], property);
+                }
+            };
+
+            std::ranges::for_each(writes, writeProperty);
+            std::ranges::for_each(removals, writeProperty);
+        }
+    }
 }
 
 // The searched value as the write buffer holds one, so a scan can compare it against what
@@ -6095,30 +7505,31 @@ void shortestPathSearch(NLExecutionContext* context, NLShortestPathLoopData* loo
 
     Column* dist = loopData->getDistanceOutput();
     auto* distCol = static_cast<ColumnVector<EdgePropType>*>(dist);
-    ColumnVector<Path>* pathCol = loopData->getPathOutput();
+    ColumnVector<GraphPath>* pathCol = loopData->getPathOutput();
 
     distCol->clear();
     pathCol->clear();
 
     // Get the total length of the path
     distCol->push_back(heap.top().distance);
-    auto& pathVec = pathCol->emplace_back();
+    GraphPath& path = pathCol->emplace_back();
 
     // In the heap all the (non-stale) values represent the shortest path to that
     // nodeID from the source set. So we can find the shortet path by following the
     // previousNode back from the target node that we have found.
     auto lastNode = heap.top().prevNode;
     auto edge = heap.top().edge;
-    pathVec.push_back(heap.top().id.getValue());
+    path.start(heap.top().id);
 
     while (lastNode.isValid()) {
-        pathVec.push_back(edge.getValue());
-        pathVec.push_back(lastNode.getValue());
+        path.addHop(edge, lastNode);
 
         const auto& pathInfo = heapValueMap[lastNode];
         lastNode = pathInfo.prevNode;
         edge = pathInfo.edge;
     }
+
+    std::ranges::reverse(path.getIDs());
 
     runBody(context, loopData->getStmts());
 }
@@ -6130,7 +7541,7 @@ NLExecutor::NLExecutor(const GraphView* view,
                        NLOutputSink* sink,
                        CommitWriteBuffer* writeBuffer,
                        const NLSystemContext* system,
-                       const MetadataBuilder* metadataBuilder)
+                       MetadataBuilder* metadataBuilder)
     : _ctxt(view, sink, prog->getChunkSize(), writeBuffer, system, metadataBuilder),
     _prog(prog)
 {
@@ -6162,24 +7573,29 @@ void NLExecutor::runCreateNode(NLExecutionContext* context, NLFunctionData* data
     const size_t rowCount = createData->getRowCount();
     const LabelSetHandle labelsetHandle = createData->getLabelSetHandle();
 
+    MetadataBuilder* metadataBuilder = context->getMetadataBuilder();
+
+    const std::vector<NLCreateNodeData::Property>& properties = createData->properties();
+    std::vector<CommitWriteBuffer::UntypedProperties> extracted;
+    extracted.reserve(properties.size());
+
+    for (const NLCreateNodeData::Property& property : properties) {
+        CommitWriteBuffer::UntypedProperties& values = extracted.emplace_back();
+
+        if (!stageCreatedProperty(metadataBuilder, property, rowCount, values)) {
+            extracted.pop_back();
+        }
+    }
+
     // Must extract this value before adding in the loop
     const size_t numPendingNodes = writeBuffer->numPendingNodes();
 
     for (size_t row = 0; row < rowCount; row++) {
         CommitWriteBuffer::PendingNode& node = writeBuffer->newPendingNode();
         node.labelsetHandle = labelsetHandle;
-    }
 
-    CommitWriteBuffer::UntypedProperties propsBuffer;
-
-    for (const NLCreateNodeData::Property& prop : createData->properties()) {
-        extractColumnProperties(prop._values, rowCount, prop._propertyTypeID, propsBuffer);
-
-        for (size_t row = 0; row < rowCount; row++) {
-            CommitWriteBuffer::PendingNode& pendingNode =
-                writeBuffer->getPendingNode(numPendingNodes + row);
-            CommitWriteBuffer::UntypedProperties& properties = pendingNode.properties;
-            properties.push_back(propsBuffer[row]);
+        for (const CommitWriteBuffer::UntypedProperties& values : extracted) {
+            node.properties.push_back(values[row]);
         }
     }
 
@@ -6224,6 +7640,20 @@ void NLExecutor::runCreateEdge(NLExecutionContext* context, NLFunctionData* data
     const PendingRows srcRows(srcPending, srcIsPending, firstPendingNodeID, numPendingNodes);
     const PendingRows tgtRows(tgtPending, tgtIsPending, firstPendingNodeID, numPendingNodes);
 
+    MetadataBuilder* metadataBuilder = context->getMetadataBuilder();
+
+    const std::vector<NLCreateEdgeData::Property>& properties = createData->properties();
+    std::vector<CommitWriteBuffer::UntypedProperties> extracted;
+    extracted.reserve(properties.size());
+
+    for (const NLCreateEdgeData::Property& property : properties) {
+        CommitWriteBuffer::UntypedProperties& values = extracted.emplace_back();
+
+        if (!stageCreatedProperty(metadataBuilder, property, rowCount, values)) {
+            extracted.pop_back();
+        }
+    }
+
     // Must extract this value before adding in the loop
     const size_t numPendingEdges = writeBuffer->numPendingEdges();
 
@@ -6233,15 +7663,9 @@ void NLExecutor::runCreateEdge(NLExecutionContext* context, NLFunctionData* data
 
         CommitWriteBuffer::PendingEdge& edge = writeBuffer->newPendingEdge(srcNode, tgtNode);
         edge.edgeType = edgeTypeID;
-    }
 
-    CommitWriteBuffer::UntypedProperties propsBuffer;
-
-    for (const NLCreateEdgeData::Property& prop : createData->properties()) {
-        extractColumnProperties(prop._values, rowCount, prop._propertyTypeID, propsBuffer);
-
-        for (size_t row = 0; row < rowCount; row++) {
-            writeBuffer->getPendingEdge(numPendingEdges + row).properties.push_back(propsBuffer[row]);
+        for (const CommitWriteBuffer::UntypedProperties& values : extracted) {
+            edge.properties.push_back(values[row]);
         }
     }
 
@@ -6263,16 +7687,9 @@ void NLExecutor::runSetNodeProperty(NLExecutionContext* context, NLFunctionData*
     const size_t rowCount = nodes->size();
 
     CommitWriteBuffer::UntypedProperties propsBuffer;
-    const PropertyTypeID propID = setData->getPropertyTypeID();
-    const ValueType nullValueType = setData->getNullValueType();
-    const ValueType listElementValueType = setData->getListElementValueType();
-
-    if (nullValueType != ValueType::Invalid) {
-        fillNullProperties(rowCount, propID, nullValueType, propsBuffer);
-    } else if (listElementValueType != ValueType::Invalid) {
-        extractListElementProperties(setData->getValue(), rowCount, propID, listElementValueType, propsBuffer);
-    } else {
-        extractColumnProperties(setData->getValue(), rowCount, propID, propsBuffer);
+    const PropertyTypeID propID = stageSetProperty(context->getMetadataBuilder(), setData, rowCount, propsBuffer);
+    if (!propID.isValid()) {
+        return;
     }
 
     const ColumnMask* pending = setData->getPending();
@@ -6288,7 +7705,7 @@ void NLExecutor::runSetNodeProperty(NLExecutionContext* context, NLFunctionData*
     // wrote, where it is not.
     const auto& raw = nodes->getRaw();
     for (size_t row = 0; row < rowCount; row++) {
-        if (!writeTouchesRow(rows, row) || !raw[row].isValid()) {
+        if (!setWritesRow(rows, raw[row], row)) {
             continue;
         }
 
@@ -6310,18 +7727,11 @@ void NLExecutor::runSetEdgeProperty(NLExecutionContext* context, NLFunctionData*
 
     const ColumnEdgeIDs* edges = setData->getInput();
     const size_t rowCount = edges->size();
-    const PropertyTypeID propID = setData->getPropertyTypeID();
-    const ValueType nullValueType = setData->getNullValueType();
-    const ValueType listElementValueType = setData->getListElementValueType();
 
     CommitWriteBuffer::UntypedProperties propsBuffer;
-
-    if (nullValueType != ValueType::Invalid) {
-        fillNullProperties(rowCount, propID, nullValueType, propsBuffer);
-    } else if (listElementValueType != ValueType::Invalid) {
-        extractListElementProperties(setData->getValue(), rowCount, propID, listElementValueType, propsBuffer);
-    } else {
-        extractColumnProperties(setData->getValue(), rowCount, propID, propsBuffer);
+    const PropertyTypeID propID = stageSetProperty(context->getMetadataBuilder(), setData, rowCount, propsBuffer);
+    if (!propID.isValid()) {
+        return;
     }
 
     const ColumnMask* pending = setData->getPending();
@@ -6333,7 +7743,7 @@ void NLExecutor::runSetEdgeProperty(NLExecutionContext* context, NLFunctionData*
 
     const auto& raw = edges->getRaw();
     for (size_t row = 0; row < rowCount; row++) {
-        if (!writeTouchesRow(rows, row) || !raw[row].isValid()) {
+        if (!setWritesRow(rows, raw[row], row)) {
             continue;
         }
 
@@ -6345,6 +7755,14 @@ void NLExecutor::runSetEdgeProperty(NLExecutionContext* context, NLFunctionData*
             writeBuffer->addEdgeUpdate(raw[row], propsBuffer[row]);
         }
     }
+}
+
+void NLExecutor::runSetNodeProperties(NLExecutionContext* context, NLFunctionData* data) {
+    runSetProperties<ColumnNodeIDs>(context, data);
+}
+
+void NLExecutor::runSetEdgeProperties(NLExecutionContext* context, NLFunctionData* data) {
+    runSetProperties<ColumnEdgeIDs>(context, data);
 }
 
 void NLExecutor::runDeleteNode(NLExecutionContext* context, NLFunctionData* data) {
@@ -7896,10 +9314,12 @@ void NLExecutor::runPathLength(NLExecutionContext* context, NLFunctionData* data
     const std::vector<PathRef>& paths = length->getPaths()->getRaw();
     std::vector<uint64_t>& lengths = length->getOutput()->getRaw();
     const PathTrie& trie = *length->getTrie();
+    const size_t steps = length->getSteps();
+    const uint64_t seed = length->countsNodes() ? 1 : 0;
 
     lengths.resize(paths.size());
     for (size_t row = 0; row < paths.size(); row++) {
-        lengths[row] = trie.getDepth(paths[row]);
+        lengths[row] = trie.getDepth(paths[row]) / steps + seed;
     }
 }
 
@@ -7911,57 +9331,67 @@ void NLExecutor::runPathElements(NLExecutionContext* context, NLFunctionData* da
     QueryListBuffer& listBuffer = *elements->getListBuffer();
     listBuffer.clear();
 
-    if (paths->getKind() == ColumnVector<Path>::staticKind()) {
-        readPathElements(static_cast<const ColumnVector<Path>*>(paths)->getRaw(), kind, output, listBuffer);
-    } else {
-        readPathElements(static_cast<const ColumnVector<EntityList>*>(paths)->getRaw(), kind, output, listBuffer);
-    }
+    readPathElements(paths, elements->getRead(), kind, output, listBuffer);
 }
 
 void NLExecutor::runMakePath(NLExecutionContext* context, NLFunctionData* data) {
     const NLMakePathData* make = static_cast<NLMakePathData*>(data);
-    const NLMakePathData::PathEntities& entities = make->entities();
-    std::vector<EntityList>& paths = make->getOutput()->getRaw();
+    const NLMakePathData::PathSteps& steps = make->steps();
+    std::vector<GraphPath>& paths = make->getOutput()->getRaw();
     const PathTrie& trie = *make->getTrie();
 
-    bioassert(!entities.empty(), "nl.make_path builds a path out of at least one node");
+    bioassert(!steps.empty(), "nl.make_path builds a path out of at least one node");
 
-    // Every entity column is row-aligned with the others, so the first gives the rows
-    const size_t rowCount = entities.front()._column->size();
+    const NLPathStep& firstStep = steps.front();
+    const size_t rowCount = firstStep._nodes ? firstStep._nodes->size() : firstStep._walks->size();
 
-    const auto isRowAligned = [rowCount](const NLPathEntity& entity) {
-        return entity._column->size() == rowCount;
+    const auto isRowAligned = [rowCount](const NLPathStep& step) {
+        const bool nodesAligned = !step._nodes || step._nodes->size() == rowCount;
+        const bool edgesAligned = !step._edges || step._edges->size() == rowCount;
+        const bool walksAligned = !step._walks || step._walks->size() == rowCount;
+
+        return nodesAligned && edgesAligned && walksAligned;
     };
-    bioassert(std::ranges::all_of(entities, isRowAligned),
+    bioassert(std::ranges::all_of(steps, isRowAligned),
               "Entity columns of a path build are not row-aligned.");
 
     paths.resize(rowCount);
-    for (EntityList& path : paths) {
+    for (GraphPath& path : paths) {
         path.clear();
     }
 
-    for (const NLPathEntity& entity : entities) {
-        switch (entity._kind) {
-            case NLPathEntity::Kind::Node: {
-                const std::vector<NodeID>& nodes = static_cast<const ColumnNodeIDs*>(entity._column)->getRaw();
+    for (const NLPathStep& step : steps) {
+        switch (step._kind) {
+            case NLPathStep::Kind::Start: {
+                const std::vector<NodeID>& nodes = step._nodes->getRaw();
                 for (size_t row = 0; row < rowCount; row++) {
-                    paths[row].add(EntityType::Node, EntityID(nodes[row].getValue()));
+                    paths[row].start(nodes[row]);
                 }
             }
             break;
 
-            case NLPathEntity::Kind::Edge: {
-                const std::vector<EdgeID>& edges = static_cast<const ColumnEdgeIDs*>(entity._column)->getRaw();
+            case NLPathStep::Kind::Hop: {
+                const std::vector<EdgeID>& edges = step._edges->getRaw();
+                const std::vector<NodeID>& nodes = step._nodes->getRaw();
                 for (size_t row = 0; row < rowCount; row++) {
-                    paths[row].add(EntityType::Edge, EntityID(edges[row].getValue()));
+                    paths[row].addHop(edges[row], nodes[row]);
                 }
             }
             break;
 
-            case NLPathEntity::Kind::Path: {
-                const std::vector<PathRef>& handles = static_cast<const ColumnVector<PathRef>*>(entity._column)->getRaw();
+            case NLPathStep::Kind::Walk: {
+                const std::vector<PathRef>& walks = step._walks->getRaw();
                 for (size_t row = 0; row < rowCount; row++) {
-                    trie.appendHops(handles[row], paths[row], entity._reversed);
+                    trie.appendHops(walks[row], paths[row]);
+                }
+            }
+            break;
+
+            case NLPathStep::Kind::ReversedWalk: {
+                const std::vector<PathRef>& walks = step._walks->getRaw();
+                const std::vector<NodeID>& seeds = step._nodes->getRaw();
+                for (size_t row = 0; row < rowCount; row++) {
+                    trie.appendReversedHops(walks[row], seeds[row], paths[row]);
                 }
             }
             break;
@@ -8248,6 +9678,15 @@ void NLExecutor::runCaseMerge(NLExecutionContext*, NLFunctionData* data) {
     }
 }
 
+void NLExecutor::runFillNulls(NLExecutionContext*, NLFunctionData* data) {
+    const NLFillNullsData* fillNulls = static_cast<NLFillNullsData*>(data);
+
+    fillNulls->getFillNullRows()(fillNulls->getResult(),
+                                 fillNulls->getValue(),
+                                 fillNulls->getNullRows(),
+                                 fillNulls->getFill());
+}
+
 void NLExecutor::runMakeList(NLExecutionContext*, NLFunctionData* data) {
     const NLMakeListData* makeList = static_cast<NLMakeListData*>(data);
 
@@ -8279,6 +9718,26 @@ void NLExecutor::runMakeList(NLExecutionContext*, NLFunctionData* data) {
         }
 
         outputRaw[rowIndex] = listBuffer.insert(row);
+    }
+}
+
+void NLExecutor::runToAny(NLExecutionContext*, NLFunctionData* data) {
+    const NLToAnyData* toAny = static_cast<NLToAnyData*>(data);
+
+    NLStepBuffers* const stepBuffers = toAny->getStepBuffers();
+    stepBuffers->clear();
+    NLValueStore& values = stepBuffers->valueStore();
+
+    const Column* const operand = toAny->getOperand();
+    const NLListItemReadFunction read = toAny->getRead();
+    const size_t rowCount = operand->size();
+
+    std::vector<CellView>& results = static_cast<ColumnVector<CellView>*>(toAny->getResult())->getRaw();
+    results.resize(rowCount);
+
+    for (size_t row = 0; row < rowCount; row++) {
+        ListBuffer<>::ListItemVariant item = read(operand, row, stepBuffers);
+        results[row] = values.ownCell(item);
     }
 }
 
@@ -8327,7 +9786,7 @@ void NLExecutor::runListSlice(NLExecutionContext*, NLFunctionData* data) {
 }
 
 void NLExecutor::runPercentileCont(NLExecutionContext*, NLFunctionData* data) {
-    const auto interpolate = [](const std::vector<ListElementView>& sorted, double percentile) {
+    const auto interpolate = [](const std::vector<CellView>& sorted, double percentile) {
         return std::optional<double>(continuousPercentile(sorted, percentile));
     };
 
@@ -8336,7 +9795,7 @@ void NLExecutor::runPercentileCont(NLExecutionContext*, NLFunctionData* data) {
 
 template <typename Result>
 void NLExecutor::runPercentileDisc(NLExecutionContext*, NLFunctionData* data) {
-    const auto pick = [](const std::vector<ListElementView>& sorted, double percentile) {
+    const auto pick = [](const std::vector<CellView>& sorted, double percentile) {
         return percentileElement<Result>(sorted[discretePercentilePosition(sorted.size(), percentile)]);
     };
 
@@ -8346,7 +9805,7 @@ void NLExecutor::runPercentileDisc(NLExecutionContext*, NLFunctionData* data) {
 template void NLExecutor::runPercentileDisc<std::optional<types::Int64::Primitive>>(NLExecutionContext* context, NLFunctionData* data);
 template void NLExecutor::runPercentileDisc<std::optional<types::UInt64::Primitive>>(NLExecutionContext* context, NLFunctionData* data);
 template void NLExecutor::runPercentileDisc<std::optional<types::Double::Primitive>>(NLExecutionContext* context, NLFunctionData* data);
-template void NLExecutor::runPercentileDisc<ListElementView>(NLExecutionContext* context, NLFunctionData* data);
+template void NLExecutor::runPercentileDisc<CellView>(NLExecutionContext* context, NLFunctionData* data);
 
 void NLExecutor::runMakeMap(NLExecutionContext*, NLFunctionData* data) {
     const NLMakeMapData* makeMap = static_cast<NLMakeMapData*>(data);
@@ -8382,6 +9841,88 @@ void NLExecutor::runMakeMap(NLExecutionContext*, NLFunctionData* data) {
         outputRaw[rowIndex] = mapBuffer.insert(row);
     }
 }
+
+template <typename Result>
+void NLExecutor::runMergeMaps(NLExecutionContext*, NLFunctionData* data) {
+    const NLMergeMapsData* merge = static_cast<NLMergeMapsData*>(data);
+
+    const std::vector<NLMergeMapsData::Operand>& operands = merge->getOperands();
+    NLStepBuffers* memory = merge->getStepBuffers();
+    memory->clear();
+    MapBuffer<>& mapBuffer = memory->mapBuffer();
+
+    const size_t rowCount = operands.front()._column->size();
+
+    const auto isRowAligned = [rowCount](const NLMergeMapsData::Operand& operand) {
+        return operand._column->size() == rowCount;
+    };
+    bioassert(std::ranges::all_of(operands, isRowAligned),
+              "Map columns of a merge are not row-aligned.");
+
+    std::vector<Result>& outputRaw = static_cast<ColumnVector<Result>*>(merge->getResult())->getRaw();
+    outputRaw.resize(rowCount);
+
+    std::vector<MapEntryView> entries;
+    std::vector<size_t> order;
+    std::vector<MapBuffer<>::MapKeyValuePair> merged;
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        entries.clear();
+
+        bool holdsEveryMap = true;
+        for (const NLMergeMapsData::Operand& operand : operands) {
+            const NLKeyedValue keyed = operand._read(operand._column, rowIndex);
+            const MapView* map = std::get_if<MapView>(&keyed);
+
+            if (!map) {
+                holdsEveryMap = false;
+                break;
+            }
+
+            entries.insert(entries.end(), map->begin(), map->end());
+        }
+
+        if constexpr (TypeUtils::is_optional_v<Result>) {
+            if (!holdsEveryMap) {
+                outputRaw[rowIndex] = std::nullopt;
+                continue;
+            }
+        } else {
+            bioassert(holdsEveryMap, "A merge typed as never null read a row holding no map.");
+        }
+
+        // Equal keys keep their operand order, so the last of each run is the one that stays
+        order.resize(entries.size());
+        std::iota(order.begin(), order.end(), 0);
+        std::ranges::sort(order, [&entries](size_t lhs, size_t rhs) {
+            const std::string_view lhsKey = entries[lhs].getKey();
+            const std::string_view rhsKey = entries[rhs].getKey();
+
+            return lhsKey < rhsKey || (lhsKey == rhsKey && lhs < rhs);
+        });
+
+        merged.clear();
+        for (size_t position = 0; position < order.size(); position++) {
+            const MapEntryView entry = entries[order[position]];
+
+            const bool replacedLater = position + 1 < order.size()
+                                    && entries[order[position + 1]].getKey() == entry.getKey();
+            if (replacedLater) {
+                continue;
+            }
+
+            merged.push_back(MapBuffer<>::MapKeyValuePair {
+                .key = entry.getKey(),
+                .value = taggedItem<MapBuffer<>::MapItemVariant>(entry.getValue()),
+            });
+        }
+
+        outputRaw[rowIndex] = mapBuffer.insert(merged);
+    }
+}
+
+template void NLExecutor::runMergeMaps<MapView>(NLExecutionContext* context, NLFunctionData* data);
+template void NLExecutor::runMergeMaps<std::optional<MapView>>(NLExecutionContext* context, NLFunctionData* data);
 
 template <typename Result>
 void NLExecutor::runSubstring(NLExecutionContext*, NLFunctionData* data) {
@@ -8432,10 +9973,10 @@ void NLExecutor::runSplit(NLExecutionContext*, NLFunctionData* data) {
     const NLSplitData* split = static_cast<NLSplitData*>(data);
 
     const NLSplitData::StringArgument& string = split->getString();
-    const NLSplitData::StringArgument& delimiter = split->getDelimiter();
+    const NLSplitData::DelimitersArgument& delimiters = split->getDelimiters();
 
     const size_t rowCount = string._column->size();
-    bioassert(delimiter._column->size() == rowCount, "Delimiter column of a split is not row-aligned with its string.");
+    bioassert(delimiters._column->size() == rowCount, "Delimiter column of a split is not row-aligned with its string.");
 
     std::vector<Result>& outputRaw = static_cast<ColumnVector<Result>*>(split->getResult())->getRaw();
     outputRaw.resize(rowCount);
@@ -8446,13 +9987,15 @@ void NLExecutor::runSplit(NLExecutionContext*, NLFunctionData* data) {
     SplitFunction function(&stepBuffers->listBuffer());
     constexpr std::string_view name = SplitFunction::NAME;
 
+    std::vector<types::String::Primitive> separators;
+
     for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
         const std::optional<types::String::Primitive> text = string._read(string._column, rowIndex, name);
-        const std::optional<types::String::Primitive> separator = delimiter._read(delimiter._column, rowIndex, name);
+        const bool readsSeparators = delimiters._read(delimiters._column, rowIndex, name, separators);
 
-        const bool readsANull = !text.has_value() || !separator.has_value();
+        const bool readsANull = !text.has_value() || !readsSeparators;
         if (!readsANull) {
-            outputRaw[rowIndex] = function(*text, *separator);
+            outputRaw[rowIndex] = function(*text, separators);
         } else if constexpr (TypeUtils::is_optional_v<Result>) {
             outputRaw[rowIndex] = std::nullopt;
         } else {
@@ -8539,6 +10082,64 @@ void NLExecutor::runReplace(NLExecutionContext*, NLFunctionData* data) {
 template void NLExecutor::runReplace<types::String::Primitive>(NLExecutionContext* context, NLFunctionData* data);
 template void NLExecutor::runReplace<std::optional<types::String::Primitive>>(NLExecutionContext* context, NLFunctionData* data);
 
+void NLExecutor::runPointDistance(NLExecutionContext*, NLFunctionData* data) {
+    const NLPointFunctionData* function = static_cast<NLPointFunctionData*>(data);
+
+    const std::vector<NLPointFunctionData::PointArgument>& arguments = function->getArguments();
+    const NLPointFunctionData::PointArgument& lhs = arguments[0];
+    const NLPointFunctionData::PointArgument& rhs = arguments[1];
+
+    const size_t rowCount = lhs._column->size();
+    bioassert(rhs._column->size() == rowCount, "Columns of a point.distance are not row-aligned.");
+
+    std::vector<std::optional<types::Double::Primitive>>& outputRaw =
+        static_cast<ColumnOptVector<types::Double::Primitive>*>(function->getResult())->getRaw();
+    outputRaw.resize(rowCount);
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        const std::optional<Point> from = lhs._read(lhs._column, rowIndex, "point.distance");
+        const std::optional<Point> to = rhs._read(rhs._column, rowIndex, "point.distance");
+
+        if (from.has_value() && to.has_value()) {
+            outputRaw[rowIndex] = Point::distance(*from, *to);
+        } else {
+            outputRaw[rowIndex] = std::nullopt;
+        }
+    }
+}
+
+void NLExecutor::runPointWithinBBox(NLExecutionContext*, NLFunctionData* data) {
+    const NLPointFunctionData* function = static_cast<NLPointFunctionData*>(data);
+
+    const std::vector<NLPointFunctionData::PointArgument>& arguments = function->getArguments();
+    const NLPointFunctionData::PointArgument& point = arguments[0];
+    const NLPointFunctionData::PointArgument& lowerLeft = arguments[1];
+    const NLPointFunctionData::PointArgument& upperRight = arguments[2];
+
+    const size_t rowCount = point._column->size();
+    bioassert(lowerLeft._column->size() == rowCount, "Columns of a point.withinBBox are not row-aligned.");
+    bioassert(upperRight._column->size() == rowCount, "Columns of a point.withinBBox are not row-aligned.");
+
+    std::vector<std::optional<types::Bool::Primitive>>& outputRaw =
+        static_cast<ColumnOptVector<types::Bool::Primitive>*>(function->getResult())->getRaw();
+    outputRaw.resize(rowCount);
+
+    for (size_t rowIndex = 0; rowIndex < rowCount; rowIndex++) {
+        const std::optional<Point> value = point._read(point._column, rowIndex, "point.withinBBox");
+        const std::optional<Point> lower = lowerLeft._read(lowerLeft._column, rowIndex, "point.withinBBox");
+        const std::optional<Point> upper = upperRight._read(upperRight._column, rowIndex, "point.withinBBox");
+
+        const bool readsANull = !value.has_value() || !lower.has_value() || !upper.has_value();
+        const std::optional<bool> within = readsANull ? std::nullopt : Point::withinBBox(*value, *lower, *upper);
+
+        if (within.has_value()) {
+            outputRaw[rowIndex] = types::Bool::Primitive {*within};
+        } else {
+            outputRaw[rowIndex] = std::nullopt;
+        }
+    }
+}
+
 void NLExecutor::runRange(NLExecutionContext*, NLFunctionData* data) {
     const NLRangeData* range = static_cast<NLRangeData*>(data);
 
@@ -8621,9 +10222,10 @@ void NLExecutor::runRowListsCollect(NLExecutionContext* context, NLFunctionData*
     const ColumnVector<uint64_t>* const tag = collect->getTag();
 
     if (!tag) {
-        // No input row to tag: every value belongs to the single row the step is
+        const uint64_t row = untaggedRow(collect->getRow());
+
         for (size_t match = 0; match < value->size(); match++) {
-            state->stage(0, valueRead(value, match, memory));
+            state->stage(row, valueRead(value, match, memory));
         }
 
         return;
@@ -8778,89 +10380,67 @@ void NLExecutor::runListComprehension(NLExecutionContext* context, NLFunctionDat
 }
 
 void NLExecutor::runReduce(NLExecutionContext* context, NLFunctionData* data) {
-    NLReduceData* reduce = static_cast<NLReduceData*>(data);
+    NLFoldData* fold = static_cast<NLFoldData*>(data);
 
-    const Column* source = reduce->getSource();
-    const NLUnwindElementCountFunction elementCount = reduce->getElementCountFunc();
-    const NLUnwindElementEmitFunction elementEmit = reduce->getElementEmitFunc();
-    const NLCellAbsentFunction cellAbsent = reduce->getCellAbsentFunc();
-    const Column* initialValue = reduce->getInitialValue();
-    const Column* value = reduce->getValue();
-    const NLStmtContainer* body = reduce->getStmts();
-    Column* accumulator = reduce->getResult();
-    NLStepBuffers* const memory = reduce->getStepBuffers();
-    memory->clear();
-    NLCompactingValueStore& accumulatorValues = reduce->accumulatorValues();
-    const NLReownFunction reown = reduce->getReown();
-    const NLReownRowsFunction reownRows = reduce->getReownRows();
+    foldElements(context, fold, [](std::vector<size_t>& endedRows) {
+    });
+}
+
+void NLExecutor::runAllReduce(NLExecutionContext* context, NLFunctionData* data) {
+    NLAllReduceData* allReduce = static_cast<NLAllReduceData*>(data);
+
+    const Column* source = allReduce->getSource();
+    const NLCellAbsentFunction cellAbsent = allReduce->getCellAbsentFunc();
+    ColumnVector<size_t>* rows = allReduce->getRows();
+    const Column* accumulator = allReduce->getAccumulator();
+    Column* testedAccumulator = allReduce->getTestedAccumulator();
+    const NLGatherFunction accumulatorGather = allReduce->getAccumulatorGather();
+    const NLStmtContainer* predicate = allReduce->getPredicateStmts();
+    const NLTruthReadFunction truthRead = allReduce->getTruthRead();
+    const Column* holds = allReduce->getHolds();
 
     const size_t sourceRows = source->size();
-    const size_t chunkSize = context->getChunkSize();
 
-    const auto write = [&](const NLCellWrite& rowWrite, size_t row, const Column* written, size_t writtenRow) {
-        writeCell(accumulator, row, rowWrite, written, writtenRow, memory, accumulatorValues.getActive());
-    };
+    std::vector<bool>& failedRows = allReduce->failedRows();
+    std::vector<bool>& unknownRows = allReduce->unknownRows();
+    failedRows.assign(sourceRows, false);
+    unknownRows.assign(sourceRows, false);
 
-    accumulatorValues.clear();
-    reduce->getReset()(accumulator, sourceRows);
+    foldElements(context, allReduce, [&](std::vector<size_t>& endedRows) {
+        accumulatorGather(accumulator, rows, testedAccumulator);
+        runBody(context, predicate);
 
-    std::vector<size_t>& elementCounts = reduce->elementCounts();
-    std::vector<size_t>& reachingRows = reduce->reachingRows();
-    elementCounts.assign(sourceRows, 0);
-    reachingRows.clear();
+        const std::vector<size_t>& rowsRaw = rows->getRaw();
 
-    // A row whose cell holds no list keeps the null the reset left it, as Cypher reads
-    // `reduce(s = 0, x IN null | s + x)`
+        bioassert(holds->size() == rowsRaw.size(),
+                  "Yielded predicate of an nl.all_reduce is not row-aligned with its elements.");
+
+        for (size_t index = 0; index < rowsRaw.size(); index++) {
+            const size_t row = rowsRaw[index];
+            const std::optional<bool> truth = truthRead(holds, index);
+
+            if (!truth.has_value()) {
+                unknownRows[row] = true;
+            } else if (!*truth) {
+                failedRows[row] = true;
+                endedRows.push_back(row);
+            }
+        }
+    });
+
+    std::vector<std::optional<CustomBool>>& resultRaw =
+        static_cast<ColumnOptMask*>(allReduce->getResult())->getRaw();
+    resultRaw.resize(sourceRows);
+
     for (size_t row = 0; row < sourceRows; row++) {
         if (cellAbsent(source, row)) {
-            continue;
-        }
-
-        write(reduce->getInitialWrite(), row, initialValue, row);
-
-        elementCounts[row] = elementCount(source, row);
-        if (elementCounts[row] > 0) {
-            reachingRows.push_back(row);
-        }
-    }
-
-    std::vector<size_t>& rowsRaw = reduce->getRows()->getRaw();
-    std::vector<size_t>& positionsRaw = reduce->getPositions()->getRaw();
-
-    for (size_t position = 0; !reachingRows.empty(); position++) {
-        for (size_t first = 0; first < reachingRows.size(); first += chunkSize) {
-            const size_t last = std::min(first + chunkSize, reachingRows.size());
-            rowsRaw.assign(reachingRows.begin() + first, reachingRows.begin() + last);
-
-            if (elementEmit) {
-                positionsRaw.assign(rowsRaw.size(), position);
-                elementEmit(source, reduce->getRows(), reduce->getPositions(), reduce->getElementOutput());
-            }
-
-            for (const NLCarriedColumn& carriedColumn : reduce->carriedColumns()) {
-                const auto gatherFunc = carriedColumn.getGatherFunc();
-                gatherFunc(carriedColumn.getInput(), reduce->getRows(), carriedColumn.getOutput());
-            }
-
-            runBody(context, body);
-
-            bioassert(value->size() == rowsRaw.size(),
-                      "Yielded accumulator of an nl.reduce is not row-aligned with its elements.");
-
-            for (size_t index = 0; index < rowsRaw.size(); index++) {
-                write(reduce->getValueWrite(), rowsRaw[index], value, index);
-            }
-
-            if (reownRows) {
-                reownRows(accumulator, rowsRaw, accumulatorValues.getActive());
-            }
-        }
-
-        std::erase_if(reachingRows, [&](size_t row) { return elementCounts[row] == position + 1; });
-
-        if (reown && !reachingRows.empty() && accumulatorValues.needsCompaction(sourceRows)) {
-            reown(accumulator, accumulatorValues.getSpare());
-            accumulatorValues.flip();
+            resultRaw[row] = std::nullopt;
+        } else if (failedRows[row]) {
+            resultRaw[row] = CustomBool(false);
+        } else if (unknownRows[row]) {
+            resultRaw[row] = std::nullopt;
+        } else {
+            resultRaw[row] = CustomBool(true);
         }
     }
 }
@@ -8895,18 +10475,14 @@ NLKeyedReadFunction NLExecutor::selectKeyedRead(const Column* input) {
         return &mapRead<ColumnConst<MapView>>;
     } else if (kind == ColumnConst<std::optional<MapView>>::staticKind()) {
         return &mapRead<ColumnConst<std::optional<MapView>>>;
-    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
-        return &readTaggedKeyed<ColumnVector<ListElementView>>;
-    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
-        return &readTaggedKeyed<ColumnOptVector<ListElementView>>;
-    } else if (kind == ColumnConst<ListElementView>::staticKind()) {
-        return &readTaggedKeyed<ColumnConst<ListElementView>>;
-    } else if (kind == ColumnConst<std::optional<ListElementView>>::staticKind()) {
-        return &readTaggedKeyed<ColumnConst<std::optional<ListElementView>>>;
-    } else if (kind == ColumnVector<MapEntryView>::staticKind()) {
-        return &readTaggedKeyed<ColumnVector<MapEntryView>>;
-    } else if (kind == ColumnConst<MapEntryView>::staticKind()) {
-        return &readTaggedKeyed<ColumnConst<MapEntryView>>;
+    } else if (kind == ColumnVector<CellView>::staticKind()) {
+        return &readTaggedKeyed<ColumnVector<CellView>>;
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
+        return &readTaggedKeyed<ColumnOptVector<CellView>>;
+    } else if (kind == ColumnConst<CellView>::staticKind()) {
+        return &readTaggedKeyed<ColumnConst<CellView>>;
+    } else if (kind == ColumnConst<std::optional<CellView>>::staticKind()) {
+        return &readTaggedKeyed<ColumnConst<std::optional<CellView>>>;
     }
 
     throw IRException("a map key read reads a map column, or a column of tagged cells");
@@ -8941,17 +10517,73 @@ NLStringArgumentRead NLExecutor::selectStringArgumentRead(const Column* input) {
         return &stringValueArgument<ColumnConst<types::String::Primitive>>;
     } else if (kind == ColumnConst<std::optional<types::String::Primitive>>::staticKind()) {
         return &stringValueArgument<ColumnConst<std::optional<types::String::Primitive>>>;
-    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
-        return &cellStringArgument<ColumnVector<ListElementView>>;
-    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
-        return &cellStringArgument<ColumnOptVector<ListElementView>>;
-    } else if (kind == ColumnConst<ListElementView>::staticKind()) {
-        return &cellStringArgument<ColumnConst<ListElementView>>;
-    } else if (kind == ColumnConst<std::optional<ListElementView>>::staticKind()) {
-        return &cellStringArgument<ColumnConst<std::optional<ListElementView>>>;
+    } else if (kind == ColumnVector<CellView>::staticKind()) {
+        return &cellStringArgument<ColumnVector<CellView>>;
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
+        return &cellStringArgument<ColumnOptVector<CellView>>;
+    } else if (kind == ColumnConst<CellView>::staticKind()) {
+        return &cellStringArgument<ColumnConst<CellView>>;
+    } else if (kind == ColumnConst<std::optional<CellView>>::staticKind()) {
+        return &cellStringArgument<ColumnConst<std::optional<CellView>>>;
     }
 
     throw IRException("a string function reads a string argument out of a nullable string column, or a column of tagged cells");
+}
+
+NLStringListArgumentRead NLExecutor::selectStringListArgumentRead(const Column* input) {
+    using String = types::String::Primitive;
+
+    const ColumnKind::Code kind = input->getKind();
+
+    if (kind == ColumnOptVector<String>::staticKind()) {
+        return &stringAsStringListArgument<ColumnOptVector<String>>;
+    } else if (kind == ColumnConst<String>::staticKind()) {
+        return &stringAsStringListArgument<ColumnConst<String>>;
+    } else if (kind == ColumnConst<std::optional<String>>::staticKind()) {
+        return &stringAsStringListArgument<ColumnConst<std::optional<String>>>;
+    } else if (kind == ColumnVector<ListView>::staticKind()) {
+        return &listAsStringListArgument<ColumnVector<ListView>>;
+    } else if (kind == ColumnOptVector<ListView>::staticKind()) {
+        return &listAsStringListArgument<ColumnOptVector<ListView>>;
+    } else if (kind == ColumnConst<ListView>::staticKind()) {
+        return &listAsStringListArgument<ColumnConst<ListView>>;
+    } else if (kind == ColumnConst<std::optional<ListView>>::staticKind()) {
+        return &listAsStringListArgument<ColumnConst<std::optional<ListView>>>;
+    } else if (kind == ColumnVector<CellView>::staticKind()) {
+        return &cellAsStringListArgument<ColumnVector<CellView>>;
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
+        return &cellAsStringListArgument<ColumnOptVector<CellView>>;
+    } else if (kind == ColumnConst<CellView>::staticKind()) {
+        return &cellAsStringListArgument<ColumnConst<CellView>>;
+    } else if (kind == ColumnConst<std::optional<CellView>>::staticKind()) {
+        return &cellAsStringListArgument<ColumnConst<std::optional<CellView>>>;
+    }
+
+    throw IRException("a string function reads a list of strings out of a nullable string column, a list column, or a column of tagged cells");
+}
+
+NLPointArgumentRead NLExecutor::selectPointArgumentRead(const Column* input) {
+    using PointValue = types::Point::Primitive;
+
+    const ColumnKind::Code kind = input->getKind();
+
+    if (kind == ColumnOptVector<PointValue>::staticKind()) {
+        return &pointValueArgument<ColumnOptVector<PointValue>>;
+    } else if (kind == ColumnConst<PointValue>::staticKind()) {
+        return &pointValueArgument<ColumnConst<PointValue>>;
+    } else if (kind == ColumnConst<std::optional<PointValue>>::staticKind()) {
+        return &pointValueArgument<ColumnConst<std::optional<PointValue>>>;
+    } else if (kind == ColumnVector<CellView>::staticKind()) {
+        return &cellPointArgument<ColumnVector<CellView>>;
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
+        return &cellPointArgument<ColumnOptVector<CellView>>;
+    } else if (kind == ColumnConst<CellView>::staticKind()) {
+        return &cellPointArgument<ColumnConst<CellView>>;
+    } else if (kind == ColumnConst<std::optional<CellView>>::staticKind()) {
+        return &cellPointArgument<ColumnConst<std::optional<CellView>>>;
+    }
+
+    throw IRException("a point function reads a point argument out of a nullable point column, or a column of tagged cells");
 }
 
 NLIntegerArgumentRead NLExecutor::selectIntegerArgumentRead(const Column* input) {
@@ -8961,27 +10593,22 @@ NLIntegerArgumentRead NLExecutor::selectIntegerArgumentRead(const Column* input)
         return &integerValueArgument;
     } else if (kind == ColumnOptVector<types::UInt64::Primitive>::staticKind()) {
         return &unsignedValueArgument;
-    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
-        return &cellIntegerArgument<ColumnVector<ListElementView>>;
-    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
-        return &cellIntegerArgument<ColumnOptVector<ListElementView>>;
+    } else if (kind == ColumnVector<CellView>::staticKind()) {
+        return &cellIntegerArgument<ColumnVector<CellView>>;
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
+        return &cellIntegerArgument<ColumnOptVector<CellView>>;
     }
 
     throw IRException("a string function reads an integer argument out of a nullable integer column, or a column of tagged cells");
 }
 
-// Row r of the result views the entry row r's map already holds under the key, so the
-// read copies nothing. A row holding no map, and a map holding no such key, read back as
-// an entry under the same key whose tag is null: every row of the column names the key
-// the query read it under, so one entry per chunk serves all of them.
+// Row r of the result views the value row r's map already holds under the key, so the read
+// copies nothing. A null row, and a map holding no such key, read back as a null cell.
 void NLExecutor::runStaticMapKey(NLExecutionContext* context, NLFunctionData* data) {
     const NLStaticMapKeyData* mapKey = static_cast<NLStaticMapKeyData*>(data);
 
     const Column* input = mapKey->getInput();
     const NLKeyedReadFunction read = mapKey->getKeyedRead();
-    const std::string_view key = mapKey->getKey();
-
-    const MapEntryView absent = mapKey->getAbsentEntry();
 
     NLStepBuffers* const stepBuffers = mapKey->getStepBuffers();
     stepBuffers->clear();
@@ -8989,70 +10616,30 @@ void NLExecutor::runStaticMapKey(NLExecutionContext* context, NLFunctionData* da
     MapBuffer<>& mapBuffer = stepBuffers->mapBuffer();
     NLEntityProperties properties(context, &stepBuffers->valueStore());
 
-    const auto entryAt = [input, read, key, absent, &properties, &mapBuffer](size_t row) {
-        MapEntryView entry;
-        if (!findKeyedEntry(read(input, row), key, properties, mapBuffer, entry)) {
-            return absent;
-        }
-
-        return entry;
+    const auto valueAt = [input, read, mapKey, &properties, &mapBuffer](size_t row) {
+        return readStaticKey(read(input, row), mapKey, properties, mapBuffer);
     };
 
     Column* result = mapKey->getResult();
 
-    if (result->getKind() == ColumnConst<MapEntryView>::staticKind()) {
-        *static_cast<ColumnConst<MapEntryView>*>(result) = entryAt(0);
+    if (result->getKind() == ColumnConst<CellView>::staticKind()) {
+        static_cast<ColumnConst<CellView>*>(result)->set(valueAt(0));
         return;
     }
 
-    std::vector<MapEntryView>& outputRaw = static_cast<ColumnVector<MapEntryView>*>(result)->getRaw();
+    std::vector<CellView>& outputRaw = static_cast<ColumnVector<CellView>*>(result)->getRaw();
     const size_t rowCount = input->size();
 
     outputRaw.resize(rowCount);
 
     for (size_t row = 0; row < rowCount; row++) {
-        outputRaw[row] = entryAt(row);
+        outputRaw[row] = valueAt(row);
     }
 }
 
-// The values are copied into the step's list buffer as one list, whose elements are the cells
-void NLExecutor::runMapEntryValue(NLExecutionContext*, NLFunctionData* data) {
-    NLMapEntryValueData* entryValue = static_cast<NLMapEntryValueData*>(data);
-
-    const Column* input = entryValue->getInput();
-    Column* result = entryValue->getResult();
-
-    NLStepBuffers* const stepBuffers = entryValue->getStepBuffers();
-    stepBuffers->clear();
-
-    std::vector<QueryListBuffer::ListItemVariant>& items = entryValue->getItems();
-    items.clear();
-
-    if (result->getKind() == ColumnConst<ListElementView>::staticKind()) {
-        const ColumnConst<MapEntryView>* constant = static_cast<const ColumnConst<MapEntryView>*>(input);
-        items.push_back(entryItem(constant->getRaw()));
-
-        const ListView cells = stepBuffers->listBuffer().insert(items);
-        static_cast<ColumnConst<ListElementView>*>(result)->set(cells.front());
-        return;
-    }
-
-    const std::vector<MapEntryView>& entries = static_cast<const ColumnVector<MapEntryView>*>(input)->getRaw();
-
-    items.resize(entries.size());
-    std::ranges::transform(entries, items.begin(), entryItem);
-
-    const ListView cells = stepBuffers->listBuffer().insert(items);
-    std::vector<ListElementView>& resultRaw = static_cast<ColumnVector<ListElementView>*>(result)->getRaw();
-
-    resultRaw.resize(entries.size());
-    std::ranges::copy(cells.elements(), resultRaw.begin());
-}
-
-// Row r of the result views the entry row r's map already holds under row r's key, so the
-// read copies nothing. A map holding no such key is answered by an entry written under that
-// row's key and tagged null, so the reader sees the key it asked for; a row holding no key
-// at all has none to name, and reads the one keyless entry translation wrote.
+// Row r of the result views the value row r's map already holds under row r's key, so the
+// read copies nothing. A map holding no such key, and a row holding no key, read back as a
+// null cell.
 void NLExecutor::runDynamicMapKey(NLExecutionContext* context, NLFunctionData* data) {
     const NLDynamicMapKeyData* dynamicMapKey = static_cast<NLDynamicMapKeyData*>(data);
 
@@ -9062,53 +10649,144 @@ void NLExecutor::runDynamicMapKey(NLExecutionContext* context, NLFunctionData* d
     const NLKeyedReadFunction readKeyed = dynamicMapKey->getKeyedRead();
     const NLStringReadFunction readKey = dynamicMapKey->getKeyRead();
 
-    const MapEntryView keyless = dynamicMapKey->getAbsentEntry();
     NLStepBuffers* const stepBuffers = dynamicMapKey->getStepBuffers();
     stepBuffers->clear();
 
     MapBuffer<>& mapBuffer = stepBuffers->mapBuffer();
     NLEntityProperties properties(context, &stepBuffers->valueStore());
 
-    const auto entryAt = [input, keyColumn, readKeyed, readKey, keyless, &properties, &mapBuffer](size_t row) {
+    const auto valueAt = [input, keyColumn, readKeyed, readKey, &properties, &mapBuffer](size_t row) {
         const std::optional<types::String::Primitive> key = readKey(keyColumn, row);
-        if (!key) {
-            return keyless;
-        }
 
         MapEntryView entry;
-        if (findKeyedEntry(readKeyed(input, row), *key, properties, mapBuffer, entry)) {
-            return entry;
+        if (!key || !findKeyedEntry(readKeyed(input, row), *key, properties, mapBuffer, entry)) {
+            return CellView::nullElement();
         }
 
-        MapWriteCursor absentCursor = mapBuffer.reserveMap(1, sizeof(PropertyNull));
-        absentCursor.writeKey(*key);
-
-        return absentCursor.writeValue(MapBufferTypeTag::Null, PropertyNull {});
+        return entry.getValue();
     };
 
     Column* result = dynamicMapKey->getResult();
 
-    if (result->getKind() == ColumnConst<MapEntryView>::staticKind()) {
-        *static_cast<ColumnConst<MapEntryView>*>(result) = entryAt(0);
+    if (result->getKind() == ColumnConst<CellView>::staticKind()) {
+        static_cast<ColumnConst<CellView>*>(result)->set(valueAt(0));
         return;
     }
 
-    const size_t mapRows = input->size();
-    const size_t keyRows = keyColumn->size();
-    const size_t rowCount = std::max(mapRows, keyRows);
+    const size_t rowCount = pairedRowCount(input, keyColumn);
 
-    bioassert(mapRows == rowCount || mapRows == 1,
-              "Map column of a dynamic map key is not row-aligned with its key column.");
-    bioassert(keyRows == rowCount || keyRows == 1,
-              "Key column of a dynamic map key is not row-aligned with its map column.");
-
-    std::vector<MapEntryView>& outputRaw = static_cast<ColumnVector<MapEntryView>*>(result)->getRaw();
+    std::vector<CellView>& outputRaw = static_cast<ColumnVector<CellView>*>(result)->getRaw();
 
     outputRaw.resize(rowCount);
 
     for (size_t row = 0; row < rowCount; row++) {
-        outputRaw[row] = entryAt(row);
+        outputRaw[row] = valueAt(row);
     }
+}
+
+template <typename Element>
+void NLExecutor::runContainerIndex(NLExecutionContext* context, NLFunctionData* data) {
+    const NLContainerIndexData* containerIndex = static_cast<NLContainerIndexData*>(data);
+
+    const Column* base = containerIndex->getBase();
+    const Column* index = containerIndex->getIndex();
+
+    const NLContainerReadFunction readBase = containerIndex->getBaseRead();
+    const NLSubscriptReadFunction readIndex = containerIndex->getIndexRead();
+
+    NLStepBuffers* const stepBuffers = containerIndex->getStepBuffers();
+    stepBuffers->clear();
+
+    MapBuffer<>& mapBuffer = stepBuffers->mapBuffer();
+    NLEntityProperties properties(context, &stepBuffers->valueStore());
+
+    const size_t rowCount = pairedRowCount(base, index);
+
+    std::vector<Element>& outputRaw = static_cast<ColumnVector<Element>*>(containerIndex->getResult())->getRaw();
+
+    outputRaw.resize(rowCount);
+
+    for (size_t row = 0; row < rowCount; row++) {
+        const std::optional<CellView> element = readContainerElement(readBase(base, row),
+                                                                     readIndex(index, row),
+                                                                     properties,
+                                                                     mapBuffer);
+
+        outputRaw[row] = containerIndexResult<Element>(element);
+    }
+}
+
+NLHandlerFunction NLExecutor::selectCellContainerIndex(bool nullable) {
+    return nullable ? &runContainerIndex<std::optional<CellView>> : &runContainerIndex<CellView>;
+}
+
+NLHandlerFunction NLExecutor::selectEntityContainerIndex(NLChunkKind kind) {
+    if (kind == NLChunkKind::NodeID) {
+        return &runContainerIndex<NodeID>;
+    } else if (kind == NLChunkKind::EdgeID) {
+        return &runContainerIndex<EdgeID>;
+    }
+
+    throw IRException("a container index reads its entities out of a list of nodes or of edges");
+}
+
+NLHandlerFunction NLExecutor::selectValueContainerIndex(ValueType valueType) {
+    NLHandlerFunction selected = nullptr;
+
+    const auto select = [&]<SupportedType T>() {
+        selected = &runContainerIndex<std::optional<typename T::Primitive>>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return selected;
+}
+
+NLContainerReadFunction NLExecutor::selectContainerRead(const Column* input) {
+    const ColumnKind::Code kind = input->getKind();
+
+    if (kind == ColumnVector<ListView>::staticKind()) {
+        return &listContainer<ColumnVector<ListView>>;
+    } else if (kind == ColumnOptVector<ListView>::staticKind()) {
+        return &listContainer<ColumnOptVector<ListView>>;
+    } else if (kind == ColumnConst<ListView>::staticKind()) {
+        return &listContainer<ColumnConst<ListView>>;
+    } else if (kind == ColumnConst<std::optional<ListView>>::staticKind()) {
+        return &listContainer<ColumnConst<std::optional<ListView>>>;
+    } else if (kind == ColumnVector<MapView>::staticKind()) {
+        return &mapContainer<ColumnVector<MapView>>;
+    } else if (kind == ColumnOptVector<MapView>::staticKind()) {
+        return &mapContainer<ColumnOptVector<MapView>>;
+    } else if (kind == ColumnConst<MapView>::staticKind()) {
+        return &mapContainer<ColumnConst<MapView>>;
+    } else if (kind == ColumnConst<std::optional<MapView>>::staticKind()) {
+        return &mapContainer<ColumnConst<std::optional<MapView>>>;
+    } else if (kind == ColumnVector<CellView>::staticKind()) {
+        return &cellContainer<ColumnVector<CellView>>;
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
+        return &cellContainer<ColumnOptVector<CellView>>;
+    } else if (kind == ColumnConst<CellView>::staticKind()) {
+        return &cellContainer<ColumnConst<CellView>>;
+    } else if (kind == ColumnConst<std::optional<CellView>>::staticKind()) {
+        return &cellContainer<ColumnConst<std::optional<CellView>>>;
+    }
+
+    throw IRException("a container index reads a list column, a map column or a column of tagged cells");
+}
+
+NLSubscriptReadFunction NLExecutor::selectSubscriptRead(const Column* input) {
+    const ColumnKind::Code kind = input->getKind();
+
+    if (kind == ColumnVector<CellView>::staticKind()) {
+        return &readSubscript<ColumnVector<CellView>>;
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
+        return &readSubscript<ColumnOptVector<CellView>>;
+    } else if (kind == ColumnConst<CellView>::staticKind()) {
+        return &readSubscript<ColumnConst<CellView>>;
+    } else if (kind == ColumnConst<std::optional<CellView>>::staticKind()) {
+        return &readSubscript<ColumnConst<std::optional<CellView>>>;
+    }
+
+    throw IRException("a container index reads its index out of a column of tagged cells");
 }
 
 NLListReadFunction NLExecutor::selectListRead(const Column* input) {
@@ -9122,13 +10800,13 @@ NLListReadFunction NLExecutor::selectListRead(const Column* input) {
         return &constListRead;
     } else if (kind == ColumnConst<std::optional<ListView>>::staticKind()) {
         return &optConstListRead;
-    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+    } else if (kind == ColumnVector<CellView>::staticKind()) {
         return &taggedListRead;
-    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
         return &optTaggedListRead;
-    } else if (kind == ColumnConst<ListElementView>::staticKind()) {
+    } else if (kind == ColumnConst<CellView>::staticKind()) {
         return &constTaggedListRead;
-    } else if (kind == ColumnConst<std::optional<ListElementView>>::staticKind()) {
+    } else if (kind == ColumnConst<std::optional<CellView>>::staticKind()) {
         return &optConstTaggedListRead;
     }
 
@@ -9151,6 +10829,15 @@ NLRangeBoundReadFunction NLExecutor::selectRangeBoundRead(ValueType valueType) {
     }
 }
 
+NLRangeBoundReadFunction NLExecutor::selectCellBoundRead(const Column* input) {
+    const NLRangeBoundReadFunction read = selectCellRowRead<std::optional<types::Int64::Primitive>, &cellBound>(input);
+    if (!read) {
+        throw IRException("a bound held in type-erased cells is read out of a column of them");
+    }
+
+    return read;
+}
+
 NLPercentileReadFunction NLExecutor::selectPercentileRead(ValueType valueType) {
     switch (valueType) {
         case ValueType::Int64:
@@ -9171,12 +10858,39 @@ NLPercentileReadFunction NLExecutor::selectPercentileRead(ValueType valueType) {
     }
 }
 
+NLPercentileReadFunction NLExecutor::selectCellPercentileRead(const Column* input) {
+    const NLPercentileReadFunction read = selectCellRowRead<std::optional<types::Double::Primitive>, &cellPercentile>(input);
+    if (!read) {
+        throw IRException("a percentile held in type-erased cells is read out of a column of them");
+    }
+
+    return read;
+}
+
 NLListItemReadFunction NLExecutor::selectNodeListItemRead() {
     return &validIDItem<ListBuffer<>::ListItemVariant, NodeID>;
 }
 
 NLListItemReadFunction NLExecutor::selectEdgeListItemRead() {
     return &validIDItem<ListBuffer<>::ListItemVariant, EdgeID>;
+}
+
+NLPathReadFunction NLExecutor::selectPathRead(const Column* paths) {
+    const ColumnKind::Code kind = paths->getKind();
+
+    if (kind == ColumnVector<GraphPath>::staticKind()) {
+        return &columnPath;
+    } else if (kind == ColumnVector<CellView>::staticKind()) {
+        return &taggedColumnPath;
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
+        return &optTaggedColumnPath;
+    }
+
+    throw IRException("nodes(), relationships() and length() read a path column, or a column of tagged cells");
+}
+
+NLListItemReadFunction NLExecutor::selectPathListItemRead() {
+    return &pathItem<ListBuffer<>::ListItemVariant>;
 }
 
 NLListItemReadFunction NLExecutor::selectNestedListItemRead() {
@@ -9208,6 +10922,10 @@ NLMapValueReadFunction NLExecutor::selectNodeMapValueRead() {
 
 NLMapValueReadFunction NLExecutor::selectEdgeMapValueRead() {
     return &validIDItem<MapBuffer<>::MapItemVariant, EdgeID>;
+}
+
+NLMapValueReadFunction NLExecutor::selectPathMapValueRead() {
+    return &pathItem<MapBuffer<>::MapItemVariant>;
 }
 
 NLMapValueReadFunction NLExecutor::selectNestedListMapValueRead() {
@@ -9278,13 +10996,22 @@ NLCaseTestFn NLExecutor::selectCaseTest(const Column* condition, bool nullable, 
         return &caseTestNever;
     } else if (condition->getContainerKind() == ContainerKind::code<ColumnMask>()) {
         return &caseTestMask;
-    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+    } else if (kind == ColumnVector<CellView>::staticKind()) {
         return &caseTestTaggedCell;
-    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
         return &caseTestOptTaggedCell;
     }
 
     return nullable ? &caseTestOptMask : &caseTestBoolColumn;
+}
+
+template <bool TESTS_NULL>
+NLUnaryFn NLExecutor::selectNullTest(const Column* operand, LocalMemory* memory, Column*& result) {
+    NullTestSelector<TESTS_NULL> selector {._memory = memory};
+    ColumnSingleDispatcher<InternalKind::Types::Tuple, NullTestSelector<TESTS_NULL>>::dispatch(operand, selector);
+
+    result = selector._result;
+    return selector._fn;
 }
 
 NLUnaryFn NLExecutor::selectIsNotTrue(const Column* operand, bool untypedNull, LocalMemory* memory, Column*& result) {
@@ -9298,33 +11025,63 @@ NLUnaryFn NLExecutor::selectIsNotTrue(const Column* operand, bool untypedNull, L
         return &applyIsNotTrueOnMask;
     } else if (kind == ColumnOptMask::staticKind()) {
         return &applyIsNotTrueOnOptMask;
-    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+    } else if (kind == ColumnVector<CellView>::staticKind()) {
         return &applyIsNotTrueOnTaggedCells;
-    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
         return &applyIsNotTrueOnOptTaggedCells;
     }
 
     return &applyIsNotTrueOnBoolColumn;
 }
 
-NLCaseResetFn NLExecutor::selectEntityCaseReset(NLChunkKind kind) {
+NLCaseResetFn NLExecutor::selectOwnNullCaseReset(NLChunkKind kind) {
     if (kind == NLChunkKind::NodeID) {
-        return &caseResetEntityColumn<NodeID>;
+        return &caseResetOwnNullColumn<NodeID>;
     } else if (kind == NLChunkKind::EdgeID) {
-        return &caseResetEntityColumn<EdgeID>;
+        return &caseResetOwnNullColumn<EdgeID>;
+    } else if (kind == NLChunkKind::Path) {
+        return &caseResetOwnNullColumn<GraphPath>;
     }
 
-    throw IRException("Only a node or an edge column can hold a selection over entities");
+    throw IRException("Only a node, an edge or a path column holds its own null");
 }
 
-NLCaseWriteFn NLExecutor::selectEntityCaseWrite(NLChunkKind kind, bool untypedNull) {
+NLCaseWriteFn NLExecutor::selectOwnNullCaseWrite(NLChunkKind kind, bool untypedNull) {
     if (kind == NLChunkKind::NodeID) {
-        return untypedNull ? &caseWriteNullEntity<NodeID> : &caseWriteEntityCell<NodeID>;
+        return untypedNull ? &caseWriteOwnNull<NodeID> : &caseWriteOwnNullCell<NodeID>;
     } else if (kind == NLChunkKind::EdgeID) {
-        return untypedNull ? &caseWriteNullEntity<EdgeID> : &caseWriteEntityCell<EdgeID>;
+        return untypedNull ? &caseWriteOwnNull<EdgeID> : &caseWriteOwnNullCell<EdgeID>;
+    } else if (kind == NLChunkKind::Path) {
+        return untypedNull ? &caseWriteOwnNull<GraphPath> : &caseWriteOwnNullCell<GraphPath>;
     }
 
-    throw IRException("Only a node or an edge column can hold a selection over entities");
+    throw IRException("Only a node, an edge or a path column holds its own null");
+}
+
+NLFillNullRowsFn NLExecutor::selectFillNullRows(ValueType valueType) {
+    NLFillNullRowsFn selected = nullptr;
+    const auto select = [&]<SupportedType T>() {
+        selected = &fillNullRows<std::optional<typename T::Primitive>>;
+    };
+    ValueTypeDispatcher(valueType).execute(select);
+
+    return selected;
+}
+
+NLFillNullRowsFn NLExecutor::selectOwnNullFillNullRows(NLChunkKind kind) {
+    if (kind == NLChunkKind::NodeID) {
+        return &fillNullRows<NodeID>;
+    } else if (kind == NLChunkKind::EdgeID) {
+        return &fillNullRows<EdgeID>;
+    } else if (kind == NLChunkKind::Path) {
+        return &fillNullRows<GraphPath>;
+    }
+
+    throw IRException("Only a node, an edge or a path column holds its own null");
+}
+
+NLFillNullRowsFn NLExecutor::selectTaggedCellFillNullRows() {
+    return &fillNullRows<CellView>;
 }
 
 NLCaseWriteFn NLExecutor::selectCaseWrite(ValueType valueType,
@@ -9365,16 +11122,16 @@ NLUnaryFn NLExecutor::selectNot(const Column* operand, LocalMemory* memory, Colu
     } else if (kind == ColumnOptMask::staticKind()) {
         result = memory->alloc<ColumnOptMask>();
         return &applyNotOnOptMask;
-    } else if (kind == ColumnVector<ListElementView>::staticKind()) {
+    } else if (kind == ColumnVector<CellView>::staticKind()) {
         result = memory->alloc<ColumnOptMask>();
         return &applyNotOnTaggedCells;
-    } else if (kind == ColumnOptVector<ListElementView>::staticKind()) {
+    } else if (kind == ColumnOptVector<CellView>::staticKind()) {
         result = memory->alloc<ColumnOptMask>();
         return &applyNotOnOptTaggedCells;
-    } else if (kind == ColumnConst<ListElementView>::staticKind()) {
+    } else if (kind == ColumnConst<CellView>::staticKind()) {
         result = memory->alloc<ColumnConst<std::optional<CustomBool>>>();
         return &applyNotOnConstTaggedCell;
-    } else if (kind == ColumnConst<std::optional<ListElementView>>::staticKind()) {
+    } else if (kind == ColumnConst<std::optional<CellView>>::staticKind()) {
         result = memory->alloc<ColumnConst<std::optional<CustomBool>>>();
         return &applyNotOnOptConstTaggedCell;
     }
@@ -9384,26 +11141,28 @@ NLUnaryFn NLExecutor::selectNot(const Column* operand, LocalMemory* memory, Colu
 }
 
 NLUnaryFn NLExecutor::selectEntityToNullable(NLChunkKind kind, LocalMemory* memory, Column*& result) {
-    const bool readsIDs = kind == NLChunkKind::NodeID || kind == NLChunkKind::EdgeID || kind == NLChunkKind::PathRef;
+    const bool readsIDs = kind == NLChunkKind::NodeID || kind == NLChunkKind::EdgeID;
     if (!readsIDs) {
-        throw IRException("Only a node, an edge or a walk column can be read as a nullable ID column");
+        throw IRException("Only a node or an edge column can be read as a nullable ID column");
     }
 
     result = memory->alloc<ColumnOptVector<types::UInt64::Primitive>>();
 
     if (kind == NLChunkKind::NodeID) {
         return &entityToNullableColumn<NodeID>;
-    } else if (kind == NLChunkKind::PathRef) {
-        return &entityToNullableColumn<PathRef>;
     }
 
     return &entityToNullableColumn<EdgeID>;
 }
 
-NLUnaryFn NLExecutor::selectPathToNullable(LocalMemory* memory, Column*& result) {
-    result = memory->alloc<ColumnOptVector<types::UInt64::Primitive>>();
+NLUnaryFn NLExecutor::selectCheckedCast(NLChunkKind kind, const Column* operand, LocalMemory* memory, Column*& result) {
+    if (kind == NLChunkKind::NodeID) {
+        return selectCheckedCastOf<NodeID>(operand, memory, result);
+    } else if (kind == NLChunkKind::EdgeID) {
+        return selectCheckedCastOf<EdgeID>(operand, memory, result);
+    }
 
-    return &pathToNullableColumn;
+    throw IRException("A tagged cell is checked to hold a node or an edge only");
 }
 
 NLUnaryFn NLExecutor::selectToNullable(ValueType valueType, const Column* operand, LocalMemory* memory, Column*& result) {
@@ -9438,6 +11197,10 @@ NLUnaryFn NLExecutor::selectToNullable(ValueType valueType, const Column* operan
 
         case ValueType::Duration:
             return selectToNullableOf<types::Duration::Primitive>(operand, memory, result);
+        break;
+
+        case ValueType::Point:
+            return selectToNullableOf<types::Point::Primitive>(operand, memory, result);
         break;
 
         // A cell is a view into the query's list buffer, so the nullable column holds the
@@ -9491,7 +11254,7 @@ NLBinaryFn NLExecutor::selectEntityListIndex(NLChunkKind kind,
     }
 
     if (!selected) {
-        throw IRException("An entity is read out of a plain list column, not out of a constant or a type-erased one");
+        throw IRException("An entity is read out of a list column, not out of a type-erased one");
     }
 
     return selected;
@@ -9609,14 +11372,14 @@ NLUnaryFunctionKernel NLExecutor::selectFunction(const Column* input, bool input
     }
 }
 
-template <typename StringFunctor>
+template <typename Conversion>
 NLUnaryFunctionKernel NLExecutor::selectConversion(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
     NLUnaryFunctionKernel kernel = nullptr;
 
     const auto selectForElement = [&]<typename Element>() {
-        using Functor = ConversionFunctorFor<StringFunctor, Element>::Type;
+        using Functor = ConversionFunctorFor<Conversion, Element>::Type;
 
-        if constexpr (!std::is_same_v<Functor, StringFunctor>) {
+        if constexpr (!std::is_same_v<Functor, Conversion>) {
             if (!kernel && columnHoldsConvertible<Element>(input)) {
                 kernel = selectFunction<Functor>(input, inputNullable, memory, result);
             }
@@ -9629,36 +11392,14 @@ NLUnaryFunctionKernel NLExecutor::selectConversion(const Column* input, bool inp
     selectForElement.template operator()<types::Bool::Primitive>();
     selectForElement.template operator()<types::DateTime::Primitive>();
     selectForElement.template operator()<types::Duration::Primitive>();
+    selectForElement.template operator()<MapView>();
+    selectForElement.template operator()<types::Point::Primitive>();
 
     if (kernel) {
         return kernel;
     }
 
-    return selectFunction<StringFunctor>(input, inputNullable, memory, result);
-}
-
-NLUnaryFunctionKernel NLExecutor::selectDateTimeConversion(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
-    if (columnHoldsElement<types::Int64::Primitive>(input)) {
-        return selectFunction<EpochSecondsToDateTimeFunction<types::Int64::Primitive>>(input, inputNullable, memory, result);
-    } else if (columnHoldsElement<types::UInt64::Primitive>(input)) {
-        return selectFunction<EpochSecondsToDateTimeFunction<types::UInt64::Primitive>>(input, inputNullable, memory, result);
-    }
-
-    return selectFunction<ToDateTimeFunction>(input, inputNullable, memory, result);
-}
-
-NLUnaryFunctionKernel NLExecutor::selectDurationConversion(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
-    if (columnHoldsElement<types::Int64::Primitive>(input)) {
-        return selectFunction<MicrosecondsToDurationFunction<types::Int64::Primitive>>(input, inputNullable, memory, result);
-    } else if (columnHoldsElement<types::UInt64::Primitive>(input)) {
-        return selectFunction<MicrosecondsToDurationFunction<types::UInt64::Primitive>>(input, inputNullable, memory, result);
-    } else if (columnHoldsElement<MapView>(input)) {
-        return selectFunction<MapToDurationFunction>(input, inputNullable, memory, result);
-    } else if (readsTaggedCells(input)) {
-        return selectTaggedCellFunction<TaggedDurationFunction>(input, inputNullable, memory, result);
-    }
-
-    throw IRException("duration() requires an integer count of microseconds or a map of unit counts");
+    return selectFunction<Conversion>(input, inputNullable, memory, result);
 }
 
 NLUnaryFunctionKernel NLExecutor::selectSize(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
@@ -9667,6 +11408,16 @@ NLUnaryFunctionKernel NLExecutor::selectSize(const Column* input, bool inputNull
     }
 
     return selectFunction<ListSizeFunction>(input, inputNullable, memory, result);
+}
+
+NLUnaryFunctionKernel NLExecutor::selectIsEmpty(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
+    if (columnHoldsElement<types::String::Primitive>(input)) {
+        return selectFunction<StringIsEmptyFunction>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<MapView>(input)) {
+        return selectFunction<MapIsEmptyFunction>(input, inputNullable, memory, result);
+    }
+
+    return selectFunction<ListIsEmptyFunction>(input, inputNullable, memory, result);
 }
 
 NLUnaryFunctionKernel NLExecutor::selectId(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
@@ -9695,9 +11446,7 @@ NLUnaryFunctionKernel NLExecutor::selectKeys(const Column* input, bool inputNull
     } else if (columnHoldsElement<EdgeID>(input)) {
         return selectFunction<NLKeysFunction<EdgeID>>(input, inputNullable, memory, result);
     } else if (readsTaggedCells(input)) {
-        return selectTaggedCellFunction<NLTaggedKeysFunction<ListElementView>>(input, inputNullable, memory, result);
-    } else if (readsMapValues(input)) {
-        return selectMapValueFunction<NLTaggedKeysFunction<MapEntryView>>(input, memory, result);
+        return selectTaggedCellFunction<NLTaggedKeysFunction>(input, inputNullable, memory, result);
     } else if (columnHoldsElement<MapView>(input)) {
         return selectFunction<MapKeysFunction>(input, inputNullable, memory, result);
     }
@@ -9709,9 +11458,7 @@ NLUnaryFunctionKernel NLExecutor::selectLabels(const Column* input, bool inputNu
     if (columnHoldsElement<NodeID>(input)) {
         return selectFunction<LabelsFunction>(input, inputNullable, memory, result);
     } else if (readsTaggedCells(input)) {
-        return selectTaggedCellFunction<NLTaggedLabelsFunction<ListElementView>>(input, inputNullable, memory, result);
-    } else if (readsMapValues(input)) {
-        return selectMapValueFunction<NLTaggedLabelsFunction<MapEntryView>>(input, memory, result);
+        return selectTaggedCellFunction<NLTaggedLabelsFunction>(input, inputNullable, memory, result);
     }
 
     throw IRException("labels() reads a node column");
@@ -9721,9 +11468,7 @@ NLUnaryFunctionKernel NLExecutor::selectEdgeType(const Column* input, bool input
     if (columnHoldsElement<EdgeID>(input)) {
         return selectFunction<EdgeTypesFunction>(input, inputNullable, memory, result);
     } else if (readsTaggedCells(input)) {
-        return selectTaggedCellFunction<NLTaggedEdgeTypeFunction<ListElementView>>(input, inputNullable, memory, result);
-    } else if (readsMapValues(input)) {
-        return selectMapValueFunction<NLTaggedEdgeTypeFunction<MapEntryView>>(input, memory, result);
+        return selectTaggedCellFunction<NLTaggedEdgeTypeFunction>(input, inputNullable, memory, result);
     }
 
     throw IRException("type() reads a relationship column");
@@ -9735,12 +11480,12 @@ NLUnaryFunctionKernel NLExecutor::selectProperties(const Column* input, bool inp
     } else if (columnHoldsElement<EdgeID>(input)) {
         return selectFunction<NLPropertiesFunction<EdgeID>>(input, inputNullable, memory, result);
     } else if (readsTaggedCells(input)) {
-        return selectTaggedCellFunction<NLTaggedPropertiesFunction<ListElementView>>(input, inputNullable, memory, result);
-    } else if (readsMapValues(input)) {
-        return selectMapValueFunction<NLTaggedPropertiesFunction<MapEntryView>>(input, memory, result);
+        return selectTaggedCellFunction<NLTaggedPropertiesFunction>(input, inputNullable, memory, result);
+    } else if (columnHoldsElement<MapView>(input)) {
+        return selectFunction<MapPropertiesFunction>(input, inputNullable, memory, result);
     }
 
-    throw IRException("properties() reads a node, a relationship or a map column");
+    throw IRException("Reading every property needs a node, a relationship or a map column");
 }
 
 template <template <typename> typename NumberFunctor>
@@ -9829,12 +11574,6 @@ template NLUnaryFunctionKernel NLExecutor::selectFunction<LabelsFunction>(const 
 template NLUnaryFunctionKernel NLExecutor::selectFunction<EdgeTypesFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<StartNodeFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<EndNodeFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
-template NLUnaryFunctionKernel NLExecutor::selectFunction<ToDateTimeFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
-template NLUnaryFunctionKernel NLExecutor::selectFunction<EpochSecondsToDateTimeFunction<types::Int64::Primitive>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
-template NLUnaryFunctionKernel NLExecutor::selectFunction<EpochSecondsToDateTimeFunction<types::UInt64::Primitive>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
-template NLUnaryFunctionKernel NLExecutor::selectFunction<MicrosecondsToDurationFunction<types::Int64::Primitive>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
-template NLUnaryFunctionKernel NLExecutor::selectFunction<MicrosecondsToDurationFunction<types::UInt64::Primitive>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
-template NLUnaryFunctionKernel NLExecutor::selectFunction<MapToDurationFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Year>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Month>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<DateTimeComponentFunction<DateTimePart::Day>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
@@ -9861,6 +11600,14 @@ template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunct
 template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::SecondsOfMinute>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MillisecondsOfSecond>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<DurationComponentFunction<DurationPart::MicrosecondsOfSecond>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<PointComponentFunction<PointPart::X>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<PointComponentFunction<PointPart::Y>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<PointComponentFunction<PointPart::Z>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<PointComponentFunction<PointPart::Longitude>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<PointComponentFunction<PointPart::Latitude>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<PointComponentFunction<PointPart::Height>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<PointComponentFunction<PointPart::CRS>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectFunction<PointComponentFunction<PointPart::SRID>>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<ListHeadFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<ListLastFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectFunction<ListTailFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
@@ -9883,6 +11630,9 @@ template NLUnaryFunctionKernel NLExecutor::selectConversion<ToIntegerFunction>(c
 template NLUnaryFunctionKernel NLExecutor::selectConversion<ToFloatFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectConversion<ToStringFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 template NLUnaryFunctionKernel NLExecutor::selectConversion<ToBoolFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectConversion<ToDateTimeFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectConversion<ToDurationFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
+template NLUnaryFunctionKernel NLExecutor::selectConversion<ToPointFunction>(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result);
 
 template <auto StrictSelector, typename TaggedFunctor>
 NLUnaryFunctionKernel NLExecutor::selectOrNull(const Column* input, bool inputNullable, LocalMemory* memory, Column*& result) {
@@ -10120,13 +11870,13 @@ void NLExecutor::runExistsMark(NLExecutionContext* context, NLFunctionData* data
 
     const ColumnVector<uint64_t>* tag = mark->getTag();
     if (!tag) {
-        // No input row to tag: the step is the single empty row, which this step's rows
-        // mark - and a predicate that cut them all leaves nothing to mark it.
+        // Every row of this step answers for one input row, which they mark - and a
+        // predicate that cut them all leaves nothing to mark it.
         const std::vector<const Column*>& columns = mark->columns();
         bioassert(!columns.empty(), "nl.exists_mark needs at least one column when it has no tag");
 
         if (columns.front()->size() > 0) {
-            state->markMatched(0);
+            state->markMatched(untaggedRow(mark->getRow()));
         }
 
         return;
@@ -10156,7 +11906,7 @@ void NLExecutor::runCountSubqueryTally(NLExecutionContext* context, NLFunctionDa
     const ColumnVector<uint64_t>* tag = tally->getTag();
     if (!tag) {
         const Column* rows = tally->getRows();
-        state->addRows(rows->size());
+        state->addRows(untaggedRow(tally->getRow()), rows->size());
 
         return;
     }
@@ -10490,7 +12240,10 @@ void NLExecutor::runAggregateResult(NLExecutionContext* context, NLFunctionData*
     // reduced value into the output chunk's one nullable row. Runs after the
     // producing loop, so the accumulator holds the whole dataflow's reduction;
     // nl.output emits this chunk at function scope.
-    result->getResult()(result->getState(), result->getOutput());
+    NLStepBuffers* const stepBuffers = result->getStepBuffers();
+    stepBuffers->clear();
+
+    result->getResult()(result->getState(), result->getOutput(), stepBuffers);
 }
 
 void NLExecutor::runGroupAggregateReset(NLExecutionContext* context, NLFunctionData* data) {
@@ -10564,21 +12317,22 @@ void NLExecutor::runGroupAggregateUpdate(NLExecutionContext* context, NLFunction
     }
 
     for (NLGroupAggregateState::Aggregate& aggregate : aggregates) {
-        aggregate._grow(aggregate._accumulator, aggregate._counts, groupCount);
+        aggregate._grow(aggregate._accumulator, aggregate._counts, aggregate._durationTotals, groupCount);
     }
 
-    NLValueStore& extremeValues = state->extremeValues();
+    NLValueStore& accumulatorValues = state->accumulatorValues();
 
     for (NLGroupAggregateState::Aggregate& aggregate : aggregates) {
         aggregate._fold(aggregate._accumulator,
                         aggregate._counts,
+                        aggregate._durationTotals,
                         aggregate._input,
                         groupIndices,
                         aggregate._distinct,
-                        extremeValues);
+                        accumulatorValues);
     }
 
-    state->compactExtremeValues();
+    state->compactAccumulatorValues();
 }
 
 void NLExecutor::runGroupAggregateLoop(NLExecutionContext* context, NLFunctionData* data) {
@@ -10593,6 +12347,7 @@ void NLExecutor::runGroupAggregateLoop(NLExecutionContext* context, NLFunctionDa
     std::vector<NLGroupAggregateState::Aggregate>& aggregates = state->aggregates();
 
     const NLLimitState* limit = loopData->getLimit();
+    NLStepBuffers* const stepBuffers = loopData->getStepBuffers();
 
     // Re-chunk the accumulated groups: each step materializes the next chunk of
     // group rows - the key values sliced from the buffers and each aggregate
@@ -10606,8 +12361,16 @@ void NLExecutor::runGroupAggregateLoop(NLExecutionContext* context, NLFunctionDa
             keyColumn._emitCopy(keyColumn._buffer, offset, stepGroups, keyColumn._output);
         }
 
+        stepBuffers->clear();
+
         for (const NLGroupAggregateState::Aggregate& aggregate : aggregates) {
-            aggregate._emit(aggregate._accumulator, aggregate._counts, offset, stepGroups, aggregate._output);
+            aggregate._emit(aggregate._accumulator,
+                            aggregate._counts,
+                            aggregate._durationTotals,
+                            offset,
+                            stepGroups,
+                            aggregate._output,
+                            stepBuffers);
         }
 
         runBody(context, loopBody);
@@ -10716,21 +12479,22 @@ void NLExecutor::runCollectUpdate(NLExecutionContext* context, NLFunctionData* d
     // The reductions taken over the same groups fold beside the list, off the group
     // assignment computed once above, exactly as nl.group_aggregate_update folds them.
     for (NLGroupAggregateState::Aggregate& aggregate : aggregates) {
-        aggregate._grow(aggregate._accumulator, aggregate._counts, groupCount);
+        aggregate._grow(aggregate._accumulator, aggregate._counts, aggregate._durationTotals, groupCount);
     }
 
-    NLValueStore& extremeValues = state->extremeValues();
+    NLValueStore& accumulatorValues = state->accumulatorValues();
 
     for (NLGroupAggregateState::Aggregate& aggregate : aggregates) {
         aggregate._fold(aggregate._accumulator,
                         aggregate._counts,
+                        aggregate._durationTotals,
                         aggregate._input,
                         groupIndices,
                         aggregate._distinct,
-                        extremeValues);
+                        accumulatorValues);
     }
 
-    state->compactExtremeValues();
+    state->compactAccumulatorValues();
 }
 
 // Only the scalar value types are collectable for now; an embedding column (a span of
@@ -10768,6 +12532,10 @@ NLCollectFoldFunction NLExecutor::selectCollectFold(ValueType valueType) {
 
         case ValueType::Duration:
             return &collectFold<types::Duration::Primitive>;
+        break;
+
+        case ValueType::Point:
+            return &collectFold<types::Point::Primitive>;
         break;
 
         default:
@@ -10813,6 +12581,10 @@ NLCollectFoldFunction NLExecutor::selectCollectDistinctFold(ValueType valueType)
 
         case ValueType::Duration:
             return &collectFoldDistinct<types::Duration::Primitive>;
+        break;
+
+        case ValueType::Point:
+            return &collectFoldDistinct<types::Point::Primitive>;
         break;
 
         default:
@@ -10870,6 +12642,11 @@ NLUnwindElementEmitFunction NLExecutor::selectListUnwindEdgeEmit(bool sourceIsNu
                             : &unwindListValidIDEmit<ColumnVector<ListView>, EdgeID>;
 }
 
+NLUnwindElementEmitFunction NLExecutor::selectListUnwindPathEmit(bool sourceIsNullable) {
+    return sourceIsNullable ? &unwindListPathEmit<ColumnOptVector<ListView>>
+                            : &unwindListPathEmit<ColumnVector<ListView>>;
+}
+
 NLUnwindElementCountFunction NLExecutor::selectTaggedUnwindElementCount() {
     return &unwindTaggedElementCount;
 }
@@ -10920,6 +12697,10 @@ NLUnwindCollectValueEmitFunction NLExecutor::selectUnwindCollectValueEmit(ValueT
             return &unwindCollectValueEmit<types::Duration::Primitive>;
         break;
 
+        case ValueType::Point:
+            return &unwindCollectValueEmit<types::Point::Primitive>;
+        break;
+
         default:
             throw IRException("unwind does not support this value type");
         break;
@@ -10960,6 +12741,10 @@ NLCollectListEmitFunction NLExecutor::selectCollectListEmit(ValueType valueType)
 
         case ValueType::Duration:
             return &collectListEmit<types::Duration::Primitive>;
+        break;
+
+        case ValueType::Point:
+            return &collectListEmit<types::Point::Primitive>;
         break;
 
         default:
@@ -11010,35 +12795,57 @@ void NLExecutor::selectCollectOptEntityHandlers(NLChunkKind kind,
 
 // A list cell is present in every row, so it folds with no null to drop; only the dedup
 // differs, keying on the elements rather than on the cell.
-void NLExecutor::selectCollectListHandlers(bool distinctValues,
-                                           NLCollectFoldFunction& fold,
-                                           NLCollectListEmitFunction& listEmit) {
-    fold = distinctValues ? &collectListFoldDistinct : &collectCellFold<ListView>;
-    listEmit = &collectListEmit<ListView>;
+template <typename Container>
+void NLExecutor::selectCollectContainerHandlers(bool distinctValues,
+                                                NLCollectFoldFunction& fold,
+                                                NLCollectListEmitFunction& listEmit) {
+    fold = distinctValues ? &collectContainerFoldDistinct<Container> : &collectCellFold<Container>;
+    listEmit = &collectListEmit<Container>;
 }
 
-void NLExecutor::selectCollectOptListHandlers(bool distinctValues,
-                                             NLCollectFoldFunction& fold,
-                                             NLCollectListEmitFunction& listEmit) {
-    fold = distinctValues ? &collectOptListFoldDistinct : &collectOptListFold;
-    listEmit = &collectListEmit<ListView>;
+template <typename Container>
+void NLExecutor::selectCollectOptContainerHandlers(bool distinctValues,
+                                                   NLCollectFoldFunction& fold,
+                                                   NLCollectListEmitFunction& listEmit) {
+    fold = distinctValues ? &collectOptContainerFoldDistinct<Container> : &collectOptContainerFold<Container>;
+    listEmit = &collectListEmit<Container>;
 }
+
+template void NLExecutor::selectCollectContainerHandlers<ListView>(bool distinctValues,
+                                                                   NLCollectFoldFunction& fold,
+                                                                   NLCollectListEmitFunction& listEmit);
+template void NLExecutor::selectCollectContainerHandlers<MapView>(bool distinctValues,
+                                                                  NLCollectFoldFunction& fold,
+                                                                  NLCollectListEmitFunction& listEmit);
+template void NLExecutor::selectCollectOptContainerHandlers<ListView>(bool distinctValues,
+                                                                      NLCollectFoldFunction& fold,
+                                                                      NLCollectListEmitFunction& listEmit);
+template void NLExecutor::selectCollectOptContainerHandlers<MapView>(bool distinctValues,
+                                                                     NLCollectFoldFunction& fold,
+                                                                     NLCollectListEmitFunction& listEmit);
 
 // A type-erased cell carries its own type, so the fold drops the ones tagged null and the
 // emit writes each survivor back under the type its tag names.
 void NLExecutor::selectCollectTaggedHandlers(bool distinctValues,
                                              NLCollectFoldFunction& fold,
                                              NLCollectListEmitFunction& listEmit) {
-    fold = distinctValues ? &collectTaggedFoldDistinct<ListElementView>
-                          : &collectTaggedFold<ListElementView>;
+    fold = distinctValues ? &collectTaggedFoldDistinct<CellView>
+                          : &collectTaggedFold<CellView>;
+    listEmit = &collectTaggedListEmit;
+}
+
+void NLExecutor::selectCollectPathHandlers(bool distinctValues,
+                                           NLCollectFoldFunction& fold,
+                                           NLCollectListEmitFunction& listEmit) {
+    fold = distinctValues ? &collectPathFoldDistinct : &collectPathFold;
     listEmit = &collectTaggedListEmit;
 }
 
 void NLExecutor::selectCollectOptTaggedHandlers(bool distinctValues,
                                                 NLCollectFoldFunction& fold,
                                                 NLCollectListEmitFunction& listEmit) {
-    fold = distinctValues ? &collectTaggedFoldDistinct<std::optional<ListElementView>>
-                          : &collectTaggedFold<std::optional<ListElementView>>;
+    fold = distinctValues ? &collectTaggedFoldDistinct<std::optional<CellView>>
+                          : &collectTaggedFold<std::optional<CellView>>;
     listEmit = &collectTaggedListEmit;
 }
 
@@ -11110,6 +12917,7 @@ void NLExecutor::runCollectLoop(NLExecutionContext* context, NLFunctionData* dat
     const NLStmtContainer* loopBody = loopData->getStmts();
 
     std::vector<NLCollectState::KeyColumn>& keyColumns = state->keyColumns();
+    NLStepBuffers* const stepBuffers = loopData->getStepBuffers();
 
     // Re-chunk the groups: each step slices the next chunk of key values from the key
     // buffers and materializes one list cell per group (a ListView over that group's
@@ -11133,8 +12941,16 @@ void NLExecutor::runCollectLoop(NLExecutionContext* context, NLFunctionData* dat
                                   valueColumn._output);
         }
 
+        stepBuffers->clear();
+
         for (const NLGroupAggregateState::Aggregate& aggregate : state->aggregates()) {
-            aggregate._emit(aggregate._accumulator, aggregate._counts, offset, stepGroups, aggregate._output);
+            aggregate._emit(aggregate._accumulator,
+                            aggregate._counts,
+                            aggregate._durationTotals,
+                            offset,
+                            stepGroups,
+                            aggregate._output,
+                            stepBuffers);
         }
 
         runBody(context, loopBody);
@@ -11186,6 +13002,8 @@ void NLExecutor::runShortestPathLoop(NLExecutionContext* context, NLFunctionData
 void NLExecutor::runProcedureInitLoop(NLExecutionContext* context, NLFunctionData* data) {
     NLProcedureLoopData* loopData = static_cast<NLProcedureLoopData*>(data);
     NLProcedureState* state = loopData->getState();
+
+    state->setExecutionContext(context);
 
     // This loop drives the procedure over one chunk of its arguments and is re-entered
     // for the next chunk, so rewind it here: a procedure that finished the previous
@@ -11247,12 +13065,12 @@ NLFillNullFunction NLExecutor::selectOptListFillNull() {
     return &fillNullColumn<std::optional<ListView>>;
 }
 
-NLFillNullFunction NLExecutor::selectOptListElementFillNull() {
-    return &fillNullColumn<std::optional<ListElementView>>;
+NLFillNullFunction NLExecutor::selectOptCellFillNull() {
+    return &fillNullColumn<std::optional<CellView>>;
 }
 
-NLFillNullFunction NLExecutor::selectListElementFillNull() {
-    return &fillNullColumn<ListElementView>;
+NLFillNullFunction NLExecutor::selectCellFillNull() {
+    return &resetTaggedCells;
 }
 
 NLGatherFunction NLExecutor::selectGatherFunction(NLChunkKind kind) {
@@ -11278,8 +13096,8 @@ NLMaskSurvivorFunction NLExecutor::selectMaskSurvivorFunction(bool nullable, boo
     return &collectMaskSurvivors;
 }
 
-NLFetchNodesFunction NLExecutor::selectNodeFetchFunction(bool nullable) {
-    return nullable ? &fetchNamedNodes<std::optional<NodeID>> : &fetchNamedNodes<NodeID>;
+NLFetchNodesFunction NLExecutor::selectNodeFetchFunction() {
+    return &fetchNamedNodes<NodeID>;
 }
 
 NLFetchNodesFunction NLExecutor::selectIntegerFetchFunction(ValueType valueType, bool nullable) {
@@ -11299,7 +13117,7 @@ NLFetchNodesFunction NLExecutor::selectIntegerFetchFunction(ValueType valueType,
 }
 
 NLFetchNodesFunction NLExecutor::selectTaggedFetchFunction(bool nullable) {
-    return nullable ? &fetchNamedNodes<std::optional<ListElementView>> : &fetchNamedNodes<ListElementView>;
+    return nullable ? &fetchNamedNodes<std::optional<CellView>> : &fetchNamedNodes<CellView>;
 }
 
 NLBroadcastFunction NLExecutor::selectBlockRepeatFunction(NLChunkKind kind) {
@@ -11352,30 +13170,47 @@ NLBroadcastConstantFunction NLExecutor::selectNullConstantBroadcast() {
 }
 
 NLBroadcastConstantFunction NLExecutor::selectConstantListBroadcast() {
-    return &broadcastConstantViewColumn<ListView>;
+    return &broadcastConstantPlainColumn<ListView>;
 }
 
 NLBroadcastConstantFunction NLExecutor::selectConstantMapBroadcast() {
-    return &broadcastConstantViewColumn<MapView>;
+    return &broadcastConstantPlainColumn<MapView>;
 }
 
-NLBroadcastConstantFunction NLExecutor::selectConstantMapEntryBroadcast() {
-    return &broadcastConstantViewColumn<MapEntryView>;
+NLBroadcastConstantFunction NLExecutor::selectConstantCellBroadcast() {
+    return &broadcastConstantPlainColumn<CellView>;
 }
 
-NLBroadcastConstantFunction NLExecutor::selectOptListElementBroadcast(const Column* value) {
+NLBroadcastConstantFunction NLExecutor::selectConstantPlainBroadcast(NLChunkKind kind, const Column* value) {
+    bioassert(value->getContainerKind() == ContainerKind::code<ColumnConst>(),
+              "A node, an edge, a path or a walk laid out over rows is read as the constant nl.row_constant made of it");
+
+    NLBroadcastConstantFunction fill = nullptr;
+    dispatchChunkKind(kind, [&]<typename Element>() { fill = &broadcastConstantPlainColumn<Element>; });
+
+    return fill;
+}
+
+NLBroadcastConstantFunction NLExecutor::selectConstantMaskBroadcast(const Column* value) {
+    bioassert(value->getKind() == ColumnConst<types::Bool::Primitive>::staticKind(),
+              "A mask laid out over rows is read as the boolean nl.row_constant made of it");
+
+    return &broadcastConstantMaskColumn;
+}
+
+NLBroadcastConstantFunction NLExecutor::selectOptCellBroadcast(const Column* value) {
     const bool isConst = value->getContainerKind() == ContainerKind::code<ColumnConst>();
-    const bool holdsOptional = value->getInternalKind() == InternalKind::code<std::optional<ListElementView>>();
+    const bool holdsOptional = value->getInternalKind() == InternalKind::code<std::optional<CellView>>();
 
     // A tagged cell carries its own null, so head() and last() answer with a plain cell rather
     // than an optional even where the chunk it is laid out over is a nullable one.
     if (!isConst) {
-        return &broadcastSingleRowColumn<ListElementView>;
+        return &broadcastSingleRowColumn<CellView>;
     } else if (holdsOptional) {
-        return &broadcastNullableConstantColumn<ListElementView>;
+        return &broadcastNullableConstantColumn<CellView>;
     }
 
-    return &broadcastConstantColumn<ListElementView>;
+    return &broadcastConstantColumn<CellView>;
 }
 
 NLBroadcastConstantFunction NLExecutor::selectConstantBroadcast(ValueType valueType, const Column* value) {
@@ -11399,6 +13234,11 @@ NLBroadcastConstantFunction NLExecutor::selectConstantBroadcast(ValueType valueT
 }
 
 NLUnaryFn NLExecutor::selectRowConstant(const Column* row, LocalMemory* memory, Column*& result) {
+    if (row->getKind() == ColumnMask::staticKind()) {
+        result = memory->alloc<ColumnConst<types::Bool::Primitive>>();
+        return &readSingleMaskRowAsConstant;
+    }
+
     NLUnaryFn read = nullptr;
 
     const auto selectForElement = [&]<typename Element>() {
@@ -11416,6 +13256,7 @@ NLUnaryFn NLExecutor::selectRowConstant(const Column* row, LocalMemory* memory, 
     selectForElement.template operator()<types::Embedding::Primitive>();
     selectForElement.template operator()<types::DateTime::Primitive>();
     selectForElement.template operator()<types::Duration::Primitive>();
+    selectForElement.template operator()<types::Point::Primitive>();
     selectForElement.template operator()<std::optional<types::Int64::Primitive>>();
     selectForElement.template operator()<std::optional<types::UInt64::Primitive>>();
     selectForElement.template operator()<std::optional<types::Double::Primitive>>();
@@ -11424,15 +13265,17 @@ NLUnaryFn NLExecutor::selectRowConstant(const Column* row, LocalMemory* memory, 
     selectForElement.template operator()<std::optional<types::Embedding::Primitive>>();
     selectForElement.template operator()<std::optional<types::DateTime::Primitive>>();
     selectForElement.template operator()<std::optional<types::Duration::Primitive>>();
+    selectForElement.template operator()<std::optional<types::Point::Primitive>>();
     selectForElement.template operator()<NodeID>();
     selectForElement.template operator()<EdgeID>();
+    selectForElement.template operator()<GraphPath>();
+    selectForElement.template operator()<PathRef>();
     selectForElement.template operator()<ListView>();
     selectForElement.template operator()<std::optional<ListView>>();
-    selectForElement.template operator()<ListElementView>();
-    selectForElement.template operator()<std::optional<ListElementView>>();
+    selectForElement.template operator()<CellView>();
+    selectForElement.template operator()<std::optional<CellView>>();
     selectForElement.template operator()<MapView>();
     selectForElement.template operator()<std::optional<MapView>>();
-    selectForElement.template operator()<MapEntryView>();
 
     if (!read) {
         throw IRException(fmt::format("nl.row_constant can not read a {} as a constant", row->getTypeName()));
@@ -11441,102 +13284,78 @@ NLUnaryFn NLExecutor::selectRowConstant(const Column* row, LocalMemory* memory, 
     return read;
 }
 
-// A !storage.any chunk is a ColumnVector<ListElementView> of fixed-width tagged
+// A !storage.any chunk is a ColumnVector<CellView> of fixed-width tagged
 // scalars, so the same broadcast templates carry the tag along with the value.
-NLBroadcastFunction NLExecutor::selectListElementBlockRepeatFunction() {
-    return &blockRepeatColumn<ListElementView>;
+NLBroadcastFunction NLExecutor::selectCellBlockRepeatFunction() {
+    return &blockRepeatColumn<CellView>;
 }
 
-NLBroadcastFunction NLExecutor::selectListElementTileFunction() {
-    return &tileColumn<ListElementView>;
+NLBroadcastFunction NLExecutor::selectCellTileFunction() {
+    return &tileColumn<CellView>;
 }
 
-NLAppendFunction NLExecutor::selectListElementAppendFunction() {
-    return &appendColumn<ListElementView>;
+NLAppendFunction NLExecutor::selectCellAppendFunction() {
+    return &appendColumn<CellView>;
 }
 
-NLGatherFunction NLExecutor::selectListElementGatherFunction() {
-    return &gatherColumn<ListElementView>;
+NLGatherFunction NLExecutor::selectCellGatherFunction() {
+    return &gatherColumn<CellView>;
 }
 
-NLAppendFunction NLExecutor::selectOptListElementAppendFunction() {
-    return &appendColumn<std::optional<ListElementView>>;
+NLAppendFunction NLExecutor::selectOptCellAppendFunction() {
+    return &appendColumn<std::optional<CellView>>;
 }
 
-NLGatherFunction NLExecutor::selectOptListElementGatherFunction() {
-    return &gatherColumn<std::optional<ListElementView>>;
+NLGatherFunction NLExecutor::selectOptCellGatherFunction() {
+    return &gatherColumn<std::optional<CellView>>;
 }
 
-NLCompareFunction NLExecutor::selectListElementCompareFunction() {
-    return &compareListElementColumn;
+NLCompareFunction NLExecutor::selectCellCompareFunction() {
+    return &compareCellColumn;
 }
 
-NLKeyAppendFunction NLExecutor::selectListElementKeyAppendFunction() {
-    return &distinctKeyAppendListElementColumn;
+NLKeyAppendFunction NLExecutor::selectCellKeyAppendFunction() {
+    return &distinctKeyAppendCellColumn;
 }
 
-NLCountFunction NLExecutor::selectListElementCountFunction() {
+NLCountFunction NLExecutor::selectCellCountFunction() {
     return &countNonNullElementsColumn;
 }
 
-NLGroupKeyGatherFunction NLExecutor::selectListElementGroupKeyGatherFunction() {
-    return &groupGatherAppendColumn<ListElementView>;
+NLGroupKeyGatherFunction NLExecutor::selectCellGroupKeyGatherFunction() {
+    return &groupGatherAppendColumn<CellView>;
 }
 
-NLCopyFunction NLExecutor::selectListElementCopyFunction() {
-    return &copyRangeColumn<ListElementView>;
+NLCopyFunction NLExecutor::selectCellCopyFunction() {
+    return &copyRangeColumn<CellView>;
 }
 
-// A map_element chunk is a ColumnVector<MapEntryView> of fixed-width entries, so the
-// same templates carry each entry's key and tag along with its value. Only the passing
-// -through families are selected here: ordering, keying and joining a map value are not
-// supported, and their selectors reject it rather than silently misreading the entry.
-NLBroadcastFunction NLExecutor::selectMapEntryBlockRepeatFunction() {
-    return &blockRepeatColumn<MapEntryView>;
+NLBroadcastFunction NLExecutor::selectOptCellBlockRepeatFunction() {
+    return &blockRepeatColumn<std::optional<CellView>>;
 }
 
-NLBroadcastFunction NLExecutor::selectMapEntryTileFunction() {
-    return &tileColumn<MapEntryView>;
+NLBroadcastFunction NLExecutor::selectOptCellTileFunction() {
+    return &tileColumn<std::optional<CellView>>;
 }
 
-NLAppendFunction NLExecutor::selectMapEntryAppendFunction() {
-    return &appendColumn<MapEntryView>;
+NLCompareFunction NLExecutor::selectOptCellCompareFunction() {
+    return &compareOptCellColumn;
 }
 
-NLGatherFunction NLExecutor::selectMapEntryGatherFunction() {
-    return &gatherColumn<MapEntryView>;
+NLKeyAppendFunction NLExecutor::selectOptCellKeyAppendFunction() {
+    return &distinctKeyAppendOptCellColumn;
 }
 
-NLCopyFunction NLExecutor::selectMapEntryCopyFunction() {
-    return &copyRangeColumn<MapEntryView>;
-}
-
-NLBroadcastFunction NLExecutor::selectOptListElementBlockRepeatFunction() {
-    return &blockRepeatColumn<std::optional<ListElementView>>;
-}
-
-NLBroadcastFunction NLExecutor::selectOptListElementTileFunction() {
-    return &tileColumn<std::optional<ListElementView>>;
-}
-
-NLCompareFunction NLExecutor::selectOptListElementCompareFunction() {
-    return &compareOptListElementColumn;
-}
-
-NLKeyAppendFunction NLExecutor::selectOptListElementKeyAppendFunction() {
-    return &distinctKeyAppendOptListElementColumn;
-}
-
-NLCountFunction NLExecutor::selectOptListElementCountFunction() {
+NLCountFunction NLExecutor::selectOptCellCountFunction() {
     return &countPresentElementsColumn;
 }
 
-NLGroupKeyGatherFunction NLExecutor::selectOptListElementGroupKeyGatherFunction() {
-    return &groupGatherAppendColumn<std::optional<ListElementView>>;
+NLGroupKeyGatherFunction NLExecutor::selectOptCellGroupKeyGatherFunction() {
+    return &groupGatherAppendColumn<std::optional<CellView>>;
 }
 
-NLCopyFunction NLExecutor::selectOptListElementCopyFunction() {
-    return &copyRangeColumn<std::optional<ListElementView>>;
+NLCopyFunction NLExecutor::selectOptCellCopyFunction() {
+    return &copyRangeColumn<std::optional<CellView>>;
 }
 
 NLCompareFunction NLExecutor::selectListCompareFunction() {
@@ -11849,7 +13668,7 @@ NLKeyAppendFunction NLExecutor::selectKeyAppendFunction(NLChunkKind kind) {
         break;
 
         case NLChunkKind::Path:
-            throw IRException("A path column cannot be a DISTINCT or grouping key: a path has no scalar value to key on");
+            return &distinctKeyAppendPathColumn;
         break;
 
         case NLChunkKind::DateTime:
@@ -11860,12 +13679,12 @@ NLKeyAppendFunction NLExecutor::selectKeyAppendFunction(NLChunkKind kind) {
             return &distinctKeyAppendPlainColumn<types::Duration::Primitive>;
         break;
 
-        case NLChunkKind::PathRef:
-            throw IRException("A path column cannot be a DISTINCT or grouping key: expand it into its list first");
+        case NLChunkKind::Point:
+            return &distinctKeyAppendPlainColumn<types::Point::Primitive>;
         break;
 
-        case NLChunkKind::EntityList:
-            return &distinctKeyAppendEntityListColumn;
+        case NLChunkKind::PathRef:
+            throw IRException("A path column cannot be a DISTINCT or grouping key: expand it into its list first");
         break;
     }
 
@@ -11916,6 +13735,10 @@ NLKeyAppendFunction NLExecutor::selectOptKeyAppendFunction(ValueType valueType) 
             return &distinctKeyAppendOptColumn<types::Duration::Primitive>;
         break;
 
+        case ValueType::Point:
+            return &distinctKeyAppendOptColumn<types::Point::Primitive>;
+        break;
+
         case ValueType::Map:
             return &distinctKeyAppendOptMapColumn;
         break;
@@ -11928,43 +13751,6 @@ NLKeyAppendFunction NLExecutor::selectOptKeyAppendFunction(ValueType valueType) 
 
     bioassert(false, "Unhandled value type");
     return nullptr;
-}
-
-NLKeyIsMatchableFunction NLExecutor::everyKeyMatchable() {
-    return &everyRowMatchable;
-}
-
-// Selected per column from its value type. A double and an embedding answer their own way,
-// since neither a NaN nor a vector holding one equals itself; every other value type
-// matches on any present row.
-NLKeyIsMatchableFunction NLExecutor::selectOptKeyMatchableFunction(ValueType valueType) {
-    if (valueType == ValueType::Double) {
-        return &optDoubleColumnRowMatchable;
-    } else if (valueType == ValueType::Embedding) {
-        return &optEmbeddingColumnRowMatchable;
-    }
-
-    NLKeyIsMatchableFunction isMatchable = nullptr;
-    const auto select = [&]<SupportedType T>() {
-        isMatchable = &optColumnRowMatchable<typename T::Primitive>;
-    };
-    ValueTypeDispatcher(valueType).execute(select);
-
-    return isMatchable;
-}
-
-// A plainly-held value carries no present flag, so a double is the only such column with
-// a row a join cannot match on.
-NLKeyIsMatchableFunction NLExecutor::selectPlainKeyMatchableFunction(ValueType valueType) {
-    if (valueType == ValueType::Double) {
-        return &plainDoubleColumnRowMatchable;
-    }
-
-    return &everyRowMatchable;
-}
-
-NLKeyIsMatchableFunction NLExecutor::selectListElementKeyMatchableFunction() {
-    return &listElementColumnRowMatchable;
 }
 
 NLJoinKeyFunctions NLExecutor::selectJoinKeyFunctions(NLChunkKind kind) {
@@ -12014,7 +13800,7 @@ NLJoinKeyFunctions NLExecutor::selectJoinKeyFunctions(NLChunkKind kind) {
         break;
 
         case NLChunkKind::List:
-            return {&hashListKeyColumn, &keyEqualColumn<ListView>};
+            return joinKeyFunctions<ListView>();
         break;
 
         case NLChunkKind::Map:
@@ -12033,12 +13819,12 @@ NLJoinKeyFunctions NLExecutor::selectJoinKeyFunctions(NLChunkKind kind) {
             return joinKeyFunctions<types::Duration::Primitive>();
         break;
 
-        case NLChunkKind::PathRef:
-            throw IRException("A path column cannot be a join key: expand it into its list first");
+        case NLChunkKind::Point:
+            return joinKeyFunctions<types::Point::Primitive>();
         break;
 
-        case NLChunkKind::EntityList:
-            throw IRException("A path column cannot be a join key: a path has no scalar value to key on");
+        case NLChunkKind::PathRef:
+            throw IRException("A path column cannot be a join key: expand it into its list first");
         break;
     }
 
@@ -12076,8 +13862,34 @@ NLJoinKeyFunctions NLExecutor::selectPlainJoinKeyFunctions(ValueType valueType) 
     }
 }
 
-NLJoinKeyFunctions NLExecutor::selectListElementJoinKeyFunctions() {
-    return {&hashListElementKeyColumn, &keyEqualColumn<ListElementView>};
+NLJoinKeyFunctions NLExecutor::selectCellJoinKeyFunctions() {
+    return joinKeyFunctions<CellView>();
+}
+
+NLJoinKeyFunctions NLExecutor::selectOptCellJoinKeyFunctions() {
+    return optJoinKeyFunctions<CellView>();
+}
+
+NLJoinKeyFunctions NLExecutor::selectMaskJoinKeyFunctions() {
+    return {&hashMaskKeyColumn, &keyEqualMaskColumn, &everyRowMatchable};
+}
+
+// The pairs `=` compares are the pairs its kernel takes, so a pair the kernel has no
+// comparison for never reaches a join: the filter it replaces could not have run.
+NLKeyEqualFunction NLExecutor::selectCrossTypeKeyEqualFunction(const Column* probe, const Column* build) {
+    using Pairs = PairRestrictions<OP_EQUAL>;
+
+    CrossTypeKeyEqualSelector selector;
+    ColumnDoubleDispatcher<typename Pairs::Allowed,
+                           typename Pairs::AllowedMixed,
+                           CrossTypeKeyEqualSelector,
+                           typename Pairs::Excluded>::dispatch(probe, build, selector);
+
+    if (!selector._equal) {
+        throw IRException("A hash join key must be a column holding one value per row");
+    }
+
+    return selector._equal;
 }
 
 // An ID chunk (node/edge/edge-type IDs) has no null rows, so every row counts,
@@ -12150,16 +13962,19 @@ NLCountFunction NLExecutor::selectOptCountFunction(ValueType valueType) {
 }
 
 NLAggregateResetFunction NLExecutor::selectAggregateReset(AggregateKind kind, ValueType accumulatorType) {
+    const bool resetsToZero = (kind == AggregateKind::Sum || kind == AggregateKind::Avg);
+    const bool totalsDurations = resetsToZero && accumulatorType == ValueType::Duration;
+
     if (kind == AggregateKind::StDev || kind == AggregateKind::StDevP) {
         return &aggregateResetDeviation;
+    } else if (totalsDurations) {
+        return &aggregateResetDurationTotal;
     }
 
     // sum/avg reset to a present zero (their identity); min/max reset to null. Both
     // resets compile for any value type and lowering has already validated the
     // kind / type pairing (and the update selector re-checks it), so a single
     // dispatch over the accumulator type suffices here.
-    const bool resetsToZero = (kind == AggregateKind::Sum || kind == AggregateKind::Avg);
-
     NLAggregateResetFunction reset = nullptr;
     const auto select = [&]<SupportedType T>() {
         reset = resetsToZero ? &aggregateResetZero<typename T::Primitive>
@@ -12199,26 +14014,45 @@ NLAggregateUpdateFunction NLExecutor::selectAggregateUpdate(AggregateKind kind, 
 }
 
 NLAggregateUpdateFunction NLExecutor::selectTaggedAggregateUpdate(AggregateKind kind) {
-    return taggedAggregateUpdateFor<ListElementView>(kind);
+    return taggedAggregateUpdateFor<CellView>(kind);
 }
 
 NLAggregateUpdateFunction NLExecutor::selectOptTaggedAggregateUpdate(AggregateKind kind) {
-    return taggedAggregateUpdateFor<std::optional<ListElementView>>(kind);
+    return taggedAggregateUpdateFor<std::optional<CellView>>(kind);
 }
 
+// A tagged accumulator holds no value until a cell is folded, so a duration can start a
+// sum that a number then cannot join
 NLAggregateResetFunction NLExecutor::selectTaggedAggregateReset() {
-    return &aggregateResetNull<ListElementView>;
+    return &aggregateResetNull<CellView>;
 }
 
-NLAggregateResultFunction NLExecutor::selectTaggedAggregateResult() {
-    return &aggregateResultCopy<ListElementView>;
+NLAggregateResultFunction NLExecutor::selectTaggedAggregateResult(AggregateKind kind) {
+    if (kind == AggregateKind::Sum) {
+        return &aggregateResultTaggedSum;
+    } else if (kind == AggregateKind::Avg) {
+        return &aggregateResultTaggedAvg;
+    }
+
+    return &aggregateResultCopy<CellView>;
 }
 
 NLAggregateResultFunction NLExecutor::selectAggregateResult(AggregateKind kind, ValueType resultType) {
     if (kind == AggregateKind::Avg) {
-        // avg always emits an f64 (the running sum divided by the count), whatever
-        // the input type was.
-        return &aggregateResultAvg;
+        // avg emits the running total divided by the count: a double over numbers and a
+        // duration over durations
+        NLAggregateResultFunction average = nullptr;
+        dispatchAverageTotal(resultType, [&]<typename Total>() {
+            if constexpr (std::is_same_v<Total, types::Duration::Primitive>) {
+                average = &aggregateResultDurationAverage;
+            } else {
+                average = &aggregateResultAvg<Total>;
+            }
+        });
+
+        return average;
+    } else if (kind == AggregateKind::Sum && resultType == ValueType::Duration) {
+        return &aggregateResultDurationSum;
     } else if (kind == AggregateKind::StDev) {
         return &aggregateResultDeviation</*Population=*/false>;
     } else if (kind == AggregateKind::StDevP) {
@@ -12238,10 +14072,10 @@ NLAggregateResultFunction NLExecutor::selectAggregateResult(AggregateKind kind, 
 
 NLGroupAggregateGrowFunction NLExecutor::selectGroupAggregateGrow(GroupAggregateKind kind, ValueType accumulatorType) {
     // count keeps only a per-group tally, so its grow ignores the accumulator type;
-    // avg carries a running f64 sum plus that tally, so its grow is always f64-typed
-    // and is the only value reduction besides count that grows the counts vector. A
-    // switch (not an if/else) over every kind so a new one is a compile error here
-    // rather than silently taking the sum/min/max path.
+    // avg carries a running total - an f64 over numbers, a 128-bit duration total over
+    // durations - plus that tally, and is the only value reduction besides count that
+    // grows the counts vector. A switch (not an if/else) over every kind so a new one is a
+    // compile error here rather than silently taking the sum/min/max path.
     switch (kind) {
         case GroupAggregateKind::Count:
         case GroupAggregateKind::CountDistinct:
@@ -12250,8 +14084,18 @@ NLGroupAggregateGrowFunction NLExecutor::selectGroupAggregateGrow(GroupAggregate
         break;
 
         case GroupAggregateKind::Avg:
-        case GroupAggregateKind::AvgDistinct:
-            return &groupGrowAvg;
+        case GroupAggregateKind::AvgDistinct: {
+            NLGroupAggregateGrowFunction grow = nullptr;
+            dispatchAverageTotal(accumulatorType, [&]<typename Total>() {
+                if constexpr (std::is_same_v<Total, types::Duration::Primitive>) {
+                    grow = &groupGrowDurationTotal</*Averages=*/true>;
+                } else {
+                    grow = &groupGrowAvg<Total>;
+                }
+            });
+
+            return grow;
+        }
         break;
 
         case GroupAggregateKind::StDev:
@@ -12274,6 +14118,10 @@ NLGroupAggregateGrowFunction NLExecutor::selectGroupAggregateGrow(GroupAggregate
             // of selectAggregateReset.
             const bool growsToZero = (kind == GroupAggregateKind::Sum) || (kind == GroupAggregateKind::SumDistinct);
 
+            if (growsToZero && accumulatorType == ValueType::Duration) {
+                return &groupGrowDurationTotal</*Averages=*/false>;
+            }
+
             NLGroupAggregateGrowFunction grow = nullptr;
             const auto select = [&]<SupportedType T>() {
                 grow = growsToZero ? &groupGrowZero<typename T::Primitive>
@@ -12291,19 +14139,37 @@ NLGroupAggregateGrowFunction NLExecutor::selectGroupAggregateGrow(GroupAggregate
 }
 
 NLGroupAggregateFoldFunction NLExecutor::selectTaggedGroupAggregateFold(GroupAggregateKind kind) {
-    return taggedGroupAggregateFoldFor<ListElementView>(kind);
+    return taggedGroupAggregateFoldFor<CellView>(kind);
 }
 
 NLGroupAggregateFoldFunction NLExecutor::selectOptTaggedGroupAggregateFold(GroupAggregateKind kind) {
-    return taggedGroupAggregateFoldFor<std::optional<ListElementView>>(kind);
+    return taggedGroupAggregateFoldFor<std::optional<CellView>>(kind);
 }
 
-NLGroupAggregateGrowFunction NLExecutor::selectTaggedGroupAggregateGrow() {
-    return &groupGrowNull<ListElementView>;
+NLGroupAggregateGrowFunction NLExecutor::selectTaggedGroupAggregateGrow(GroupAggregateKind kind) {
+    const bool sums = (kind == GroupAggregateKind::Sum) || (kind == GroupAggregateKind::SumDistinct);
+    const bool averages = (kind == GroupAggregateKind::Avg) || (kind == GroupAggregateKind::AvgDistinct);
+
+    if (sums) {
+        return &groupGrowTaggedSum</*Averages=*/false>;
+    } else if (averages) {
+        return &groupGrowTaggedSum</*Averages=*/true>;
+    }
+
+    return &groupGrowNull<CellView>;
 }
 
-NLGroupAggregateEmitFunction NLExecutor::selectTaggedGroupAggregateEmit() {
-    return &groupEmitCopy<ListElementView>;
+NLGroupAggregateEmitFunction NLExecutor::selectTaggedGroupAggregateEmit(GroupAggregateKind kind) {
+    const bool sums = (kind == GroupAggregateKind::Sum) || (kind == GroupAggregateKind::SumDistinct);
+    const bool averages = (kind == GroupAggregateKind::Avg) || (kind == GroupAggregateKind::AvgDistinct);
+
+    if (sums) {
+        return &groupEmitTaggedSum;
+    } else if (averages) {
+        return &groupEmitTaggedAvg;
+    }
+
+    return &groupEmitCopy<CellView>;
 }
 
 NLGroupAggregateFoldFunction NLExecutor::selectGroupAggregateFold(GroupAggregateKind kind, ValueType inputType) {
@@ -12373,20 +14239,20 @@ NLGroupAggregateFoldFunction NLExecutor::selectGroupAggregateFold(GroupAggregate
     return nullptr;
 }
 
-NLGroupAggregateFoldFunction NLExecutor::selectGroupCountListElementFold() {
-    return &groupFoldCountPresentListElement<ListElementView>;
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountCellFold() {
+    return &groupFoldCountPresentCell<CellView>;
 }
 
-NLGroupAggregateFoldFunction NLExecutor::selectGroupCountOptListElementFold() {
-    return &groupFoldCountPresentListElement<std::optional<ListElementView>>;
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountOptCellFold() {
+    return &groupFoldCountPresentCell<std::optional<CellView>>;
 }
 
-NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctListElementFold() {
-    return &groupFoldCountDistinctListElement<ListElementView>;
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctCellFold() {
+    return &groupFoldCountDistinctCell<CellView>;
 }
 
-NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctOptListElementFold() {
-    return &groupFoldCountDistinctListElement<std::optional<ListElementView>>;
+NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctOptCellFold() {
+    return &groupFoldCountDistinctCell<std::optional<CellView>>;
 }
 
 NLGroupAggregateFoldFunction NLExecutor::selectGroupCountAllFold() {
@@ -12435,6 +14301,10 @@ NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctFold(ValueType 
             return &groupFoldCountDistinctPresent<types::Duration::Primitive>;
         break;
 
+        case ValueType::Point:
+            return &groupFoldCountDistinctPresent<types::Point::Primitive>;
+        break;
+
         case ValueType::Map:
             return &groupFoldCountDistinctPresentMap;
         break;
@@ -12449,87 +14319,11 @@ NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctFold(ValueType 
     return nullptr;
 }
 
-// count(DISTINCT x) over a chunk that is never null - an ID column, or one a procedure
-// yielded: each group is charged once per distinct value it sees. The chunk kind picks
-// the column layout the key is read from, the way selectKeyAppendFunction does for a
-// DISTINCT row key. An ID keys on its integer, everything else on the value itself.
 NLGroupAggregateFoldFunction NLExecutor::selectGroupCountDistinctChunkFold(NLChunkKind kind) {
-    switch (kind) {
-        case NLChunkKind::NodeID:
-            return &groupFoldCountDistinctID<NodeID>;
-        break;
+    NLGroupAggregateFoldFunction fold = nullptr;
+    dispatchChunkKind(kind, [&]<typename ElementType>() { fold = &groupFoldCountDistinctChunk<ElementType>; });
 
-        case NLChunkKind::EdgeID:
-            return &groupFoldCountDistinctID<EdgeID>;
-        break;
-
-        case NLChunkKind::EdgeTypeID:
-            return &groupFoldCountDistinctID<EdgeTypeID>;
-        break;
-
-        case NLChunkKind::LabelID:
-            return &groupFoldCountDistinctID<LabelID>;
-        break;
-
-        case NLChunkKind::PropertyTypeID:
-            return &groupFoldCountDistinctID<PropertyTypeID>;
-        break;
-
-        case NLChunkKind::ValueTypeCode:
-            return &groupFoldCountDistinctValue<ValueType>;
-        break;
-
-        case NLChunkKind::UInt64:
-            return &groupFoldCountDistinctValue<types::UInt64::Primitive>;
-        break;
-
-        case NLChunkKind::Int64:
-            return &groupFoldCountDistinctValue<types::Int64::Primitive>;
-        break;
-
-        case NLChunkKind::Double:
-            return &groupFoldCountDistinctValue<types::Double::Primitive>;
-        break;
-
-        case NLChunkKind::Bool:
-            return &groupFoldCountDistinctValue<types::Bool::Primitive>;
-        break;
-
-        case NLChunkKind::String:
-            return &groupFoldCountDistinctValue<types::String::Primitive>;
-        break;
-
-        case NLChunkKind::List:
-            return &groupFoldCountDistinctList;
-        break;
-
-        case NLChunkKind::Map:
-            throw IRException("count(DISTINCT) cannot key on a map column: a map has no scalar value to count distinct");
-        break;
-
-        case NLChunkKind::Path:
-            throw IRException("count(DISTINCT) cannot key on a path column: a path has no scalar value to count distinct");
-        break;
-
-        case NLChunkKind::DateTime:
-            return &groupFoldCountDistinctValue<types::DateTime::Primitive>;
-        break;
-
-        case NLChunkKind::Duration:
-            return &groupFoldCountDistinctValue<types::Duration::Primitive>;
-        break;
-
-        case NLChunkKind::PathRef:
-            throw IRException("count(DISTINCT) cannot key on a path column: expand it into its list first");
-        break;
-
-        case NLChunkKind::EntityList:
-            throw IRException("count(DISTINCT) cannot key on a path column: a path has no scalar value to count distinct");
-        break;
-    }
-
-    bioassert(false, "Unknown NLChunkKind");
-    return nullptr;
+    return fold;
 }
 
 NLGroupAggregateEmitFunction NLExecutor::selectGroupAggregateEmit(GroupAggregateKind kind, ValueType resultType) {
@@ -12544,9 +14338,20 @@ NLGroupAggregateEmitFunction NLExecutor::selectGroupAggregateEmit(GroupAggregate
         break;
 
         case GroupAggregateKind::Avg:
-        case GroupAggregateKind::AvgDistinct:
-            // avg emits the running f64 sum divided by the count, per group.
-            return &groupEmitAvg;
+        case GroupAggregateKind::AvgDistinct: {
+            // avg emits the running total divided by the count, per group: a double over
+            // numbers and a duration over durations
+            NLGroupAggregateEmitFunction emit = nullptr;
+            dispatchAverageTotal(resultType, [&]<typename Total>() {
+                if constexpr (std::is_same_v<Total, types::Duration::Primitive>) {
+                    emit = &groupEmitDurationAverage;
+                } else {
+                    emit = &groupEmitAvg<Total>;
+                }
+            });
+
+            return emit;
+        }
         break;
 
         case GroupAggregateKind::StDev:
@@ -12567,6 +14372,11 @@ NLGroupAggregateEmitFunction NLExecutor::selectGroupAggregateEmit(GroupAggregate
             // sum/min/max/first hold each group's reduced value in the result's own type, so
             // the emit copies the accumulator slice - valid for any value type, the
             // grouped sibling of selectAggregateResult.
+            const bool sums = (kind == GroupAggregateKind::Sum) || (kind == GroupAggregateKind::SumDistinct);
+            if (sums && resultType == ValueType::Duration) {
+                return &groupEmitDurationSum;
+            }
+
             NLGroupAggregateEmitFunction emit = nullptr;
             const auto select = [&]<SupportedType T>() {
                 emit = &groupEmitCopy<typename T::Primitive>;
@@ -12715,7 +14525,6 @@ NLKeyAppendFunction NLExecutor::selectPlainMergeKeyAppendFunction(NLChunkKind ki
         case NLChunkKind::Map:
         case NLChunkKind::Path:
         case NLChunkKind::PathRef:
-        case NLChunkKind::EntityList:
             throw IRException("a MERGE pattern cannot constrain a property to this value");
         break;
 
@@ -12727,6 +14536,11 @@ NLKeyAppendFunction NLExecutor::selectPlainMergeKeyAppendFunction(NLChunkKind ki
         case NLChunkKind::Duration:
             throwUnlessKeyedAsItsOwnType(ValueType::Duration, keyType);
             return &mergeKeyAppendPlainColumn<types::Duration::Primitive>;
+        break;
+
+        case NLChunkKind::Point:
+            throwUnlessKeyedAsItsOwnType(ValueType::Point, keyType);
+            return &mergeKeyAppendPlainColumn<types::Point::Primitive>;
         break;
     }
 
@@ -12774,6 +14588,11 @@ NLKeyAppendFunction NLExecutor::selectConstMergeKeyAppendFunction(ValueType valu
         case ValueType::Duration:
             throwUnlessKeyedAsItsOwnType(ValueType::Duration, keyType);
             return &mergeKeyAppendConstColumn<types::Duration::Primitive>;
+        break;
+
+        case ValueType::Point:
+            throwUnlessKeyedAsItsOwnType(ValueType::Point, keyType);
+            return &mergeKeyAppendConstColumn<types::Point::Primitive>;
         break;
 
         case ValueType::Map:
@@ -12961,12 +14780,12 @@ NLCompareFunction NLExecutor::selectCompareFunction(NLChunkKind kind) {
             return &compareColumn<types::Duration::Primitive>;
         break;
 
-        case NLChunkKind::PathRef:
-            throw IRException("A path column cannot be a sort key: expand it into its list first");
+        case NLChunkKind::Point:
+            return &compareColumn<types::Point::Primitive>;
         break;
 
-        case NLChunkKind::EntityList:
-            throw IRException("A path column cannot be a sort key: a path has no order here");
+        case NLChunkKind::PathRef:
+            throw IRException("A path column cannot be a sort key: expand it into its list first");
         break;
     }
 
@@ -13016,6 +14835,10 @@ NLCompareFunction NLExecutor::selectOptCompareFunction(ValueType valueType) {
             return &compareOptColumn<types::Duration::Primitive>;
         break;
 
+        case ValueType::Point:
+            return &compareOptColumn<types::Point::Primitive>;
+        break;
+
         case ValueType::Map:
             return &compareOptContainerColumn<MapView>;
         break;
@@ -13048,8 +14871,8 @@ void NLExecutor::runPropertyFetch(NLExecutionContext* context, NLFunctionData* d
     writer.fill(inputIDs->size());
 
     // The fetch above read the graph, which holds this change's writes nowhere: a row
-    // whose entity the change wrote holds a write-buffer offset rather than an ID the
-    // graph knows, and a row it merely updated still reads the value from before.
+    // whose entity the change wrote names it by the ID it will commit as, which the graph
+    // holds nothing under, and a row it merely updated still reads the value from before.
     const ColumnMask* pending = fetchData->getPending();
     const bool allPending = fetchData->isAllPending();
     CommitWriteBuffer* writeBuffer = context->getWriteBuffer();
@@ -13107,6 +14930,7 @@ template void NLExecutor::runPropertyFetch<NodeID, types::Embedding>(NLExecution
 template void NLExecutor::runPropertyFetch<NodeID, types::List>(NLExecutionContext*, NLFunctionData*);
 template void NLExecutor::runPropertyFetch<NodeID, types::DateTime>(NLExecutionContext*, NLFunctionData*);
 template void NLExecutor::runPropertyFetch<NodeID, types::Duration>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<NodeID, types::Point>(NLExecutionContext*, NLFunctionData*);
 template void NLExecutor::runPropertyFetch<NodeID, types::Map>(NLExecutionContext*, NLFunctionData*);
 template void NLExecutor::runPropertyFetch<EdgeID, types::Int64>(NLExecutionContext*, NLFunctionData*);
 template void NLExecutor::runPropertyFetch<EdgeID, types::UInt64>(NLExecutionContext*, NLFunctionData*);
@@ -13117,6 +14941,7 @@ template void NLExecutor::runPropertyFetch<EdgeID, types::Embedding>(NLExecution
 template void NLExecutor::runPropertyFetch<EdgeID, types::List>(NLExecutionContext*, NLFunctionData*);
 template void NLExecutor::runPropertyFetch<EdgeID, types::DateTime>(NLExecutionContext*, NLFunctionData*);
 template void NLExecutor::runPropertyFetch<EdgeID, types::Duration>(NLExecutionContext*, NLFunctionData*);
+template void NLExecutor::runPropertyFetch<EdgeID, types::Point>(NLExecutionContext*, NLFunctionData*);
 template void NLExecutor::runPropertyFetch<EdgeID, types::Map>(NLExecutionContext*, NLFunctionData*);
 
 void NLExecutor::runGetNodeLabelSet(NLExecutionContext* context, NLFunctionData* data) {
@@ -13239,6 +15064,9 @@ void NLExecutor::runCheckEdgeTypeConstraint(NLExecutionContext* context, NLFunct
 template void NLExecutor::runCheckEdgeTypeConstraint<ColumnMask>(NLExecutionContext*, NLFunctionData*);
 template void NLExecutor::runCheckEdgeTypeConstraint<ColumnOptMask>(NLExecutionContext*, NLFunctionData*);
 
+template NLUnaryFn NLExecutor::selectNullTest<true>(const Column* operand, LocalMemory* memory, Column*& result);
+template NLUnaryFn NLExecutor::selectNullTest<false>(const Column* operand, LocalMemory* memory, Column*& result);
+
 template NLBinaryFn NLExecutor::selectBinary<OP_ADD>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
 template NLBinaryFn NLExecutor::selectBinary<OP_CONCAT>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
 template NLBinaryFn NLExecutor::selectBinary<OP_INDEX>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
@@ -13260,5 +15088,6 @@ template NLBinaryFn NLExecutor::selectBinary<OP_STARTS_WITH>(const Column* lhs, 
 template NLBinaryFn NLExecutor::selectBinary<OP_ENDS_WITH>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
 template NLBinaryFn NLExecutor::selectBinary<OP_CONTAINS>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
 template NLBinaryFn NLExecutor::selectBinary<OP_IN>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
+template NLBinaryFn NLExecutor::selectBinary<OP_INDEX_OF>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
 template NLBinaryFn NLExecutor::selectBinary<OP_FUNC_COSINE_SIMILARITY>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);
 template NLBinaryFn NLExecutor::selectBinary<OP_FUNC_EUCLIDEAN_DISTANCE>(const Column* lhs, const Column* rhs, LocalMemory* memory, Column*& result);

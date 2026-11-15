@@ -2,14 +2,15 @@
 
 #include <string.h>
 
-#include "ListBufferTypeTag.h"
+#include "CellTag.h"
 #include "ListContainer.h"
-#include "ListElementView.h"
+#include "CellView.h"
 
 #include "map/EncodedMap.h"
 #include "map/MapContainer.h"
 
 #include "ID.h"
+#include "PathView.h"
 #include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
 
@@ -31,59 +32,68 @@ void appendValue(std::vector<std::byte>& out, const T& value) {
 
 void encodeList(ListView list, std::vector<std::byte>& out);
 
-void encodeElement(ListElementView element, std::vector<std::byte>& out) {
-    const ListBufferTypeTag tag = element.getTag();
+void encodeElement(CellView element, std::vector<std::byte>& out) {
+    const CellTag tag = element.getTag();
     appendValue(out, tag);
 
     switch (tag) {
-        case ListBufferTypeTag::Int:
+        case CellTag::Int:
             appendValue(out, element.getAs<types::Int64::Primitive>());
         break;
-        case ListBufferTypeTag::UInt:
+        case CellTag::UInt:
             appendValue(out, element.getAs<types::UInt64::Primitive>());
         break;
-        case ListBufferTypeTag::Double:
+        case CellTag::Double:
             appendValue(out, element.getAs<types::Double::Primitive>());
         break;
-        case ListBufferTypeTag::Bool:
+        case CellTag::Bool:
             appendValue(out, element.getAs<types::Bool::Primitive>());
         break;
-        case ListBufferTypeTag::NodeID:
+        case CellTag::NodeID:
             appendValue(out, element.getAs<NodeID>());
         break;
-        case ListBufferTypeTag::EdgeID:
+        case CellTag::EdgeID:
             appendValue(out, element.getAs<EdgeID>());
         break;
-        case ListBufferTypeTag::DateTime:
+        case CellTag::DateTime:
             appendValue(out, element.getAs<types::DateTime::Primitive>());
         break;
-        case ListBufferTypeTag::Duration:
+        case CellTag::Duration:
             appendValue(out, element.getAs<types::Duration::Primitive>());
         break;
-        case ListBufferTypeTag::Null:
+        case CellTag::Point:
+            appendValue(out, element.getAs<types::Point::Primitive>());
         break;
-        case ListBufferTypeTag::String: {
+        case CellTag::Null:
+        break;
+        case CellTag::String: {
             const types::String::Primitive value = element.getAs<types::String::Primitive>();
             appendValue<uint64_t>(out, value.size());
             appendBytes(out, value.data(), value.size());
         }
         break;
-        case ListBufferTypeTag::Embedding: {
+        case CellTag::Embedding: {
             const types::Embedding::Primitive value = element.getAs<types::Embedding::Primitive>();
             appendValue<uint64_t>(out, value.size());
             appendBytes(out, value.data(), value.size_bytes());
         }
         break;
-        case ListBufferTypeTag::ListView:
+        case CellTag::ListView:
             encodeList(element.getAs<ListView>(), out);
         break;
-        case ListBufferTypeTag::MapView: {
+        case CellTag::MapView: {
             const EncodedMap map(element.getAs<MapView>());
             appendValue<uint64_t>(out, map.byteSize());
             appendBytes(out, map.bytes().data(), map.byteSize());
         }
         break;
-        case ListBufferTypeTag::INVALID:
+        case CellTag::Path: {
+            const std::span<const uint64_t> ids = element.getAs<PathView>().getIDs();
+            appendValue<uint64_t>(out, ids.size());
+            appendBytes(out, ids.data(), ids.size_bytes());
+        }
+        break;
+        case CellTag::INVALID:
             throw FatalException("Cannot encode a list element with an invalid type tag");
         break;
     }
@@ -92,7 +102,7 @@ void encodeElement(ListElementView element, std::vector<std::byte>& out) {
 void encodeList(ListView list, std::vector<std::byte>& out) {
     appendValue<uint64_t>(out, list.size());
 
-    for (const ListElementView element : list) {
+    for (const CellView element : list) {
         encodeElement(element, out);
     }
 }
@@ -156,49 +166,55 @@ private:
     }
 
     ListContainer::ListItemVariant decodeElement() {
-        const ListBufferTypeTag tag = read<ListBufferTypeTag>();
+        const CellTag tag = read<CellTag>();
 
         switch (tag) {
-            case ListBufferTypeTag::Int:
+            case CellTag::Int:
                 return read<types::Int64::Primitive>();
             break;
-            case ListBufferTypeTag::UInt:
+            case CellTag::UInt:
                 return read<types::UInt64::Primitive>();
             break;
-            case ListBufferTypeTag::Double:
+            case CellTag::Double:
                 return read<types::Double::Primitive>();
             break;
-            case ListBufferTypeTag::Bool:
+            case CellTag::Bool:
                 return read<types::Bool::Primitive>();
             break;
-            case ListBufferTypeTag::NodeID:
+            case CellTag::NodeID:
                 return read<NodeID>();
             break;
-            case ListBufferTypeTag::EdgeID:
+            case CellTag::EdgeID:
                 return read<EdgeID>();
             break;
-            case ListBufferTypeTag::DateTime:
+            case CellTag::DateTime:
                 return read<types::DateTime::Primitive>();
             break;
-            case ListBufferTypeTag::Duration:
+            case CellTag::Duration:
                 return read<types::Duration::Primitive>();
             break;
-            case ListBufferTypeTag::Null:
+            case CellTag::Point:
+                return read<types::Point::Primitive>();
+            break;
+            case CellTag::Null:
                 return PropertyNull {};
             break;
-            case ListBufferTypeTag::String:
+            case CellTag::String:
                 return decodeString();
             break;
-            case ListBufferTypeTag::Embedding:
+            case CellTag::Embedding:
                 return decodeEmbedding();
             break;
-            case ListBufferTypeTag::ListView:
+            case CellTag::ListView:
                 return decodeList();
             break;
-            case ListBufferTypeTag::MapView:
+            case CellTag::MapView:
                 return decodeMap();
             break;
-            case ListBufferTypeTag::INVALID:
+            case CellTag::Path:
+                return decodePath();
+            break;
+            case CellTag::INVALID:
             break;
         }
 
@@ -217,6 +233,13 @@ private:
         const std::span<const std::byte> payload = readPayload(count * sizeof(float));
 
         return {reinterpret_cast<const float*>(payload.data()), count};
+    }
+
+    PathView decodePath() {
+        const uint64_t count = read<uint64_t>();
+        const std::span<const std::byte> payload = readPayload(count * sizeof(uint64_t));
+
+        return PathView {reinterpret_cast<const uint64_t*>(payload.data()), count};
     }
 
     MapView decodeMap() {

@@ -39,10 +39,13 @@ enum class EvaluatedType : uint8_t {
     EdgeType,
     DateTime,
     Duration,
+    Point,
     NormalForm,
 
     _SIZE,
 };
+
+static_assert(std::to_underlying(EvaluatedType::_SIZE) <= 32, "TypePairBitset holds a pair of 32 types");
 
 class TypePairBitset {
 public:
@@ -91,11 +94,12 @@ using EvaluatedTypeName = EnumToString<EvaluatedType>::Create<
     EnumStringPair<EvaluatedType::EdgeType, "EdgeType">,
     EnumStringPair<EvaluatedType::DateTime, "DateTime">,
     EnumStringPair<EvaluatedType::Duration, "Duration">,
+    EnumStringPair<EvaluatedType::Point, "Point">,
     EnumStringPair<EvaluatedType::NormalForm, "NormalForm">>;
 
 // Evaluated Type to ValueType conversion
 static constexpr size_t VALUE_TYPE_COUNT = std::to_underlying(ValueType::_SIZE);
-static_assert(VALUE_TYPE_COUNT == 11, "ValueType added: please update below map.");
+static_assert(VALUE_TYPE_COUNT == 12, "ValueType added: please update below map.");
 
 static constexpr std::pair<ValueType, EvaluatedType> EVConversions[VALUE_TYPE_COUNT + 1] = {
     {ValueType::Int64,     EvaluatedType::Integer  },
@@ -107,6 +111,7 @@ static constexpr std::pair<ValueType, EvaluatedType> EVConversions[VALUE_TYPE_CO
     {ValueType::List,      EvaluatedType::List     },
     {ValueType::DateTime,  EvaluatedType::DateTime },
     {ValueType::Duration,  EvaluatedType::Duration },
+    {ValueType::Point,     EvaluatedType::Point    },
     {ValueType::Map,       EvaluatedType::Map      },
 
     {ValueType::Invalid,   EvaluatedType::Invalid  },
@@ -140,6 +145,21 @@ inline bool convertibleToValueType(EvaluatedType e) {
     return toValueType(e).has_value();
 }
 
+// The types a list is homogeneous in: the scalars a value column holds, the entities a
+// pattern binds - [n, m] is a list of nodes, as collect(n) gathers one - the paths it names,
+// and the lists a nesting is made of.
+inline bool namesAListElementType(EvaluatedType type) {
+    return convertibleToValueType(type)
+        || type == EvaluatedType::NodePattern
+        || type == EvaluatedType::EdgePattern
+        || type == EvaluatedType::GraphPath
+        || type == EvaluatedType::List;
+}
+
+inline bool isNumber(EvaluatedType e) {
+    return e == EvaluatedType::Integer || e == EvaluatedType::Double;
+}
+
 // The types naming a value an equality can be answered over without reading a row: the
 // scalars, the list and the map, but not a tagged cell, whose type is the row's rather
 // than the column's
@@ -153,11 +173,18 @@ inline bool namesAComparableValue(EvaluatedType e) {
         || e == EvaluatedType::List
         || e == EvaluatedType::DateTime
         || e == EvaluatedType::Duration
+        || e == EvaluatedType::Point
         || e == EvaluatedType::Map;
 }
 
 inline bool namesATaggedCell(EvaluatedType e) {
     return e == EvaluatedType::Any;
+}
+
+// The types of a variable holding a node or a relationship on some rows only: a tagged
+// cell, whose type is the row's, and the null
+inline bool holdsAnEntityPerRow(EvaluatedType e) {
+    return e == EvaluatedType::Any || e == EvaluatedType::Null;
 }
 
 // The types a WHERE, a WHEN, NOT, AND, OR and XOR read as a truth value. A value of type
@@ -166,12 +193,13 @@ inline bool namesATruthValue(EvaluatedType e) {
     return e == EvaluatedType::Bool || e == EvaluatedType::Null || e == EvaluatedType::Any;
 }
 
-// The types = and <> take: every value and every entity
+// The types = and <> take: every value, every entity and every path
 inline bool namesAnEqualityOperand(EvaluatedType e) {
     return namesAComparableValue(e)
         || namesATaggedCell(e)
         || e == EvaluatedType::NodePattern
-        || e == EvaluatedType::EdgePattern;
+        || e == EvaluatedType::EdgePattern
+        || e == EvaluatedType::GraphPath;
 }
 
 // Whether both types are numbers, which = and <> compare by value: 32 equals 32.0
@@ -202,10 +230,60 @@ inline bool comparesAsDisjointTypes(EvaluatedType a, EvaluatedType b) {
     return !bothNumeric && !bothTextual && !comparesAnID;
 }
 
+// The type one column takes when one branch fills it with @param carried and another with
+// @param branch, each value keeping its own type: a null branch constrains nothing and a
+// one-character string literal reads as the string it is. Invalid when the two differ.
+inline EvaluatedType unifiedBranchType(EvaluatedType carried, EvaluatedType branch) {
+    if (carried == branch) {
+        return carried;
+    } else if (carried == EvaluatedType::Null) {
+        return branch;
+    } else if (branch == EvaluatedType::Null) {
+        return carried;
+    } else if (TypePairBitset(carried, branch) == TypePairBitset(EvaluatedType::Char, EvaluatedType::String)) {
+        return EvaluatedType::String;
+    }
+
+    return EvaluatedType::Invalid;
+}
+
+inline bool holdsAsAny(EvaluatedType e) {
+    return e == EvaluatedType::Any
+        || e == EvaluatedType::Char
+        || e == EvaluatedType::NodePattern
+        || e == EvaluatedType::EdgePattern
+        || convertibleToValueType(e);
+}
+
+// The type of one column the branches of a CASE, a coalesce, a UNION or a WHEN fill: the
+// type the two unify to, Any when they differ but each rides a tagged cell, Invalid otherwise
+inline EvaluatedType selectedType(EvaluatedType carried, EvaluatedType value) {
+    const EvaluatedType unified = unifiedBranchType(carried, value);
+
+    if (unified != EvaluatedType::Invalid) {
+        return unified;
+    } else if (holdsAsAny(carried) && holdsAsAny(value)) {
+        return EvaluatedType::Any;
+    }
+
+    return EvaluatedType::Invalid;
+}
+
+// The type values of @param carried and of @param value both convert to without loss, which
+// a property written from them takes: the type they select into, and Double for an integer
+// beside a double where they select into Any
+inline EvaluatedType commonType(EvaluatedType carried, EvaluatedType value) {
+    if (TypePairBitset(carried, value) == TypePairBitset(EvaluatedType::Integer, EvaluatedType::Double)) {
+        return EvaluatedType::Double;
+    }
+
+    return selectedType(carried, value);
+}
+
 // The types <, <=, > and >= take: every value, entities and paths included, though only
-// numbers, strings, booleans, datetimes, durations and lists have an order
+// numbers, strings, booleans, datetimes, durations, points and lists have an order
 inline bool namesAnOrderingOperand(EvaluatedType e) {
-    return namesAnEqualityOperand(e) || e == EvaluatedType::GraphPath;
+    return namesAnEqualityOperand(e);
 }
 
 // The class a type is ordered in, or nullopt for a type with no order: a map, an
@@ -223,6 +301,7 @@ inline std::optional<EvaluatedType> orderClassOf(EvaluatedType e) {
         case EvaluatedType::Bool:
         case EvaluatedType::DateTime:
         case EvaluatedType::Duration:
+        case EvaluatedType::Point:
         case EvaluatedType::List:
             return e;
         break;

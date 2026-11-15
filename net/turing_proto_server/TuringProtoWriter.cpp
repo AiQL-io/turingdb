@@ -14,8 +14,17 @@
 
 using namespace net::proto;
 
+namespace {
+
+size_t checkedBufferCapacity(size_t capacity) {
+    bioassert(capacity <= MAX_PAYLOAD_SIZE, "The proto buffer capacity exceeds the protocol's maximum payload size");
+    return capacity;
+}
+
+}
+
 TuringProtoWriter::TuringProtoWriter(size_t bufferCapacity)
-    : _buffer(bufferCapacity),
+    : _buffer(checkedBufferCapacity(bufferCapacity)),
     _encoder(&_buffer)
 {
 }
@@ -50,15 +59,15 @@ void TuringProtoWriter::sendRaw(const char* data, size_t size) {
     }
 }
 
-void TuringProtoWriter::startResponse(net::ConnectionHeader connection) {
+void TuringProtoWriter::startResponse(net::HTTP::Status status, net::ConnectionHeader connection) {
     if (errorOccured()) {
         return;
     }
 
     std::array<char, net::http::RESPONSE_HEADER_BUFFER_SIZE> buffer;
     size_t offset = 0;
-    offset += net::http::writeStatusLine(net::HTTP::Status::OK, buffer.data() + offset, buffer.size() - offset);
-    offset += net::http::writeRawHeader("Content-type: application/turing-proto", buffer.data() + offset, buffer.size() - offset);
+    offset += net::http::writeStatusLine(status, buffer.data() + offset, buffer.size() - offset);
+    offset += net::http::writeRawHeader(CONTENT_TYPE_HEADER, buffer.data() + offset, buffer.size() - offset);
     offset += net::http::writeChunkedTransferEncoding(buffer.data() + offset, buffer.size() - offset);
     offset += net::http::writeConnection(connection, buffer.data() + offset, buffer.size() - offset);
     offset += net::http::writeHeadersEnd(buffer.data() + offset, buffer.size() - offset);
@@ -118,16 +127,26 @@ void TuringProtoWriter::writeProtocolError(std::string_view message) {
     writePacket(MessageTypes::PROTOCOL_ERROR);
 }
 
-void TuringProtoWriter::writeAnalyzeError(int32_t error) {
-    std::string details;
-    net::HTTP::describeError(static_cast<net::HTTP::Error>(error), details);
-
-    // The request failed HTTP framing analysis before dispatch, so no response has been
-    // started yet. Open the 200 OK envelope, send one PROTOCOL_ERROR packet and the chunk
-    // terminator, and swallow a send failure: the connection is closed right after.
+// No response has been started yet. A send failure is swallowed: the connection is closed
+// right after.
+void TuringProtoWriter::writeProtocolErrorResponse(net::HTTP::Status status, std::string_view message) {
     try {
-        startResponse(net::ConnectionHeader::CLOSE);
-        writeProtocolError(details);
+        startResponse(status, net::ConnectionHeader::CLOSE);
+        writeProtocolError(message);
+    } catch (const NetException&) {
+    }
+}
+
+void TuringProtoWriter::writeAnalyzeError(int32_t error) {
+    const net::HTTP::Error httpError = static_cast<net::HTTP::Error>(error);
+
+    std::string details;
+    net::HTTP::describeError(httpError, details);
+
+    // The request failed HTTP framing analysis before dispatch and the connection is closed
+    // without the end-of-request flush, so the terminator is sent here.
+    writeProtocolErrorResponse(net::HTTP::errorToStatus(httpError), details);
+    try {
         flush();
     } catch (const NetException&) {
     }

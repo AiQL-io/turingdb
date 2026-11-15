@@ -14,6 +14,10 @@ namespace net::proto {
 class TuringProtoOutBuf;
 
 inline constexpr size_t DEFAULT_BUFFER_CAPACITY = 1024ul * 1024;
+inline constexpr size_t MAX_PAYLOAD_SIZE = 64ul * 1024 * 1024;
+
+inline constexpr std::string_view CONTENT_TYPE = "application/turing-proto";
+inline constexpr std::string_view CONTENT_TYPE_HEADER = "Content-type: application/turing-proto";
 
 // Integer type used on the wire for every variable-length framing field of the binary protocol:
 // the message payload length, column name lengths, per-value byte sizes, and element / row /
@@ -59,12 +63,10 @@ enum class ColumnInternalKind : uint32_t {
     DOUBLE,
     STRING,
     BOOL,
-    PATH,
     EMBEDDING,
-    ENTITY_LIST,
     LIST_VIEW,
     VALUE_TYPE,
-    LIST_ELEMENT_VIEW,
+    CELL_VIEW,
     NODE_ID,
     EDGE_ID,
     EDGE_TYPE_ID,
@@ -75,9 +77,10 @@ enum class ColumnInternalKind : uint32_t {
     CHANGE_ID,
     PROPERTY_NULL,
     MAP_VIEW,
-    MAP_ENTRY_VIEW,
     DATE_TIME,
     DURATION,
+    GRAPH_PATH,
+    POINT,
 };
 
 enum class ColumnKind : uint8_t {

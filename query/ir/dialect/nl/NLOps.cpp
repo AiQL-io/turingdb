@@ -7,7 +7,9 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
+#include "IRConstantColumn.h"
 #include "IRLiteralList.h"
+#include "IRValueTypes.h"
 #include "StorageEnums.h"
 #include "ColumnIndicesFormat.h"
 #include "EdgeDirectionsFormat.h"
@@ -16,6 +18,8 @@
 #include "LabelAlternativesFormat.h"
 #include "StorageAttributes.h"
 #include "MergePatternShape.h"
+#include "MakePathShape.h"
+#include "NullLiteralType.h"
 #include "GroupAggregateKindsFormat.h"
 #include "PropertyScanLiteral.h"
 
@@ -63,7 +67,13 @@ bool holdsAMapPerRow(Type chunkType) {
     const auto nullable = dyn_cast<storage::NullableType>(chunk.getElementType());
     const Type read = nullable ? nullable.getValueType() : chunk.getElementType();
 
-    return isa<storage::MapType, storage::AnyType, storage::MapElementType>(read);
+    return isa<storage::MapType, storage::AnyType>(read);
+}
+
+bool writesAMapPerRow(Type chunkType) {
+    const auto chunk = dyn_cast<ChunkType>(chunkType);
+
+    return holdsAMapPerRow(chunkType) || (chunk && isNullLiteralType(chunk.getElementType()));
 }
 
 // The value type an aggregate reduces: the T in a !nl.chunk<!storage.nullable<T>>.
@@ -159,6 +169,50 @@ LogicalResult verifyElementBody(Operation* op, Block& bodyBlock, OperandRange ca
     }
 
     return success();
+}
+
+// A region of a fold over the elements of one row's list: one block taking the element,
+// the accumulator and one chunk per carried column, ending in a @param YieldOp
+template <typename YieldOp>
+LogicalResult verifyFoldRegion(Operation* op, Block& block, OperandRange carried, llvm::StringLiteral yieldName) {
+    if (block.empty() || !isa<YieldOp>(block.back())) {
+        return op->emitOpError("region must end with an ") << yieldName;
+    }
+
+    const size_t expectedArguments = carried.size() + 2;
+
+    if (block.getNumArguments() != expectedArguments) {
+        return op->emitOpError("region takes the element and the accumulator plus one chunk per "
+                               "carried column, ")
+               << "expected " << expectedArguments << " but has " << block.getNumArguments();
+    }
+
+    if (!llvm::isa<ChunkType>(block.getArgument(0).getType())) {
+        return op->emitOpError("argument 0 must be the chunk of elements");
+    }
+
+    if (!llvm::isa<ChunkType>(block.getArgument(1).getType())) {
+        return op->emitOpError("argument 1 must be the chunk of accumulators");
+    }
+
+    for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
+        const Type argumentType = block.getArgument(carriedIndex + 2).getType();
+
+        if (argumentType != carried[carriedIndex].getType()) {
+            return op->emitOpError("argument ") << carriedIndex + 2
+                                                << " must have the type of carried chunk "
+                                                << carriedIndex;
+        }
+    }
+
+    return success();
+}
+
+bool holdsNullableBooleans(Value chunk) {
+    const Type elementType = llvm::cast<ChunkType>(chunk.getType()).getElementType();
+    const auto nullableType = llvm::dyn_cast<storage::NullableType>(elementType);
+
+    return nullableType && nullableType.getValueType().isInteger(1);
 }
 }
 
@@ -503,7 +557,7 @@ LogicalResult ExplorePaths::verify() {
                            "read a chunk that holds one value per seed");
     }
 
-    MLIRContext* context = getContext();
+    MLIRContext* const context = getContext();
     const Type nodeChunk = getNodeIDChunkType(context);
     const Type edgeChunk = getEdgeIDChunkType(context);
 
@@ -571,9 +625,7 @@ LogicalResult Constant::inferReturnTypes(MLIRContext* context,
     // An array of per-element attributes is a list literal; it carries no type of its own,
     // so the element type is the homogeneity verdict over the elements.
     if (const auto elements = dyn_cast<ArrayAttr>(adaptor.getValue())) {
-        const Type shared = ::db::sharedLiteralElementType(elements);
-        const Type listElement = shared ? shared : storage::AnyType::get(context);
-        const Type listType = storage::ListType::get(context, listElement);
+        const Type listType = storage::ListType::get(context, ::db::sharedLiteralElementType(elements));
 
         inferredReturnTypes.push_back(ChunkType::get(context, listType));
         return success();
@@ -633,12 +685,54 @@ LogicalResult SkipTruncate::inferReturnTypes(MLIRContext* context,
     return success();
 }
 
+LogicalResult Eq::verify() {
+    const Type lhsElement = cast<ChunkType>(getLhs().getType()).getElementType();
+    const Type rhsElement = cast<ChunkType>(getRhs().getType()).getElementType();
+
+    return verifyComparesNoNullLiteral(getOperation(), lhsElement, rhsElement);
+}
+
+LogicalResult Neq::verify() {
+    const Type lhsElement = cast<ChunkType>(getLhs().getType()).getElementType();
+    const Type rhsElement = cast<ChunkType>(getRhs().getType()).getElementType();
+
+    return verifyComparesNoNullLiteral(getOperation(), lhsElement, rhsElement);
+}
+
+LogicalResult MakePath::verify() {
+    llvm::SmallVector<Type> elementTypes;
+    for (const Value entity : getEntities()) {
+        const auto chunk = dyn_cast<ChunkType>(entity.getType());
+        elementTypes.push_back(chunk ? chunk.getElementType() : Type());
+    }
+
+    return verifyMakePath(getOperation(), elementTypes, getReversedPaths());
+}
+
+LogicalResult ExistsMark::verify() {
+    if (getTag() && getRow()) {
+        return emitOpError("marks either the rows a tag names or the one row `row` names, not both");
+    }
+
+    return success();
+}
+
 LogicalResult CountSubqueryTally::verify() {
     const bool hasTag = getTag() != nullptr;
     const bool hasRows = getRows() != nullptr;
 
     if (hasTag == hasRows) {
         return emitOpError("counts either the rows of a tag or a row count, exactly one of the two");
+    } else if (getRow() && !hasRows) {
+        return emitOpError("names the row a row count answers for, which a tagged tally has none of");
+    }
+
+    return success();
+}
+
+LogicalResult RowListsCollect::verify() {
+    if (getTag() && getRow()) {
+        return emitOpError("stages under either the rows a tag names or the one row `row` names, not both");
     }
 
     return success();
@@ -669,6 +763,49 @@ LogicalResult SortBuffer::verify() {
 LogicalResult SortCollect::verify() {
     if (getColumns().empty()) {
         return emitOpError("requires at least one column to collect");
+    }
+
+    return success();
+}
+
+LogicalResult FillNulls::verify() {
+    const Type resultType = getResult().getType();
+    const Type nullRowsElement = cast<ChunkType>(getNullRows().getType()).getElementType();
+
+    const bool valueHasTheResultType = getValue().getType() == resultType;
+    const bool fillHasTheResultType = getFill().getType() == resultType;
+
+    if (!valueHasTheResultType || !fillHasTheResultType) {
+        return emitOpError("fills a chunk out of a chunk of its own type, into a chunk of that type");
+    } else if (!isa<storage::BoolType>(nullRowsElement)) {
+        return emitOpError("marks the null rows it fills with a mask");
+    }
+
+    return success();
+}
+
+// An nl.to_any answers tagged cells, or out of lists the lists their elements join into,
+// nullable when the lists it reads are
+LogicalResult ToAny::verify() {
+    const Type operandElement = cast<ChunkType>(getOperand().getType()).getElementType();
+    const Type resultElement = cast<ChunkType>(getResult().getType()).getElementType();
+
+    if (isa<storage::AnyType>(resultElement)) {
+        return success();
+    }
+
+    const auto nullableResult = dyn_cast<storage::NullableType>(resultElement);
+    const auto nullableOperand = dyn_cast<storage::NullableType>(operandElement);
+    if (static_cast<bool>(nullableResult) != static_cast<bool>(nullableOperand)) {
+        return emitOpError("keeps a list column nullable exactly when its operand is");
+    }
+
+    const Type resultList = nullableResult ? nullableResult.getValueType() : resultElement;
+    const Type operandList = nullableOperand ? nullableOperand.getValueType() : operandElement;
+
+    const bool readsAList = isa<storage::ListType>(resultList) && isa<storage::ListType>(operandList);
+    if (!readsAList || storage::joinedElementType(operandList, resultList) != resultList) {
+        return emitOpError("answers tagged cells, or for a list operand a list its elements join into");
     }
 
     return success();
@@ -807,15 +944,6 @@ LogicalResult StaticMapKey::verify() {
     return success();
 }
 
-LogicalResult MapEntryValue::verify() {
-    const Type resultElement = llvm::cast<ChunkType>(getResult().getType()).getElementType();
-    if (!llvm::isa<storage::AnyType>(resultElement)) {
-        return emitOpError("answers a chunk of tagged cells");
-    }
-
-    return success();
-}
-
 LogicalResult DynamicMapKey::verify() {
     if (!holdsAMapPerRow(getMap().getType())) {
         return emitOpError("reads a chunk of maps or of tagged cells, optionally nullable");
@@ -830,6 +958,28 @@ LogicalResult DynamicMapKey::verify() {
 
     if (!readsAStringKey && !readsANullKey) {
         return emitOpError("reads its key out of a chunk of strings, optionally nullable");
+    }
+
+    return success();
+}
+
+LogicalResult ContainerIndex::verify() {
+    const Type base = valueElementOf(getBase().getType());
+    if (!isa<storage::ListType, storage::MapType, storage::AnyType>(base)) {
+        return emitOpError("reads a chunk of lists, of maps or of tagged cells, optionally nullable");
+    }
+
+    if (!isa<storage::AnyType>(valueElementOf(getIndex().getType()))) {
+        return emitOpError("reads its index out of a chunk of tagged cells, optionally nullable");
+    }
+
+    const Type result = cast<ChunkType>(getResult().getType()).getElementType();
+    const bool answersCells = isa<storage::AnyType>(result);
+    const bool answersListElements = isa<storage::ListType>(base)
+                                  && isa<storage::NullableType, storage::NodeIDType, storage::EdgeIDType>(result);
+
+    if (!answersCells && !answersListElements) {
+        return emitOpError("answers tagged cells, or for a list base the nullable value, the node or the edge it holds");
     }
 
     return success();
@@ -854,6 +1004,36 @@ LogicalResult MakeMap::verify() {
     }
 
     return success();
+}
+
+LogicalResult MergeMaps::verify() {
+    const OperandRange maps = getMaps();
+    if (maps.size() < 2) {
+        return emitOpError("requires at least two map chunks");
+    }
+
+    const auto operandTypes = maps.getTypes();
+
+    if (!llvm::all_of(operandTypes, holdsAMapPerRow)) {
+        return emitOpError("operands must be chunks of maps or of tagged cells");
+    } else if (getResult().getType() != resultChunkType(getContext(), operandTypes)) {
+        return emitOpError("result must be a chunk of maps, nullable unless every operand holds a map in every row");
+    }
+
+    return success();
+}
+
+// Only a plain chunk of maps holds one in every row, so a result over any other operand is
+// nullable.
+Type MergeMaps::resultChunkType(MLIRContext* context, TypeRange mapTypes) {
+    const bool everyRowHoldsAMap = llvm::all_of(mapTypes, [](Type mapType) {
+        return isa<storage::MapType>(cast<ChunkType>(mapType).getElementType());
+    });
+
+    const Type map = storage::MapType::get(context);
+    const Type element = everyRowHoldsAMap ? map : storage::NullableType::get(context, map);
+
+    return ChunkType::get(context, element);
 }
 
 // A bound is read as a nullable value chunk, so a row missing one gets no list, and what
@@ -884,28 +1064,33 @@ LogicalResult RowConstant::verify() {
 
     while (!worklist.empty()) {
         const Value value = worklist.pop_back_val();
-        if (!visited.insert(value).second) {
+        if (!visited.insert(value).second || ::db::isFunctionArgument(value)) {
             continue;
         }
 
         Operation* const definingOp = value.getDefiningOp();
-        if (!definingOp) {
-            return emitOpError("operand must be computed from constants, not from the rows of a step");
+        if (definingOp) {
+            worklist.append(definingOp->operand_begin(), definingOp->operand_end());
+            continue;
         }
 
-        worklist.append(definingOp->operand_begin(), definingOp->operand_end());
+        For loop = dyn_cast<For>(cast<BlockArgument>(value).getOwner()->getParentOp());
+        const bool bindsOneRow = loop && loop.getIterator().getDefiningOp<EachRow>();
+        if (!bindsOneRow) {
+            return emitOpError("operand must be computed from constants or from the one row of an nl.each_row step, "
+                               "not from the rows of a step");
+        }
     }
 
     return success();
 }
 
 LogicalResult Split::verify() {
-    const bool readsStrings = llvm::isa<storage::StringType, storage::AnyType>(
-                                  valueElementOf(getString().getType()))
-                           && llvm::isa<storage::StringType, storage::AnyType>(
-                                  valueElementOf(getDelimiter().getType()));
-    if (!readsStrings) {
-        return emitOpError("operands must be string chunks or chunks of tagged cells");
+    const bool readsAString = llvm::isa<storage::StringType, storage::AnyType>(valueElementOf(getString().getType()));
+    const bool readsDelimiters = llvm::isa<storage::StringType, storage::ListType, storage::AnyType>(
+                                     valueElementOf(getDelimiter().getType()));
+    if (!readsAString || !readsDelimiters) {
+        return emitOpError("operands must be a string chunk and a string or list chunk, or chunks of tagged cells");
     }
 
     const storage::ListType listType = llvm::dyn_cast<storage::ListType>(valueElementOf(getResult().getType()));
@@ -934,41 +1119,39 @@ LogicalResult ListComprehension::verify() {
     return success();
 }
 
-// The body binds the element, the accumulator - of the result's type - and one chunk per
-// carried column, and ends naming the next accumulator.
 LogicalResult Reduce::verify() {
     Block& bodyBlock = getBody().front();
 
-    auto yield = dyn_cast_or_null<ReduceYield>(bodyBlock.empty() ? nullptr : &bodyBlock.back());
-    if (!yield) {
-        return emitOpError("body region must end with an nl.reduce_yield");
-    }
-
-    const OperandRange carried = getColumnsToFilter();
-    const size_t expectedArguments = carried.size() + 2;
-
-    if (bodyBlock.getNumArguments() != expectedArguments) {
-        return emitOpError("body region takes the element and the accumulator plus one chunk per "
-                           "carried column, ")
-               << "expected " << expectedArguments << " but has " << bodyBlock.getNumArguments();
-    }
-
-    if (!llvm::isa<ChunkType>(bodyBlock.getArgument(0).getType())) {
-        return emitOpError("body argument 0 must be the chunk of elements");
+    if (failed(verifyFoldRegion<ReduceYield>(getOperation(), bodyBlock, getColumnsToFilter(), "nl.reduce_yield"))) {
+        return failure();
     }
 
     if (bodyBlock.getArgument(1).getType() != getResult().getType()) {
         return emitOpError("body argument 1 must be the accumulator, of the result's type");
     }
 
-    for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
-        const Type argumentType = bodyBlock.getArgument(carriedIndex + 2).getType();
+    return success();
+}
 
-        if (argumentType != carried[carriedIndex].getType()) {
-            return emitOpError("body argument ") << carriedIndex + 2
-                                                 << " must have the type of carried chunk "
-                                                 << carriedIndex;
-        }
+LogicalResult AllReduce::verify() {
+    Block& bodyBlock = getBody().front();
+    Block& predicateBlock = getPredicate().front();
+    const OperandRange carried = getColumnsToFilter();
+
+    if (failed(verifyFoldRegion<ReduceYield>(getOperation(), bodyBlock, carried, "nl.reduce_yield"))) {
+        return failure();
+    }
+
+    if (failed(verifyFoldRegion<AllReduceYield>(getOperation(), predicateBlock, carried, "nl.all_reduce_yield"))) {
+        return failure();
+    }
+
+    if (predicateBlock.getArgumentTypes() != bodyBlock.getArgumentTypes()) {
+        return emitOpError("predicate region must take the arguments of the body");
+    }
+
+    if (!holdsNullableBooleans(getResult())) {
+        return emitOpError("result must be a chunk of nullable booleans");
     }
 
     return success();
@@ -981,10 +1164,7 @@ LogicalResult ListPredicate::verify() {
         return failure();
     }
 
-    const Type elementType = llvm::cast<ChunkType>(getResult().getType()).getElementType();
-    const auto nullableType = llvm::dyn_cast<storage::NullableType>(elementType);
-
-    if (!nullableType || !nullableType.getValueType().isInteger(1)) {
+    if (!holdsNullableBooleans(getResult())) {
         return emitOpError("result must be a chunk of nullable booleans");
     }
 
@@ -1171,15 +1351,17 @@ LogicalResult Output::verify() {
     return success();
 }
 
-// avg and stdev accumulate as f64, so their accumulator state must be an f64;
-// sum/min/max accumulate in the value's own type, so any value element type is
-// fine here (the update and result ops check the input/output against it).
+// stdev and avg of numbers accumulate as f64, so their accumulator state must be an f64;
+// sum/min/max and avg of durations or of tagged cells accumulate in the value's own type,
+// so any value element type is fine there (the update and result ops check the
+// input/output against it).
 LogicalResult Aggregate::verify() {
-    if (storage::reducesToADouble(getKind())) {
-        const auto stateType = cast<AggregateStateType>(getState().getType());
-        if (!isa<Float64Type>(stateType.getElementType())) {
-            return emitOpError("avg and stdev must produce an f64 accumulator state");
-        }
+    const Type stateElement = cast<AggregateStateType>(getState().getType()).getElementType();
+    const bool foldsIntoDouble = storage::reducesToADouble(getKind(), stateElement);
+    const bool holdsADouble = isa<Float64Type>(stateElement);
+
+    if (foldsIntoDouble && !holdsADouble) {
+        return emitOpError("avg of numbers and stdev must produce an f64 accumulator state");
     }
 
     return success();
@@ -1191,29 +1373,24 @@ LogicalResult Aggregate::verify() {
 // rather than folding into a wrongly-typed or wrongly-initialized accumulator.
 LogicalResult AggregateUpdate::verify() {
     const storage::AggregateKind kind = getKind();
-    const bool foldsIntoDouble = storage::reducesToADouble(kind);
     const Type accumulatorType = cast<AggregateStateType>(getState().getType()).getElementType();
 
     // A type-erased column of tagged cells has no one value type: every cell is read
-    // through its own tag. sum, avg and stdev fold one into the f64 a reduction over
-    // mixed numeric tags lands on, and min/max into a tagged cell holding the winning one.
+    // through its own tag. stdev folds one into an f64, sum and avg into a tagged cell
+    // holding an integer, a float or a duration, and min/max into a tagged cell holding
+    // the winning one.
     const auto rowsChunk = cast<ChunkType>(getRows().getType());
     const Type rowsElement = rowsChunk.getElementType();
     const auto rowsNullable = dyn_cast<storage::NullableType>(rowsElement);
     const Type reducedElement = rowsNullable ? rowsNullable.getValueType() : rowsElement;
+    const bool foldsIntoDouble = storage::reducesToADouble(kind, reducedElement);
     const bool taggedCells = isa<storage::AnyType>(reducedElement);
-    if (taggedCells) {
-        const bool isSum = kind == storage::AggregateKind::Sum;
-
-        if ((foldsIntoDouble || isSum) && !isa<Float64Type>(accumulatorType)) {
-            return emitOpError("a sum, avg or stdev over type-erased cells must fold into an f64 accumulator state");
-        } else if (!foldsIntoDouble && !isSum && !isa<storage::AnyType>(accumulatorType)) {
-            return emitOpError("a min or max over type-erased cells must fold into a tagged cell accumulator state");
-        }
+    if (taggedCells && !foldsIntoDouble && !isa<storage::AnyType>(accumulatorType)) {
+        return emitOpError("a sum, avg, min or max over type-erased cells must fold into a tagged cell accumulator state");
     }
 
     // Every other input is a property value chunk; its value type is what the fold
-    // reads, and sum/min/max fold into an accumulator of that type.
+    // reads, and sum/min/max and avg of durations fold into an accumulator of that type.
     if (!taggedCells) {
         const Type declaredValueType = aggregateValueType(getRows().getType());
         if (!declaredValueType) {
@@ -1226,13 +1403,14 @@ LogicalResult AggregateUpdate::verify() {
         const Type inputValueType = untypedNull ? IntegerType::get(getContext(), 64) : declaredValueType;
 
         if (!foldsIntoDouble && inputValueType != accumulatorType) {
-            return emitOpError("sum/min/max must fold into an accumulator of the input's value type");
+            return emitOpError("sum/min/max and avg of durations or points must fold into an accumulator of the input's value type");
         }
     }
 
-    // avg and stdev fold any numeric input into an f64 accumulator, tagged cells included.
+    // stdev folds any numeric input into an f64 accumulator, tagged cells included, and
+    // avg folds numbers into one.
     if (foldsIntoDouble && !isa<Float64Type>(accumulatorType)) {
-        return emitOpError("avg and stdev must fold into an f64 accumulator state");
+        return emitOpError("avg of numbers and stdev must fold into an f64 accumulator state");
     }
 
     // The accumulator's reset depends on the producer's kind (a present zero for
@@ -1258,16 +1436,17 @@ LogicalResult AggregateResult::verify() {
         return emitOpError("result must be a nullable value chunk");
     }
 
-    // avg and stdev emit an f64 result from an f64 accumulator; sum/min/max emit a
-    // result of the accumulator's own value type.
+    // stdev and avg of numbers emit an f64 result from an f64 accumulator; sum/min/max
+    // and avg of durations or of tagged cells emit a result of the accumulator's own
+    // value type.
     const Type accumulatorType = cast<AggregateStateType>(getState().getType()).getElementType();
-    if (storage::reducesToADouble(kind)) {
+    if (storage::reducesToADouble(kind, accumulatorType)) {
         const bool bothF64 = isa<Float64Type>(accumulatorType) && isa<Float64Type>(resultValueType);
         if (!bothF64) {
-            return emitOpError("avg and stdev must emit an f64 result from an f64 accumulator state");
+            return emitOpError("avg of numbers and stdev must emit an f64 result from an f64 accumulator state");
         }
     } else if (resultValueType != accumulatorType) {
-        return emitOpError("sum/min/max must emit a result of the accumulator's value type");
+        return emitOpError("sum/min/max and avg of durations must emit a result of the accumulator's value type");
     }
 
     if (Aggregate producer = producingAggregate(getState())) {
@@ -1343,6 +1522,34 @@ LogicalResult SetNodeProperty::verify() {
 LogicalResult SetEdgeProperty::verify() {
     if (getProperty().empty()) {
         return emitOpError("requires a non-empty property name");
+    }
+
+    return success();
+}
+
+LogicalResult SetNodeProperties::verify() {
+    if (!writesAMapPerRow(getValue().getType())) {
+        return emitOpError("writes a chunk of maps or of tagged cells, optionally nullable, or the null literal");
+    } else if (!::db::namesPropertyElementTypes(getCreatedTypesAttr())) {
+        return emitOpError("creates each property with the element type of a stored value");
+    }
+
+    return success();
+}
+
+LogicalResult SetEdgeProperties::verify() {
+    if (!writesAMapPerRow(getValue().getType())) {
+        return emitOpError("writes a chunk of maps or of tagged cells, optionally nullable, or the null literal");
+    } else if (!::db::namesPropertyElementTypes(getCreatedTypesAttr())) {
+        return emitOpError("creates each property with the element type of a stored value");
+    }
+
+    return success();
+}
+
+LogicalResult ImportGraph::verify() {
+    if (!::db::namesImportedPropertyTypes(getFormat(), getTypesAttr())) {
+        return emitOpError("types each property as a datetime, duration or point a jsonl import reads, or a duration a parquet import reads");
     }
 
     return success();

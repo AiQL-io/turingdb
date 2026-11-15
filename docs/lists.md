@@ -47,20 +47,20 @@ pointer stability.
 # Implementation
 
 `storage/ListBuffer.h` implements the required datastructure. `ListBuffer` provides stable references to
-contiguously stored list elements, as well as views into each element: `ListElementView`.
+contiguously stored list elements, as well as views into each element: `CellView`.
 
 
-Each list element is stored packed and type erased: a "type tag" (`ListBufferTypeTag`) followed by the bytes
+Each list element is stored packed and type erased: a "type tag" (`CellTag`) followed by the bytes
 of the value of the element. Each element must be trivially copyable.
 
 
-A `ListElementView` is a slim wrapper over a pointer to the element's type tag. Helper functions are provided
+A `CellView` is a slim wrapper over a pointer to the element's type tag. Helper functions are provided
 to interpret the tag. The type tag is used to determine the number of bytes of the value of the element, which
 can then be read into a generic `T` with the `getAs` helper function.
 
 
 Since the `ListBuffer` guarantees that all elements in a single list are stored contiguously, a `ListView` is
-a span over the `ListElementViews` which make up the elements of the list.
+a span over the `CellViews` which make up the elements of the list.
 
 
 We can then have `using types::List::Primitive = ListView`, with the desired properties outlined above.
@@ -83,3 +83,15 @@ A view cannot leave the buffers that built it, so a list that has to outlive the
 (`storage/list/EncodedList.h`): a self-describing byte sequence carrying the whole value, nested lists and
 payloads included. It is the owning form the write buffer stages a `CREATE` / `SET` value in until the commit
 builds its datapart, and the same encoding the dumper writes to disk and the loader reads back.
+
+## Paths
+
+A list element or a map value may be a path, tagged `CellTag::Path`. Its value is a `PathView`
+(`storage/PathView.h`): a span over the path's IDs, node, edge, node, ... as `GraphPath` lays
+them out, held in a buffer beside the elements. The query buffers view the IDs of the path
+column they read from, and `ListContainer`, `MapContainer` and `NLValueStore` copy them into a
+`SpanBuffer<uint64_t, PathView>` of their own, the way they copy an embedding's floats.
+
+A path is a value of the query that matched it, so a property cannot hold one: a write of a list
+or a map holding a path, at any depth, is rejected. `EncodedList` and `EncodedMap` still encode a
+path, as its ID count then its IDs, since they also compare query values.

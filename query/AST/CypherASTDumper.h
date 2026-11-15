@@ -6,6 +6,7 @@
 namespace db {
 
 class CypherAST;
+class RegularQuery;
 class SinglePartQuery;
 class UnionQuery;
 class ConditionalQuery;
@@ -76,14 +77,14 @@ private:
     const CypherAST* _ast {nullptr};
     std::unordered_set<const VarDecl*> _dumpedVariables;
 
-    void dump(std::ostream& out, const SinglePartQuery* query);
+    void dump(std::ostream& out, const RegularQuery* query);
 
     // The query alone, without the edge joining it to the script: a union branch hangs off
     // the union rather than off the script, as queries() already reports it
+    void dumpRegularQuery(std::ostream& out, const RegularQuery* query);
     void dumpQueryBody(std::ostream& out, const SinglePartQuery* query);
-
-    void dump(std::ostream& out, const UnionQuery* query);
-    void dump(std::ostream& out, const ConditionalQuery* query);
+    void dumpUnion(std::ostream& out, const UnionQuery* query);
+    void dumpConditional(std::ostream& out, const ConditionalQuery* query);
     void dump(std::ostream& out, const WithStmt* with);
     void dump(std::ostream& out, const LoadGraphQuery* query);
     void dump(std::ostream& out, const LoadJsonlQuery* query);
@@ -124,6 +125,7 @@ private:
     void dump(std::ostream& out, const UnaryExpr* expr);
     void dump(std::ostream& out, const SymbolExpr* expr);
     void dump(std::ostream& out, const LiteralExpr* expr);
+    void dump(std::ostream& out, const ParameterExpr* expr);
     void dump(std::ostream& out, const EntityTypeExpr* expr);
     void dump(std::ostream& out, const StringExpr* expr);
     void dump(std::ostream& out, const PropertyExpr* expr);

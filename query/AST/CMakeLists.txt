@@ -5,11 +5,13 @@ set(ast_sources
     SourceManager.cpp
     DiagnosticsManager.cpp
     FunctionDecls.cpp
+    FunctionNamespace.cpp
     FunctionSignature.cpp
     ProcedureLookup.cpp
 
     decl/DeclContext.cpp
     decl/ListShape.cpp
+    decl/ParameterDecl.cpp
     decl/PatternData.cpp
     decl/SchemaNameRef.cpp
     decl/VarDecl.cpp
@@ -18,6 +20,7 @@ set(ast_sources
     expr/BinaryExpr.cpp
     expr/LogicalExpr.cpp
     expr/LiteralExpr.cpp
+    expr/ParameterExpr.cpp
     expr/EntityTypeExpr.cpp
     expr/PropertyExpr.cpp
     expr/PropertyLookupExpr.cpp
@@ -60,6 +63,7 @@ set(ast_sources
     EntityPattern.cpp
     Projection.cpp
     QueryCommand.cpp
+    RegularQuery.cpp
     SinglePartQuery.cpp
     UnionQuery.cpp
     ConditionalQuery.cpp
@@ -90,6 +94,8 @@ set(ast_sources
     expr/PatternComprehensionExpr.cpp
     expr/ListPredicateExpr.cpp
     expr/ReduceExpr.cpp
+    expr/AllReduceExpr.cpp
+    expr/MapProjectionExpr.cpp
     expr/CaseExpr.cpp
     NodePattern.cpp
     EdgePattern.cpp
@@ -109,8 +115,6 @@ set(ast_sources
     DropIndexQuery.cpp
     MergeDataPartsQuery.cpp
     SquashCommitsQuery.cpp
-
-    ExprUtils.cpp
   )
 
 add_library(turing_db_ast_s STATIC ${ast_sources})

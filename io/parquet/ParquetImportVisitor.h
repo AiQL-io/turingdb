@@ -11,10 +11,11 @@
 
 #include <parquet/types.h>
 
+#include "ParquetGeometry.h"
 #include "ParquetReader.h"
 
-#include "DurationSpec.h"
 #include "ID.h"
+#include "TypedPropertySpec.h"
 #include "list/ListContainer.h"
 #include "list/ListView.h"
 #include "metadata/PropertyType.h"
@@ -36,10 +37,10 @@ public:
     using NodeIDs = std::span<const int64_t>;
     using IDMap = std::unordered_map<int64_t, NodeID>;
 
-    ParquetImportVisitor(CommitBuilder* builder, IDMap& nodeIDs, const DurationSpec& durationSpecs)
+    ParquetImportVisitor(CommitBuilder* builder, IDMap& nodeIDs, const TypedPropertySpec& typedProperties)
         : _builder(builder),
         _nodeIDs(nodeIDs),
-        _durationSpecs(durationSpecs)
+        _typedProperties(typedProperties)
     {
     }
 
@@ -64,6 +65,9 @@ protected:
 
         bool holdsDurations {false};
 
+        bool holdsGeometries {false};
+        ParquetGeometryCRS geometryCRS {ParquetGeometryCRS::Geographic};
+
         // Indexed by repetition depth: the definition level a value must reach for the
         // list at that depth to hold an element. Index 0 is unused.
         std::vector<int16_t> listDefLevels;
@@ -79,7 +83,7 @@ protected:
     // @ref DataPartBuilder used when importing
     IDMap& _nodeIDs;
 
-    const DurationSpec& _durationSpecs;
+    const TypedPropertySpec& _typedProperties;
 
     std::unordered_map<size_t, PropertyColumn> _propertyColumns;
 
@@ -125,7 +129,8 @@ protected:
     // Infers a property column value type and registers property type
     void discoverPropertyColumn(size_t columnIndex,
                                 const std::string& path,
-                                const parquet::ColumnDescriptor& descriptor);
+                                const parquet::ColumnDescriptor& descriptor,
+                                const ParquetGeometry& geometry);
 
     // Capture helpers for property columns, called by the derived value callbacks
     // once they have handled their entity-specific columns.

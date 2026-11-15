@@ -4,6 +4,8 @@
 #include <limits>
 #include <numeric>
 
+#include "NLExecutionContext.h"
+#include "NLRuntimeProperty.h"
 #include "NLMergeWorkingSet.h"
 #include "Procedure.h"
 #include "ProcedureData.h"
@@ -15,9 +17,9 @@ using namespace db;
 
 namespace {
 
-void compactExtremes(NLCompactingValueStore& extremes,
-                     std::vector<NLGroupAggregateState::Aggregate>& aggregates,
-                     size_t groupCount) {
+void compactAccumulators(NLCompactingValueStore& values,
+                         std::vector<NLGroupAggregateState::Aggregate>& aggregates,
+                         size_t groupCount) {
     size_t liveCount = 0;
     for (const NLGroupAggregateState::Aggregate& aggregate : aggregates) {
         if (aggregate._reown) {
@@ -25,18 +27,18 @@ void compactExtremes(NLCompactingValueStore& extremes,
         }
     }
 
-    if (!extremes.needsCompaction(liveCount)) {
+    if (!values.needsCompaction(liveCount)) {
         return;
     }
 
-    NLValueStore& spare = extremes.getSpare();
+    NLValueStore& spare = values.getSpare();
     for (NLGroupAggregateState::Aggregate& aggregate : aggregates) {
         if (aggregate._reown) {
             aggregate._reown(aggregate._accumulator, spare);
         }
     }
 
-    extremes.flip();
+    values.flip();
 }
 
 }
@@ -93,6 +95,27 @@ NLMergeNodeIndex* NLProgram::addMergeNodeIndex(const std::string& signature,
     _mergeNodeIndexes.emplace(signature, std::move(index));
 
     return indexPtr;
+}
+
+Column* db::allocOptValueColumn(LocalMemory* memory, ValueType valueType, size_t reserveSize) {
+    Column* column = nullptr;
+    const auto allocate = [&]<SupportedType T>() {
+        ColumnOptVector<typename T::Primitive>* typed = memory->alloc<ColumnOptVector<typename T::Primitive>>();
+        typed->reserve(reserveSize);
+        column = typed;
+    };
+    ValueTypeDispatcher(valueType).execute(allocate);
+
+    return column;
+}
+
+NLRuntimeProperty* NLProgram::getRuntimeProperty(std::string_view name) {
+    std::unique_ptr<NLRuntimeProperty>& property = _runtimeProperties[std::string(name)];
+    if (!property) {
+        property = std::make_unique<NLRuntimeProperty>(name);
+    }
+
+    return property.get();
 }
 
 NLProcedureState::NLProcedureState(const Procedure* procedure,
@@ -172,6 +195,11 @@ std::span<const NodeID> NLNodeSetState::getNodes() {
     }
 
     return _nodes;
+}
+
+void NLProcedureState::setExecutionContext(const NLExecutionContext* context) {
+    _context.setWriteBuffer(context->getWriteBuffer());
+    _context.setFirstQueryNode(context->getFirstQueryNode());
 }
 
 void NLProcedureState::prepareOrResetForNewDrive() {
@@ -321,9 +349,9 @@ void NLCountSubqueryState::reset() {
     _counts.assign(getRowCount(), 0);
 }
 
-void NLCountSubqueryState::addRows(size_t rowCount) {
-    bioassert(_counts.size() == 1, "An untagged step answers for 1 row, not {}", _counts.size());
-    _counts.front() += rowCount;
+void NLCountSubqueryState::addRows(uint64_t row, size_t rowCount) {
+    bioassert(row < _counts.size(), "Row {} is outside the {} rows of the step", row, _counts.size());
+    _counts[row] += rowCount;
 }
 
 void NLCountSubqueryState::addTaggedRows(std::span<const uint64_t> tag) {
@@ -339,9 +367,13 @@ NLSubqueryExpressionResetData::NLSubqueryExpressionResetData(NLSubqueryExpressio
 {
 }
 
-NLCountSubqueryTallyData::NLCountSubqueryTallyData(NLCountSubqueryState* state, const ColumnVector<uint64_t>* tag, const Column* rows)
+NLCountSubqueryTallyData::NLCountSubqueryTallyData(NLCountSubqueryState* state,
+                                                   const ColumnVector<uint64_t>* tag,
+                                                   const ColumnVector<uint64_t>* row,
+                                                   const Column* rows)
     : _state(state),
     _tag(tag),
+    _row(row),
     _rows(rows)
 {
 }
@@ -454,7 +486,7 @@ void NLGroupTable::clear() {
 void NLGroupAggregateState::reset() {
     _groupTable.clear();
     _keyValues.clear();
-    _extremeValues.clear();
+    _accumulatorValues.clear();
 
     for (KeyColumn& key : _keyColumns) {
         key._buffer->clear();
@@ -468,16 +500,17 @@ void NLGroupAggregateState::reset() {
         }
 
         aggregate._counts.clear();
+        aggregate._durationTotals.clear();
         aggregate._distinct.clear();
     }
 }
 
-void NLGroupAggregateState::compactExtremeValues() {
-    compactExtremes(_extremeValues, _aggregates, _groupTable.getGroupCount());
+void NLGroupAggregateState::compactAccumulatorValues() {
+    compactAccumulators(_accumulatorValues, _aggregates, _groupTable.getGroupCount());
 }
 
-void NLCollectState::compactExtremeValues() {
-    compactExtremes(_extremeValues, _aggregates, _groupTable.getGroupCount());
+void NLCollectState::compactAccumulatorValues() {
+    compactAccumulators(_accumulatorValues, _aggregates, _groupTable.getGroupCount());
 }
 
 NLCollectState::ValueColumn& NLCollectState::unwoundColumn() {
@@ -507,7 +540,7 @@ void NLCollectState::reset() {
     _listBuffer.clear();
     _keyValues.clear();
     _collectedValues.clear();
-    _extremeValues.clear();
+    _accumulatorValues.clear();
 
     for (NLGroupAggregateState::Aggregate& aggregate : _aggregates) {
         if (aggregate._accumulator) {
@@ -515,6 +548,7 @@ void NLCollectState::reset() {
         }
 
         aggregate._counts.clear();
+        aggregate._durationTotals.clear();
         aggregate._distinct.clear();
     }
 
@@ -532,7 +566,7 @@ void NLCollectState::reset() {
         }
 
         for (NLGroupAggregateState::Aggregate& aggregate : _aggregates) {
-            aggregate._grow(aggregate._accumulator, aggregate._counts, 1);
+            aggregate._grow(aggregate._accumulator, aggregate._counts, aggregate._durationTotals, 1);
         }
     }
 }
@@ -681,9 +715,10 @@ std::span<const NLMergePendingEdges::Entry> NLMergePendingEdges::lookup(
     return findIt->second;
 }
 
-NLMergeData::NLMergeData(NLMergePendingEdges* pendingEdges, ColumnMask* created)
+NLMergeData::NLMergeData(NLMergePendingEdges* pendingEdges, ColumnMask* created, LocalMemory* memory)
     : _pendingEdges(pendingEdges),
     _created(created),
+    _memory(memory),
     _workingSet(std::make_unique<NLMergeWorkingSet>())
 {
 }
@@ -702,4 +737,61 @@ NLMakeMapData::~NLMakeMapData() {
 
 void NLMakeMapData::addEntry(const Entry& entry) {
     _entries.push_back(entry);
+}
+
+NLKeylessValue::NLKeylessValue(CellTag tag)
+    : _tag(tag)
+{
+}
+
+NLNeitherPositionNorKey::NLNeitherPositionNorKey(CellTag tag)
+    : _tag(tag)
+{
+}
+
+NLContainerIndexData::NLContainerIndexData(const Column* base,
+                                           NLContainerReadFunction baseRead,
+                                           const Column* index,
+                                           NLSubscriptReadFunction indexRead,
+                                           Column* result,
+                                           NLStepBuffers* stepBuffers)
+    : _base(base),
+    _baseRead(baseRead),
+    _index(index),
+    _indexRead(indexRead),
+    _result(result),
+    _stepBuffers(stepBuffers)
+{
+}
+
+NLContainerIndexData::~NLContainerIndexData() {
+}
+
+NLMergeMapsData::NLMergeMapsData(Column* result, NLStepBuffers* stepBuffers)
+    : _result(result),
+    _stepBuffers(stepBuffers)
+{
+}
+
+NLMergeMapsData::~NLMergeMapsData() {
+}
+
+void NLMergeMapsData::addOperand(const Operand& operand) {
+    _operands.push_back(operand);
+}
+
+NLFillNullsData::NLFillNullsData(const Column* value,
+                                 const ColumnMask* nullRows,
+                                 const Column* fill,
+                                 Column* result,
+                                 NLFillNullRowsFn fillNullRows)
+    : _value(value),
+    _nullRows(nullRows),
+    _fill(fill),
+    _result(result),
+    _fillNullRows(fillNullRows)
+{
+}
+
+NLFillNullsData::~NLFillNullsData() {
 }

@@ -8,27 +8,32 @@
 #include <type_traits>
 #include <utility>
 
+#include <spdlog/fmt/bundled/format.h>
+
+#include "GraphPath.h"
 #include "ID.h"
+#include "IteratedList.h"
 #include "NumberOrder.h"
+#include "QueryTypeName.h"
 #include "TypeUtils.h"
 #include "ColumnMask.h"
 #include "ColumnConst.h"
-#include "list/ListElementOrder.h"
+#include "CellOrder.h"
 #include "metadata/PropertyType.h"
 
 namespace db {
 
 // A mask's boolean reaches the comparisons of a type-erased cell only through its
 // conversion to a number, so it is compared as the boolean property type
-inline bool operator==(ListElementView element, ColumnMask::Bool_t predicate) {
+inline bool operator==(CellView element, ColumnMask::Bool_t predicate) {
     return element == types::Bool::Primitive {predicate._value};
 }
 
-inline std::strong_ordering operator<=>(ListElementView element, ColumnMask::Bool_t predicate) {
+inline std::strong_ordering operator<=>(CellView element, ColumnMask::Bool_t predicate) {
     return element <=> types::Bool::Primitive {predicate._value};
 }
 
-inline std::optional<std::partial_ordering> comparisonOrder(ListElementView element, ColumnMask::Bool_t predicate) {
+inline std::optional<std::partial_ordering> comparisonOrder(CellView element, ColumnMask::Bool_t predicate) {
     return comparisonOrder(element, types::Bool::Primitive {predicate._value});
 }
 
@@ -55,21 +60,22 @@ template <typename T>
 concept ListOperand =
     std::same_as<TypeUtils::unwrap_optional_t<std::decay_t<T>>, ListView>;
 
-// A list the membership test has to read out of a tag: what an index of a nested list
+template <typename T>
+concept MapOperand =
+    std::same_as<TypeUtils::unwrap_optional_t<std::decay_t<T>>, MapView>;
+
+// Two lists or two maps, whose equality is unknown where a null inside one meets a value
+template <typename T, typename U>
+concept ComparesTwoContainers = (ListOperand<T> && ListOperand<U>) || (MapOperand<T> && MapOperand<U>);
+
+// A cell the membership test reads the iterated list of: what an index of a nested list
 // answers, since the type of an element is settled row by row
 template <typename T>
 concept TaggedListOperand =
-    std::same_as<TypeUtils::unwrap_optional_t<std::decay_t<T>>, ListElementView>;
-
-// A map value, which carries its own null in the entry's tag rather than in a nullable
-// column. Comparing one is three-valued for that reason, so it needs an overload of its
-// own; a null of unknown type is excluded, since IS NULL tests the tag rather than
-// answering unknown about it.
-template <typename T>
-concept MapEntryOperand = std::same_as<std::decay_t<T>, MapEntryView>;
+    std::same_as<TypeUtils::unwrap_optional_t<std::decay_t<T>>, CellView>;
 
 // The list a type-erased cell holds, absent where it holds anything else - a number, a
-// string, a null - which is what a membership test over it then answers
+// string, a null
 template <typename C>
 inline std::optional<ListView> taggedList(const C& cell) {
     if constexpr (TypeUtils::is_optional_v<C>) {
@@ -79,7 +85,7 @@ inline std::optional<ListView> taggedList(const C& cell) {
 
         return taggedList(*cell);
     } else {
-        if (cell.getTag() != ListBufferTypeTag::ListView) {
+        if (cell.getTag() != CellTag::ListView) {
             return std::nullopt;
         }
 
@@ -89,18 +95,11 @@ inline std::optional<ListView> taggedList(const C& cell) {
 
 template <typename T>
 concept TaggedCellOperand =
-    std::same_as<TypeUtils::unwrap_optional_t<std::decay_t<T>>, ListElementView>;
+    std::same_as<TypeUtils::unwrap_optional_t<std::decay_t<T>>, CellView>;
 
-// Every comparison of a cell but the IS NULL test, which reads the tag and always answers
+// Every comparison of a cell but one against a null of unknown type
 template <typename T, typename U>
 concept ComparesATaggedCell = (TaggedCellOperand<T> || TaggedCellOperand<U>) && !HoldsPropertyNull<T, U>;
-
-// The same for a map value, on whichever side it is written. A pair meeting a list element
-// is left to ComparesATaggedCell, whose body reads both.
-template <typename T, typename U>
-concept ComparesAMapEntry = (MapEntryOperand<T> || MapEntryOperand<U>)
-                         && !TaggedCellOperand<T> && !TaggedCellOperand<U>
-                         && !HoldsPropertyNull<T, U>;
 
 template <typename T>
 concept IDOperand = TypedInternalID<TypeUtils::unwrap_optional_t<std::decay_t<T>>>;
@@ -115,38 +114,30 @@ template <typename T, typename U>
 concept ComparesAnID = (IDOperand<T> && (IDOperand<U> || IntegerOperand<U>))
                     || (IntegerOperand<T> && IDOperand<U>);
 
-// IS NULL over an entity, which reads the ID: the null is the invalid one
-template <typename T, typename U>
-concept TestsAnIDForNull = TypedInternalID<std::decay_t<T>> && std::same_as<std::decay_t<U>, PropertyNull>;
-
 template <typename T, typename U>
 concept OrdersToANullableBool = ComparesATaggedCell<T, U>
-                             || ComparesAMapEntry<T, U>
                              || (ListOperand<T> && ListOperand<U>);
 
 template <typename T>
 inline bool holdsAValue(const T& operand) {
     if constexpr (TypeUtils::is_optional_v<T>) {
         return operand.has_value() && holdsAValue(*operand);
-    } else if constexpr (std::is_same_v<T, ListElementView>) {
-        return operand.getTag() != ListBufferTypeTag::Null;
-    } else if constexpr (TypedInternalID<T>) {
+    } else if constexpr (std::is_same_v<T, CellView>) {
+        return operand.getTag() != CellTag::Null;
+    } else if constexpr (TypedInternalID<T> || std::is_same_v<T, PathRef>) {
         return operand.isValid();
-    } else if constexpr (std::is_same_v<T, MapEntryView>) {
-        return operand.getValueTag() != MapBufferTypeTag::Null;
+    } else if constexpr (std::is_same_v<T, GraphPath>) {
+        return !operand.isNull();
+    } else if constexpr (std::is_same_v<T, PropertyNull>) {
+        return false;
     } else {
         return true;
     }
 }
 
-inline bool holdsAnInteger(const ListElementView element) {
-    const ListBufferTypeTag tag = element.getTag();
-    return tag == ListBufferTypeTag::Int || tag == ListBufferTypeTag::UInt;
-}
-
-inline bool holdsAnInteger(const MapEntryView entry) {
-    const MapBufferTypeTag tag = entry.getValueTag();
-    return tag == MapBufferTypeTag::Int || tag == MapBufferTypeTag::UInt;
+inline bool holdsAnInteger(const CellView element) {
+    const CellTag tag = element.getTag();
+    return tag == CellTag::Int || tag == CellTag::UInt;
 }
 
 template <typename Cell, TypedInternalID IDT>
@@ -159,24 +150,28 @@ inline bool cellIsID(const Cell cell, const IDT id) {
     return cell == id;
 }
 
-// The list a map entry holds, absent where it holds anything else, as taggedList answers
-// for a list element
-inline std::optional<ListView> entryList(const MapEntryView entry) {
-    if (entry.getValueTag() != MapBufferTypeTag::ListView) {
-        return std::nullopt;
-    }
-
-    return entry.getValueAs<ListView>();
-}
-
 template <typename T>
 inline std::optional<ListView> heldList(const T& operand) {
     if constexpr (std::is_same_v<T, ListView>) {
         return operand;
-    } else if constexpr (std::is_same_v<T, ListElementView>) {
+    } else if constexpr (std::is_same_v<T, CellView>) {
         return taggedList(operand);
-    } else if constexpr (std::is_same_v<T, MapEntryView>) {
-        return entryList(operand);
+    } else {
+        return std::nullopt;
+    }
+}
+
+// The map a cell holds, absent where it holds anything else, as heldList answers for a list
+template <typename T>
+inline std::optional<MapView> heldMap(const T& operand) {
+    if constexpr (std::is_same_v<T, MapView>) {
+        return operand;
+    } else if constexpr (std::is_same_v<T, CellView>) {
+        if (operand.getTag() != CellTag::MapView) {
+            return std::nullopt;
+        }
+
+        return operand.template getAs<MapView>();
     } else {
         return std::nullopt;
     }
@@ -184,9 +179,7 @@ inline std::optional<ListView> heldList(const T& operand) {
 
 template <typename T, typename U>
 inline std::optional<std::partial_ordering> cellComparisonOrder(const T& a, const U& b) {
-    constexpr bool leadsWithAMapEntry = std::is_same_v<T, MapEntryView> && !std::is_same_v<U, ListElementView>;
-
-    if constexpr (std::is_same_v<T, ListElementView> || std::is_same_v<T, U> || leadsWithAMapEntry) {
+    if constexpr (std::is_same_v<T, CellView> || std::is_same_v<T, U>) {
         return comparisonOrder(a, b);
     } else {
         const std::optional<std::partial_ordering> order = comparisonOrder(b, a);
@@ -197,11 +190,6 @@ inline std::optional<std::partial_ordering> cellComparisonOrder(const T& a, cons
         return 0 <=> *order;
     }
 }
-
-template <typename F>
-concept TestsEquality =
-    (std::is_same_v<F, std::equal_to<>> || std::is_same_v<F, std::not_equal_to<>>
-     || std::is_same_v<F, TuringEqual> || std::is_same_v<F, TuringNotEqual>);
 
 // The built-in comparisons convert one operand of a mixed pair to the other's type, so a
 // count compared with -1 would be compared with 2^64 - 1, and 2^53 + 1 with 2^53.0 would
@@ -251,27 +239,49 @@ struct TuringOrder {
     }
 };
 
+// The truth value a Boolean operand holds, unknown for a null
+template <BooleanOpt T>
+inline std::optional<bool> truthOf(const T& operand) {
+    if constexpr (std::same_as<std::decay_t<T>, PropertyNull>) {
+        return std::nullopt;
+    } else if constexpr (TypeUtils::is_optional_v<T>) {
+        if (!operand.has_value()) {
+            return std::nullopt;
+        }
+
+        return *operand == sentinelTrue;
+    } else {
+        return operand == sentinelTrue;
+    }
+}
+
 // The following Boolean operators have unique semantics for 3-way logic (i.e.
 // short-circuiting) so are defined explicitly rather than generically
 template <BooleanOpt T, BooleanOpt U>
 inline std::optional<CustomBool> optionalOr(const T& a, const U& b) {
-    if (a == sentinelTrue || b == sentinelTrue) {
+    const std::optional<bool> lhs = truthOf(a);
+    const std::optional<bool> rhs = truthOf(b);
+
+    if (lhs == true || rhs == true) {
         return true;
-    }
-    if (a == sentinelFalse && b == sentinelFalse) {
+    } else if (lhs == false && rhs == false) {
         return false;
     }
+
     return std::nullopt;
 }
 
 template <BooleanOpt T, BooleanOpt U>
 inline std::optional<CustomBool> optionalAnd(const T& a, const U& b) {
-    if (a == sentinelTrue && b == sentinelTrue) {
+    const std::optional<bool> lhs = truthOf(a);
+    const std::optional<bool> rhs = truthOf(b);
+
+    if (lhs == true && rhs == true) {
         return true;
-    }
-    if (a == sentinelFalse || b == sentinelFalse) {
+    } else if (lhs == false || rhs == false) {
         return false;
     }
+
     return std::nullopt;
 }
 
@@ -297,16 +307,16 @@ inline std::optional<CustomBool> truthValue(const T& value) {
         }
 
         return truthValue(*value);
-    } else if constexpr (std::is_same_v<Decayed, ListElementView>) {
-        const ListBufferTypeTag tag = value.getTag();
+    } else if constexpr (std::is_same_v<Decayed, CellView>) {
+        const CellTag tag = value.getTag();
 
-        if (tag == ListBufferTypeTag::Bool) {
+        if (tag == CellTag::Bool) {
             return value.template getAs<types::Bool::Primitive>();
-        } else if (tag == ListBufferTypeTag::Null) {
+        } else if (tag == CellTag::Null) {
             return std::nullopt;
         }
 
-        throw TuringException("Logical operands must be booleans");
+        throw TuringException(fmt::format("A logical operand must be a boolean, not '{}'", queryTypeName(tag)));
     } else if constexpr (std::is_same_v<Decayed, PropertyNull>) {
         return std::nullopt;
     } else {
@@ -731,63 +741,28 @@ struct BinaryPredicate {
     inline ColumnMask::Bool_t operator()(T&& a, U&& b) {
         return F{}(std::forward<T>(a), std::forward<U>(b));
     }
-    
-    // Specialisation for IS NOT NULL and IS NULL
-    template <typename T>
-    requires(TypeUtils::is_optional_v<T> && TestsEquality<F>)
-    inline ColumnMask::Bool_t operator()(T&& a, const PropertyNull& null) {
-        return F{}(std::forward<T>(a), null);
-    }
 };
 
 struct TuringEqual {
     template <typename T, typename U>
-        requires ListOperand<T> && ListOperand<U>
+        requires ComparesTwoContainers<T, U>
     std::optional<CustomBool> operator()(const T& a, const U& b) {
-        if constexpr (TypeUtils::is_optional_v<T>) {
-            if (!a.has_value()) {
-                return std::nullopt;
-            }
-        }
-
-        if constexpr (TypeUtils::is_optional_v<U>) {
-            if (!b.has_value()) {
-                return std::nullopt;
-            }
-        }
-
-        const std::span<const ListElementView> lhs = TypeUtils::unwrap(a).elements();
-        const std::span<const ListElementView> rhs = TypeUtils::unwrap(b).elements();
-
-        if (lhs.size() != rhs.size()) {
-            return CustomBool {false};
-        }
-
-        bool unknown = false;
-
-        for (size_t index = 0; index < lhs.size(); index++) {
-            const bool holdsNull = lhs[index].getTag() == ListBufferTypeTag::Null
-                                || rhs[index].getTag() == ListBufferTypeTag::Null;
-            if (holdsNull) {
-                unknown = true;
-                continue;
-            }
-
-            if (!(lhs[index] == rhs[index])) {
-                return CustomBool {false};
-            }
-        }
-
-        if (unknown) {
+        if (!holdsAValue(a) || !holdsAValue(b)) {
             return std::nullopt;
         }
 
-        return CustomBool {true};
+        const std::optional<bool> equal = equalOrUnknown(TypeUtils::unwrap(a), TypeUtils::unwrap(b));
+        if (!equal.has_value()) {
+            return std::nullopt;
+        }
+
+        return CustomBool {*equal};
     }
 
-    // A cell holding a list compares as that list, so its null elements answer as a list's do
+    // A cell holding a list or a map compares as that value, so the nulls inside it answer
+    // as they do there
     template <typename T, typename U>
-        requires ComparesATaggedCell<T, U> || ComparesAMapEntry<T, U>
+        requires ComparesATaggedCell<T, U>
     std::optional<CustomBool> operator()(const T& a, const U& b) {
         if (!holdsAValue(a) || !holdsAValue(b)) {
             return std::nullopt;
@@ -802,6 +777,12 @@ struct TuringEqual {
             return (*this)(*lhsList, *rhsList);
         }
 
+        const std::optional<MapView> lhsMap = heldMap(lhs);
+        const std::optional<MapView> rhsMap = heldMap(rhs);
+        if (lhsMap && rhsMap) {
+            return (*this)(*lhsMap, *rhsMap);
+        }
+
         using Lhs = std::decay_t<decltype(lhs)>;
         using Rhs = std::decay_t<decltype(rhs)>;
 
@@ -812,6 +793,16 @@ struct TuringEqual {
         } else {
             return CustomBool {lhs == rhs};
         }
+    }
+
+    // Two paths are equal when they run through the same nodes and edges. The null path an
+    // OPTIONAL MATCH leaves compares as a null.
+    std::optional<CustomBool> operator()(const GraphPath& a, const GraphPath& b) {
+        if (!holdsAValue(a) || !holdsAValue(b)) {
+            return std::nullopt;
+        }
+
+        return CustomBool {a == b};
     }
 
     bool operator()(const types::Embedding::Primitive& a, const types::Embedding::Primitive& b) {
@@ -839,19 +830,11 @@ struct TuringEqual {
         }
     }
 
-    template <typename T, typename U>
-        requires TestsAnIDForNull<T, U>
-    bool operator()(const T& id, const U& null) {
-        return !id.isValid();
-    }
-
     // Generalist fallback for all other types
     template <typename T, typename U>
-        requires (!ListOperand<T> || !ListOperand<U>)
+        requires (!ComparesTwoContainers<T, U>)
               && (!ComparesATaggedCell<T, U>)
-              && (!ComparesAMapEntry<T, U>)
               && (!ComparesAnID<T, U>)
-              && (!TestsAnIDForNull<T, U>)
     bool operator()(const T& a, const U& b) {
         if constexpr (MixedNumbers<T, U>) {
             return numbersEqual(a, b);
@@ -905,8 +888,8 @@ inline std::optional<types::String::Primitive> predicateText(const types::String
     return value;
 }
 
-inline std::optional<types::String::Primitive> predicateText(const ListElementView element) {
-    if (element.getTag() != ListBufferTypeTag::String) {
+inline std::optional<types::String::Primitive> predicateText(const CellView element) {
+    if (element.getTag() != CellTag::String) {
         return std::nullopt;
     }
 
@@ -968,6 +951,73 @@ struct StringContains {
     }
 };
 
+// The first element of a list equal to a value, and whether an element before it compared
+// as unknown: a null, or a list or map holding one. The value is never null.
+struct ListElementMatch {
+    std::optional<size_t> _position;
+    bool _unknown {false};
+};
+
+template <typename Scalar>
+inline ListElementMatch findListElement(const ListView elements, const Scalar& scalar) {
+    if constexpr (std::is_same_v<Scalar, CellView>) {
+        const std::optional<ListView> scalarList = taggedList(scalar);
+        if (scalarList) {
+            return findListElement(elements, *scalarList);
+        }
+
+        const std::optional<MapView> scalarMap = heldMap(scalar);
+        if (scalarMap) {
+            return findListElement(elements, *scalarMap);
+        }
+    }
+
+    ListElementMatch match;
+    const std::span<const CellView> cells = elements.elements();
+
+    for (size_t position = 0; position < cells.size(); position++) {
+        const CellView element = cells[position];
+
+        if (element.getTag() == CellTag::Null) {
+            match._unknown = true;
+            continue;
+        }
+
+        bool equal = false;
+
+        if constexpr (std::is_same_v<Scalar, ListView> || std::is_same_v<Scalar, MapView>) {
+            std::optional<Scalar> elementValue;
+            if constexpr (std::is_same_v<Scalar, ListView>) {
+                elementValue = heldList(element);
+            } else {
+                elementValue = heldMap(element);
+            }
+
+            if (!elementValue) {
+                continue;
+            }
+
+            const std::optional<CustomBool> containersEqual = TuringEqual {}(*elementValue, scalar);
+            if (!containersEqual) {
+                match._unknown = true;
+            } else {
+                equal = containersEqual->_boolean;
+            }
+        } else if constexpr (TypedInternalID<Scalar>) {
+            equal = cellIsID(element, scalar);
+        } else {
+            equal = element == scalar;
+        }
+
+        if (equal) {
+            match._position = position;
+            return match;
+        }
+    }
+
+    return match;
+}
+
 /// IN [ ... ]
 struct TuringIn {
     template <typename L>
@@ -986,11 +1036,10 @@ struct TuringIn {
         return std::nullopt;
     }
 
-    // The list a type-erased cell holds is the list the value is looked for in
     template <typename T, typename C>
         requires TaggedListOperand<C>
     std::optional<CustomBool> operator()(const T& value, const C& cell) const {
-        const std::optional<ListView> list = taggedList(cell);
+        const std::optional<ListView> list = iteratedList(cell);
         if (!list) {
             return std::nullopt;
         }
@@ -1013,73 +1062,19 @@ struct TuringIn {
             return CustomBool {false};
         }
 
-        if constexpr (TypeUtils::is_optional_v<T>) {
-            if (!value.has_value()) {
-                return std::nullopt;
-            }
-        }
-
-        using Scalar = TypeUtils::unwrap_optional_t<T>;
-        const Scalar& scalar = TypeUtils::unwrap(value);
-
-        if constexpr (std::is_same_v<Scalar, ListElementView>) {
-            if (scalar.getTag() == ListBufferTypeTag::Null) {
-                return std::nullopt;
-            }
-
-            const std::optional<ListView> scalarList = taggedList(scalar);
-            if (scalarList) {
-                return (*this)(*scalarList, elements);
-            }
-        } else if constexpr (std::is_same_v<Scalar, MapEntryView>) {
-            if (scalar.getValueTag() == MapBufferTypeTag::Null) {
-                return std::nullopt;
-            }
-
-            const std::optional<ListView> scalarList = entryList(scalar);
-            if (scalarList) {
-                return (*this)(*scalarList, elements);
-            }
-        } else if constexpr (TypedInternalID<Scalar>) {
-            if (!scalar.isValid()) {
-                return std::nullopt;
-            }
-        }
-
-        bool unknown = false;
-
-        for (const ListElementView element : elements) {
-            if (element.getTag() == ListBufferTypeTag::Null) {
-                unknown = true;
-                continue;
-            }
-
-            if constexpr (std::is_same_v<Scalar, ListView>) {
-                const std::optional<ListView> elementList = taggedList(element);
-                if (!elementList) {
-                    continue;
-                }
-
-                const std::optional<CustomBool> equal = TuringEqual {}(*elementList, scalar);
-                if (!equal) {
-                    unknown = true;
-                } else if (equal->_boolean) {
-                    return CustomBool {true};
-                }
-            } else if constexpr (TypedInternalID<Scalar>) {
-                if (cellIsID(element, scalar)) {
-                    return CustomBool {true};
-                }
-            } else if (element == scalar) {
-                return CustomBool {true};
-            }
-        }
-
-        if (unknown) {
+        if (!holdsAValue(value)) {
             return std::nullopt;
         }
 
-        return CustomBool {false};
+        const ListElementMatch match = findListElement(elements, TypeUtils::unwrap(value));
+
+        if (match._position) {
+            return CustomBool {true};
+        } else if (match._unknown) {
+            return std::nullopt;
+        } else {
+            return CustomBool {false};
+        }
     }
 
     // Unused but needed to satisfy symmetry of dispatcher
@@ -1094,6 +1089,62 @@ struct TuringIn {
         requires TaggedListOperand<C> && (!TaggedListOperand<T>) && (!ListOperand<T>)
     std::optional<CustomBool> operator()(const C& cell, const T& value) const {
         throw FatalException("IN operands in incorrect order");
+    }
+};
+
+/// coll.indexOf(list, value). A null element matches nothing and is skipped, where IN
+/// answers null over it.
+struct TuringIndexOf {
+    template <typename L>
+        requires ListOperand<L> || TaggedListOperand<L>
+    std::optional<types::Int64::Primitive> operator()(const L& list, const PropertyNull& null) const {
+        return std::nullopt;
+    }
+
+    template <typename L, typename T>
+        requires ListOperand<L>
+    std::optional<types::Int64::Primitive> operator()(const L& list, const T& value) const {
+        if constexpr (TypeUtils::is_optional_v<L>) {
+            if (!list.has_value()) {
+                return std::nullopt;
+            }
+        }
+
+        if (!holdsAValue(value)) {
+            return std::nullopt;
+        }
+
+        const ListElementMatch match = findListElement(TypeUtils::unwrap(list), TypeUtils::unwrap(value));
+        if (!match._position) {
+            return -1;
+        }
+
+        return static_cast<types::Int64::Primitive>(*match._position);
+    }
+
+    // The list a type-erased cell holds is the list the value is looked for in
+    template <typename C, typename T>
+        requires TaggedListOperand<C>
+    std::optional<types::Int64::Primitive> operator()(const C& cell, const T& value) const {
+        const std::optional<ListView> list = taggedList(cell);
+        if (!list) {
+            return std::nullopt;
+        }
+
+        return (*this)(*list, value);
+    }
+
+    // Unused but needed to satisfy symmetry of dispatcher
+    template <typename T, typename L>
+        requires ListOperand<L> && (!ListOperand<T>) && (!TaggedListOperand<T>)
+    std::optional<types::Int64::Primitive> operator()(const T& value, const L& list) const {
+        throw FatalException("coll.indexOf operands in incorrect order");
+    }
+
+    template <typename T, typename C>
+        requires TaggedListOperand<C> && (!TaggedListOperand<T>) && (!ListOperand<T>)
+    std::optional<types::Int64::Primitive> operator()(const T& value, const C& cell) const {
+        throw FatalException("coll.indexOf operands in incorrect order");
     }
 };
 
@@ -1117,5 +1168,6 @@ using EndsWith = BinaryPredicate<StringPredicate<StringEndsWith>>;
 using Contains = BinaryPredicate<StringPredicate<StringContains>>;
 
 using In = BinaryPredicate<TuringIn>;
+using IndexOf = TuringIndexOf;
 
 }

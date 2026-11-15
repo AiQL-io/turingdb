@@ -9,8 +9,6 @@
 #include <thread>
 #include <unistd.h>
 
-#include <nlohmann/json.hpp>
-
 #include "FatalException.h"
 #include "TuringTime.h"
 
@@ -80,6 +78,45 @@ size_t receiveLine(int socket, std::string& received, size_t position) {
     }
 }
 
+void sendPost(int socket, const HttpRequest& request) {
+    std::string bytes = "POST " + request.uri + " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ";
+    bytes += std::to_string(request.body.size());
+    bytes += "\r\n\r\n";
+    bytes += request.body;
+
+    sendAll(socket, bytes);
+}
+
+// Reads the chunked response that starts at position, and leaves position past its last chunk
+void receiveChunkedResponse(int socket, std::string& received, size_t& position, HttpResponse& response) {
+    const size_t statusLineEnd = receiveLine(socket, received, position);
+    response.statusLine = received.substr(position, statusLineEnd - position);
+
+    size_t headerEnd = received.find("\r\n\r\n", position);
+    while (headerEnd == std::string::npos) {
+        receiveUntil(socket, received, received.size() + 1);
+        headerEnd = received.find("\r\n\r\n", position);
+    }
+
+    const size_t headersBegin = statusLineEnd + 2;
+    response.headers = received.substr(headersBegin, headerEnd + 2 - headersBegin);
+
+    position = headerEnd + 4;
+    while (true) {
+        const size_t sizeLineEnd = receiveLine(socket, received, position);
+        const size_t chunkSize = std::stoul(received.substr(position, sizeLineEnd - position), nullptr, 16);
+        const size_t chunkBegin = sizeLineEnd + 2;
+        receiveUntil(socket, received, chunkBegin + chunkSize + 2);
+        position = chunkBegin + chunkSize + 2;
+
+        if (chunkSize == 0) {
+            break;
+        }
+
+        response.body.append(received, chunkBegin, chunkSize);
+    }
+}
+
 }
 
 uint16_t reserveFreePort() {
@@ -135,57 +172,21 @@ bool waitUntilListening(uint16_t port, std::chrono::milliseconds timeout) {
     return false;
 }
 
-ProtoEnvScope::ProtoEnvScope() {
-    const char* existing = ::getenv("USE_TURING_PROTO");
-    _hadPrior = existing != nullptr;
-    if (_hadPrior) {
-        _prior = existing;
-    }
-    ::setenv("USE_TURING_PROTO", "1", 1);
-}
-
-ProtoEnvScope::~ProtoEnvScope() {
-    if (_hadPrior) {
-        ::setenv("USE_TURING_PROTO", _prior.c_str(), 1);
-    } else {
-        ::unsetenv("USE_TURING_PROTO");
-    }
-}
-
 void postHttpBody(uint16_t port, const std::string& uri, const std::string& body, HttpResponse& response) {
+    std::vector<HttpResponse> responses;
+    postHttpBodies(port, {HttpRequest {uri, body}}, responses);
+    response = responses.front();
+}
+
+void postHttpBodies(uint16_t port, const std::vector<HttpRequest>& requests, std::vector<HttpResponse>& responses) {
     const int socket = connectTo(port);
 
-    std::string request = "POST " + uri + " HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: ";
-    request += std::to_string(body.size());
-    request += "\r\n\r\n";
-    request += body;
-
+    std::string received;
+    size_t position = 0;
     try {
-        sendAll(socket, request);
-
-        std::string received;
-        const size_t statusLineEnd = receiveLine(socket, received, 0);
-        response.statusLine = received.substr(0, statusLineEnd);
-
-        size_t headerEnd = received.find("\r\n\r\n");
-        while (headerEnd == std::string::npos) {
-            receiveUntil(socket, received, received.size() + 1);
-            headerEnd = received.find("\r\n\r\n");
-        }
-
-        size_t position = headerEnd + 4;
-        while (true) {
-            const size_t sizeLineEnd = receiveLine(socket, received, position);
-            const size_t chunkSize = std::stoul(received.substr(position, sizeLineEnd - position), nullptr, 16);
-            const size_t chunkBegin = sizeLineEnd + 2;
-            receiveUntil(socket, received, chunkBegin + chunkSize + 2);
-
-            if (chunkSize == 0) {
-                break;
-            }
-
-            response.body.append(received, chunkBegin, chunkSize);
-            position = chunkBegin + chunkSize + 2;
+        for (const HttpRequest& request : requests) {
+            sendPost(socket, request);
+            receiveChunkedResponse(socket, received, position, responses.emplace_back());
         }
     } catch (...) {
         ::close(socket);
@@ -195,9 +196,20 @@ void postHttpBody(uint16_t port, const std::string& uri, const std::string& body
     ::close(socket);
 }
 
-void postHttpQuery(uint16_t port, const std::string& uri, const std::string& query, HttpResponse& response) {
-    const nlohmann::json body = {{"query", query}};
-    postHttpBody(port, uri, body.dump(), response);
+void sendHttpRequest(uint16_t port, const std::string& request, HttpResponse& response) {
+    const int socket = connectTo(port);
+
+    std::string received;
+    size_t position = 0;
+    try {
+        sendAll(socket, request);
+        receiveChunkedResponse(socket, received, position, response);
+    } catch (...) {
+        ::close(socket);
+        throw;
+    }
+
+    ::close(socket);
 }
 
 }

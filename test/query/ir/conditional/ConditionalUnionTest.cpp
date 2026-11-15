@@ -104,21 +104,15 @@ TEST_F(ConditionalUnionTest, rejectsSidesReturningDifferentColumns) {
                 "All sub-queries of a UNION must return the same column names");
 }
 
-TEST_F(ConditionalUnionTest, rejectsAColumnWithoutAName) {
+TEST_F(ConditionalUnionTest, namesAColumnWithoutAnAliasByItsExpression) {
+    expectRows("{ WHEN true THEN RETURN 1 + 1 } UNION ALL { WHEN true THEN RETURN 1 + 1 }", {{"2"}, {"2"}});
     expectError("{ WHEN true THEN RETURN 1 + 1 } UNION { WHEN true THEN RETURN 2 AS x }",
-                "A WHEN combined by UNION must name each column it returns with AS");
+                "All sub-queries of a UNION must return the same column names");
 }
 
 TEST_F(ConditionalUnionTest, rejectsAPredicateReadingWhatNoScopeClauseImports) {
     expectError("MATCH (p:Person) CALL { { WHEN p.isFrench THEN RETURN 1 AS x } UNION { WHEN true THEN RETURN 2 AS x } } RETURN x",
                 "Variable 'p' not found");
-}
-
-TEST_F(ConditionalUnionTest, rejectsAConditionalInAnExistsOrCountBody) {
-    expectError("MATCH (p:Person) RETURN EXISTS { { WHEN true THEN RETURN 1 AS x } UNION RETURN 2 AS x }",
-                "Not implemented: WHEN in an EXISTS body");
-    expectError("MATCH (p:Person) RETURN COUNT { RETURN 2 AS x UNION { WHEN true THEN RETURN 1 AS x } }",
-                "Not implemented: WHEN in a COUNT body");
 }
 
 TEST_F(ConditionalUnionTest, dedupsAnEntityOneSideMergedAndAnotherMatched) {
