@@ -6,6 +6,7 @@
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringMap.h"
 
@@ -112,6 +113,8 @@ public:
     mlir::func::FuncOp lower(mlir::func::FuncOp dbFunction, mlir::ModuleOp module);
 
 private:
+    using ChunkPredicate = llvm::function_ref<bool(mlir::Value)>;
+
     struct ProducerWalkVisit {
         bool _reachedALoop {false};
         bool _rowsDroppedBeforeTheCut {false};
@@ -124,6 +127,12 @@ private:
         llvm::SmallVector<mlir::Value, 2> _operands;
         bool _operandsRowsDropped {false};
         size_t _nextOperand {0};
+    };
+
+    struct LaidOutOperand {
+        mlir::Value _operand;
+        mlir::Value _constantChunk;
+        mlir::Value _laidOutChunk;
     };
 
     mlir::OpBuilder _builder;
@@ -141,6 +150,11 @@ private:
     // handle the branches of a union share
     llvm::DenseMap<mlir::Value, mlir::Value> _valueMap;
 
+    // The constant operands of the ops being lowered, bound in _valueMap to chunks laid out
+    // over those ops' rows. An op in their regions runs over other rows, so it reads the
+    // constant chunks instead.
+    llvm::SmallVector<LaidOutOperand, 4> _laidOutOperands;
+
     // Property name -> the hoisted nl.get_property_type handle, so a name is
     // resolved once and shared by every fetch that reads it
     llvm::StringMap<mlir::Value> _propertyTypes;
@@ -155,9 +169,10 @@ private:
     // Entry block of the nl function being built
     mlir::Block* _entryBlock {nullptr};
 
-    // The last constant hoisted to the entry block, which the next one goes after. Null
-    // while the block opens on something else, where the next constant goes to the top
-    mlir::Operation* _lastHoistedConstant {nullptr};
+    // The last op of the run the entry block opens on: the constants and handles hoisted
+    // above every loop. The next one goes after it and an op computed from them alone goes
+    // below it, so each dominates every op and body that reads it
+    mlir::Operation* _lastHoisted {nullptr};
 
     // The block the WHEN being lowered runs in, or the loop of its branch being lowered. A
     // computation over constants alone goes there in place of the entry block, so neither
@@ -180,6 +195,11 @@ private:
     // not left in the loop body - just a record of which block is innermost.
     mlir::Block* _innermostLoopBody {nullptr};
 
+    // The region of an op over a list's elements, a fold, a hop or a computed unwind being
+    // lowered. Its op already sits in the block above, so an op lowered for the region into
+    // a block enclosing it must go ahead of that op, not at the end of the block.
+    mlir::Block* _innermostRegionBody {nullptr};
+
     // Defines the cardinality of the innermost loop, used for projection
     mlir::Value _innermostCardinality;
 
@@ -187,18 +207,21 @@ private:
     // A pre-scan in lower() finds every db.limit before any loop is built, so the
     // handles exist first to be threaded into the loops as they are created. The
     // count is unsigned end to end (UI64Attr accessor -> NLLimitState's size_t),
-    // so there is no signed round-trip and no cast.
-    llvm::DenseMap<mlir::Operation*, mlir::Value> _limitHandles;     // db.limit -> nl.limit handle
+    // so there is no signed round-trip and no cast. An optional match whose pattern a
+    // cut bounds holds the nl.limit_remaining handle of what that cut still admits.
+    llvm::DenseMap<mlir::Operation*, mlir::Value> _limitHandles;  // db.limit or db.optional_match -> handle
 
-    // The handle a loop-opening or cross-product op carries, if it lies in some
+    // The op whose handle a loop-opening or cross-product op carries, if it lies in some
     // limit's producing nest. Built by the pre-scan; the first (outermost,
     // program-order) limit to claim a shared producer wins, so a loop never needs
     // two handles. Absent (null on lookup) for a consumer loop, which fans out.
-    llvm::DenseMap<mlir::Operation*, mlir::Value> _loopLimitHandle;  // db producer -> handle
+    // It names the db op rather than the handle: a fold whose accumulator widens lowers its
+    // body again, which makes new handles.
+    llvm::DenseMap<mlir::Operation*, mlir::Operation*> _loopLimits;  // db producer -> db.limit or db.optional_match
 
-    // The handle of the cut every row of an optional match reaches. Its pattern's loops
-    // are bounded by what that cut still admits at each step.
-    llvm::DenseMap<mlir::Operation*, mlir::Value> _optionalMatchLimits;  // db.optional_match -> handle
+    // The cut every row of an optional match reaches. Its pattern's loops are bounded by
+    // what that cut still admits at each step.
+    llvm::DenseMap<mlir::Operation*, mlir::Operation*> _optionalMatchLimits;  // db.optional_match -> db.limit
 
     // The columns one limit's walk has reached, so a column reached along many paths of
     // the dataflow is walked once rather than once per path
@@ -235,17 +258,27 @@ private:
     // Lowers @param operation with its constants laid out over the rows reaching it
     void lowerOverReachingRows(mlir::Operation& operation);
 
-    // @param chunk with the values of its map entries copied out as tagged cells, or
-    // @param chunk itself where it holds no map entries
-    mlir::Value mapEntriesAsCells(mlir::Value chunk);
+    // Lowers @param operation with each constant operand @param laysOut picks laid out
+    // over @param cardinality, or over a single row where it is null
+    void lowerWithConstantsLaidOut(mlir::Operation& operation, mlir::Value cardinality, ChunkPredicate laysOut);
 
-    // The chunk a region's terminator hands the op owning it, whose kernels read no map
-    // entry in place
-    mlir::Value yieldedChunk(mlir::Value column);
+    // Whether @param chunk is a constant node, edge, path, walk or mask, which no kernel reads
+    // as a constant: every op reading one has it laid out over its rows first
+    bool isConstantReadAsRows(mlir::Value chunk);
+    bool readsConstantsAsRows(mlir::Operation& operation);
+
+    // The chunk of the rows @param operation reads: its first operand that carries rows, or
+    // the rows in flight
+    mlir::Value rowsReadBy(mlir::Operation& operation);
+
+    // The relation driving the step, or the row the step binds when none does
+    mlir::Value rowsInFlight() const;
 
     // Moves @param computation, and the ops it reads that were placed after the first loop
     // of its block, ahead of that loop, where every loop reading it can see it
     void moveAheadOfLoops(mlir::Operation* computation);
+
+    void eraseOp(mlir::Operation* operation);
 
     // Hoist one nl.limit handle per db.limit of @param region to the top of @param
     // hoistBlock and assign it to the loops producing the limited columns. A limit
@@ -270,10 +303,14 @@ private:
     void lowerUnwindComputed(mlir::db::UnwindComputed unwind);
     void lowerMakeList(mlir::db::MakeList makeList);
     void lowerMakeMap(mlir::db::MakeMap makeMap);
+    void lowerMergeMaps(mlir::db::MergeMaps merge);
     void lowerRange(mlir::db::Range range);
     void lowerSubstring(mlir::db::Substring substring);
     void lowerSplit(mlir::db::Split split);
     void lowerReplace(mlir::db::Replace replace);
+
+    template <typename NLOp>
+    void lowerPointFunction(mlir::Operation* operation, mlir::Type valueType);
 
     template <typename NLStringEndOp, typename StringEndOp>
     void lowerStringEnd(StringEndOp stringEnd);
@@ -290,14 +327,20 @@ private:
     // What the two share: the chunks an op over the elements of one row's list reads.
     // The source is laid out over the carried chunks where it is a constant, and the
     // body's arguments are the element, the row tag and one chunk per carried column.
+    // _readAboveChunks are the values the body reads from above the op, which the op has to
+    // follow as it follows its operands.
     struct ElementOperands {
         mlir::Value _sourceChunk;
         llvm::SmallVector<mlir::Value, 4> _carriedChunks;
+        llvm::SmallVector<mlir::Value, 4> _readAboveChunks;
         llvm::SmallVector<mlir::Type, 4> _argumentTypes;
         llvm::SmallVector<mlir::Location, 4> _argumentLocations;
     };
 
-    void lowerElementOperands(mlir::Value source, mlir::OperandRange carried, ElementOperands& operands);
+    void lowerElementOperands(mlir::Operation* op,
+                              mlir::Value source,
+                              mlir::OperandRange carried,
+                              ElementOperands& operands);
 
     // Lowers the body of such an op into @param nlBody, whose arguments are already bound,
     // and hands back the chunks its yield names. The nl yield is the caller's to create,
@@ -306,14 +349,27 @@ private:
                                       mlir::Block* nlBody,
                                       mlir::Value& rowTagChunk,
                                       mlir::Value& valueChunk);
-    // Lowers `reduce(acc = init, x IN xs | f(acc, x))`, settling the accumulator's type on
-    // what the initial value and the body's value share
+    // Lowers `reduce(acc = init, x IN xs | f(acc, x))`, into an op whose result is the
+    // accumulator
     void lowerReduce(mlir::db::Reduce reduce);
 
-    // Lowers a db.reduce's body into @param nlBody, whose arguments are already bound, and
-    // hands back the chunk its yield names. The caller creates the nl yield, then erases
-    // the placeholder terminator this returns
-    mlir::Operation* lowerReduceBody(mlir::Block& dbBody, mlir::Block* nlBody, mlir::Value& valueChunk);
+    // Lowers `allReduce(acc = init, x IN xs | f(acc, x), p(acc, x))`, into an op whose
+    // result is one nullable truth value per row
+    void lowerAllReduce(mlir::db::AllReduce allReduce);
+
+    using FoldResultType = llvm::function_ref<mlir::Type(mlir::nl::ChunkType)>;
+
+    // What the two share: lowers the operands and the body of @param fold into an
+    // @param NLFoldOp of the type @param resultTypeOf gives for the accumulator's, settling
+    // the accumulator's type on what the initial value and the body's value share
+    template <typename NLFoldOp, typename DBFoldOp>
+    NLFoldOp lowerFold(DBFoldOp fold, FoldResultType resultTypeOf);
+
+    // Lowers a region of a fold into @param nlBlock, whose arguments are already bound, and
+    // hands back the chunk its yield names. The caller creates the nl yield, then erases the
+    // placeholder terminator this returns
+    template <typename NLFoldYield>
+    mlir::Operation* lowerFoldRegion(mlir::Block& dbBlock, mlir::Block* nlBlock, mlir::Value& valueChunk);
 
     // The element type an accumulator holds once it has held @param accumulated and then a
     // chunk of @param chunkType: numbers promote, lists of two element types hold tagged
@@ -382,6 +438,8 @@ private:
     void lowerMerge(mlir::db::Merge merge);
     void lowerSetNodeProperty(mlir::db::SetNodeProperty setNodeProperty);
     void lowerSetEdgeProperty(mlir::db::SetEdgeProperty setEdgeProperty);
+    template <typename NLSetProperties, typename DBSetProperties>
+    void lowerSetProperties(DBSetProperties setProperties, mlir::Value input);
     void lowerDeleteNode(mlir::db::DeleteNode deleteNode);
     void lowerDeleteEdge(mlir::db::DeleteEdge deleteEdge);
     void lowerCrossProduct(mlir::db::CrossProduct product);
@@ -421,7 +479,8 @@ private:
                                 mlir::Operation* holder);
 
     // The columns the regions of @param conditional read from around it, but for the
-    // constants, which stand for every row and are read where they are bound
+    // constants, which stand for every row and are read where they are bound, and the
+    // relations an op reads in full, which are no rows of the ones in flight
     void collectRowColumnsReadByBranches(mlir::db::Conditional conditional,
                                          llvm::SmallVectorImpl<mlir::Value>& columns);
 
@@ -451,7 +510,13 @@ private:
                                size_t columnIndex,
                                mlir::ArrayAttr columnNames);
 
-    void throwOnDisagreeingBranchTypes(mlir::Type branchType,
+    void retypeBranchColumn(mlir::OpOperand& operand, mlir::Type chunkType);
+    mlir::Value branchChunkAs(mlir::Value chunk, mlir::Type chunkType);
+
+    // An nl.to_any of @param chunk answering @param chunkType, placed right after it
+    mlir::Value toAnyChunk(mlir::Value chunk, mlir::Type chunkType);
+
+    [[noreturn]] void throwOnDisagreeingBranchTypes(mlir::Type branchType,
                                        mlir::Type resultType,
                                        mlir::ArrayAttr columnNames,
                                        size_t columnIndex);
@@ -459,6 +524,11 @@ private:
     // Reads the null literal's chunk as a column of @param chunkType, holding one absent
     // value per row of it
     mlir::Value typedNullChunk(mlir::Value chunk, mlir::Type chunkType);
+
+    // The null literal laid out over rows is a column no kernel reads a value of, so an op
+    // reads it as the nullable column of @param valueElement it needs there. Any other
+    // @param chunk, the null constant among them, is handed back as it is.
+    mlir::Value laidOutNullAs(mlir::Value chunk, mlir::Type valueElement);
 
     // Lower a db.optional_match into an nl.optional_buffer, the pattern's own loop nest,
     // an nl.optional_collect at its deepest point and an nl.optional_drain loop yielding
@@ -469,17 +539,11 @@ private:
     // Lower a db.exists_subquery to an nl.exists_buffer, the body's loop nest ending in an
     // nl.exists_mark, and an nl.exists_result; a db.count_subquery to the count_subquery
     // buffer, tally and result; a db.collect_subquery to the row_lists buffer, collect and
-    // result. A body that cannot carry its input rows runs under a loop over them, and the
-    // rest of the query goes on inside that loop.
+    // result. A body that cannot carry its input rows runs under a loop over them, each
+    // answered for under its row's tag, and the answers are read over the whole step once
+    // the loop closes, as a body carrying its rows has them read.
     template <typename SubqueryOp, typename YieldOp>
     void lowerSubqueryExpression(SubqueryOp subquery);
-
-    // The db values bound over @param stepBlock ahead of @param subquery, and read after it,
-    // that are not its inputs. What follows a body run a row at a time is lowered inside the
-    // loop over the step's rows, so that loop hands these on a row at a time as well.
-    void collectReadPastRowLoop(mlir::Operation* subquery,
-                                mlir::Block* stepBlock,
-                                llvm::SmallVectorImpl<mlir::Value>& readPast);
 
     // Lower a db.call_subquery. A body carrying its scope, and a unit body, are lowered in
     // place: the block arguments become the step's chunks, the body's loops nest in the
@@ -519,7 +583,9 @@ private:
     // Lays the constant out over the rows of its driver, the layout rowAlignedChunk
     // performs for every consumer that reads a constant per row
     void lowerBroadcastConstant(mlir::db::BroadcastConstant broadcast);
+    void lowerRowConstant(mlir::db::RowConstant rowConstant);
     void lowerToNullable(mlir::db::ToNullable toNullable);
+    void lowerCheckedCast(mlir::db::CheckedCast checkedCast);
     void lowerLimit(mlir::db::Limit limit);
     void lowerSkip(mlir::db::Skip skip);
 
@@ -606,6 +672,7 @@ private:
         Concat,    // concat: string or list (determined at lowering)
         Index,     // index: a nullable tagged scalar, whatever the list holds
         Membership, // in: a nullable i1, since a list element can be null
+        Position,   // index_of: a nullable i64, null where the list or the value is
     };
 
     template <typename NLOp>
@@ -618,6 +685,9 @@ private:
     // Propagates nullity from operand to result
     void lowerNot(mlir::db::NotOp notOp);
 
+    template <typename NLOp>
+    void lowerNullTest(mlir::Value operand, mlir::Value result);
+
     // Lower a db.case into its nl sibling: resolve the one value column its branches
     // share, convert the branches that need promoting into it, and place the selection
     // where every condition and value it reads is bound.
@@ -628,8 +698,19 @@ private:
     // nl.case_merge writes the values back in the order of the rows
     void lowerLazyCase(mlir::db::LazyCase caseOp);
 
-    // Lowers one region of a db.lazy_case over @param chunks, whose rows @param cardinality
-    // counts, and returns what it yields laid out over them
+    // Lower a db.coalesce: each argument is computed over the rows every earlier one left
+    // null, cut by nl.filter down to the columns a later argument reads
+    void lowerCoalesce(mlir::db::Coalesce coalesce);
+
+    // The values of a coalesce's arguments merged back to front, each into the null rows of
+    // the one before it, which @param nullRows marks for every value but the last and the
+    // null literal: the rows the later one was computed over. The values are converted as
+    // a CASE's are, then to the one chunk a CASE over them lands in.
+    mlir::Value mergeCoalescedValues(llvm::ArrayRef<mlir::Value> values, llvm::ArrayRef<mlir::Value> nullRows);
+
+    // Lowers one region of a db.lazy_case or a db.coalesce over @param chunks, whose rows
+    // @param cardinality counts, and returns what it yields laid out over them. A null chunk
+    // stands for a carried column the region does not read.
     mlir::Value lowerCaseRegion(mlir::Region& region, llvm::ArrayRef<mlir::Value> chunks, mlir::Value cardinality);
 
     // Lowers @param block over the rows @param cardinality counts, a computation over
@@ -640,14 +721,21 @@ private:
     // counts them whether or not there are chunks, then the chunks
     void filterCaseRows(mlir::Value mask, llvm::ArrayRef<mlir::Value> chunks, llvm::SmallVectorImpl<mlir::Value>& filtered);
 
+    // The chunks @param isRead marks cut down to the rows @param mask holds for, the others
+    // null: no region past the cut reads them. Returns the cut mask, which counts the rows.
+    mlir::Value cutCarriedChunks(mlir::Value mask,
+                                 llvm::ArrayRef<mlir::Value> chunks,
+                                 llvm::function_ref<bool(size_t)> isRead,
+                                 llvm::SmallVectorImpl<mlir::Value>& cut);
+
     // The chunk a CASE over @param resultElement lands in: the entity chunk for nodes and
     // edges, which holds the null of an unmatched row in its ID, and a nullable one otherwise
     mlir::nl::ChunkType caseResultChunkType(mlir::Type resultElement);
 
-    // The value element type a CASE's branches share: the one they all carry, the
-    // promotion of their numbers when they carry two, a list of tagged cells when they
-    // carry lists of different elements, !storage.any when they share no type, and an i64
-    // when every branch is null. A branch no value column can hold is rejected here.
+    // The value element type a CASE's branches share: the one they all carry, one integer
+    // for integers, a list of tagged cells when they carry lists of different elements,
+    // !storage.any when they share no type, and an i64 when every branch is null. A branch
+    // no value column can hold is rejected here.
     mlir::Type caseResultElement(llvm::ArrayRef<mlir::Value> valueChunks);
 
     // @param chunk as a column of @param resultElement: itself when it already carries
@@ -725,8 +813,8 @@ private:
     void buildLoopForSource(mlir::Value iterator, mlir::Operation* dbOp);
 
     // Walk the db dataflow backward from a limited column, recording in
-    // _loopLimitHandle that each loop-opening op (scan / get_out_edges) and cross
-    // product it depends on carries this limit's handle.
+    // _loopLimits that each loop-opening op (scan / get_out_edges) and cross
+    // product it depends on carries the handle of @param limitOwner.
     // A cross product's factors are regions, so the walk goes through their
     // db.yield operands; a property fetch opens no loop but is traversed to reach
     // its input chunk's loop. The first limit to claim a producer keeps it.
@@ -735,14 +823,14 @@ private:
     // @param rowsDroppedBeforeTheCut is set once the walk has passed an op that
     // drops rows, which bars the handle from a cross product below it.
     bool assignProducerLoops(mlir::Value column,
-                             mlir::Value handle,
+                             mlir::Operation* limitOwner,
                              bool rowsDroppedBeforeTheCut,
                              mlir::Operation* holder);
 
-    // Claims @param column's producer for @param handle and lists in @param frame the
+    // Claims @param column's producer for @param limitOwner and lists in @param frame the
     // columns the walk goes on to, without walking them
     void visitProducer(mlir::Value column,
-                       mlir::Value handle,
+                       mlir::Operation* limitOwner,
                        bool rowsDroppedBeforeTheCut,
                        mlir::Operation* holder,
                        ProducerWalkFrame& frame);
@@ -752,11 +840,14 @@ private:
     // Records that the loops producing the relation which drives @param limit's projection
     // carry its handle, so a cut charged to constants alone stops its nest as any other
     // cut does rather than letting it run to the end.
-    void assignCardinalityDriverLoop(mlir::db::Limit limit, mlir::Value handle, mlir::Operation* holder);
+    void assignCardinalityDriverLoop(mlir::db::Limit limit, mlir::Operation* holder);
 
     // Records in _optionalMatchLimits the optional matches ahead of @param limit that
     // only ops keeping every row separate from it.
-    void assignOptionalMatchLimits(mlir::db::Limit limit, mlir::Value handle);
+    void assignOptionalMatchLimits(mlir::db::Limit limit);
+
+    // The handle of the limit @param dbOp's loop carries, or null for a loop no limit bounds
+    mlir::Value loopLimitHandle(mlir::Operation* dbOp) const;
 
     // Peephole over the lowered nl function: where an nl.limit_truncate's results
     // are consumed exactly by one adjacent nl.output (the terminal-LIMIT shape),
@@ -788,14 +879,15 @@ private:
     // Point the builder just before the terminator of block, where the next
     // lowered op belongs
     void setInsertionInto(mlir::Block* block);
+    void setWriteInsertion(mlir::Value inputChunk, mlir::Value valueChunk);
 
-    // Point the builder at the end of the entry block's run of hoisted constants, where
-    // the next one belongs
-    void setInsertionAfterHoistedConstants();
+    // Point the builder at the end of the entry block's run of hoisted constants and
+    // handles, where the next one belongs
+    void setInsertionAfterHoisted();
 
-    // Point the builder at the very top of the entry block, above the constants hoisted
-    // there
-    void setInsertionToEntryBlockStart();
+    // Point the builder below the entry block's hoisted run and after @param lastOperandDef,
+    // where an op computed from hoisted values alone sits under every one its body reads
+    void setInsertionBelowHoisted(mlir::Operation* lastOperandDef);
 
     // The chunks one group of a db op's column operands lowered to, in order
     void mapColumns(mlir::OperandRange columns, llvm::SmallVectorImpl<mlir::Value>& chunks);
@@ -837,8 +929,8 @@ private:
     void rowAlignFactorChunks(llvm::SmallVectorImpl<mlir::Value>& chunks);
 
     // The chunk whose rows the constants of a step are laid out over: the first of
-    // @param chunks carrying rows of its own, and the innermost loop's cardinality when
-    // every one of them is a constant, or there are none.
+    // @param chunks carrying rows of its own, and the rows in flight when every one of
+    // them is a constant, or there are none.
     mlir::Value cardinalityDriver(llvm::ArrayRef<mlir::Value> chunks);
 
     // Follows the cardinality driver through a step that narrows the relation, from the
@@ -857,15 +949,21 @@ private:
 
     mlir::Value nullableValueChunk(mlir::Value chunk);
 
+    // A number held in type-erased cells - a range or slice bound, a percentile - is read as
+    // it stands: the op takes the number out of each row's cell, raising on a cell holding
+    // another value
+    mlir::Value numberOperandChunk(mlir::Value chunk);
+
     // The chunk a body's value is staged into its row's list from: laid out over @param rows
     // where it is a constant, and read as nullable where it is a scalar
     mlir::Value rowListsValueChunk(mlir::Value valueChunk, mlir::Value rows);
-    mlir::Value nullTestedChunk(mlir::Value chunk);
     mlir::Value reducedValueChunk(mlir::Value chunk);
 
     void lowerStaticMapKey(mlir::db::StaticMapKey mapKey);
 
     void lowerDynamicMapKey(mlir::db::DynamicMapKey mapKey);
+
+    void lowerContainerIndex(mlir::db::ContainerIndex index);
 
     // The chunks a container build reads its cells from: every operand laid out over the
     // same rows, and a scalar value read as nullable
@@ -887,9 +985,9 @@ private:
     // nullable column, which the value and the container siblings above share
     mlir::Value toNullableChunk(mlir::Value chunk, mlir::Type valueElement);
 
-    // The element type of the lists @param chunks build: the one type every chunk carries,
-    // falling back to the type-erased !storage.any when they carry no single one - the
-    // homogeneity verdict taken over the resolved chunks rather than over the db columns
+    // The element type of the lists @param chunks build: the type the chunks' own types
+    // join to - the homogeneity verdict taken over the resolved chunks rather than over the
+    // db columns
     static mlir::Type listedElementType(mlir::MLIRContext* context, llvm::ArrayRef<mlir::Value> chunks);
 
     // The nl chunk a db value lowered to, and the block that holds a chunk

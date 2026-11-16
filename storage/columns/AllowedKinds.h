@@ -9,7 +9,6 @@
 #include "list/ListBuffer.h"
 #include "ID.h"
 #include "map/MapBuffer.h"
-#include "map/MapEntryView.h"
 #include "versioning/ChangeID.h"
 #include "ColumnOperator.h"
 #include "metadata/PropertyNull.h"
@@ -18,8 +17,6 @@
 #include "ContainerKind.h"
 
 namespace db {
-
-class EntityList;
 
 template <typename... Tuples>
 struct TupleFlatten {
@@ -64,18 +61,8 @@ struct OptionalKindPairs {
 };
 
 template <typename T>
-struct ListElementKindPairs {
-    using Pairs = typename OptionalKindPairs<ListElementView, T>::Pairs;
-};
-
-// The map entry's sibling of the above: a map value is a tagged cell too, so it compares
-// against the same value types. Only the other side is ever optional - a map entry column
-// carries its null in the entry's own tag, so there is no optional<MapEntryView> kind.
-template <typename T>
-struct MapEntryKindPairs {
-    using Pairs = std::tuple<
-        KindPair<MapEntryView, T>,
-        KindPair<MapEntryView, std::optional<T>>>;
+struct CellKindPairs {
+    using Pairs = typename OptionalKindPairs<CellView, T>::Pairs;
 };
 
 // A number joins a string as the text Cypher writes it with, either way round and whichever
@@ -89,26 +76,43 @@ struct TextKindPairs {
         typename OptionalKindPairs<types::String::OwningPrimitive, T>::Pairs>::Type;
 };
 
+// A value tested against a list, or against the list a type-erased cell is iterated as, which
+// is what an index of a nested list answers: `x IN list`
 template <typename T>
-struct ListMembershipKindPairs {
-    using Pairs = typename OptionalKindPairs<T, ListView>::Pairs;
+struct MembershipKindPairs {
+    using Pairs = TupleFlatten<
+        typename OptionalKindPairs<T, ListView>::Pairs,
+        typename OptionalKindPairs<T, CellView>::Pairs>::Type;
 };
 
-// The same test with a map value as the needle, against a list or the list a cell holds. Only
-// the list side is ever optional, for the reason MapEntryKindPairs gives.
-struct MapEntryMembershipKindPairs {
-    using Pairs = std::tuple<
-        KindPair<MapEntryView, ListView>,
-        KindPair<MapEntryView, std::optional<ListView>>,
-        KindPair<MapEntryView, ListElementView>,
-        KindPair<MapEntryView, std::optional<ListElementView>>>;
+// The same pairs the other way round: `coll.indexOf(list, x)`
+template <typename T>
+struct ListSearchKindPairs {
+    using Pairs = TupleFlatten<
+        typename OptionalKindPairs<ListView, T>::Pairs,
+        typename OptionalKindPairs<CellView, T>::Pairs>::Type;
 };
 
-// The same test against the list a type-erased cell holds, which is what an index of a
-// nested list answers
-template <typename T>
-struct TaggedMembershipKindPairs {
-    using Pairs = typename OptionalKindPairs<T, ListElementView>::Pairs;
+// Every kind of value a list is searched for, laid beside the list as @param SearchPairs
+// lays it, so IN and coll.indexOf find the same values
+template <template <typename> class SearchPairs>
+struct SearchedValueKindPairs {
+    using Pairs = TupleFlatten<
+        typename SearchPairs<types::Int64::Primitive>::Pairs,
+        typename SearchPairs<types::UInt64::Primitive>::Pairs,
+        typename SearchPairs<types::Double::Primitive>::Pairs,
+        typename SearchPairs<types::String::Primitive>::Pairs,
+        typename SearchPairs<types::String::OwningPrimitive>::Pairs,
+        typename SearchPairs<types::Bool::Primitive>::Pairs,
+        typename SearchPairs<types::DateTime::Primitive>::Pairs,
+        typename SearchPairs<types::Duration::Primitive>::Pairs,
+        typename SearchPairs<types::Point::Primitive>::Pairs,
+        typename SearchPairs<types::Embedding::Primitive>::Pairs,
+        typename SearchPairs<NodeID>::Pairs,
+        typename SearchPairs<EdgeID>::Pairs,
+        typename SearchPairs<CellView>::Pairs,
+        typename SearchPairs<ListView>::Pairs,
+        typename SearchPairs<MapView>::Pairs>::Type;
 };
 
 template <typename T>
@@ -186,39 +190,31 @@ struct PairRestrictions<Op> {
         OptionalKindPairs<types::Embedding::Primitive, types::Embedding::Primitive>::Pairs,
         OptionalKindPairs<types::DateTime::Primitive, types::DateTime::Primitive>::Pairs,
         OptionalKindPairs<types::Duration::Primitive, types::Duration::Primitive>::Pairs,
+        OptionalKindPairs<types::Point::Primitive, types::Point::Primitive>::Pairs,
         OptionalKindPairs<ListView, ListView>::Pairs,
         OptionalKindPairs<MapView, MapView>::Pairs,
 
         // Equality against a type-erased cell, which holds its own type
-        ListElementKindPairs<types::Int64::Primitive>::Pairs,
-        ListElementKindPairs<types::UInt64::Primitive>::Pairs,
-        ListElementKindPairs<types::Double::Primitive>::Pairs,
-        ListElementKindPairs<types::String::Primitive>::Pairs,
-        ListElementKindPairs<types::Bool::Primitive>::Pairs,
-        ListElementKindPairs<types::DateTime::Primitive>::Pairs,
-        ListElementKindPairs<types::Duration::Primitive>::Pairs,
-        ListElementKindPairs<types::Embedding::Primitive>::Pairs,
-        OptionalKindPairs<ListElementView, ListElementView>::Pairs,
-        ListElementKindPairs<ListView>::Pairs,
-        ListElementKindPairs<MapView>::Pairs,
-        ListElementKindPairs<NodeID>::Pairs,
-        ListElementKindPairs<EdgeID>::Pairs,
+        CellKindPairs<types::Int64::Primitive>::Pairs,
+        CellKindPairs<types::UInt64::Primitive>::Pairs,
+        CellKindPairs<types::Double::Primitive>::Pairs,
+        CellKindPairs<types::String::Primitive>::Pairs,
+        CellKindPairs<types::Bool::Primitive>::Pairs,
+        CellKindPairs<types::DateTime::Primitive>::Pairs,
+        CellKindPairs<types::Duration::Primitive>::Pairs,
+        CellKindPairs<types::Point::Primitive>::Pairs,
+        CellKindPairs<types::Embedding::Primitive>::Pairs,
+        OptionalKindPairs<CellView, CellView>::Pairs,
+        CellKindPairs<ListView>::Pairs,
+        CellKindPairs<MapView>::Pairs,
+        CellKindPairs<NodeID>::Pairs,
+        CellKindPairs<EdgeID>::Pairs,
+        std::tuple<
+            KindPair<CellView, GraphPath>,
+            KindPair<std::optional<CellView>, GraphPath>
+        >,
 
         // Equality against a map value, which holds its own type as a list element does
-        MapEntryKindPairs<types::Int64::Primitive>::Pairs,
-        MapEntryKindPairs<types::UInt64::Primitive>::Pairs,
-        MapEntryKindPairs<types::Double::Primitive>::Pairs,
-        MapEntryKindPairs<types::String::Primitive>::Pairs,
-        MapEntryKindPairs<types::Bool::Primitive>::Pairs,
-        MapEntryKindPairs<types::DateTime::Primitive>::Pairs,
-        MapEntryKindPairs<types::Duration::Primitive>::Pairs,
-        MapEntryKindPairs<types::Embedding::Primitive>::Pairs,
-        MapEntryKindPairs<ListView>::Pairs,
-        MapEntryKindPairs<MapView>::Pairs,
-        MapEntryKindPairs<NodeID>::Pairs,
-        MapEntryKindPairs<EdgeID>::Pairs,
-        MapEntryKindPairs<ListElementView>::Pairs,
-        std::tuple<KindPair<MapEntryView, MapEntryView>>,
 
         // A loaded CSV field owns its characters, so a comparison against a string
         // property meets a borrowed view on one side and an owned string on the other -
@@ -235,38 +231,11 @@ struct PairRestrictions<Op> {
         OptionalKindPairs<EdgeID, EdgeID>::Pairs,
 
         std::tuple<
+            KindPair<GraphPath, GraphPath>,
+
             // Filtering by ID or labels/edge type
             KindPair<LabelSetID, LabelSetID>,
             KindPair<EdgeTypeID, EdgeTypeID>,
-
-            // IS (NOT) NULL
-            KindPair<std::optional<types::Int64::Primitive>, PropertyNull>,
-            KindPair<std::optional<types::UInt64::Primitive>, PropertyNull>,
-            KindPair<std::optional<types::Double::Primitive>, PropertyNull>,
-            KindPair<std::optional<types::String::Primitive>, PropertyNull>,
-            KindPair<std::optional<types::String::OwningPrimitive>, PropertyNull>,
-            KindPair<std::optional<types::Bool::Primitive>, PropertyNull>,
-            KindPair<std::optional<types::Embedding::Primitive>, PropertyNull>,
-            KindPair<std::optional<types::DateTime::Primitive>, PropertyNull>,
-            KindPair<std::optional<types::Duration::Primitive>, PropertyNull>,
-            KindPair<std::optional<ListElementView>, PropertyNull>,
-            KindPair<std::optional<ListView>, PropertyNull>,
-            KindPair<std::optional<MapView>, PropertyNull>,
-
-            KindPair<std::optional<NodeID>, PropertyNull>,
-            KindPair<std::optional<EdgeID>, PropertyNull>,
-            KindPair<std::optional<EdgeTypeID>, PropertyNull>,
-            KindPair<std::optional<LabelID>, PropertyNull>,
-            KindPair<std::optional<PropertyTypeID>, PropertyNull>,
-            KindPair<std::optional<ValueType>, PropertyNull>,
-
-            // A tagged cell carries its null in the tag rather than in a nullable
-            // column, so it is tested against null as a cell rather than as an optional,
-            // and an entity in the ID
-            KindPair<ListElementView, PropertyNull>,
-            KindPair<MapEntryView, PropertyNull>,
-            KindPair<NodeID, PropertyNull>,
-            KindPair<EdgeID, PropertyNull>,
 
             KindPair<NodeID, types::Int64::Primitive>,                // WHERE n = 1
             KindPair<NodeID, std::optional<types::Int64::Primitive>>, // WHERE e = e.age
@@ -282,8 +251,8 @@ struct PairRestrictions<Op> {
     using AllowedMixed = AllowedMixedList<
         MixedKind<ColumnMask, CustomBool>,
         MixedKind<ColumnMask, std::optional<CustomBool>>,
-        MixedKind<ColumnMask, ListElementView>,
-        MixedKind<ColumnMask, std::optional<ListElementView>>
+        MixedKind<ColumnMask, CellView>,
+        MixedKind<ColumnMask, std::optional<CellView>>
     >;
 
     using Excluded = ExcludedContainers<
@@ -308,6 +277,9 @@ struct PairRestrictions<Op> {
 
         OptionalKindPairs<types::Duration::Primitive, types::Duration::Primitive>::Pairs,
 
+        // A point orders against another point, across CRSs as ORDER BY sorts them
+        OptionalKindPairs<types::Point::Primitive, types::Point::Primitive>::Pairs,
+
         OptionalKindPairs<types::Bool::Primitive, types::Bool::Primitive>::Pairs,
 
         // Lexicographic ordering of strings, whether each side borrows its characters
@@ -320,36 +292,27 @@ struct PairRestrictions<Op> {
 
         // Ordering against a type-erased cell, which holds its own type: it is ordered as
         // an element holding the other side would be
-        ListElementKindPairs<types::Int64::Primitive>::Pairs,
-        ListElementKindPairs<types::UInt64::Primitive>::Pairs,
-        ListElementKindPairs<types::Double::Primitive>::Pairs,
-        ListElementKindPairs<types::String::Primitive>::Pairs,
-        ListElementKindPairs<types::Bool::Primitive>::Pairs,
-        ListElementKindPairs<types::DateTime::Primitive>::Pairs,
-        ListElementKindPairs<types::Duration::Primitive>::Pairs,
-        OptionalKindPairs<ListElementView, ListElementView>::Pairs,
+        CellKindPairs<types::Int64::Primitive>::Pairs,
+        CellKindPairs<types::UInt64::Primitive>::Pairs,
+        CellKindPairs<types::Double::Primitive>::Pairs,
+        CellKindPairs<types::String::Primitive>::Pairs,
+        CellKindPairs<types::Bool::Primitive>::Pairs,
+        CellKindPairs<types::DateTime::Primitive>::Pairs,
+        CellKindPairs<types::Duration::Primitive>::Pairs,
+        CellKindPairs<types::Point::Primitive>::Pairs,
+        OptionalKindPairs<CellView, CellView>::Pairs,
 
         // A map value is a type-erased cell too, and orders the same way
-        MapEntryKindPairs<types::Int64::Primitive>::Pairs,
-        MapEntryKindPairs<types::UInt64::Primitive>::Pairs,
-        MapEntryKindPairs<types::Double::Primitive>::Pairs,
-        MapEntryKindPairs<types::String::Primitive>::Pairs,
-        MapEntryKindPairs<types::Bool::Primitive>::Pairs,
-        MapEntryKindPairs<types::DateTime::Primitive>::Pairs,
-        MapEntryKindPairs<types::Duration::Primitive>::Pairs,
-        MapEntryKindPairs<ListView>::Pairs,
-        MapEntryKindPairs<ListElementView>::Pairs,
-        std::tuple<KindPair<MapEntryView, MapEntryView>>,
 
         OptionalKindPairs<ListView, ListView>::Pairs,
-        ListElementKindPairs<ListView>::Pairs
+        CellKindPairs<ListView>::Pairs
     >;
 
     using AllowedMixed = AllowedMixedList<
         MixedKind<ColumnMask, CustomBool>,
         MixedKind<ColumnMask, std::optional<CustomBool>>,
-        MixedKind<ColumnMask, ListElementView>,
-        MixedKind<ColumnMask, std::optional<ListElementView>>
+        MixedKind<ColumnMask, CellView>,
+        MixedKind<ColumnMask, std::optional<CellView>>
     >;
 
     using Excluded = ExcludedContainers<
@@ -367,10 +330,10 @@ struct PairRestrictions<Op> {
         OptionalKindPairs<types::String::OwningPrimitive, types::String::OwningPrimitive>::Pairs,
 
         // A type-erased cell against a string, or against another cell, read by its tag
-        ListElementKindPairs<types::String::Primitive>::Pairs,
-        ListElementKindPairs<types::String::OwningPrimitive>::Pairs,
+        CellKindPairs<types::String::Primitive>::Pairs,
+        CellKindPairs<types::String::OwningPrimitive>::Pairs,
 
-        std::tuple<KindPair<ListElementView, ListElementView>>
+        std::tuple<KindPair<CellView, CellView>>
     >;
 
     using AllowedMixed = AllowedMixedList<>;
@@ -389,15 +352,15 @@ struct PairRestrictions<Op> {
         OptionalKindPairs<types::Bool::Primitive, types::Bool::Primitive>::Pairs,
 
         // A type-erased cell, read as the truth value it holds
-        ListElementKindPairs<types::Bool::Primitive>::Pairs,
-        OptionalKindPairs<ListElementView, ListElementView>::Pairs,
+        CellKindPairs<types::Bool::Primitive>::Pairs,
+        OptionalKindPairs<CellView, CellView>::Pairs,
 
         std::tuple<
             // A null of unknown type, which the truth tables read as an unknown truth
             // value: the lowering reads the other side as nullable to meet it
             KindPair<std::optional<types::Bool::Primitive>, PropertyNull>,
-            KindPair<ListElementView, PropertyNull>,
-            KindPair<std::optional<ListElementView>, PropertyNull>
+            KindPair<CellView, PropertyNull>,
+            KindPair<std::optional<CellView>, PropertyNull>
         >
     >;
 
@@ -422,8 +385,8 @@ struct TemporalArithmeticKindPairs<OP_ADD> {
     using Pairs = TupleFlatten<
         OptionalKindPairs<types::DateTime::Primitive, types::Duration::Primitive>::Pairs,
         OptionalKindPairs<types::Duration::Primitive, types::Duration::Primitive>::Pairs,
-        ListElementKindPairs<types::DateTime::Primitive>::Pairs,
-        ListElementKindPairs<types::Duration::Primitive>::Pairs
+        CellKindPairs<types::DateTime::Primitive>::Pairs,
+        CellKindPairs<types::Duration::Primitive>::Pairs
     >::Type;
 };
 
@@ -433,8 +396,8 @@ struct TemporalArithmeticKindPairs<OP_SUB> {
         OptionalKindPairs<types::DateTime::Primitive, types::DateTime::Primitive>::Pairs,
         OptionalKindPairs<types::DateTime::Primitive, types::Duration::Primitive>::Pairs,
         OptionalKindPairs<types::Duration::Primitive, types::Duration::Primitive>::Pairs,
-        ListElementKindPairs<types::DateTime::Primitive>::Pairs,
-        ListElementKindPairs<types::Duration::Primitive>::Pairs
+        CellKindPairs<types::DateTime::Primitive>::Pairs,
+        CellKindPairs<types::Duration::Primitive>::Pairs
     >::Type;
 };
 
@@ -445,7 +408,7 @@ struct TemporalArithmeticKindPairs<Op> {
         OptionalKindPairs<types::Duration::Primitive, types::Int64::Primitive>::Pairs,
         OptionalKindPairs<types::Duration::Primitive, types::UInt64::Primitive>::Pairs,
         OptionalKindPairs<types::Duration::Primitive, types::Double::Primitive>::Pairs,
-        ListElementKindPairs<types::Duration::Primitive>::Pairs
+        CellKindPairs<types::Duration::Primitive>::Pairs
     >::Type;
 };
 
@@ -459,9 +422,9 @@ struct CellTextKindPairs {
 template <>
 struct CellTextKindPairs<OP_ADD> {
     using Pairs = TupleFlatten<
-        ListElementKindPairs<types::String::Primitive>::Pairs,
-        ListElementKindPairs<types::String::OwningPrimitive>::Pairs,
-        ListElementKindPairs<types::Bool::Primitive>::Pairs
+        CellKindPairs<types::String::Primitive>::Pairs,
+        CellKindPairs<types::String::OwningPrimitive>::Pairs,
+        CellKindPairs<types::Bool::Primitive>::Pairs
     >::Type;
 };
 
@@ -474,23 +437,7 @@ struct CellListKindPairs {
 
 template <>
 struct CellListKindPairs<OP_ADD> {
-    using Pairs = ListElementKindPairs<ListView>::Pairs;
-};
-
-// A cell meets the null literal under '+' alone, which appends it to the list the cell holds
-template <ColumnOperator Op>
-struct CellNullKindPairs {
-    using Pairs = std::tuple<>;
-};
-
-template <>
-struct CellNullKindPairs<OP_ADD> {
-    using Pairs = std::tuple<
-        KindPair<ListElementView, PropertyNull>,
-        KindPair<std::optional<ListElementView>, PropertyNull>,
-        KindPair<PropertyNull, ListElementView>,
-        KindPair<PropertyNull, std::optional<ListElementView>>
-    >;
+    using Pairs = CellKindPairs<ListView>::Pairs;
 };
 
 template <ColumnOperator Op>
@@ -509,17 +456,16 @@ struct PairRestrictions<Op> {
         OptionalKindPairs<types::UInt64::Primitive, types::Double::Primitive>::Pairs,
 
         // Arithmetic over a type-erased cell, read as the number its tag says it holds
-        ListElementKindPairs<types::Int64::Primitive>::Pairs,
-        ListElementKindPairs<types::UInt64::Primitive>::Pairs,
-        ListElementKindPairs<types::Double::Primitive>::Pairs,
-        OptionalKindPairs<ListElementView, ListElementView>::Pairs,
+        CellKindPairs<types::Int64::Primitive>::Pairs,
+        CellKindPairs<types::UInt64::Primitive>::Pairs,
+        CellKindPairs<types::Double::Primitive>::Pairs,
+        OptionalKindPairs<CellView, CellView>::Pairs,
 
         // Temporal arithmetic operations.
         typename TemporalArithmeticKindPairs<Op>::Pairs,
 
         typename CellTextKindPairs<Op>::Pairs,
-        typename CellListKindPairs<Op>::Pairs,
-        typename CellNullKindPairs<Op>::Pairs
+        typename CellListKindPairs<Op>::Pairs
     >;
 
     using AllowedMixed = AllowedMixedList<>;
@@ -544,10 +490,10 @@ struct PairRestrictions<Op> {
         OptionalKindPairs<types::String::OwningPrimitive, types::String::OwningPrimitive>::Pairs,
 
         // A type-erased cell joins a string or a list where its row holds one
-        ListElementKindPairs<types::String::Primitive>::Pairs,
-        ListElementKindPairs<types::String::OwningPrimitive>::Pairs,
-        ListElementKindPairs<ListView>::Pairs,
-        OptionalKindPairs<ListElementView, ListElementView>::Pairs,
+        CellKindPairs<types::String::Primitive>::Pairs,
+        CellKindPairs<types::String::OwningPrimitive>::Pairs,
+        CellKindPairs<ListView>::Pairs,
+        OptionalKindPairs<CellView, CellView>::Pairs,
 
         // A number or a boolean joins a string as the text Cypher writes it with:
         // 1 + ' apples', true + 'x'
@@ -569,39 +515,50 @@ template <ColumnOperator Op>
     requires (Op == OP_IN)
 struct PairRestrictions<Op> {
     using Allowed = GenerateKindPairList<
-        ListMembershipKindPairs<types::Int64::Primitive>::Pairs,
-        ListMembershipKindPairs<types::UInt64::Primitive>::Pairs,
-        ListMembershipKindPairs<types::Double::Primitive>::Pairs,
-        ListMembershipKindPairs<types::String::Primitive>::Pairs,
-        ListMembershipKindPairs<types::String::OwningPrimitive>::Pairs,
-        ListMembershipKindPairs<types::Bool::Primitive>::Pairs,
-        ListMembershipKindPairs<types::Embedding::Primitive>::Pairs,
-        ListMembershipKindPairs<NodeID>::Pairs,
-        ListMembershipKindPairs<EdgeID>::Pairs,
+        SearchedValueKindPairs<MembershipKindPairs>::Pairs,
 
-        ListMembershipKindPairs<ListElementView>::Pairs,
-        MapEntryMembershipKindPairs::Pairs,
-        ListMembershipKindPairs<ListView>::Pairs,
-        ListMembershipKindPairs<MapView>::Pairs,
-
-        TaggedMembershipKindPairs<types::Int64::Primitive>::Pairs,
-        TaggedMembershipKindPairs<types::UInt64::Primitive>::Pairs,
-        TaggedMembershipKindPairs<types::Double::Primitive>::Pairs,
-        TaggedMembershipKindPairs<types::String::Primitive>::Pairs,
-        TaggedMembershipKindPairs<types::String::OwningPrimitive>::Pairs,
-        TaggedMembershipKindPairs<types::Bool::Primitive>::Pairs,
-        TaggedMembershipKindPairs<types::Embedding::Primitive>::Pairs,
-        TaggedMembershipKindPairs<NodeID>::Pairs,
-        TaggedMembershipKindPairs<EdgeID>::Pairs,
-        TaggedMembershipKindPairs<ListElementView>::Pairs,
-        TaggedMembershipKindPairs<ListView>::Pairs,
-        TaggedMembershipKindPairs<MapView>::Pairs,
+        // A path column holds its null in the path, so it has no optional sibling
+        std::tuple<
+            KindPair<GraphPath, ListView>,
+            KindPair<GraphPath, std::optional<ListView>>,
+            KindPair<GraphPath, CellView>,
+            KindPair<GraphPath, std::optional<CellView>>
+        >,
 
         std::tuple<
             KindPair<PropertyNull, ListView>,
             KindPair<PropertyNull, std::optional<ListView>>,
-            KindPair<PropertyNull, ListElementView>,
-            KindPair<PropertyNull, std::optional<ListElementView>>
+            KindPair<PropertyNull, CellView>,
+            KindPair<PropertyNull, std::optional<CellView>>
+        >
+    >;
+
+    using AllowedMixed = AllowedMixedList<>;
+
+    using Excluded = ExcludedContainers<
+        ContainerKind::code<ColumnSet>(),
+        ContainerKind::code<ColumnMask>()
+    >;
+};
+
+template <ColumnOperator Op>
+    requires (Op == OP_INDEX_OF)
+struct PairRestrictions<Op> {
+    using Allowed = GenerateKindPairList<
+        SearchedValueKindPairs<ListSearchKindPairs>::Pairs,
+
+        std::tuple<
+            KindPair<ListView, GraphPath>,
+            KindPair<std::optional<ListView>, GraphPath>,
+            KindPair<CellView, GraphPath>,
+            KindPair<std::optional<CellView>, GraphPath>
+        >,
+
+        std::tuple<
+            KindPair<ListView, PropertyNull>,
+            KindPair<std::optional<ListView>, PropertyNull>,
+            KindPair<CellView, PropertyNull>,
+            KindPair<std::optional<CellView>, PropertyNull>
         >
     >;
 
@@ -617,24 +574,19 @@ template <ColumnOperator Op>
     requires (Op == OP_INDEX)
 struct PairRestrictions<Op> {
     using Allowed = GenerateKindPairList<
-        OptionalKindPairs<ListElementView, types::Int64::Primitive>::Pairs,
-        OptionalKindPairs<ListElementView, types::UInt64::Primitive>::Pairs,
+        OptionalKindPairs<CellView, types::Int64::Primitive>::Pairs,
+        OptionalKindPairs<CellView, types::UInt64::Primitive>::Pairs,
 
         // A stored list is read through a nullable column, a node carrying none reading
         // as absent there, so every position is indexed on either shape of list column
         OptionalKindPairs<ListView, types::Int64::Primitive>::Pairs,
         OptionalKindPairs<ListView, types::UInt64::Primitive>::Pairs,
 
-        // A list held by a map is indexed through the entry viewing it
-        MapEntryKindPairs<types::Int64::Primitive>::Pairs,
-        MapEntryKindPairs<types::UInt64::Primitive>::Pairs,
-
         std::tuple<
             KindPair<ListView, PropertyNull>,
             KindPair<std::optional<ListView>, PropertyNull>,
-            KindPair<ListElementView, PropertyNull>,
-            KindPair<std::optional<ListElementView>, PropertyNull>,
-            KindPair<MapEntryView, PropertyNull>
+            KindPair<CellView, PropertyNull>,
+            KindPair<std::optional<CellView>, PropertyNull>
         >
     >;
 
@@ -670,7 +622,7 @@ struct MaskedPairs {
         MixedKind<ColumnMask, NodeID>,
         MixedKind<ColumnMask, EdgeID>,
         MixedKind<ColumnMask, LabelID>,
-        MixedKind<ColumnMask, Path>,
+        MixedKind<ColumnMask, GraphPath>,
         MixedKind<ColumnMask, LabelSetID>,
         MixedKind<ColumnMask, EdgeTypeID>,
         MixedKind<ColumnMask, ValueType>,
@@ -678,8 +630,7 @@ struct MaskedPairs {
         MixedKind<ColumnMask, CommitHash>,
         MixedKind<ColumnMask, ChangeID>,
         MixedKind<ColumnMask, std::string>,
-        MixedKind<ColumnMask, size_t>,
-        MixedKind<ColumnMask, EntityList>
+        MixedKind<ColumnMask, size_t>
     >;
 
     using Excluded = ExcludedContainers<
@@ -786,6 +737,7 @@ struct OutputtedTypes {
         types::Embedding::Primitive,
         types::DateTime::Primitive,
         types::Duration::Primitive,
+        types::Point::Primitive,
         std::optional<types::Int64::Primitive>,
         std::optional<types::Int64::Primitive>,
         std::optional<types::UInt64::Primitive>,
@@ -795,6 +747,7 @@ struct OutputtedTypes {
         std::optional<types::Embedding::Primitive>,
         std::optional<types::DateTime::Primitive>,
         std::optional<types::Duration::Primitive>,
+        std::optional<types::Point::Primitive>,
         PropertyNull,
 
         std::optional<std::string>,
@@ -802,7 +755,7 @@ struct OutputtedTypes {
         NodeID,
         EdgeID,
         LabelID,
-        Path,
+        GraphPath,
         LabelSetID,
         EdgeTypeID,
         ValueType,
@@ -820,16 +773,14 @@ struct OutputtedTypes {
 
         std::string,
         size_t,
-        EntityList,
 
         ListView,
         std::optional<ListView>,
-        ListElementView,
-        std::optional<ListElementView>,
+        CellView,
+        std::optional<CellView>,
         std::optional<ListView>,
 
         MapView,
-        MapEntryView,
         std::optional<MapView>
     >>;
 
@@ -861,7 +812,7 @@ struct OrderedTypes {
         LabelSetID,
 
         // Tagged scalars
-        ListElementView
+        CellView
     >>;
 
     using Excluded = ExcludedContainers<
@@ -881,6 +832,7 @@ struct WriteProcessorPropertyTypes {
         types::Embedding::Primitive,
         types::DateTime::Primitive,
         types::Duration::Primitive,
+        types::Point::Primitive,
         ListView,
         MapView,
 
@@ -892,6 +844,7 @@ struct WriteProcessorPropertyTypes {
         std::optional<types::Embedding::Primitive>,
         std::optional<types::DateTime::Primitive>,
         std::optional<types::Duration::Primitive>,
+        std::optional<types::Point::Primitive>,
         std::optional<ListView>,
         std::optional<MapView>,
 
@@ -911,6 +864,7 @@ struct WriteProcessorPropertyTypes {
         types::Embedding::Primitive,
         types::DateTime::Primitive,
         types::Duration::Primitive,
+        types::Point::Primitive,
         ListView,
         MapView,
 
@@ -922,6 +876,7 @@ struct WriteProcessorPropertyTypes {
         std::optional<types::Embedding::Primitive>,
         std::optional<types::DateTime::Primitive>,
         std::optional<types::Duration::Primitive>,
+        std::optional<types::Point::Primitive>,
         std::optional<ListView>,
 
         std::string // For LOAD CSV inputs
@@ -1061,6 +1016,9 @@ struct CartesianProductKinds {
         types::Duration::Primitive,
         std::optional<types::Duration::Primitive>,
 
+        types::Point::Primitive,
+        std::optional<types::Point::Primitive>,
+
         // Entities and metadata
         NodeID,
         EdgeID,
@@ -1072,8 +1030,8 @@ struct CartesianProductKinds {
 
         // Lists
         ListView,
-        ListElementView,
-        EntityList,
+        CellView,
+        GraphPath,
 
         // Owning strings occasionally needed for procedures; tests
         std::string

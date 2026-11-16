@@ -7,8 +7,10 @@
 #include <unordered_set>
 
 #include "decl/EvaluatedType.h"
+#include "decl/ExprType.h"
 #include "expr/CaseExpr.h"
 #include "metadata/PropertyType.h"
+#include "metadata/ValueComponent.h"
 #include "views/GraphView.h"
 
 namespace db {
@@ -19,6 +21,8 @@ namespace db {
 
 class CypherAST;
 class CypherAnalyzer;
+class ParameterMap;
+class ParameterValue;
 class DeclContext;
 class FunctionResolver;
 class LoadCSVStmt;
@@ -29,6 +33,7 @@ class LogicalExpr;
 class UnaryExpr;
 class SymbolExpr;
 class LiteralExpr;
+class ParameterExpr;
 class PropertyExpr;
 class PropertyLookupExpr;
 class StringExpr;
@@ -42,6 +47,8 @@ class ListExpr;
 class ListComprehensionExpr;
 class ListPredicateExpr;
 class ReduceExpr;
+class AllReduceExpr;
+class MapProjectionExpr;
 class ExistsExpr;
 class CountSubqueryExpr;
 class CollectSubqueryExpr;
@@ -52,7 +59,7 @@ class ReadStmtAnalyzer;
 
 class ExprAnalyzer {
 public:
-    ExprAnalyzer(CypherAST* ast, const GraphView& graphView);
+    ExprAnalyzer(CypherAST* ast, const GraphView& graphView, const ParameterMap* parameters = nullptr);
     ~ExprAnalyzer();
 
     ExprAnalyzer(const ExprAnalyzer&) = delete;
@@ -92,11 +99,14 @@ public:
     void analyzeUnaryExpr(UnaryExpr* expr);
     void analyzeSymbolExpr(SymbolExpr* expr);
     void analyzeLiteralExpr(LiteralExpr* expr);
+    void analyzeParameterExpr(ParameterExpr* expr);
     void analyzeListExpr(ListExpr* expr);
     void analyzeListComprehensionExpr(ListComprehensionExpr* expr);
     void analyzePatternComprehensionExpr(PatternComprehensionExpr* expr);
     void analyzeListPredicateExpr(ListPredicateExpr* expr);
     void analyzeReduceExpr(ReduceExpr* expr);
+    void analyzeAllReduceExpr(AllReduceExpr* expr);
+    void analyzeMapProjectionExpr(MapProjectionExpr* expr);
     void analyzeCaseExpr(CaseExpr* expr);
     void analyzeExistsExpr(ExistsExpr* expr);
     void analyzeCountSubqueryExpr(CountSubqueryExpr* expr);
@@ -119,7 +129,18 @@ public:
 
     void addToBeCreatedType(std::string_view name, ValueType type, const void* obj = nullptr);
 
+    // A property a write of a value whose type is only known per row creates as it runs,
+    // which a read later in the query reads as such a value
+    void addCellCreatedProperty(std::string_view name);
+
     static bool propTypeCompatible(ValueType vt, EvaluatedType exprType);
+
+    // The type property @param name has in this query: the graph's, or the one a write
+    // earlier in the query creates it with. Invalid for a name neither knows.
+    ValueType resolvePropertyType(std::string_view name) const;
+
+    // The value bound to the parameter @param name, or an error at @param obj when none is
+    const ParameterValue& boundParameterValue(std::string_view name, const void* obj) const;
 
     /// Adds an empty declaration for the given NodePattern
     void registerNodePatternDeclaration(const NodePattern* node);
@@ -131,11 +152,13 @@ private:
     CypherAST* _ast {nullptr};
     CypherAnalyzer* _queryAnalyzer {nullptr};
     GraphView _graphView;
+    const ParameterMap* _parameters {nullptr};
     DeclContext* _ctxt {nullptr};
     ReadStmtAnalyzer* _readAnalyzer {nullptr};
     const GraphMetadata& _graphMetadata;
 
     std::unordered_map<std::string_view, ValueType> _toBeCreatedTypes;
+    std::unordered_set<std::string_view> _cellCreatedProperties;
 
     // The LOAD CSV each row variable in scope was bound by
     std::unordered_map<const VarDecl*, LoadCSVStmt*> _csvSources;
@@ -146,32 +169,29 @@ private:
     // The declaration a name reads as, noting it when it came from an enclosing scope
     VarDecl* resolveVariable(std::string_view name);
 
-    // The type property @param name has in this query: the graph's, or the one a write
-    // earlier in the query creates it with. Invalid for a name neither knows.
-    ValueType resolvePropertyType(std::string_view name) const;
-
     // Lets @param expr and the expressions under it be analyzed again, as a reduce's body
     // is once its accumulator has widened
     void forgetAnalysis(const Expr* expr);
+
+    template <typename FoldExpr>
+    void openFoldScope(FoldExpr* expr, std::string_view foldName);
+
+    template <typename FoldExpr>
+    void closeFoldScope(FoldExpr* expr);
 
     void analyzeListElements(Expr* expr, std::span<Expr* const> elements);
     void analyzeMapEntries(Expr* expr, const MapLiteral* map);
 
     // The type a CASE has once @param branch is folded into the type its earlier branches
     // already share, reporting a pair no column type can hold
-    EvaluatedType unifyCaseBranch(EvaluatedType carried, const Expr* branch);
+    EvaluatedType unifyCaseBranch(EvaluatedType carried, const Expr* branch) const;
 
-    // Rejects a CASE subject no column holds. A node and an edge are subjects of their
-    // own: the MLIR engine binds one, and an OPTIONAL MATCH can leave it null
+    // Rejects a CASE subject that is not a value
     void requireCaseSubject(const Expr* subject) const;
-
-    // The type = and <> give over @param a and @param b, for a binary equality and for a
-    // CASE testing its subject alike. Reports a pair no equality takes at @param expr.
-    EvaluatedType analyzeEquality(EvaluatedType a, EvaluatedType b, const Expr* expr) const;
 
     // One WHEN value of @param branch, read as a predicate when the CASE has no subject
     // and as something to compare that subject against when it has one
-    void analyzeCaseTest(const CaseExpr::Branch& branch, const Expr* subject, const CaseExpr::Test& test);
+    void analyzeCaseTest(const CaseExpr::Branch& branch, const Expr* subject, CaseExpr::Test& test);
 
     // The type the arguments of a call to @param name share, folded the way a CASE folds
     // its branches, reporting a pair no column type can hold
@@ -180,6 +200,17 @@ private:
     // row[i] over a LOAD CSV row, which reads a field rather than an element. A constant
     // index names the field the load publishes it under; a computed one names none
     void analyzeCSVRowIndex(IndexExpr* expr);
+
+    Expr* createDottedForm(const IndexExpr* expr);
+
+    [[noreturn]] void throwTargetInsideAProperty(const PropertyExpr* expr, const VarDecl* varDecl);
+
+    // The component @param name names of a value of @param ownerType, an instant, a duration
+    // or a point. Raises where it names none.
+    void resolveComponent(const Expr* expr,
+                          EvaluatedType ownerType,
+                          std::string_view name,
+                          ValueComponent& component) const;
 
     LoadCSVStmt* findCSVSource(const VarDecl* alias) const;
 

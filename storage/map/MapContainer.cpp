@@ -4,7 +4,7 @@
 #include <variant>
 
 #include "MapEntryView.h"
-#include "MapUtils.h"
+#include "CellUtils.h"
 
 using namespace db;
 
@@ -22,6 +22,7 @@ MapContainer::MapContainer(MapContainer&& other) noexcept
     : _maps(std::move(other._maps)),
     _strings(std::move(other._strings)),
     _embeddings(std::move(other._embeddings)),
+    _paths(std::move(other._paths)),
     _lists(std::move(other._lists)),
     _views(std::move(other._views))
 {
@@ -31,6 +32,7 @@ MapContainer& MapContainer::operator=(MapContainer&& other) noexcept {
     _maps = std::move(other._maps);
     _strings = std::move(other._strings);
     _embeddings = std::move(other._embeddings);
+    _paths = std::move(other._paths);
     _lists = std::move(other._lists);
     _views = std::move(other._views);
     return *this;
@@ -63,6 +65,9 @@ void MapContainer::clear() {
     _maps->clear();
     _strings->clear();
     _embeddings->clear();
+    if (_paths) {
+        _paths->clear();
+    }
     _lists.clear();
     _views.clear();
 }
@@ -78,24 +83,28 @@ MapView MapContainer::copy(MapView map) {
     return insert(entries);
 }
 
-MapEntryView MapContainer::copy(MapEntryView entry) {
-    const MapKeyValuePair owned = ownedEntry(entry);
-
-    return insert(std::span<const MapKeyValuePair> {&owned, 1}).front();
-}
-
 MapContainer::MapKeyValuePair MapContainer::ownedEntry(MapEntryView entry) {
-    const auto asVariant = [this]<typename T>(const MapEntryView view) -> MapBuffer<>::MapItemVariant {
+    const auto asVariant = [this]<typename T>(const CellView value) -> MapBuffer<>::MapItemVariant {
         if constexpr (std::same_as<T, MapView>) {
-            return copy(view.getValueAs<MapView>());
+            return copy(value.getAs<MapView>());
         } else if constexpr (std::same_as<T, ListView>) {
-            return _lists.copy(view.getValueAs<ListView>());
+            return _lists.copy(value.getAs<ListView>());
         } else {
-            return view.getValueAs<T>();
+            return value.getAs<T>();
         }
     };
 
-    return {entry.getKey(), dispatchMapEntry(asVariant, entry)};
+    const CellView value = entry.getValue();
+
+    return {entry.getKey(), CellTagDispatcher {value.getTag()}.execute(asVariant, value)};
+}
+
+MapContainer::PathBuffer& MapContainer::getPaths() {
+    if (!_paths) {
+        _paths = std::make_unique<PathBuffer>();
+    }
+
+    return *_paths;
 }
 
 MapContainer::MapKeyValuePair MapContainer::own(const MapKeyValuePair& entry) {
@@ -106,6 +115,8 @@ MapContainer::MapKeyValuePair MapContainer::own(const MapKeyValuePair& entry) {
             return _strings->insert(value);
         } else if constexpr (std::same_as<T, types::Embedding::Primitive>) {
             return _embeddings->insert(value);
+        } else if constexpr (std::same_as<T, PathView>) {
+            return getPaths().insert(value.getIDs());
         } else {
             return value;
         }

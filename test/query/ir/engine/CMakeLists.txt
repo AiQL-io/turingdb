@@ -5,6 +5,8 @@ add_ir_tests(test_query_ir_dblowering DBLoweringTest.cpp)
 
 add_call_v3_test(test_query_ir_empty_result_column_names EmptyResultColumnNamesTest.cpp)
 
+add_call_v3_test(test_query_ir_string_row_sink StringRowSinkTest.cpp)
+
 add_ir_tests(test_query_ir_dbdialect DBDialectTest.cpp)
 
 add_ir_tests(test_query_ir_nldialect NLDialectTest.cpp)
@@ -23,6 +25,14 @@ target_include_directories(test_query_ir_exec_v3_error PRIVATE ${IR_TEST_DIR})
 
 add_turing_test(test_query_ir_equivalence EquivalenceTest.cpp)
 target_include_directories(test_query_ir_equivalence PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_lowering_determinism LoweringDeterminismTest.cpp)
+target_sources(test_query_ir_lowering_determinism PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_lowering_determinism PRIVATE ${IR_TEST_DIR})
+
+add_ir_tests(test_query_ir_limit_in_widened_fold LimitInWidenedFoldTest.cpp)
+
+add_ir_tests(test_query_ir_carried_column_row_source CarriedColumnRowSourceTest.cpp)
 
 add_turing_test(test_query_ir_cypher_output CypherOutputTest.cpp)
 target_include_directories(test_query_ir_cypher_output PRIVATE ${IR_TEST_DIR})
@@ -64,3 +74,5 @@ target_sources(test_query_ir_compiler_context_reuse PRIVATE ${IR_TEST_DIR}/Strin
 target_include_directories(test_query_ir_compiler_context_reuse PRIVATE ${IR_TEST_DIR})
 
 add_ir_tests(test_query_ir_db_pass_pipeline_reuse DBPassPipelineReuseTest.cpp)
+
+add_ir_tests(test_query_ir_insertion_ordered_map InsertionOrderedMapTest.cpp)

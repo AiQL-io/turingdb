@@ -20,32 +20,42 @@ jobs:
     permissions:
       contents: read
 
+    env:
+      # The AiQL fork has no Anthropic key: the review is skipped without one
+      HAS_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+
     outputs:
+      reviewed: ${{ steps.review.outcome == 'success' }}
       has_violations: ${{ steps.review.outputs.has_violations || 'false' }}
       review_body: ${{ steps.review.outputs.review_body }}
 
     steps:
       - name: Setup Node.js
+        if: env.HAS_ANTHROPIC_API_KEY == 'true'
         uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Install Claude Code CLI
+        if: env.HAS_ANTHROPIC_API_KEY == 'true'
         run: npm install -g @anthropic-ai/claude-code
 
       - name: Checkout PR code
+        if: env.HAS_ANTHROPIC_API_KEY == 'true'
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
 
       - name: Fetch base branch
+        if: env.HAS_ANTHROPIC_API_KEY == 'true'
         run: |
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git fetch origin ${{ github.base_ref }}
 
       - name: Run Claude review
         id: review
+        if: env.HAS_ANTHROPIC_API_KEY == 'true'
         env:
           BASE_REF: ${{ github.base_ref }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -55,7 +65,7 @@ jobs:
   claude-comment:
     runs-on: ubuntu-24.04
     needs: claude-review
-    if: always() && needs.claude-review.result == 'success'
+    if: always() && needs.claude-review.result == 'success' && needs.claude-review.outputs.reviewed == 'true'
 
     permissions:
       contents: read

@@ -6,7 +6,7 @@
 
 #include <range/v3/view/zip.hpp>
 
-#include "list/ListElementOrder.h"
+#include "CellOrder.h"
 #include "map/MapHash.h"
 #include "properties/PropertyContainer.h"
 
@@ -179,6 +179,15 @@ public:
                 if (!TypedPropertyContainerComparator<types::Duration>::same(
                         a->cast<types::Duration>(),
                         b->cast<types::Duration>())) {
+                    return false;
+                }
+                break;
+            }
+
+            case ValueType::Point: {
+                if (!TypedPropertyContainerComparator<types::Point>::same(
+                        a->cast<types::Point>(),
+                        b->cast<types::Point>())) {
                     return false;
                 }
                 break;

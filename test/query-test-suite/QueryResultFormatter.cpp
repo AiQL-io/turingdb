@@ -1,22 +1,20 @@
 #include "QueryResultFormatter.h"
 
 #include <optional>
-#include <ranges>
 #include <span>
 #include <sstream>
 
 #include <spdlog/fmt/bundled/format.h>
 
 #include "BioAssert.h"
-#include "EntityList.h"
 #include "GraphPath.h"
+#include "PathView.h"
 #include "ID.h"
-#include "list/ListElementView.h"
-#include "list/ListUtils.h"
+#include "CellView.h"
+#include "CellUtils.h"
 #include "list/ListView.h"
 
 #include "map/MapEntryView.h"
-#include "map/MapUtils.h"
 #include "map/MapView.h"
 #include "QueryStatus.h"
 #include "columns/AllowedKinds.h"
@@ -44,25 +42,32 @@ namespace {
     return value;
 }
 
-[[maybe_unused]] std::string valueToString(const db::Path& value) {
-    std::string result;
+[[maybe_unused]] std::string valueToString(const db::PathView value) {
+    const std::span<const uint64_t> ids = value.getIDs();
 
-    if (value.empty()) {
-        return "";
-    }
-
-    const auto reversed = value | std::views::reverse;
-    size_t i = 0;
-    for (auto val : reversed) {
-        if (i % 2 == 0) {
-            result += fmt::format("({})", val.getValue());
-        } else {
-            result += fmt::format("-[{}]->", val.getValue());
+    std::string result = "[";
+    for (size_t position = 0; position < ids.size(); position++) {
+        if (position > 0) {
+            result += ", ";
         }
-        ++i;
+
+        if (db::GraphPath::isNodeAt(position)) {
+            result += fmt::format("({})", ids[position]);
+        } else {
+            result += fmt::format("[{}]", ids[position]);
+        }
     }
 
+    result += "]";
     return result;
+}
+
+[[maybe_unused]] std::string valueToString(const db::GraphPath& value) {
+    if (value.isNull()) {
+        return "null";
+    }
+
+    return valueToString(db::PathView {value.getIDs()});
 }
 
 [[maybe_unused]] std::string valueToString(const std::string_view& value) {
@@ -101,6 +106,13 @@ template <int I, int Radix>
     return result;
 }
 
+[[maybe_unused]] std::string valueToString(const db::Point& value) {
+    std::string result;
+    db::Point::format(result, value);
+
+    return result;
+}
+
 [[maybe_unused]] std::string valueToString(const db::CommitBuilder* value) {
     return value ? "commit_builder_ptr" : "null";
 }
@@ -133,7 +145,7 @@ template <typename T>
     return result;
 }
 
-[[maybe_unused]] std::string valueToString(const db::ListElementView element);
+[[maybe_unused]] std::string valueToString(const db::CellView element);
 [[maybe_unused]] std::string valueToString(db::ListView view);
 [[maybe_unused]] std::string valueToString(db::MapView view);
 
@@ -146,33 +158,13 @@ template <typename T>
     return valueToString(*value);
 }
 
-[[maybe_unused]] std::string valueToString(const db::EntityList& value) {
-    std::string result = "[";
-    size_t i = 0;
-
-    for (const auto& entry : value) {
-        if (i++ > 0) {
-            result += ", ";
-        }
-
-        if (entry._type == db::EntityType::Node) {
-            result += fmt::format("({})", entry._id.getValue());
-        } else {
-            result += fmt::format("[{}]", entry._id.getValue());
-        }
-    }
-
-    result += "]";
-    return result;
-}
-
-[[maybe_unused]] std::string valueToString(const db::ListElementView element) {
-    const auto writeTyped = []<typename T>(const db::ListElementView element) -> std::string {
+[[maybe_unused]] std::string valueToString(const db::CellView element) {
+    const auto writeTyped = []<typename T>(const db::CellView element) -> std::string {
         return valueToString(element.getAs<T>());
     };
 
-    const db::ListBufferTypeTag tag = element.getTag();
-    db::ListTagDispatcher writer {._tag = tag};
+    const db::CellTag tag = element.getTag();
+    db::CellTagDispatcher writer {._tag = tag};
 
     return writer.execute(writeTyped, element);
 }
@@ -185,7 +177,7 @@ template <typename T>
     std::string out = "[";
     size_t i = 0;
 
-    for (const db::ListElementView element : view.elements()) {
+    for (const db::CellView element : view.elements()) {
         if (i++ > 0) {
             out += ", ";
         }
@@ -196,20 +188,10 @@ template <typename T>
     return out;
 }
 
-// The value of one entry, which is what a cell of a map value column is. The key is added
-// by entryToString, for an entry read as a member of its map rather than alone.
-[[maybe_unused]] std::string valueToString(const db::MapEntryView entry) {
-    const auto writeTyped = []<typename T>(const db::MapEntryView entry) -> std::string {
-        return valueToString(entry.getValueAs<T>());
-    };
-
-    return db::dispatchMapEntry(writeTyped, entry);
-}
-
 [[maybe_unused]] std::string entryToString(const db::MapEntryView entry) {
     std::string out {entry.getKey()};
     out += ": ";
-    out += valueToString(entry);
+    out += valueToString(entry.getValue());
     return out;
 }
 

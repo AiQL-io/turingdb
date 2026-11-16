@@ -1,25 +1,36 @@
 #include "IRConstantColumn.h"
 
+#include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 
 using namespace db;
 
 namespace {
 
-// What @param operation reads: its operands, and the values its regions take from above it
+// What @param operation reads: its operands, and the values its regions take from above it.
+// It looks only inside @param operation: codegen asks it of a body no op holds yet, and
+// climbing above one, as mlir::getUsedValuesDefinedAbove does, asserts
 void collectReadValues(mlir::Operation* operation, llvm::SmallVectorImpl<mlir::Value>& reads) {
     reads.append(operation->operand_begin(), operation->operand_end());
 
-    operation->walk([operation, &reads](mlir::Operation* nested) {
+    llvm::SmallPtrSet<mlir::Region*, 4> innerRegions;
+    operation->walk([&innerRegions](mlir::Operation* nested) {
+        for (mlir::Region& region : nested->getRegions()) {
+            innerRegions.insert(&region);
+        }
+    });
+
+    operation->walk([operation, &innerRegions, &reads](mlir::Operation* nested) {
         if (nested == operation) {
             return;
         }
 
         for (mlir::Value operand : nested->getOperands()) {
-            if (!operation->isAncestor(operand.getParentRegion()->getParentOp())) {
+            if (!innerRegions.contains(operand.getParentRegion())) {
                 reads.push_back(operand);
             }
         }
@@ -39,9 +50,10 @@ bool isConstantColumn(mlir::Value root, llvm::DenseMap<mlir::Value, bool>& class
         }
 
         mlir::Operation* const definingOp = value.getDefiningOp();
-        const bool isConstantLike = definingOp
-                                 && (definingOp->hasTrait<mlir::OpTrait::ConstantLike>()
-                                     || definingOp->hasTrait<mlir::OpTrait::ConstantResult>());
+        const bool isConstantLike = isFunctionArgument(value)
+                                 || (definingOp
+                                     && (definingOp->hasTrait<mlir::OpTrait::ConstantLike>()
+                                         || definingOp->hasTrait<mlir::OpTrait::ConstantResult>()));
         const bool constantThroughOperands = definingOp
                                           && definingOp->hasTrait<mlir::OpTrait::ConstantThroughOperands>()
                                           && runsWithoutRaising(definingOp);
@@ -84,6 +96,11 @@ bool isConstantColumn(mlir::Value root, llvm::DenseMap<mlir::Value, bool>& class
 
 }
 
+bool db::isFunctionArgument(mlir::Value value) {
+    const mlir::BlockArgument argument = mlir::dyn_cast<mlir::BlockArgument>(value);
+    return argument && mlir::isa_and_present<mlir::func::FuncOp>(argument.getOwner()->getParentOp());
+}
+
 bool db::yieldsConstantColumn(mlir::Value value) {
     llvm::DenseMap<mlir::Value, bool> classified;
     return isConstantColumn(value, classified);
@@ -91,6 +108,22 @@ bool db::yieldsConstantColumn(mlir::Value value) {
 
 bool db::yieldsConstantColumn(mlir::Value value, llvm::DenseMap<mlir::Value, bool>& classified) {
     return isConstantColumn(value, classified);
+}
+
+void db::forgetErasedValues(mlir::Operation* operation, llvm::DenseMap<mlir::Value, bool>& classified) {
+    operation->walk([&classified](mlir::Operation* nested) {
+        for (const mlir::Value result : nested->getResults()) {
+            classified.erase(result);
+        }
+
+        for (mlir::Region& region : nested->getRegions()) {
+            for (mlir::Block& block : region) {
+                for (const mlir::Value argument : block.getArguments()) {
+                    classified.erase(argument);
+                }
+            }
+        }
+    });
 }
 
 bool db::runsWithoutRaising(mlir::Operation* operation) {

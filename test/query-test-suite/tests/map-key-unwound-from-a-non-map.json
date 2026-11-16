@@ -3,7 +3,7 @@
   "graph": "simpledb",
   "query": "UNWIND [1, 'x'] AS m RETURN m.a",
   "expect": {
-    "result": "m.a\nnull\nnull"
+    "result": "EXEC ERROR\nType mismatch: a value of type 'Integer' has no property 'a'"
   },
   "tags": [
     "map",

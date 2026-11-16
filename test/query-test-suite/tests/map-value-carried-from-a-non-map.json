@@ -3,7 +3,7 @@
   "graph": "simpledb",
   "query": "WITH {a: 1} AS m WITH m.a AS inner RETURN inner.b",
   "expect": {
-    "result": "inner.b\nnull"
+    "result": "EXEC ERROR\nType mismatch: a value of type 'Integer' has no property 'b'"
   },
   "tags": [
     "map",

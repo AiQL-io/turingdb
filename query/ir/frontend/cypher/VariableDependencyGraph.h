@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "DependencyEdge.h"
+#include "InsertionOrderedMap.h"
 #include "VariableDependency.h"
 
 namespace db {
@@ -39,8 +40,8 @@ class VarDecl;
 class VariableDependencyGraph {
 public:
     using Cycle = std::vector<VariableDependency*>;
-    using EdgeIdentityMap = std::unordered_map<const VarDecl*, std::vector<VariableDependency*>>;
-    using UnwindSourceMap = std::unordered_map<const VariableDependency*, const UnwindStmt*>;
+    using EdgeIdentityMap = InsertionOrderedMap<const VarDecl*, std::vector<VariableDependency*>>;
+    using UnwindSourceMap = InsertionOrderedMap<const VariableDependency*, const UnwindStmt*>;
     using BoundVars = std::vector<VariableDependency*>;
 
     VariableDependencyGraph();

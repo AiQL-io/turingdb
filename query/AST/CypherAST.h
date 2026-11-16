@@ -4,6 +4,7 @@
 #include <vector>
 #include <stdint.h>
 #include <string_view>
+#include <unordered_map>
 
 namespace db {
 
@@ -51,6 +52,8 @@ class ListComprehensionExpr;
 class PatternComprehensionExpr;
 class ListPredicateExpr;
 class ReduceExpr;
+class AllReduceExpr;
+class MapProjectionExpr;
 class CaseExpr;
 class Pattern;
 class PatternElement;
@@ -87,10 +90,10 @@ class YieldClause;
 class YieldItems;
 class DeclContext;
 class VarDecl;
+class ParameterDecl;
 class NodePatternData;
 class EdgePatternData;
 class CypherParserState;
-class YCypherParser;
 class ListGraphQuery;
 class ListAvailableGraphsQuery;
 class CreateGraphQuery;
@@ -166,6 +169,8 @@ public:
     friend PatternComprehensionExpr;
     friend ListPredicateExpr;
     friend ReduceExpr;
+    friend AllReduceExpr;
+    friend MapProjectionExpr;
     friend CaseExpr;
     friend Pattern;
     friend PatternElement;
@@ -198,6 +203,7 @@ public:
     friend ChangeQuery;
     friend DeclContext;
     friend VarDecl;
+    friend ParameterDecl;
     friend NodePatternData;
     friend EdgePatternData;
     friend LoadGraphQuery;
@@ -222,7 +228,6 @@ public:
     friend InstallExtensionQuery;
     friend ShowExtensionsQuery;
     friend VectorSearchStmt;
-    friend YCypherParser;
     friend CreateNodePropertyIndexQuery;
     friend CreateEdgePropertyIndexQuery;
     friend DropIndexQuery;
@@ -231,6 +236,39 @@ public:
     friend WithStmt;
 
     using QueryCommands = std::vector<QueryCommand*>;
+
+    struct Checkpoint {
+        size_t _parameters {0};
+        size_t _symbols {0};
+        size_t _symbolChains {0};
+        size_t _labelExprs {0};
+        size_t _qualifiedNames {0};
+        size_t _quantifiedPaths {0};
+        size_t _functionInvocations {0};
+        size_t _literals {0};
+        size_t _expressions {0};
+        size_t _exprChains {0};
+        size_t _patterns {0};
+        size_t _patternElems {0};
+        size_t _entityPatterns {0};
+        size_t _projections {0};
+        size_t _whereClauses {0};
+        size_t _yieldClauses {0};
+        size_t _yieldItems {0};
+        size_t _stmts {0};
+        size_t _subStmts {0};
+        size_t _setItems {0};
+        size_t _orderByItems {0};
+        size_t _stmtContainers {0};
+        size_t _queries {0};
+        size_t _subQueries {0};
+        size_t _declContexts {0};
+        size_t _varDecls {0};
+        size_t _parameterDecls {0};
+        size_t _nodePatternDatas {0};
+        size_t _edgePatternDatas {0};
+        size_t _unnamedVarIdentifiers {0};
+    };
 
     CypherAST(const ProcedureManager* procedures,
               std::string_view queryString);
@@ -247,6 +285,9 @@ public:
     // Moves a command out of the top-level list and into the one a holder reads it
     // through, once that holder is built over it
     void nestQuery(QueryCommand* query);
+
+    void saveCheckpoint(Checkpoint& checkpoint) const;
+    void rollback(const Checkpoint& checkpoint);
 
     const std::vector<Expr*>& getExpressions() const { return _expressions; }
     const std::vector<EntityPattern*>& getEntityPatterns() const { return _entityPatterns; }
@@ -267,6 +308,11 @@ public:
     // it rather than explain it.
     ExplainRequest& explainRequest();
     const ExplainRequest* getExplainRequest() const { return _explainRequest.get(); }
+
+    // A parameter has one value for the whole request, so every $name in it, in any
+    // scope, union branch or subquery, reads the same declaration
+    ParameterDecl* findParameterDecl(std::string_view name);
+    const std::vector<ParameterDecl*>& parameterDecls() const { return _parameterDecls; }
 
 private:
     SourceManager* _sourceManager {nullptr};
@@ -303,6 +349,8 @@ private:
     QueryCommands _subQueries;
     std::vector<DeclContext*> _declContexts;
     std::vector<VarDecl*> _varDecls;
+    std::vector<ParameterDecl*> _parameterDecls;
+    std::unordered_map<std::string_view, ParameterDecl*> _parameterDeclMap;
     std::vector<NodePatternData*> _nodePatternDatas;
     std::vector<EdgePatternData*> _edgePatternDatas;
     std::vector<std::string*> _unnamedVarIdentifiers;
@@ -335,9 +383,13 @@ private:
 
     void addDeclContext(DeclContext* ctxt);
     void addVarDecl(VarDecl* decl);
+    void addParameterDecl(ParameterDecl* decl);
     void addNodePatternData(NodePatternData* data);
     void addEdgePatternData(EdgePatternData* data);
     void addFunctionInvocation(FunctionInvocation* invocation);
+
+    template <typename Object>
+    void truncateObjects(std::vector<Object*>& objects, size_t count);
 };
 
 }

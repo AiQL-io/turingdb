@@ -48,6 +48,11 @@ public:
     // becomes the pattern node it is used as rather than conflicting with it
     VarDecl* getOrCreateNodePatternVariable(CypherAST* ast, std::string_view name);
 
+    // The name an entity of a pattern binds, @param type being a node or a relationship. A
+    // variable whose type is known per row only, a tagged cell or a null, holds the entity
+    // on some rows: the pattern binds a variable of its own in its place, cast out of it
+    VarDecl* getOrCreateEntityPatternVariable(CypherAST* ast, EvaluatedType type, std::string_view name);
+
     // The name a projected item publishes its column under. What follows the projection
     // reads that column, so the name binds to the item even when the query already used
     // it for a variable of another type
@@ -61,7 +66,15 @@ public:
     // query, so nothing after the comprehension - a wildcard projection included - sees it
     void dropVariable(std::string_view name);
 
+    // Undeclares the variable a pattern cast out of @param source, so @param name reads
+    // @param source again. A pattern comprehension binds its casts for its body alone
+    void dropCastVariable(std::string_view name, VarDecl* source);
+
     void declareAlias(std::string_view name, VarDecl* decl);
+
+    // Declares @param decl, a variable of an enclosing scope, in this one too, where a
+    // wildcard returns it as it returns the variables this scope declares
+    void redeclare(VarDecl* decl);
 
 private:
     DeclContext* _parent {nullptr};
@@ -75,6 +88,7 @@ private:
     uint64_t _unnamedVarCounter {0};
 
     void addDecl(VarDecl* decl);
+    VarDecl* declareCastVariable(CypherAST* ast, VarDecl* source, EvaluatedType type, std::string_view name);
 };
 
 }

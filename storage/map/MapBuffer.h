@@ -6,11 +6,12 @@
 
 #include "MapByteBuffer.h"
 #include "MapEntryViewBuffer.h"
-#include "MapBufferTypeTag.h"
+#include "CellTag.h"
 #include "MapView.h"
 #include "MapWriteCursor.h"
 
 #include "ID.h"
+#include "PathView.h"
 #include "list/ListView.h"
 #include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
@@ -22,7 +23,8 @@ using MappableTypesImpl =
                db::types::Double::Primitive, db::types::Bool::Primitive,
                db::types::String::Primitive, db::types::Embedding::Primitive,
                db::ListView, db::MapView, db::PropertyNull, db::NodeID, db::EdgeID,
-               db::types::DateTime::Primitive, db::types::Duration::Primitive>;
+               db::types::DateTime::Primitive, db::types::Duration::Primitive, db::PathView,
+               db::types::Point::Primitive>;
 }
 
 namespace db {
@@ -81,6 +83,6 @@ private:
 
 // Ensure we have a type tag for each mappable type
 static_assert(std::tuple_size_v<MappableTypesImpl>
-              == std::to_underlying(MapBufferTypeTag::INVALID));
+              == std::to_underlying(CellTag::INVALID));
 
 }

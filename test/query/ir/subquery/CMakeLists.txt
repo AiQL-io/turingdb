@@ -147,6 +147,9 @@ target_include_directories(test_query_ir_subquery_after_update PRIVATE ${IR_TEST
 # OPTIONAL CALL over a body returning a list.
 add_call_v3_test(test_query_ir_optional_subquery_list_padding OptionalSubqueryListPaddingTest.cpp)
 
+# OPTIONAL CALL over a body returning a value of type any or a value read out of a map.
+add_call_v3_test(test_query_ir_optional_subquery_any_padding OptionalSubqueryAnyPaddingTest.cpp)
+
 add_turing_test(test_query_ir_pattern_comprehension PatternComprehensionTest.cpp)
 target_include_directories(test_query_ir_pattern_comprehension PRIVATE ${IR_TEST_DIR})
 
@@ -213,3 +216,76 @@ add_turing_test(test_query_ir_exists_over_created_node ExistsOverCreatedNodeTest
 
 # A CALL () over rows holding only a projected constant leaves those rows in flight.
 add_turing_test(test_query_ir_call_without_inputs_after_rows CallWithoutInputsAfterRowsTest.cpp)
+
+# Every { } holds a single query, a UNION, a WHEN or a NEXT chain, nested in any of the others.
+add_turing_test(test_query_ir_subquery_body_forms SubqueryBodyFormsTest.cpp)
+
+# exists(<pattern>): the pattern predicate, written as a function.
+add_turing_test(test_query_ir_exists_function ExistsFunctionTest.cpp)
+
+# A subquery expression whose body runs one row at a time, inside a CASE, a comprehension,
+# a reduce, a list predicate and an UNWIND.
+add_turing_test(test_query_ir_per_row_subquery_expression PerRowSubqueryExpressionTest.cpp)
+
+# A COLLECT subquery or a pattern comprehension whose body returns a map.
+add_call_v3_test(test_query_ir_subquery_collecting_a_map SubqueryCollectingAMapTest.cpp)
+
+# Two expressions of one projection that each run a subquery per row inside the elements of a list.
+add_call_v3_test(test_query_ir_sibling_per_row_subquery SiblingPerRowSubqueryTest.cpp)
+
+# The textual form of db.collect_subquery_yield prints and parses back, with a tag or none.
+add_ir_tests(test_query_ir_collect_subquery_yield_format CollectSubqueryYieldFormatTest.cpp)
+
+# db.row_constant: a node, an edge or a path a body run once per row reads as a constant.
+add_ir_tests(test_query_ir_row_constant RowConstantTest.cpp)
+
+# A body run once per row reads its imports past every barrier: TUR-304.
+add_turing_test(test_query_ir_per_run_import PerRunImportTest.cpp)
+
+# A list expression in a body run once per row reads a property of an imported node.
+add_turing_test(test_query_ir_per_run_import_list_expression PerRunImportListExpressionTest.cpp)
+target_sources(test_query_ir_per_run_import_list_expression PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_per_run_import_list_expression PRIVATE ${IR_TEST_DIR})
+
+# A body run once per row takes a node or an edge out of a list it imports.
+add_turing_test(test_query_ir_per_run_import_list_index PerRunImportListIndexTest.cpp)
+target_sources(test_query_ir_per_run_import_list_index PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_per_run_import_list_index PRIVATE ${IR_TEST_DIR})
+
+# A path a body run once per row returns is read as a path after the CALL.
+add_turing_test(test_query_ir_per_run_import_path PerRunImportPathTest.cpp)
+target_sources(test_query_ir_per_run_import_path PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_per_run_import_path PRIVATE ${IR_TEST_DIR})
+
+# A body run once per row collects its import beside a second aggregate.
+add_turing_test(test_query_ir_per_run_import_aggregates PerRunImportAggregatesTest.cpp)
+target_sources(test_query_ir_per_run_import_aggregates PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_per_run_import_aggregates PRIVATE ${IR_TEST_DIR})
+
+# A subquery expression whose body runs per row, beside outer ORDER BY, LIMIT, DISTINCT,
+# aggregation, OPTIONAL MATCH and inputs spanning several chunks.
+add_ir_tests(test_query_ir_per_row_subquery_composition PerRowSubqueryCompositionTest.cpp)
+
+# A body run once per row reads its import past a keyless WITH or a NEXT, beside the other clauses.
+add_ir_tests(test_query_ir_per_run_import_composition PerRunImportCompositionTest.cpp)
+
+# exists(<pattern>) as a grouping key, in comprehensions, folds, boolean operators and ORDER BY.
+add_ir_tests(test_query_ir_exists_function_composition ExistsFunctionCompositionTest.cpp)
+
+# Functions and operators over a node, an edge, a path or a list a body run once per row imports.
+add_ir_tests(test_query_ir_run_constant_read RunConstantReadTest.cpp)
+
+# A body run once per row walks from, or to, the nodes it imports.
+add_ir_tests(test_query_ir_run_constant_walk RunConstantWalkTest.cpp)
+
+# A body run once per row writes from its import, and a merge reads back the rows it wrote.
+add_ir_tests(test_query_ir_per_run_import_write PerRunImportWriteTest.cpp)
+
+# A variable-length named path read inside and past a subquery.
+add_ir_tests(test_query_ir_named_walk_across_subquery NamedWalkAcrossSubqueryTest.cpp)
+
+# A body run once per row reads the relationships of a variable-length pattern it imports.
+add_ir_tests(test_query_ir_per_run_import_walk PerRunImportWalkTest.cpp)
+
+# A CASE or coalesce in a CALL body over a constant the body binds, in a SET, a CREATE, a MERGE and a RETURN: TUR-376.
+add_turing_test(test_query_ir_call_body_case_over_bound_constant CallBodyCaseOverBoundConstantTest.cpp)

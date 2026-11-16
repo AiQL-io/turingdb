@@ -50,6 +50,7 @@
 #include "expr/PatternComprehensionExpr.h"
 #include "expr/PropertyExpr.h"
 #include "expr/ReduceExpr.h"
+#include "expr/AllReduceExpr.h"
 #include "metadata/PropertyType.h"
 #include "reader/GraphReader.h"
 #include "stmt/ShortestPathStmt.h"
@@ -77,10 +78,28 @@
 
 #include "BioAssert.h"
 #include "AnalyzeException.h"
+#include "FileName.h"
 
 using namespace db;
 
 namespace {
+
+std::string_view importedTypeName(ValueType type) {
+    switch (type) {
+        case ValueType::DateTime:
+            return "a datetime";
+        break;
+        case ValueType::Duration:
+            return "a duration";
+        break;
+        case ValueType::Point:
+            return "a point";
+        break;
+        default:
+            return ValueTypeName::value(type);
+        break;
+    }
+}
 
 const FunctionSignature* aggregateSignatureOf(const Expr* expr) {
     if (expr->getKind() != Expr::Kind::FUNCTION_INVOCATION) {
@@ -98,15 +117,45 @@ const FunctionSignature* aggregateSignatureOf(const Expr* expr) {
     return signature;
 }
 
+// The variables @param expr binds per element for its child @param child to read: a list
+// comprehension's element, and a fold's element and accumulator, which neither the list
+// iterated nor the initial value sees
+void collectElementDecls(const Expr* expr, const Expr* child, std::vector<const VarDecl*>& decls) {
+    const Expr::Kind kind = expr->getKind();
+
+    if (kind == Expr::Kind::LIST_COMPREHENSION) {
+        const ListComprehensionExpr* comprehension = static_cast<const ListComprehensionExpr*>(expr);
+
+        if (child != comprehension->getSource()) {
+            decls.push_back(comprehension->getDecl());
+        }
+    } else if (kind == Expr::Kind::REDUCE) {
+        const ReduceExpr* reduce = static_cast<const ReduceExpr*>(expr);
+
+        if (child == reduce->getExpression()) {
+            decls.push_back(reduce->getItemDecl());
+            decls.push_back(reduce->getAccumulatorDecl());
+        }
+    } else if (kind == Expr::Kind::ALL_REDUCE) {
+        const AllReduceExpr* allReduce = static_cast<const AllReduceExpr*>(expr);
+
+        const bool readsTheFold = child == allReduce->getExpression() || child == allReduce->getPredicate();
+        if (readsTheFold) {
+            decls.push_back(allReduce->getItemDecl());
+            decls.push_back(allReduce->getAccumulatorDecl());
+        }
+    }
+}
+
 constexpr std::string_view shortestPathErr = "Cannot return {} after SHORTESTPATH.";
 
 }
 
-CypherAnalyzer::CypherAnalyzer(CypherAST* ast, GraphView graphView)
+CypherAnalyzer::CypherAnalyzer(CypherAST* ast, GraphView graphView, const ParameterMap* parameters)
     : _ast(ast),
     _graphView(graphView),
     _graphMetadata(graphView.metadata()),
-    _exprAnalyzer(std::make_unique<ExprAnalyzer>(_ast, _graphView)),
+    _exprAnalyzer(std::make_unique<ExprAnalyzer>(_ast, _graphView, parameters)),
     _readAnalyzer(std::make_unique<ReadStmtAnalyzer>(_ast, _graphView)),
     _writeAnalyzer(std::make_unique<WriteStmtAnalyzer>(_ast, _graphView))
 {
@@ -125,15 +174,9 @@ void CypherAnalyzer::analyze() {
 
         switch (query->getKind()) {
             case QueryCommand::Kind::SINGLE_PART_QUERY:
-                analyze(static_cast<const SinglePartQuery*>(query));
-            break;
-
             case QueryCommand::Kind::UNION_QUERY:
-                analyze(static_cast<const UnionQuery*>(query));
-            break;
-
             case QueryCommand::Kind::CONDITIONAL_QUERY:
-                analyze(static_cast<const ConditionalQuery*>(query));
+                analyzeTopLevelQuery(static_cast<RegularQuery*>(query));
             break;
 
             case QueryCommand::Kind::LOAD_GRAPH_QUERY:
@@ -211,6 +254,18 @@ void CypherAnalyzer::analyze(const SinglePartQuery* query) {
     analyzeQueryBody(query, /*returnRequired=*/true);
 }
 
+// The branches of a UNION or a WHEN fill one result, whose columns the code generator
+// binds to the declarations the first RETURN publishes
+void CypherAnalyzer::analyzeTopLevelQuery(RegularQuery* query) {
+    std::vector<DeclContext*> returnScopes;
+    analyzeSubqueryBody(query, {}, BranchImports::SCOPE_CLAUSE, returnScopes);
+
+    const bool composite = query->getKind() != QueryCommand::Kind::SINGLE_PART_QUERY;
+    if (composite && query->isReturning()) {
+        publishBranchReturns(query, DeclContext::create(_ast, _ctxt));
+    }
+}
+
 void CypherAnalyzer::analyzeQueryBody(const SinglePartQuery* query, bool returnRequired) {
     const StmtContainer* stmts = query->getStmts();
     const ReturnStmt* returnStmt = query->getReturnStmt();
@@ -279,27 +334,7 @@ void CypherAnalyzer::analyzeQueryBody(const SinglePartQuery* query, bool returnR
     analyzeShortestPathReturn(query);
 }
 
-void CypherAnalyzer::analyze(const UnionQuery* query) {
-    const UnionQuery::Branches& branches = query->branches();
-
-    // Each branch is a query body of its own: it declares its own variables, so the scope
-    // is opened fresh for it, exactly as a WITH opens one
-    for (const UnionQuery::Branch& branch : branches) {
-        _ctxt = branch._query->getDeclContext();
-
-        _exprAnalyzer->setDeclContext(_ctxt);
-        _readAnalyzer->setDeclContext(_ctxt);
-        _writeAnalyzer->setDeclContext(_ctxt);
-
-        analyze(branch._query);
-    }
-
-    for (size_t index = 1; index < branches.size(); index++) {
-        analyzeUnionColumns(branches.front()._query, branches[index]._query);
-    }
-}
-
-void CypherAnalyzer::analyzeUnionColumns(const SinglePartQuery* first, const SinglePartQuery* branch) const {
+void CypherAnalyzer::analyzeUnionColumns(const RegularQuery* first, const RegularQuery* branch) const {
     std::vector<std::string_view> firstNames;
     collectProjectionNames(unionBranchProjection(first), firstNames);
 
@@ -309,14 +344,14 @@ void CypherAnalyzer::analyzeUnionColumns(const SinglePartQuery* first, const Sin
     throwOnDifferentColumns("All sub-queries of a UNION", firstNames, names, branch);
 }
 
-void CypherAnalyzer::analyzeConditionalColumns(const SinglePartQuery* first, const SinglePartQuery* branch) const {
+void CypherAnalyzer::analyzeConditionalColumns(const RegularQuery* first, const RegularQuery* branch) const {
     std::vector<std::string_view> firstNames;
-    if (const ReturnStmt* firstReturn = first->getReturnStmt()) {
+    if (const ReturnStmt* firstReturn = first->getFirstSingleQuery()->getReturnStmt()) {
         collectProjectionNames(firstReturn->getProjection(), firstNames);
     }
 
     std::vector<std::string_view> names;
-    if (const ReturnStmt* branchReturn = branch->getReturnStmt()) {
+    if (const ReturnStmt* branchReturn = branch->getFirstSingleQuery()->getReturnStmt()) {
         collectProjectionNames(branchReturn->getProjection(), names);
     }
 
@@ -326,7 +361,7 @@ void CypherAnalyzer::analyzeConditionalColumns(const SinglePartQuery* first, con
 void CypherAnalyzer::throwOnDifferentColumns(std::string_view branches,
                                              std::span<const std::string_view> firstNames,
                                              std::span<const std::string_view> names,
-                                             const SinglePartQuery* branch) const {
+                                             const RegularQuery* branch) const {
     if (names.size() != firstNames.size()) {
         throwError(fmt::format("{} must return the same number of columns: "
                                "this one returns {} where the first returns {}",
@@ -351,8 +386,8 @@ void CypherAnalyzer::throwOnDifferentColumns(std::string_view branches,
 
 // The union emits one result table, so each branch has to say which columns it fills it
 // with. A branch ending on a write or on a standalone CALL names none.
-const Projection* CypherAnalyzer::unionBranchProjection(const SinglePartQuery* branch) const {
-    const ReturnStmt* returnStmt = branch->getReturnStmt();
+const Projection* CypherAnalyzer::unionBranchProjection(const RegularQuery* branch) const {
+    const ReturnStmt* returnStmt = branch->getFirstSingleQuery()->getReturnStmt();
     if (!returnStmt) {
         throwError("Every sub-query of a UNION must end with a RETURN clause", branch);
     }
@@ -409,7 +444,7 @@ void CypherAnalyzer::analyze(WithStmt* withSt) {
     analyzeWithAliases(projection);
     analyzeProjection(projection, withSt);
 
-    openWithScope(projection);
+    openWithScope(withSt);
 
     const WhereClause* where = withSt->getWhere();
     if (!where) {
@@ -445,10 +480,17 @@ void CypherAnalyzer::analyze(WithStmt* withSt) {
 
 // The names a WITH gives its columns are the whole scope of what follows, so a statement
 // after the barrier resolves its items and nothing the projection dropped
-void CypherAnalyzer::openWithScope(Projection* projection) {
+void CypherAnalyzer::openWithScope(WithStmt* withSt) {
     DeclContext* scope = DeclContext::create(_ast, _ctxt);
 
-    publishProjection(projection, scope);
+    publishProjection(withSt->getProjection(), scope);
+
+    std::vector<const VarDecl*> redeclared;
+    redeclareDroppedImports(scope, redeclared);
+
+    for (const VarDecl* decl : redeclared) {
+        withSt->addRedeclaredImport(decl);
+    }
 
     setScope(scope);
 }
@@ -458,7 +500,7 @@ void CypherAnalyzer::publishProjection(Projection* projection, DeclContext* scop
         if (const auto* declPtr = std::get_if<VarDecl*>(&returnItem)) {
             const VarDecl* decl = *declPtr;
             VarDecl* published = scope->getOrCreateNamedVariable(_ast, decl->getType(), decl->getName());
-            published->setListShape(decl->getListShape());
+            published->setExprType(decl->getExprType());
             published->setIsQuantifiedPath(decl->isQuantifiedPath());
             projection->addPublishedDecl(published);
 
@@ -478,7 +520,7 @@ void CypherAnalyzer::publishProjection(Projection* projection, DeclContext* scop
         const VarDecl* itemDecl = item->getExprVarDecl();
 
         VarDecl* published = scope->getOrCreateNamedVariable(_ast, item->getType(), *name);
-        published->setListShape(item->getListShape());
+        published->setExprType(item->getExprType());
         published->setIsQuantifiedPath(itemDecl && itemDecl->isQuantifiedPath());
         projection->addPublishedDecl(published);
 
@@ -494,22 +536,14 @@ void CypherAnalyzer::setScope(DeclContext* scope) {
 }
 
 void CypherAnalyzer::analyze(CallSubqueryStmt* subquery) {
-    CallSubqueryStmt::Branches& branches = subquery->branches();
-    const bool hasScopeClause = subquery->hasScopeClause();
-
     if (subquery->importsEverything()) {
         importEveryVariable(subquery);
     }
 
-    for (CallSubqueryStmt::Branch& branch : branches) {
-        if (!hasScopeClause) {
-            importThroughLeadingWith(branch);
-        }
+    const BranchImports mode = subquery->hasScopeClause() ? BranchImports::SCOPE_CLAUSE : BranchImports::LEADING_WITH;
 
-        analyzeSubqueryBranch(branch, hasScopeClause ? BranchImports::SCOPE_CLAUSE : BranchImports::LEADING_WITH);
-    }
-
-    analyzeBranchColumns(subquery);
+    std::vector<DeclContext*> returnScopes;
+    analyzeSubqueryBody(subquery->getBody(), subquery->getImports(), mode, returnScopes);
 
     if (subquery->isReturning()) {
         publishSubqueryReturn(subquery);
@@ -517,114 +551,93 @@ void CypherAnalyzer::analyze(CallSubqueryStmt* subquery) {
 }
 
 void CypherAnalyzer::analyze(NextSegmentStmt* segment) {
-    CallSubqueryStmt* body = segment->getBody();
+    CallSubqueryStmt* call = segment->getBody();
+    RegularQuery* body = call->getBody();
 
-    importEveryVariable(body);
+    importEveryVariable(call);
 
     std::vector<DeclContext*> returnScopes;
-    for (CallSubqueryStmt::Branch& branch : body->branches()) {
-        returnScopes.push_back(analyzeSubqueryBranch(branch, BranchImports::NEXT_SEGMENT));
-    }
-
-    analyzeBranchColumns(body);
+    analyzeSubqueryBody(body, call->getImports(), BranchImports::NEXT_SEGMENT, returnScopes);
 
     DeclContext* scope = DeclContext::create(_ast, _ctxt);
 
     if (body->isReturning()) {
-        carrySegmentImports(body, returnScopes);
         publishBranchReturns(body, scope);
-    } else {
-        for (const std::string_view import : _subqueryImports) {
-            const VarDecl* decl = _ctxt->getDecl(import);
-            if (!decl) {
-                continue;
-            }
+    }
 
-            VarDecl* carried = scope->getOrCreateNamedVariable(_ast, decl->getType(), import);
-            carried->setListShape(decl->getListShape());
-            carried->setIsQuantifiedPath(decl->isQuantifiedPath());
-            _declSources[carried] = decl;
+    std::vector<const VarDecl*> redeclared;
+    redeclareDroppedImports(scope, redeclared);
 
-            segment->addCarriedImport(carried);
-        }
+    for (const VarDecl* decl : redeclared) {
+        segment->addRedeclaredImport(decl);
     }
 
     setScope(scope);
 }
 
-// The branches return one table, so either every one of them carries the imports of the
-// CALL around the segment or none does
-void CypherAnalyzer::carrySegmentImports(const CallSubqueryStmt* body, std::span<DeclContext* const> returnScopes) {
-    const CallSubqueryStmt::Branches& branches = body->branches();
+void CypherAnalyzer::analyzeSubqueryBody(RegularQuery* body,
+                                         std::span<const Symbol* const> imports,
+                                         BranchImports mode,
+                                         std::vector<DeclContext*>& returnScopes) {
+    const QueryCommand::Kind kind = body->getKind();
 
-    if (_subqueryImports.empty()) {
-        return;
-    }
+    if (kind == QueryCommand::Kind::SINGLE_PART_QUERY) {
+        SinglePartQuery* query = static_cast<SinglePartQuery*>(body);
 
-    // A keyless aggregate, or a WITH of the branch that dropped an import, stops the imports
-    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
-        const ReturnStmt* returnStmt = branches[branchIndex]._query->getReturnStmt();
-        const Projection* projection = returnStmt->getProjection();
-        const DeclContext* returnScope = returnScopes[branchIndex];
+        if (mode == BranchImports::LEADING_WITH) {
+            CallSubqueryStmt::Imports leadingImports;
+            importThroughLeadingWith(query, leadingImports);
 
-        const bool keyless = projection->isAggregate() && !projection->hasGroupingKeys();
-        const auto dropped = [returnScope](std::string_view import) {
-            return !returnScope->getDecl(import);
-        };
-
-        if (keyless || std::ranges::any_of(_subqueryImports, dropped)) {
-            return;
-        }
-    }
-
-    DeclContext* const outer = _ctxt;
-
-    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
-        ReturnStmt* returnStmt = branches[branchIndex]._query->getReturnStmt();
-        Projection* projection = returnStmt->getProjection();
-
-        setScope(returnScopes[branchIndex]);
-        carrySubqueryImports(projection, projection->isAggregate(), projection->hasGroupingKeys());
-    }
-
-    setScope(outer);
-}
-
-void CypherAnalyzer::analyzeBranchColumns(const CallSubqueryStmt* subquery) const {
-    const CallSubqueryStmt::Branches& branches = subquery->branches();
-    const bool conditional = subquery->isConditional();
-
-    for (size_t index = 1; index < branches.size(); index++) {
-        if (conditional) {
-            analyzeConditionalColumns(branches.front()._query, branches[index]._query);
+            returnScopes.push_back(analyzeSubqueryBranch(query, leadingImports, mode));
         } else {
+            returnScopes.push_back(analyzeSubqueryBranch(query, imports, mode));
+        }
+    } else if (kind == QueryCommand::Kind::UNION_QUERY) {
+        const UnionQuery::Branches& branches = static_cast<const UnionQuery*>(body)->branches();
+
+        for (const UnionQuery::Branch& branch : branches) {
+            analyzeSubqueryBody(branch._query, imports, mode, returnScopes);
+        }
+
+        for (size_t index = 1; index < branches.size(); index++) {
             analyzeUnionColumns(branches.front()._query, branches[index]._query);
         }
+    } else {
+        ConditionalQuery* conditional = static_cast<ConditionalQuery*>(body);
+        const ConditionalQuery::Branches& branches = conditional->branches();
+
+        analyzeConditionalPredicates(conditional, imports, mode);
+
+        for (const ConditionalQuery::Branch& branch : branches) {
+            analyzeSubqueryBody(branch._query, imports, mode, returnScopes);
+        }
+
+        for (size_t index = 1; index < branches.size(); index++) {
+            analyzeConditionalColumns(branches.front()._query, branches[index]._query);
+        }
     }
 }
 
-DeclContext* CypherAnalyzer::analyzeSubqueryBranch(CallSubqueryStmt::Branch& branch, BranchImports imports) {
+DeclContext* CypherAnalyzer::analyzeSubqueryBranch(SinglePartQuery* query,
+                                                   std::span<const Symbol* const> imports,
+                                                   BranchImports mode) {
     // The body reads the imported variables and nothing else of the scope around it, so
     // its context is seeded with a declaration per import and the body resolves in that
-    const SinglePartQuery* body = branch._query;
     DeclContext* const outer = _ctxt;
-    DeclContext* const inner = body->getDeclContext();
+    DeclContext* const inner = query->getDeclContext();
 
-    const bool predicateReadsImports = imports != BranchImports::LEADING_WITH;
-    const bool keepsEnclosingImports = imports == BranchImports::NEXT_SEGMENT;
+    importIntoQuery(query, imports, outer, inner);
 
     // What the scope clause names is readable everywhere in the body. A body importing
     // through a leading WITH carries nothing this way: that WITH is an ordinary
     // projection, and an ordinary WITH below it descopes what it does not project. Nor
     // does a segment, whose WITH reads the whole table and groups it on its own keys.
-    std::vector<std::string_view> outerImports;
-    if (predicateReadsImports) {
-        importIntoBranch(branch, outer, inner);
-    }
+    const bool keepsEnclosingImports = mode == BranchImports::NEXT_SEGMENT;
 
-    if (imports == BranchImports::SCOPE_CLAUSE) {
-        for (const Symbol* import : branch._imports) {
-            outerImports.push_back(import->getName());
+    std::vector<VarDecl*> outerImports;
+    if (mode == BranchImports::SCOPE_CLAUSE) {
+        for (const Symbol* import : imports) {
+            outerImports.push_back(inner->getDecl(import->getName()));
         }
     }
 
@@ -634,26 +647,7 @@ DeclContext* CypherAnalyzer::analyzeSubqueryBranch(CallSubqueryStmt::Branch& bra
 
     setScope(inner);
 
-    if (Expr* predicate = branch._condition) {
-        _exprAnalyzer->analyzeRootExpr(predicate);
-
-        if (predicate->isAggregate()) {
-            throwError("Invalid use of aggregate expression in this context", predicate);
-        }
-
-        const EvaluatedType predicateType = predicate->getType();
-        if (!namesATruthValue(predicateType)) {
-            throwError("WHEN predicate must be a boolean", predicate);
-        }
-    }
-
-    // A leading WITH runs only once the WHEN predicate has picked its branch, so the
-    // predicate does not read what that WITH imports
-    if (!predicateReadsImports) {
-        importIntoBranch(branch, outer, inner);
-    }
-
-    analyze(body);
+    analyze(query);
 
     if (!keepsEnclosingImports) {
         std::swap(_subqueryImports, outerImports);
@@ -665,10 +659,50 @@ DeclContext* CypherAnalyzer::analyzeSubqueryBranch(CallSubqueryStmt::Branch& bra
     return returnScope;
 }
 
-void CypherAnalyzer::importIntoBranch(CallSubqueryStmt::Branch& branch, DeclContext* outer, DeclContext* inner) {
-    branch._importDecls.clear();
+// A predicate reads the row the WHEN runs for. Under a leading WITH it reads none of it:
+// that WITH runs only once the predicate has picked its branch.
+void CypherAnalyzer::analyzeConditionalPredicates(ConditionalQuery* conditional,
+                                                  std::span<const Symbol* const> imports,
+                                                  BranchImports mode) {
+    DeclContext* const outer = _ctxt;
+    DeclContext* const inner = conditional->getDeclContext();
 
-    for (const Symbol* import : branch._imports) {
+    if (mode != BranchImports::LEADING_WITH) {
+        importIntoQuery(conditional, imports, outer, inner);
+    }
+
+    setScope(inner);
+    analyzePredicates(conditional);
+    setScope(outer);
+}
+
+void CypherAnalyzer::analyzePredicates(const ConditionalQuery* conditional) {
+    for (const ConditionalQuery::Branch& branch : conditional->branches()) {
+        Expr* predicate = branch._condition;
+        if (!predicate) {
+            continue;
+        }
+
+        _exprAnalyzer->analyzeRootExpr(predicate);
+
+        if (predicate->isAggregate()) {
+            throwError("Invalid use of aggregate expression in this context", predicate);
+        }
+
+        const EvaluatedType predicateType = predicate->getType();
+        if (!namesATruthValue(predicateType)) {
+            throwError("WHEN predicate must be a boolean", predicate);
+        }
+    }
+}
+
+void CypherAnalyzer::importIntoQuery(RegularQuery* query,
+                                     std::span<const Symbol* const> imports,
+                                     DeclContext* outer,
+                                     DeclContext* inner) {
+    query->clearImportDecls();
+
+    for (const Symbol* import : imports) {
         const std::string_view name = import->getName();
 
         const VarDecl* decl = outer->getDecl(name);
@@ -677,26 +711,20 @@ void CypherAnalyzer::importIntoBranch(CallSubqueryStmt::Branch& branch, DeclCont
         }
 
         VarDecl* imported = inner->getOrCreateNamedVariable(_ast, decl->getType(), name);
-        imported->setListShape(decl->getListShape());
+        imported->setExprType(decl->getExprType());
         imported->setIsQuantifiedPath(decl->isQuantifiedPath());
         _declSources[imported] = decl;
         _exprAnalyzer->importCSVSource(imported, decl);
 
-        branch._importDecls.push_back(imported);
+        query->addImportDecl(imported);
     }
 }
 
-void CypherAnalyzer::analyze(const ConditionalQuery* query) {
-    analyze(query->getBody());
-}
-
 void CypherAnalyzer::analyzeExistsBody(ExistsExpr* exists) {
-    const ExistsExpr::Branches& branches = exists->branches();
+    RegularQuery* body = exists->getBody();
 
-    for (const SinglePartQuery* branch : branches) {
-        if (branch->writesToTheGraph()) {
-            throwError("An EXISTS subquery is read-only: its body cannot write to the graph", exists);
-        }
+    if (body->writesToTheGraph()) {
+        throwError("An EXISTS subquery is read-only: its body cannot write to the graph", exists);
     }
 
     if (const Pattern* predicatePattern = exists->getPredicatePattern()) {
@@ -708,78 +736,101 @@ void CypherAnalyzer::analyzeExistsBody(ExistsExpr* exists) {
         throwOnPatternPredicateVariable(predicatePattern, _ctxt);
     }
 
-    for (const SinglePartQuery* branch : branches) {
-        analyzeExistsBranch(branch);
-    }
-
     // A branch needs no RETURN here, but one that has it names the union's columns
-    const auto hasReturn = [](const SinglePartQuery* branch) {
-        return branch->getReturnStmt() != nullptr;
-    };
-
-    const bool namesColumns = std::ranges::any_of(branches, hasReturn);
-    if (namesColumns) {
-        for (size_t index = 1; index < branches.size(); index++) {
-            analyzeUnionColumns(branches.front(), branches[index]);
-        }
-    }
+    analyzeCorrelatedBody(body, /*dedupNamesColumns=*/false);
 }
 
 void CypherAnalyzer::analyzeCountSubqueryBody(CountSubqueryExpr* count) {
-    const CountSubqueryExpr::Branches& branches = count->getBranches();
+    RegularQuery* body = count->getBody();
 
-    for (const UnionQuery::Branch& branch : branches) {
-        if (branch._query->writesToTheGraph()) {
-            throwError("A COUNT subquery is read-only: its body cannot write to the graph", count);
-        }
-    }
-
-    for (const UnionQuery::Branch& branch : branches) {
-        analyzeExistsBranch(branch._query);
+    if (body->writesToTheGraph()) {
+        throwError("A COUNT subquery is read-only: its body cannot write to the graph", count);
     }
 
     // A UNION dedups the rows it counts on the columns they return, so it needs them named
-    const auto hasReturn = [](const UnionQuery::Branch& branch) {
-        return branch._query->getReturnStmt() != nullptr;
-    };
-
-    const bool namesColumns = UnionQuery::getDedupedBranchCount(branches) > 0 || std::ranges::any_of(branches, hasReturn);
-    if (namesColumns) {
-        for (size_t index = 1; index < branches.size(); index++) {
-            analyzeUnionColumns(branches.front()._query, branches[index]._query);
-        }
-    }
+    analyzeCorrelatedBody(body, /*dedupNamesColumns=*/true);
 }
 
 void CypherAnalyzer::analyzeCollectSubqueryBody(CollectSubqueryExpr* collect) {
-    const CollectSubqueryExpr::Branches& branches = collect->getBranches();
+    RegularQuery* body = collect->getBody();
 
-    for (const UnionQuery::Branch& branch : branches) {
-        if (branch._query->writesToTheGraph()) {
-            throwError("A COLLECT subquery is read-only: its body cannot write to the graph", collect);
-        }
+    if (body->writesToTheGraph()) {
+        throwError("A COLLECT subquery is read-only: its body cannot write to the graph", collect);
     }
 
-    for (const UnionQuery::Branch& branch : branches) {
-        analyzeExistsBranch(branch._query);
-    }
+    std::vector<const SinglePartQuery*> queries;
+    RegularQuery::collectSingleQueries(body, queries);
 
-    for (const UnionQuery::Branch& branch : branches) {
-        const ReturnStmt* returnStmt = branch._query->getReturnStmt();
+    for (const SinglePartQuery* query : queries) {
+        const ReturnStmt* returnStmt = query->getReturnStmt();
         if (!returnStmt) {
-            throwError("A COLLECT subquery must end with a RETURN clause", branch._query);
+            throwError("A COLLECT subquery must end with a RETURN clause", query);
         }
 
         const size_t columnCount = returnStmt->getProjection()->items().size();
         if (columnCount != 1) {
             throwError(fmt::format("A COLLECT subquery must return exactly one column, not {}", columnCount),
-                       branch._query);
+                       query);
         }
     }
 
-    for (size_t index = 1; index < branches.size(); index++) {
-        analyzeUnionColumns(branches.front()._query, branches[index]._query);
+    analyzeCorrelatedBody(body, /*dedupNamesColumns=*/true);
+}
+
+void CypherAnalyzer::analyzeCorrelatedBody(RegularQuery* body, bool dedupNamesColumns) {
+    const QueryCommand::Kind kind = body->getKind();
+
+    if (kind == QueryCommand::Kind::SINGLE_PART_QUERY) {
+        analyzeExistsBranch(static_cast<const SinglePartQuery*>(body));
+    } else if (kind == QueryCommand::Kind::UNION_QUERY) {
+        const UnionQuery* unionQuery = static_cast<const UnionQuery*>(body);
+        const UnionQuery::Branches& branches = unionQuery->branches();
+
+        for (const UnionQuery::Branch& branch : branches) {
+            analyzeCorrelatedBody(branch._query, dedupNamesColumns);
+        }
+
+        const auto hasReturn = [](const UnionQuery::Branch& branch) {
+            return branch._query->isReturning();
+        };
+
+        const bool dedupNames = dedupNamesColumns && unionQuery->getDedupedBranchCount() > 0;
+        const bool namesColumns = dedupNames || std::ranges::any_of(branches, hasReturn);
+        if (namesColumns) {
+            for (size_t index = 1; index < branches.size(); index++) {
+                analyzeUnionColumns(branches.front()._query, branches[index]._query);
+            }
+        }
+    } else {
+        ConditionalQuery* conditional = static_cast<ConditionalQuery*>(body);
+        const ConditionalQuery::Branches& branches = conditional->branches();
+
+        analyzeCorrelatedPredicates(conditional);
+
+        for (const ConditionalQuery::Branch& branch : branches) {
+            analyzeCorrelatedBody(branch._query, dedupNamesColumns);
+        }
+
+        for (size_t index = 1; index < branches.size(); index++) {
+            analyzeConditionalColumns(branches.front()._query, branches[index]._query);
+        }
     }
+}
+
+void CypherAnalyzer::analyzeCorrelatedPredicates(ConditionalQuery* conditional) {
+    if (!_analyzedBodies.insert(conditional).second) {
+        return;
+    }
+
+    DeclContext* const outer = _ctxt;
+    DeclContext* const inner = conditional->getDeclContext();
+
+    std::vector<VarDecl*> correlated;
+    importCorrelatedVariables(inner, correlated);
+
+    setScope(inner);
+    analyzePredicates(conditional);
+    setScope(outer);
 }
 
 void CypherAnalyzer::analyzeExistsBranch(const SinglePartQuery* body) {
@@ -787,25 +838,52 @@ void CypherAnalyzer::analyzeExistsBranch(const SinglePartQuery* body) {
         return;
     }
 
-    // EXISTS is correlated: the body reads every variable in flight, through declarations
-    // of its own, so the variables it binds stay inside it
     DeclContext* const outer = _ctxt;
     DeclContext* const inner = body->getDeclContext();
 
-    // Each one stays readable through the whole body, as what a CALL's scope clause names
-    // does: a WITH inside it carries them past the barrier rather than descoping them,
-    // which is what keeps a pattern below that WITH reading the row the EXISTS answers for
-    std::vector<std::string_view> correlated;
+    // Each variable in flight stays readable through the whole body, as what a CALL's scope
+    // clause names does: a WITH inside it carries them past the barrier rather than descoping
+    // them, which is what keeps a pattern below that WITH reading the row the EXISTS answers for
+    std::vector<VarDecl*> correlated;
+    importCorrelatedVariables(inner, correlated);
+
+    const Projection* const orderedProjection = std::exchange(_orderedProjection, nullptr);
+    DeclSet consumedVariables;
+
+    std::swap(_subqueryImports, correlated);
+    std::swap(_consumedVariables, consumedVariables);
+
+    setScope(inner);
+
+    analyzeQueryBody(body, /*returnRequired=*/false);
+
+    std::swap(_subqueryImports, correlated);
+    std::swap(_consumedVariables, consumedVariables);
+    _orderedProjection = orderedProjection;
+
+    // A RETURN answers for no column outside the body, but the code generator reads the
+    // declarations its items publish, so they are declared in a scope nothing else holds
+    if (const ReturnStmt* returnStmt = body->getReturnStmt()) {
+        publishProjection(returnStmt->getProjection(), DeclContext::create(_ast, inner));
+    }
+
+    setScope(outer);
+}
+
+// EXISTS is correlated: the body reads every variable in flight, through declarations of
+// its own, so the variables it binds stay inside it
+void CypherAnalyzer::importCorrelatedVariables(DeclContext* inner, std::vector<VarDecl*>& correlated) {
+    DeclContext* const outer = _ctxt;
 
     const auto importDecl = [this, inner, &correlated](std::string_view name, const VarDecl* decl) {
         VarDecl* imported = inner->getOrCreateNamedVariable(_ast, decl->getType(), name);
-        imported->setListShape(decl->getListShape());
+        imported->setExprType(decl->getExprType());
         imported->setIsQuantifiedPath(decl->isQuantifiedPath());
         imported->setImportSource(decl);
         _declSources[imported] = decl;
         _exprAnalyzer->importCSVSource(imported, decl);
 
-        correlated.push_back(name);
+        correlated.push_back(imported);
     };
 
     for (const VarDecl* decl : outer->decls()) {
@@ -866,28 +944,6 @@ void CypherAnalyzer::analyzeExistsBranch(const SinglePartQuery* body) {
             }
         }
     }
-
-    const Projection* const orderedProjection = std::exchange(_orderedProjection, nullptr);
-    DeclSet consumedVariables;
-
-    std::swap(_subqueryImports, correlated);
-    std::swap(_consumedVariables, consumedVariables);
-
-    setScope(inner);
-
-    analyzeQueryBody(body, /*returnRequired=*/false);
-
-    std::swap(_subqueryImports, correlated);
-    std::swap(_consumedVariables, consumedVariables);
-    _orderedProjection = orderedProjection;
-
-    // A RETURN answers for no column outside the body, but the code generator reads the
-    // declarations its items publish, so they are declared in a scope nothing else holds
-    if (const ReturnStmt* returnStmt = body->getReturnStmt()) {
-        publishProjection(returnStmt->getProjection(), DeclContext::create(_ast, inner));
-    }
-
-    setScope(outer);
 }
 
 void CypherAnalyzer::throwOnPatternPredicateVariable(const Pattern* pattern, const DeclContext* outer) const {
@@ -921,8 +977,8 @@ void CypherAnalyzer::importEveryVariable(CallSubqueryStmt* subquery) const {
     }
 }
 
-void CypherAnalyzer::importThroughLeadingWith(CallSubqueryStmt::Branch& branch) const {
-    const StmtContainer* stmts = branch._query->getStmts();
+void CypherAnalyzer::importThroughLeadingWith(const SinglePartQuery* query, CallSubqueryStmt::Imports& imports) const {
+    const StmtContainer* stmts = query->getStmts();
     if (!stmts || stmts->stmts().empty()) {
         return;
     }
@@ -969,7 +1025,7 @@ void CypherAnalyzer::importThroughLeadingWith(CallSubqueryStmt::Branch& branch) 
                        with);
         }
 
-        branch._imports.push_back(static_cast<const SymbolExpr*>(item)->getSymbol());
+        imports.push_back(static_cast<const SymbolExpr*>(item)->getSymbol());
     }
 }
 
@@ -989,7 +1045,8 @@ bool CypherAnalyzer::carrySubqueryImports(Projection* projection,
 
     bool carried = false;
 
-    for (const std::string_view import : _subqueryImports) {
+    for (const VarDecl* importDecl : _subqueryImports) {
+        const std::string_view import = importDecl->getName();
         VarDecl* decl = _ctxt->getDecl(import);
         if (!decl) {
             continue;
@@ -1007,6 +1064,15 @@ bool CypherAnalyzer::carrySubqueryImports(Projection* projection,
     }
 
     return carried;
+}
+
+void CypherAnalyzer::redeclareDroppedImports(DeclContext* scope, std::vector<const VarDecl*>& redeclared) const {
+    for (VarDecl* importDecl : _subqueryImports) {
+        if (!scope->getDecl(importDecl->getName())) {
+            scope->redeclare(importDecl);
+            redeclared.push_back(importDecl);
+        }
+    }
 }
 
 void CypherAnalyzer::throwOnRedeclaredImport(const Projection* projection,
@@ -1044,8 +1110,8 @@ void CypherAnalyzer::throwOnRedeclaredImport(const Projection* projection,
 }
 
 void CypherAnalyzer::publishSubqueryReturn(const CallSubqueryStmt* subquery) {
-    const CallSubqueryStmt::Branches& branches = subquery->branches();
-    const ReturnStmt* returnStmt = branches.front()._query->getReturnStmt();
+    RegularQuery* body = subquery->getBody();
+    const ReturnStmt* returnStmt = body->getFirstSingleQuery()->getReturnStmt();
     Projection* projection = returnStmt->getProjection();
 
     for (const Projection::ReturnItem& returnItem : projection->items()) {
@@ -1066,25 +1132,26 @@ void CypherAnalyzer::publishSubqueryReturn(const CallSubqueryStmt* subquery) {
         }
     }
 
-    publishBranchReturns(subquery, _ctxt);
+    publishBranchReturns(body, _ctxt);
 }
 
-void CypherAnalyzer::publishBranchReturns(const CallSubqueryStmt* subquery, DeclContext* scope) {
-    const CallSubqueryStmt::Branches& branches = subquery->branches();
-    ReturnStmt* returnStmt = branches.front()._query->getReturnStmt();
-    Projection* projection = returnStmt->getProjection();
+void CypherAnalyzer::publishBranchReturns(RegularQuery* body, DeclContext* scope) {
+    std::vector<SinglePartQuery*> branches;
+    RegularQuery::collectSingleQueries(body, branches);
+
+    Projection* projection = branches.front()->getReturnStmt()->getProjection();
 
     publishProjection(projection, scope);
 
     for (size_t branchIndex = 1; branchIndex < branches.size(); branchIndex++) {
-        Projection* branchProjection = branches[branchIndex]._query->getReturnStmt()->getProjection();
+        Projection* branchProjection = branches[branchIndex]->getReturnStmt()->getProjection();
         publishUnionBranchReturn(branchProjection, projection);
     }
 }
 
 // Every branch of a union publishes its columns under the declarations the first one
-// made. A branch returning null says nothing about what the column holds, so the first
-// branch returning something else types the declaration.
+// made, typed by every branch: a null says nothing about what the column holds, and
+// branches of different types leave each row its own, as the branches of a CASE do.
 void CypherAnalyzer::publishUnionBranchReturn(Projection* branchProjection, const Projection* firstProjection) {
     const Projection::PublishedDecls& published = firstProjection->publishedDecls();
 
@@ -1092,23 +1159,37 @@ void CypherAnalyzer::publishUnionBranchReturn(Projection* branchProjection, cons
     for (const Projection::ReturnItem& returnItem : branchProjection->items()) {
         VarDecl* decl = published[index];
 
-        EvaluatedType itemType = EvaluatedType::Invalid;
-        const ListShape* itemShape = nullptr;
+        const ExprType* itemType = nullptr;
+        EvaluatedType itemCommonType = EvaluatedType::Invalid;
 
         if (const auto* declPtr = std::get_if<VarDecl*>(&returnItem)) {
-            itemType = (*declPtr)->getType();
-            itemShape = &(*declPtr)->getListShape();
+            itemType = &(*declPtr)->getExprType();
+            itemCommonType = (*declPtr)->getCommonType();
         } else {
             const Expr* item = std::get<Expr*>(returnItem);
-            itemType = item->getType();
-            itemShape = &item->getListShape();
+            itemType = &item->getExprType();
+            itemCommonType = item->getCommonType();
         }
 
-        const bool typesTheColumn = decl->getType() == EvaluatedType::Null && itemType != EvaluatedType::Null;
-        if (typesTheColumn) {
-            decl->setType(itemType);
-            decl->setListShape(*itemShape);
+        const EvaluatedType columnType = decl->getType();
+
+        const EvaluatedType selected = selectedType(columnType, itemType->_type);
+        ExprType column {selected};
+
+        if (selected == EvaluatedType::Invalid) {
+            throwError(fmt::format("Column '{}' cannot hold both '{}' and '{}' values",
+                                   decl->getName(),
+                                   EvaluatedTypeName::value(columnType),
+                                   EvaluatedTypeName::value(itemType->_type)),
+                       branchProjection);
         }
+
+        const ListShape columnShape = ListShape::selected(columnType, decl->getListShape());
+        const ListShape itemListShape = ListShape::selected(itemType->_type, itemType->_shape);
+
+        column._shape = selected == EvaluatedType::List ? ListShape::unified(columnShape, itemListShape) : ListShape();
+        column._commonType = commonType(decl->getCommonType(), itemCommonType);
+        decl->setExprType(column);
 
         branchProjection->addPublishedDecl(decl);
         index++;
@@ -1222,12 +1303,8 @@ void CypherAnalyzer::analyzeProjection(Projection* projection, const Stmt* claus
         std::swap(_consumedVariables, consumedVariables);
         _orderedProjection = outerOrderedProjection;
 
-        // An aggregate in the ORDER BY aggregates the projection as an aggregate item
-        // would - RETURN a.name ORDER BY count(b) orders one row per name - so the items
-        // beside it are the grouping keys, and a projection of nothing but keys is
-        // aggregating after all
-        for (const OrderByItem* item : projection->getOrderBy()->getItems()) {
-            isAggregate |= item->getExpr()->isAggregate();
+        if (!isAggregate) {
+            throwOnOrderByAggregate(projection, clause);
         }
     }
 
@@ -1303,7 +1380,7 @@ void CypherAnalyzer::declareItemAlias(Expr* item, std::string_view alias) {
 
     const bool rebindsAnImport = declared
                                  && declared != aliasedDecl
-                                 && std::ranges::find(_subqueryImports, alias) != _subqueryImports.end();
+                                 && std::ranges::find(_subqueryImports, alias, &VarDecl::getName) != _subqueryImports.end();
 
     if (rebindsAnImport) {
         throwError(fmt::format("Variable '{}' is imported by the subquery: a clause of the subquery "
@@ -1355,6 +1432,21 @@ void CypherAnalyzer::analyzeAggregateOrderBy(const Projection* projection) const
     }
 }
 
+void CypherAnalyzer::throwOnOrderByAggregate(const Projection* projection, const Stmt* clause) const {
+    const std::string_view clauseName = clause->getKind() == Stmt::Kind::WITH ? "WITH" : "RETURN";
+
+    for (const OrderByItem* item : projection->getOrderBy()->getItems()) {
+        const Expr* keyExpr = item->getExpr();
+
+        if (keyExpr->isAggregate()) {
+            throwError(fmt::format("Cannot use aggregation in ORDER BY if there are no aggregate "
+                                   "expressions in the preceding {}",
+                                   clauseName),
+                       keyExpr);
+        }
+    }
+}
+
 void CypherAnalyzer::analyzeAggregateItems(const Projection* projection) const {
     for (const Projection::ReturnItem& returnItem : projection->items()) {
         const auto* exprPtr = std::get_if<Expr*>(&returnItem);
@@ -1379,26 +1471,11 @@ void CypherAnalyzer::throwOnImplicitGroupingKey(const Expr* expr,
         return;
     }
 
-    const ListComprehensionExpr* comprehension = nullptr;
-    const ReduceExpr* reduce = nullptr;
-    if (expr->getKind() == Expr::Kind::LIST_COMPREHENSION) {
-        comprehension = static_cast<const ListComprehensionExpr*>(expr);
-    } else if (expr->getKind() == Expr::Kind::REDUCE) {
-        reduce = static_cast<const ReduceExpr*>(expr);
-    }
-
+    std::vector<const VarDecl*> elementDecls;
     for (const Expr* child : children) {
-        const bool readsTheElement = comprehension && child != comprehension->getSource();
-        const VarDecl* elementDecl = readsTheElement ? comprehension->getDecl() : nullptr;
-        if (readsTheElement) {
-            elements.insert(elementDecl);
-        }
-
-        const bool readsTheAccumulator = reduce && child == reduce->getExpression();
-        if (readsTheAccumulator) {
-            elements.insert(reduce->getItemDecl());
-            elements.insert(reduce->getAccumulatorDecl());
-        }
+        elementDecls.clear();
+        collectElementDecls(expr, child, elementDecls);
+        elements.insert(elementDecls.begin(), elementDecls.end());
 
         if (child->isAggregate()) {
             throwOnImplicitGroupingKey(child, projection, elements);
@@ -1408,13 +1485,8 @@ void CypherAnalyzer::throwOnImplicitGroupingKey(const Expr* expr,
                        child);
         }
 
-        if (readsTheElement) {
-            elements.erase(elementDecl);
-        }
-
-        if (readsTheAccumulator) {
-            elements.erase(reduce->getItemDecl());
-            elements.erase(reduce->getAccumulatorDecl());
+        for (const VarDecl* decl : elementDecls) {
+            elements.erase(decl);
         }
     }
 }
@@ -1442,7 +1514,7 @@ bool CypherAnalyzer::isGroupWise(const Expr* expr,
 
     // An aggregate reduces its group to one value, which is what a group-wise key is: a
     // count of the group orders the groups whether or not the projection returns it
-    if (expr->isAggregate()) {
+    if (aggregateSignatureOf(expr)) {
         return true;
     }
 
@@ -1458,14 +1530,7 @@ bool CypherAnalyzer::isGroupWise(const Expr* expr,
         const PropertyExpr* property = static_cast<const PropertyExpr*>(expr);
         const VarDecl* const entityDecl = property->getEntityVarDecl();
 
-        const bool readsAComponentOfAReturnedProperty = property->readsAComponent()
-                                                     && projection->hasItemReadingThePropertyOfComponent(property);
-
-        if (readsAComponentOfAReturnedProperty) {
-            return true;
-        }
-
-        return elements.contains(entityDecl) || projection->hasVariableItem(entityDecl);
+        return elements.contains(entityDecl) || projection->hasItemDecl(entityDecl);
     } else if (kind == Expr::Kind::ENTITY_TYPES) {
         const EntityTypeExpr* entityType = static_cast<const EntityTypeExpr*>(expr);
 
@@ -1475,7 +1540,7 @@ bool CypherAnalyzer::isGroupWise(const Expr* expr,
 
         const VarDecl* const entityDecl = entityType->getEntityVarDecl();
 
-        return elements.contains(entityDecl) || projection->hasVariableItem(entityDecl);
+        return elements.contains(entityDecl) || projection->hasItemDecl(entityDecl);
     } else if (kind == Expr::Kind::SYMBOL) {
         // A returned variable, and the alias of a returned item, are both matched above:
         // a symbol reaching here names a variable the grouping consumed, unless a
@@ -1483,41 +1548,6 @@ bool CypherAnalyzer::isGroupWise(const Expr* expr,
         const SymbolExpr* symbol = static_cast<const SymbolExpr*>(expr);
 
         return elements.contains(symbol->getDecl());
-    } else if (kind == Expr::Kind::LIST_COMPREHENSION) {
-        const ListComprehensionExpr* comprehension = static_cast<const ListComprehensionExpr*>(expr);
-
-        if (!isGroupWise(comprehension->getSource(), projection, elements)) {
-            return false;
-        }
-
-        const VarDecl* const elementDecl = comprehension->getDecl();
-        elements.insert(elementDecl);
-
-        const bool predicateIsGroupWise = isGroupWise(comprehension->getPredicate(), projection, elements);
-        const bool projectionIsGroupWise = isGroupWise(comprehension->getProjection(), projection, elements);
-
-        elements.erase(elementDecl);
-
-        return predicateIsGroupWise && projectionIsGroupWise;
-    } else if (kind == Expr::Kind::REDUCE) {
-        const ReduceExpr* reduce = static_cast<const ReduceExpr*>(expr);
-
-        const bool operandsAreGroupWise = isGroupWise(reduce->getInitialValue(), projection, elements)
-                                       && isGroupWise(reduce->getSource(), projection, elements);
-
-        if (!operandsAreGroupWise) {
-            return false;
-        }
-
-        elements.insert(reduce->getItemDecl());
-        elements.insert(reduce->getAccumulatorDecl());
-
-        const bool expressionIsGroupWise = isGroupWise(reduce->getExpression(), projection, elements);
-
-        elements.erase(reduce->getItemDecl());
-        elements.erase(reduce->getAccumulatorDecl());
-
-        return expressionIsGroupWise;
     } else if (kind == Expr::Kind::PATTERN_COMPREHENSION) {
         const PatternComprehensionExpr* comprehension = static_cast<const PatternComprehensionExpr*>(expr);
 
@@ -1525,33 +1555,15 @@ bool CypherAnalyzer::isGroupWise(const Expr* expr,
     } else if (kind == Expr::Kind::COUNT_SUBQUERY) {
         const CountSubqueryExpr* count = static_cast<const CountSubqueryExpr*>(expr);
 
-        for (const UnionQuery::Branch& branch : count->getBranches()) {
-            if (!readsGroupWiseVariables(branch._query, projection, elements)) {
-                return false;
-            }
-        }
-
-        return true;
+        return readsGroupWiseVariables(count->getBody(), projection, elements);
     } else if (kind == Expr::Kind::COLLECT_SUBQUERY) {
         const CollectSubqueryExpr* collect = static_cast<const CollectSubqueryExpr*>(expr);
 
-        for (const UnionQuery::Branch& branch : collect->getBranches()) {
-            if (!readsGroupWiseVariables(branch._query, projection, elements)) {
-                return false;
-            }
-        }
-
-        return true;
+        return readsGroupWiseVariables(collect->getBody(), projection, elements);
     } else if (kind == Expr::Kind::EXISTS) {
         const ExistsExpr* exists = static_cast<const ExistsExpr*>(expr);
 
-        for (const SinglePartQuery* branch : exists->branches()) {
-            if (!readsGroupWiseVariables(branch, projection, elements)) {
-                return false;
-            }
-        }
-
-        return true;
+        return readsGroupWiseVariables(exists->getBody(), projection, elements);
     }
 
     std::vector<const Expr*> children;
@@ -1559,7 +1571,24 @@ bool CypherAnalyzer::isGroupWise(const Expr* expr,
         return false;
     }
 
-    return isGroupWise(children, projection, elements);
+    std::vector<const VarDecl*> elementDecls;
+    for (const Expr* child : children) {
+        elementDecls.clear();
+        collectElementDecls(expr, child, elementDecls);
+        elements.insert(elementDecls.begin(), elementDecls.end());
+
+        const bool childIsGroupWise = isGroupWise(child, projection, elements);
+
+        for (const VarDecl* decl : elementDecls) {
+            elements.erase(decl);
+        }
+
+        if (!childIsGroupWise) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 // A pattern comprehension reduces the matches of its pattern to one list, so it holds one
@@ -1609,7 +1638,7 @@ bool CypherAnalyzer::joinsGroupWiseVariables(const Pattern* pattern,
 
             const VarDecl* const decl = entity->getDecl();
 
-            if (!elements.contains(decl) && !projection->hasVariableItem(decl)) {
+            if (!elements.contains(decl) && !projection->hasItemDecl(decl)) {
                 return false;
             }
         }
@@ -1618,24 +1647,29 @@ bool CypherAnalyzer::joinsGroupWiseVariables(const Pattern* pattern,
     return true;
 }
 
-bool CypherAnalyzer::readsGroupWiseVariables(const SinglePartQuery* body,
+bool CypherAnalyzer::readsGroupWiseVariables(const RegularQuery* body,
                                              const Projection* projection,
                                              const DeclSet& elements) const {
     DeclSet read;
     collectReadDecls(read);
 
-    for (const VarDecl* decl : body->getDeclContext()->decls()) {
-        const auto sourceIt = _declSources.find(decl);
-        const bool readsAnImport = sourceIt != _declSources.end() && read.contains(decl);
+    std::vector<const RegularQuery*> queries;
+    RegularQuery::collectQueries(body, queries);
 
-        if (!readsAnImport) {
-            continue;
-        }
+    for (const RegularQuery* query : queries) {
+        for (const VarDecl* decl : query->getDeclContext()->decls()) {
+            const auto sourceIt = _declSources.find(decl);
+            const bool readsAnImport = sourceIt != _declSources.end() && read.contains(decl);
 
-        const VarDecl* source = sourceIt->second;
+            if (!readsAnImport) {
+                continue;
+            }
 
-        if (!elements.contains(source) && !projection->hasItemDecl(source)) {
-            return false;
+            const VarDecl* source = sourceIt->second;
+
+            if (!elements.contains(source) && !projection->hasItemDecl(source)) {
+                return false;
+            }
         }
     }
 
@@ -1677,18 +1711,6 @@ void CypherAnalyzer::collectReadDecls(DeclSet& read) const {
             pending.push_back(sourceIt->second);
         }
     }
-}
-
-bool CypherAnalyzer::isGroupWise(std::span<const Expr* const> exprs,
-                                 const Projection* projection,
-                                 DeclSet& elements) const {
-    for (const Expr* expr : exprs) {
-        if (!isGroupWise(expr, projection, elements)) {
-            return false;
-        }
-    }
-
-    return true;
 }
 
 void CypherAnalyzer::analyzeShortestPathReturn(const SinglePartQuery* query) const {
@@ -1841,28 +1863,16 @@ void CypherAnalyzer::analyze(const LoadGraphQuery* loadGraph) {
         throwError("LOAD GRAPH should not have an empty graph name");
     }
 
-    // Check that the graph name is only [A-Z0-9_]+
-    for (char c : graphName) {
-        if (!(isalnum(c) || c == '_')) [[unlikely]] {
-            throwError(fmt::format("Graph name must only contain alphanumeric characters or '_': character '{}' not allowed.", c), loadGraph);
-        }
-    }
+    throwIfInvalidGraphName(graphName, loadGraph);
 }
 
 void CypherAnalyzer::analyze(const CreateGraphQuery* createGraph) {
     const std::string_view graphName = createGraph->getGraphName();
     if (graphName.empty()) {
         throwError("CREATE GRAPH should not have an empty graph name");
-        // Check that the graph name is only [A-Z0-9_]+
-        for (char c : graphName) {
-            if (!(isalnum(c) || c == '_')) [[unlikely]] {
-                throwError(fmt::format("Graph name must only contain alphanumeric characters or '_': "
-                                       "character '{}' not allowed.",
-                                       c),
-                           createGraph);
-            }
-        }
     }
+
+    throwIfInvalidGraphName(graphName, createGraph);
 }
 
 void CypherAnalyzer::analyze(LoadJsonlQuery* loadJsonl) {
@@ -1873,15 +1883,7 @@ void CypherAnalyzer::analyze(LoadJsonlQuery* loadJsonl) {
 
     loadJsonl->setGraphName(graphName);
 
-    // Check that the graph name is only [A-Z0-9_]+
-    for (char c : graphName) {
-        if (!(isalnum(c) || c == '_')) {
-            throwError(fmt::format("Graph name must only contain alphanumeric characters or '_': "
-                                   "character '{}' not allowed.",
-                                   c),
-                       loadJsonl);
-        }
-    }
+    throwIfInvalidGraphName(graphName, loadJsonl);
 
     const auto& embDims = loadJsonl->getEmbeddingSpecs();
     const bool validDims =
@@ -1890,13 +1892,19 @@ void CypherAnalyzer::analyze(LoadJsonlQuery* loadJsonl) {
         throwError("All embedding properties must have dimension greater than 1.");
     }
 
-    const DateTimeSpec& dateTimeSpecs = loadJsonl->getDateTimeSpecs();
-    for (const std::string_view name : loadJsonl->getDurationSpecs()) {
-        if (dateTimeSpecs.contains(name)) {
-            throwError(fmt::format("Property '{}' is named both a datetime and a duration.", name),
-                       loadJsonl);
-        } else if (embDims.find(name) != embDims.end()) {
-            throwError(fmt::format("Property '{}' is named both an embedding and a duration.", name),
+    const TypedPropertySpec& typedProperties = loadJsonl->getTypedPropertySpec();
+
+    for (const TypedPropertySpec::Clash& clash : typedProperties.getClashes()) {
+        throwError(fmt::format("Property '{}' is named both {} and {}.",
+                               clash._name,
+                               importedTypeName(clash._first),
+                               importedTypeName(clash._second)),
+                   loadJsonl);
+    }
+
+    for (const auto& [name, type] : typedProperties) {
+        if (embDims.find(name) != embDims.end()) {
+            throwError(fmt::format("Property '{}' is named both an embedding and {}.", name, importedTypeName(type)),
                        loadJsonl);
         }
     }
@@ -1910,15 +1918,7 @@ void CypherAnalyzer::analyze(LoadGMLQuery* loadGML) {
 
     loadGML->setGraphName(graphName);
 
-    // Check that the graph name is only [A-Z0-9_]+
-    for (char c : graphName) {
-        if (!(isalnum(c) || c == '_')) [[unlikely]] {
-            throwError(fmt::format("Graph name must only contain alphanumeric characters or '_': "
-                                   "character '{}' not allowed.",
-                                   c),
-                       loadGML);
-        }
-    }
+    throwIfInvalidGraphName(graphName, loadGML);
 }
 
 void CypherAnalyzer::analyze(LoadParquetQuery* loadParquet) {
@@ -1929,16 +1929,7 @@ void CypherAnalyzer::analyze(LoadParquetQuery* loadParquet) {
 
     loadParquet->setGraphName(graphName);
 
-    // Check that the graph name is only [A-Z0-9_]+
-    for (char c : graphName) {
-        if (!(isalnum(c) || c == '_')) {
-            throwError(fmt::format(
-                           "Graph name must only contain alphanumeric characters or '_': "
-                           "character '{}' not allowed.",
-                           c),
-                       loadParquet);
-        }
-    }
+    throwIfInvalidGraphName(graphName, loadParquet);
 }
 
 void CypherAnalyzer::analyze(const S3ConnectQuery* s3Connect) {
@@ -2035,13 +2026,12 @@ void CypherAnalyzer::analyze(const InstallExtensionQuery* query) {
         throwError("INSTALL extension name cannot be empty", query);
     }
 
-    for (char c : name) {
-        if (!(isalnum(c) || c == '_')) [[unlikely]] {
-            throwError(fmt::format("Extension name must only contain "
-                                   "alphanumeric characters or '_': "
-                                   "character '{}' not allowed.", c),
-                       query);
-        }
+    const size_t invalid = FileName::findInvalidCharacter(name);
+    if (invalid != std::string_view::npos) [[unlikely]] {
+        throwError(fmt::format("Extension name must only contain "
+                               "alphanumeric characters or '_': "
+                               "character '{}' not allowed.", name[invalid]),
+                   query);
     }
 }
 
@@ -2116,6 +2106,13 @@ void CypherAnalyzer::analyze(const CreateEdgePropertyIndexQuery* query) {
     const GraphReader reader = _graphView.read();
     if (!reader.isEdgeProperty(propType._id)) {
         throwError("Property is not an edge property.", propertyExpr);
+    }
+}
+
+void CypherAnalyzer::throwIfInvalidGraphName(std::string_view graphName, const void* obj) const {
+    const size_t invalid = FileName::findInvalidCharacter(graphName);
+    if (invalid != std::string_view::npos) [[unlikely]] {
+        throwError(fmt::format("Graph name must only contain alphanumeric characters or '_': character '{}' not allowed.", graphName[invalid]), obj);
     }
 }
 

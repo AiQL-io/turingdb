@@ -1,32 +1,6 @@
 #include "SourceManager.h"
 
-#include "spdlog/fmt/bundled/base.h"
-
 using namespace db;
-
-namespace {
-
-std::string_view nextLine(std::string_view& str) {
-    const auto pos = str.find('\n');
-    if (pos == std::string_view::npos) {
-        const auto line = str;
-        str = str.substr(str.size(), str.size());
-
-        return line;
-    }
-
-    const auto line = str.substr(0, pos);
-    str = str.substr(pos + 1, str.size());
-    return line;
-}
-
-void ignoreLines(std::string_view& str, size_t count) {
-    for (size_t i = 0; i < count; i++) {
-        nextLine(str);
-    }
-}
-
-}
 
 SourceManager::SourceManager(std::string_view queryString)
     : _queryString(queryString)
@@ -40,30 +14,17 @@ void SourceManager::setLocation(uintptr_t obj, const SourceLocation& loc) {
     _locations[obj] = loc;
 }
 
+void SourceManager::eraseLocation(uintptr_t obj) {
+    _locations.erase(obj);
+}
+
 std::string_view SourceManager::getStringRepr(uintptr_t obj) const {
     const SourceLocation* loc = getLocation(obj);
     if (!loc) {
         return "";
     }
 
-    std::string_view repr = _queryString;
-
-    const size_t firstLineNo = loc->_beginLine;
-    const size_t lastLineNo = loc->_endLine;
-    size_t lastCol = loc->_endColumn;
-
-    ignoreLines(repr, firstLineNo - 1);
-    repr = repr.substr(loc->_beginColumn - 1);
-
-    if (firstLineNo != lastLineNo) {
-        ignoreLines(repr, lastLineNo - firstLineNo);
-        nextLine(repr);
-    } else {
-        lastCol = loc->_endColumn - loc->_beginColumn;
-    }
-
-    repr = repr.substr(0, lastCol);
-    return repr;
+    return _queryString.substr(loc->_beginOffset, loc->_endOffset - loc->_beginOffset);
 }
 
 const SourceLocation* SourceManager::getLocation(uintptr_t obj) const {

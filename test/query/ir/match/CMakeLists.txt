@@ -70,6 +70,8 @@ target_include_directories(test_query_ir_edge_type_disjunction PRIVATE ${IR_TEST
 
 add_turing_test(test_query_ir_label_expression LabelExpressionTest.cpp)
 
+add_turing_test(test_query_ir_is_label IsLabelTest.cpp)
+
 add_turing_test(test_query_ir_component_name_resolution ComponentNameResolutionTest.cpp)
 target_include_directories(test_query_ir_component_name_resolution PRIVATE ${IR_TEST_DIR})
 
@@ -79,3 +81,23 @@ add_call_v3_test(test_query_ir_double_dash DoubleDashTest.cpp)
 add_call_v3_test(test_query_ir_both_arrow_heads BothArrowHeadsTest.cpp)
 
 add_call_v3_test(test_query_ir_scan_edges_by_endpoint_labels ScanEdgesByEndpointLabelsTest.cpp)
+
+add_call_v3_test(test_query_ir_property_constraint_on_an_entity PropertyConstraintOnAnEntityTest.cpp)
+
+add_call_v3_test(test_query_ir_non_reserved_keyword NonReservedKeywordTest.cpp)
+
+add_call_v3_test(test_query_ir_reserved_keyword ReservedKeywordTest.cpp)
+
+add_turing_test(test_query_ir_supplier_keyword SupplierKeywordTest.cpp)
+target_sources(test_query_ir_supplier_keyword PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_supplier_keyword PRIVATE ${IR_TEST_DIR})
+
+add_call_v3_test(test_query_ir_token_whitespace TokenWhitespaceTest.cpp)
+add_call_v3_test(test_query_ir_pattern_from_a_tagged_cell PatternFromATaggedCellTest.cpp)
+add_call_v3_test(test_query_ir_value_after_a_pattern_comprehension ValueAfterAPatternComprehensionTest.cpp)
+add_call_v3_test(test_query_ir_cast_after_a_dropping_clause CastAfterADroppingClauseTest.cpp)
+add_call_v3_test(test_query_ir_bound_null_node BoundNullNodeTest.cpp)
+
+add_turing_test(test_query_ir_codegen_determinism CodegenDeterminismTest.cpp)
+target_sources(test_query_ir_codegen_determinism PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_codegen_determinism PRIVATE ${IR_TEST_DIR})

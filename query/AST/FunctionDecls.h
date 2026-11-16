@@ -1,11 +1,9 @@
 #pragma once
 
-#include <string>
 #include <string_view>
-#include <memory>
-#include <unordered_map>
 #include <vector>
 
+#include "FunctionNamespace.h"
 #include "FunctionResolver.h"
 #include "FunctionSignature.h"
 
@@ -13,8 +11,7 @@ namespace db {
 
 class FunctionDecls : public FunctionResolver {
 public:
-    using FunctionSignatures = std::vector<FunctionSignature*>;
-    using PossibleArgTypes = std::vector<FunctionArgumentType>;
+    using PossibleArgTypes = FunctionNamespace::PossibleArgTypes;
 
     ~FunctionDecls() override;
 
@@ -25,20 +22,24 @@ public:
 
     static const FunctionDecls& getBuiltins();
 
-    FunctionSignatureRange lookup(std::string_view fullName) const override;
+    FunctionSignatureRange lookup(const QualifiedName* name) const override;
 
 private:
-    std::vector<std::unique_ptr<FunctionSignature>> _owned;
-    std::unordered_map<std::string, FunctionSignatures> _nameMap;
+    FunctionNamespace _root {""};
 
     FunctionDecls();
 
     void initDefault();
 
-    FunctionSignature* createFunction(std::string_view fullName);
+    void initCollectionFunctions();
 
-    // One overload per way of typing the arguments, position i taking any of positionTypes[i]
-    void createOverloads(std::string_view fullName,
+    void initSpatialFunctions();
+
+    FunctionSignature* createFunction(std::string_view name);
+
+    void addAlias(std::string_view alias, std::string_view name);
+
+    void createOverloads(std::string_view name,
                          const std::vector<PossibleArgTypes>& positionTypes,
                          std::vector<FunctionSignature*>& overloads);
 };

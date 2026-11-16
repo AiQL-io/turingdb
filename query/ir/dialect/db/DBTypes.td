@@ -42,7 +42,6 @@ def ColumnEdgeIDs : ColumnOf<"::mlir::storage::EdgeIDType", "edgeid">;
 def ColumnEdgeTypes : ColumnOf<"::mlir::storage::EdgeTypeIDType", "edge_type_id">;
 def ColumnPath : ColumnOf<"::mlir::storage::PathType", "path">;
 def ColumnPathRefs : ColumnOf<"::mlir::storage::PathRefType", "path_ref">;
-def ColumnEntityList : ColumnOf<"::mlir::storage::EntityListType", "entity_list">;
 
 def ColumnChangeIDs : ColumnOf<"::mlir::storage::ChangeIDType", "change_id">;
 
@@ -77,7 +76,7 @@ def ColumnMaps : Type<
     BuildableType<"::mlir::db::ColumnType::get($_builder.getContext(), "
                   "::mlir::storage::MapType::get($_builder.getContext()))">;
 
-def ColumnMapElements : ColumnOf<"::mlir::storage::MapElementType", "map_element">;
+def ColumnCells : ColumnOf<"::mlir::storage::AnyType", "any">;
 
 // The seen-set several db.remove_duplicates share, so that one dedup spans dataflows
 // that never meet: the branches of a UNION, whose rows reach the result through one

@@ -25,6 +25,9 @@ class ConstantResult
 
 namespace db {
 
+// Whether @param value is an argument of the function: a parameter, bound once for the run
+bool isFunctionArgument(mlir::Value value);
+
 // Whether @param value holds the same value in every row: a constant, or a computation
 // over constants alone
 bool yieldsConstantColumn(mlir::Value value);
@@ -33,6 +36,11 @@ bool yieldsConstantColumn(mlir::Value value);
 // already decided: a caller asking it of every op of a block would otherwise rewalk the
 // whole cone under each one.
 bool yieldsConstantColumn(mlir::Value value, llvm::DenseMap<mlir::Value, bool>& classified);
+
+// Drops from @param classified the values @param operation and the ops nested in it define,
+// as it is erased: a value created later at an erased one's address would otherwise read the
+// erased one's answer
+void forgetErasedValues(mlir::Operation* operation, llvm::DenseMap<mlir::Value, bool>& classified);
 
 // Whether @param operation, and every op nested in it, runs on any value it reads without
 // raising, so it can run where no row has asked for it

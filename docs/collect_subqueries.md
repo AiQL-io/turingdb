@@ -33,8 +33,10 @@ branches. A chain mixing both follows UnionQuery, as COUNT does.
 The result is a list column. Its element type is the body's column's, resolved during
 lowering, as a pattern comprehension's is.
 
-Out of scope: the conditional `WHEN ... THEN { } ELSE { }` body, as in COUNT and EXISTS.
-`CollectNeo4jManualTest` holds the manual's example, skipped.
+A body can be a WHEN, as an EXISTS or a COUNT body can: the list holds what the branch
+its predicates pick returns for the row. `CollectNeo4jManualTest` holds the manual's
+example, skipped: it tests its predicate with the `exists()` function over a pattern, which
+the grammar has no rule for.
 
 ## 2. Ops
 
@@ -55,8 +57,10 @@ nl.for ... {
 `db.pattern_comprehension` keeps its own db op and lowering, and ends on the same three nl
 ops.
 
-A body run one row at a time opens the `nl.each_row` loop a COUNT body does. The step is
-then one row, and `nl.row_lists_collect` takes no tag: every value goes into that row's list.
+A body run one row at a time opens the `nl.each_row` loop a COUNT body does, over the step and
+the buffer's tag. `nl.row_lists_collect` then takes no tag but the row the loop hands the
+body, `nl.row_lists_collect %state, row %r, %value`: every value goes into that row's list,
+and the lists are built over the whole step once the loop closes.
 
 ## 3. UNION
 

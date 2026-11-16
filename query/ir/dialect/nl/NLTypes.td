@@ -317,6 +317,13 @@ def NLEdgeIDChunk : Type<
     BuildableType<"::mlir::nl::ChunkType::get($_builder.getContext(), "
                   "::mlir::storage::EdgeIDType::get($_builder.getContext()))">;
 
+def NLPathRefChunk : Type<
+        CPred<"::llvm::isa<::mlir::nl::ChunkType>($_self) && "
+              "::llvm::isa<::mlir::storage::PathRefType>(::llvm::cast<::mlir::nl::ChunkType>($_self).getElementType())">,
+        "chunk of path handles", "::mlir::nl::ChunkType">,
+    BuildableType<"::mlir::nl::ChunkType::get($_builder.getContext(), "
+                  "::mlir::storage::PathRefType::get($_builder.getContext()))">;
+
 // The mask sibling of NLNodeIDChunk: constrains an operand to
 // !nl.chunk<!storage.bool> - a row-by-row flag beside another chunk, as nl.merge's
 // pending masks are - and carries the recipe that lets a format omit its type.
@@ -348,12 +355,12 @@ def NLMapChunk : Type<
     BuildableType<"::mlir::nl::ChunkType::get($_builder.getContext(), "
                   "::mlir::storage::MapType::get($_builder.getContext()))">;
 
-def NLMapElementChunk : Type<
+def NLCellChunk : Type<
         CPred<"::llvm::isa<::mlir::nl::ChunkType>($_self) && "
-              "::llvm::isa<::mlir::storage::MapElementType>(::llvm::cast<::mlir::nl::ChunkType>($_self).getElementType())">,
-        "chunk of map entries", "::mlir::nl::ChunkType">,
+              "::llvm::isa<::mlir::storage::AnyType>(::llvm::cast<::mlir::nl::ChunkType>($_self).getElementType())">,
+        "chunk of tagged cells", "::mlir::nl::ChunkType">,
     BuildableType<"::mlir::nl::ChunkType::get($_builder.getContext(), "
-                  "::mlir::storage::MapElementType::get($_builder.getContext()))">;
+                  "::mlir::storage::AnyType::get($_builder.getContext()))">;
 
 // Constrains an operand to a resolved !nl.property_type handle, the same way
 // NLNodeIDChunk constrains a chunk operand. The single concrete type - there is

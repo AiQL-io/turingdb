@@ -1,0 +1,999 @@
+// Copyright Turing Biosystems Ltd
+// SPDX-License-Identifier: Apache-2.0
+
+// Browser/Node client for the TuringDB binary protocol: sends Cypher over HTTP and
+// decodes the streamed Turing Proto packets with the wasm decoder module.
+//
+// The server answers with HTTP/1.1 chunked transfer, one proto packet per chunk. fetch()
+// strips the HTTP chunk framing, so the packet stream is re-framed here from each packet's own
+// [type u8][dataLen u32le] header before being fed to the wasm decoder.
+//
+// The decoder hands each column back as flat buffers (values, offsets, validity) copied
+// out of wasm memory in one call per column; a Column wraps them and builds JS values
+// only when a row is read.
+//
+// Usage:
+//     const client = new TuringClient({ url: "/api/query", graph: "mygraph" });
+//
+//     const { chunks, execTimeMs } = await client.query("MATCH (n) RETURN n");
+//     // chunks[i] = { names, columns }; columns[j] is a Column: get(row), toArray(),
+//     // 64-bit integers and IDs as BigInt
+//
+//     const data = await client.queryData("MATCH (n) RETURN n");
+//     // chunks x columns x rows with BigInt converted to Number
+
+const PROTO_HEADER_SIZE = 5;
+// Mirrors net::proto::MAX_PAYLOAD_SIZE (TuringProtoHeaders.h).
+const MAX_PAYLOAD_SIZE = 64 * 1024 * 1024;
+
+const MESSAGE_CHUNK_HEADER = 0;
+const MESSAGE_CHUNK = 1;
+const MESSAGE_END_CHUNK = 2;
+const MESSAGE_END = 3;
+const MESSAGE_ERROR = 4;
+const MESSAGE_PROTOCOL_ERROR = 5;
+
+// Mirrors net::proto::ColumnInternalKind and ColumnKind (TuringProtoHeaders.h).
+export const ColumnType = Object.freeze({
+    UINT64: 0,
+    INT64: 1,
+    DOUBLE: 2,
+    STRING: 3,
+    BOOL: 4,
+    EMBEDDING: 5,
+    LIST_VIEW: 6,
+    VALUE_TYPE: 7,
+    CELL_VIEW: 8,
+    NODE_ID: 9,
+    EDGE_ID: 10,
+    EDGE_TYPE_ID: 11,
+    PROPERTY_TYPE_ID: 12,
+    LABEL_ID: 13,
+    LABEL_SET_ID: 14,
+    COMMIT_HASH: 15,
+    CHANGE_ID: 16,
+    PROPERTY_NULL: 17,
+    MAP_VIEW: 18,
+    DATE_TIME: 19,
+    DURATION: 20,
+    GRAPH_PATH: 21,
+    POINT: 22,
+});
+
+// The column types whose values the nested reader walks out of the flat nested bytes
+const NESTED_COLUMN_TYPES = [ColumnType.LIST_VIEW, ColumnType.CELL_VIEW, ColumnType.MAP_VIEW];
+
+export const ColumnEncoding = Object.freeze({
+    VECTOR: 0,
+    OPTIONAL_VECTOR: 1,
+    CONSTANT: 2,
+    OPTIONAL_CONSTANT: 3,
+});
+
+// Mirrors db::CellTag (storage/CellTag.h).
+const CELL_TAG_INT = 0;
+const CELL_TAG_UINT = 1;
+const CELL_TAG_DOUBLE = 2;
+const CELL_TAG_BOOL = 3;
+const CELL_TAG_STRING = 4;
+const CELL_TAG_EMBEDDING = 5;
+const CELL_TAG_LIST_VIEW = 6;
+const CELL_TAG_NULL = 7;
+const CELL_TAG_NODE_ID = 8;
+const CELL_TAG_EDGE_ID = 9;
+const CELL_TAG_DATETIME = 10;
+const CELL_TAG_MAP_VIEW = 11;
+const CELL_TAG_DURATION = 12;
+const CELL_TAG_PATH = 13;
+const CELL_TAG_POINT = 14;
+
+// Mirrors db::PointCRS (storage/metadata/Point.h): the SRID of each CRS ordinal.
+const POINT_SRIDS = [7203, 9157, 4326, 4979];
+const POINT_CRS_NAMES = { 7203: "cartesian", 9157: "cartesian-3d", 4326: "wgs-84", 4979: "wgs-84-3d" };
+const POINT_SIZE = 32;
+
+// Mirrors db::QueryStatus::Status (base/QueryStatus.h); the ERROR packet's first
+// payload byte indexes into this.
+const QUERY_STATUS_NAMES = [
+    "OK",
+    "GRAPH_NOT_FOUND",
+    "PARSE_ERROR",
+    "ANALYZE_ERROR",
+    "PLAN_ERROR",
+    "EXEC_ERROR",
+    "COMMIT_NOT_FOUND",
+    "COMMIT_NOT_LOADED",
+    "CHANGE_NOT_FOUND",
+];
+
+// ignoreBOM keeps a leading U+FEFF as a character, so decoded lengths match the
+// decoder's UTF-16 offsets.
+const utf8Decoder = new TextDecoder("utf-8", { ignoreBOM: true });
+const utf8Encoder = new TextEncoder();
+
+// Thrown for every failed query: status carries the server's QueryStatus name (or a
+// client-side pseudo-status such as HTTP_ERROR / PROTOCOL_ERROR / DECODE_ERROR) and
+// message the human-readable details.
+export class TuringQueryError extends Error {
+    constructor(status, message) {
+        super(message);
+        this.name = "TuringQueryError";
+        this.status = status;
+    }
+}
+
+// Reassembles whole proto packets from the arbitrarily-sliced fetch byte stream.
+class PacketAssembler {
+    constructor() {
+        this.chunks = [];
+        this.offset = 0; // read offset into chunks[0]
+        this.size = 0;
+    }
+
+    push(bytes) {
+        if (bytes.length > 0) {
+            this.chunks.push(bytes);
+            this.size += bytes.length;
+        }
+    }
+
+    // Copies the next count bytes without consuming them (caller checks size first).
+    peek(count) {
+        const out = new Uint8Array(count);
+        let written = 0;
+        let chunkIndex = 0;
+        let offset = this.offset;
+
+        while (written < count) {
+            const chunk = this.chunks[chunkIndex];
+            const copied = Math.min(chunk.length - offset, count - written);
+            out.set(chunk.subarray(offset, offset + copied), written);
+            written += copied;
+            chunkIndex += 1;
+            offset = 0;
+        }
+
+        return out;
+    }
+
+    // Consumes and returns the next count bytes (caller checks size first).
+    take(count) {
+        const out = new Uint8Array(count);
+        let written = 0;
+
+        while (written < count) {
+            const head = this.chunks[0];
+            const copied = Math.min(head.length - this.offset, count - written);
+            out.set(head.subarray(this.offset, this.offset + copied), written);
+            written += copied;
+            this.offset += copied;
+            if (this.offset === head.length) {
+                this.chunks.shift();
+                this.offset = 0;
+            }
+        }
+
+        this.size -= count;
+        return out;
+    }
+
+    // Returns the next whole packet ([header][payload]) or null until fully buffered.
+    nextPacket() {
+        if (this.size < PROTO_HEADER_SIZE) {
+            return null;
+        }
+
+        const header = this.peek(PROTO_HEADER_SIZE);
+        const dataLen = (header[1] | (header[2] << 8) | (header[3] << 16) | (header[4] << 24)) >>> 0;
+        if (dataLen > MAX_PAYLOAD_SIZE) {
+            throw new TuringQueryError("PROTOCOL_ERROR", `A packet payload of ${dataLen} bytes is more than the ${MAX_PAYLOAD_SIZE} bytes the binary protocol allows`);
+        }
+
+        const packetSize = PROTO_HEADER_SIZE + dataLen;
+        if (this.size < packetSize) {
+            return null;
+        }
+
+        return this.take(packetSize);
+    }
+}
+
+const INT64_MIN = -(2n ** 63n);
+const INT64_MAX = 2n ** 63n - 1n;
+
+// A little-endian byte sink that grows as it is written to.
+class ByteWriter {
+    constructor() {
+        this._bytes = new Uint8Array(256);
+        this._view = new DataView(this._bytes.buffer);
+        this._length = 0;
+    }
+
+    u8(value) {
+        this._reserve(1);
+        this._view.setUint8(this._length, value);
+        this._length += 1;
+    }
+
+    u32(value) {
+        this._reserve(4);
+        this._view.setUint32(this._length, value, true);
+        this._length += 4;
+    }
+
+    i64(value) {
+        this._reserve(8);
+        this._view.setBigInt64(this._length, value, true);
+        this._length += 8;
+    }
+
+    f64(value) {
+        this._reserve(8);
+        this._view.setFloat64(this._length, value, true);
+        this._length += 8;
+    }
+
+    bytes(value) {
+        this._reserve(value.length);
+        this._bytes.set(value, this._length);
+        this._length += value.length;
+    }
+
+    toUint8Array() {
+        return this._bytes.subarray(0, this._length);
+    }
+
+    _reserve(count) {
+        if (this._length + count <= this._bytes.length) {
+            return;
+        }
+
+        let capacity = this._bytes.length * 2;
+        while (capacity < this._length + count) {
+            capacity *= 2;
+        }
+
+        const grown = new Uint8Array(capacity);
+        grown.set(this.toUint8Array());
+        this._bytes = grown;
+        this._view = new DataView(grown.buffer);
+    }
+}
+
+// A number sent as a Double whatever its value: an integral number otherwise goes as an Int64
+export class DoubleValue {
+    constructor(value) {
+        if (typeof value !== "number") {
+            throw new TypeError(`double() takes a number, not ${describeKind(value)}`);
+        }
+
+        this.value = value;
+        Object.freeze(this);
+    }
+}
+
+export function double(value) {
+    return new DoubleValue(value);
+}
+
+// A point a query returns. z is undefined for a 2D point.
+export class Point {
+    constructor(srid, x, y, z) {
+        this.srid = srid;
+        this.x = x;
+        this.y = y;
+        this.z = z;
+        Object.freeze(this);
+    }
+
+    get crs() {
+        return POINT_CRS_NAMES[this.srid];
+    }
+}
+
+// A point's 32 bytes: x, y and z as doubles, then the ordinal of its CRS
+function readPoint(view, offset) {
+    const srid = POINT_SRIDS[view.getUint8(offset + 24)];
+    const isThreeDimensional = srid === 9157 || srid === 4979;
+    const z = isThreeDimensional ? view.getFloat64(offset + 16, true) : undefined;
+
+    return new Point(srid, view.getFloat64(offset, true), view.getFloat64(offset + 8, true), z);
+}
+
+function throwParameterError(path, message) {
+    throw new TuringQueryError("PARAMETER_ERROR", `Parameter ${path} ${message}`);
+}
+
+function isPlainObject(value) {
+    const prototype = Object.getPrototypeOf(value);
+    return prototype === Object.prototype || prototype === null;
+}
+
+function describeKind(value) {
+    if (value === undefined || value === null) {
+        return String(value);
+    } else if (typeof value === "object") {
+        const name = value.constructor?.name;
+        return name ? `a ${name}` : "an object with no constructor";
+    }
+    return `a ${typeof value}`;
+}
+
+function compareBytes(left, right) {
+    const length = Math.min(left.length, right.length);
+    for (let index = 0; index < length; index++) {
+        if (left[index] !== right[index]) {
+            return left[index] - right[index];
+        }
+    }
+    return left.length - right.length;
+}
+
+// A container is its count, then the byte size a result decoder reserves for it, which the
+// server's parameter reader does not read. A map's keys go in the order of their UTF-8
+// bytes, the order the server holds them in.
+function writeMap(writer, map, pathOf, ancestors) {
+    const entries = Object.entries(map).map(([key, value]) => ({ key, bytes: utf8Encoder.encode(key), value }));
+    entries.sort((left, right) => compareBytes(left.bytes, right.bytes));
+
+    writer.u32(entries.length);
+    writer.u32(0);
+
+    for (const { key, bytes, value } of entries) {
+        writer.u32(bytes.length);
+        writer.bytes(bytes);
+        writeParameterValue(writer, value, pathOf(key), ancestors);
+    }
+}
+
+// An integral number goes as an Int64, as Cypher reads 470, and any other number as a Double
+function writeParameterValue(writer, value, path, ancestors) {
+    if (value === null) {
+        writer.u8(CELL_TAG_NULL);
+        writer.u8(0);
+    } else if (typeof value === "boolean") {
+        writer.u8(CELL_TAG_BOOL);
+        writer.u8(value ? 1 : 0);
+    } else if (typeof value === "bigint") {
+        if (value < INT64_MIN || value > INT64_MAX) {
+            throwParameterError(path, `is ${value}, outside the 64-bit integer range`);
+        }
+        writer.u8(CELL_TAG_INT);
+        writer.i64(value);
+    } else if (typeof value === "number") {
+        if (Number.isInteger(value) && value >= -(2 ** 63) && value < 2 ** 63) {
+            writer.u8(CELL_TAG_INT);
+            writer.i64(BigInt(value));
+        } else {
+            writer.u8(CELL_TAG_DOUBLE);
+            writer.f64(value);
+        }
+    } else if (value instanceof DoubleValue) {
+        writer.u8(CELL_TAG_DOUBLE);
+        writer.f64(value.value);
+    } else if (typeof value === "string") {
+        const bytes = utf8Encoder.encode(value);
+        writer.u8(CELL_TAG_STRING);
+        writer.u32(bytes.length);
+        writer.bytes(bytes);
+    } else if (ancestors.has(value)) {
+        throwParameterError(path, "refers back to a value that contains it");
+    } else if (Array.isArray(value)) {
+        ancestors.add(value);
+        writer.u8(CELL_TAG_LIST_VIEW);
+        writer.u32(value.length);
+        writer.u32(0);
+        for (let index = 0; index < value.length; index++) {
+            writeParameterValue(writer, value[index], `${path}[${index}]`, ancestors);
+        }
+        ancestors.delete(value);
+    } else if (typeof value === "object" && isPlainObject(value)) {
+        ancestors.add(value);
+        writer.u8(CELL_TAG_MAP_VIEW);
+        writeMap(writer, value, (key) => `${path}.${key}`, ancestors);
+        ancestors.delete(value);
+    } else {
+        throwParameterError(path, `is ${describeKind(value)}, which a query parameter cannot hold`);
+    }
+}
+
+// No parameter at all is an empty map, which goes as no byte
+function encodeParameters(parameters) {
+    if (parameters === undefined || parameters === null) {
+        return new Uint8Array(0);
+    }
+
+    if (typeof parameters !== "object" || Array.isArray(parameters) || !isPlainObject(parameters)) {
+        throw new TuringQueryError("PARAMETER_ERROR", "The parameters must be a plain object of names to values");
+    }
+
+    if (Object.keys(parameters).length === 0) {
+        return new Uint8Array(0);
+    }
+
+    const writer = new ByteWriter();
+    writeMap(writer, parameters, (key) => `$${key}`, new Set([parameters]));
+    return writer.toUint8Array();
+}
+
+// 'main'/'head'/'HEAD' select the tip; a number, BigInt or string selects a specific
+// change/commit. The server reads a change ID in decimal and a commit hash in hex.
+function normalizeRef(value, radix) {
+    if (typeof value === "number" || typeof value === "bigint") {
+        return value.toString(radix);
+    }
+    const text = String(value).toLowerCase();
+    return text === "main" || text === "head" ? "head" : text;
+}
+
+// Fixed-width element kinds: the typed array over the column's value bytes and, where
+// the array element is not already the JS value, its conversion.
+const FIXED_WIDTH_KINDS = {
+    [ColumnType.UINT64]: { size: 8, wrap: (buffer) => new BigUint64Array(buffer) },
+    [ColumnType.INT64]: { size: 8, wrap: (buffer) => new BigInt64Array(buffer) },
+    [ColumnType.DOUBLE]: { size: 8, wrap: (buffer) => new Float64Array(buffer) },
+    [ColumnType.BOOL]: { size: 1, wrap: (buffer) => new Uint8Array(buffer), read: (array, index) => array[index] !== 0 },
+    [ColumnType.VALUE_TYPE]: { size: 1, wrap: (buffer) => new Uint8Array(buffer) },
+    [ColumnType.NODE_ID]: { size: 8, wrap: (buffer) => new BigUint64Array(buffer) },
+    [ColumnType.EDGE_ID]: { size: 8, wrap: (buffer) => new BigUint64Array(buffer) },
+    [ColumnType.EDGE_TYPE_ID]: { size: 8, wrap: (buffer) => new BigUint64Array(buffer) },
+    [ColumnType.PROPERTY_TYPE_ID]: { size: 2, wrap: (buffer) => new Uint16Array(buffer) },
+    [ColumnType.LABEL_ID]: { size: 8, wrap: (buffer) => new BigUint64Array(buffer) },
+    [ColumnType.LABEL_SET_ID]: { size: 4, wrap: (buffer) => new Uint32Array(buffer) },
+    [ColumnType.CHANGE_ID]: { size: 8, wrap: (buffer) => new BigUint64Array(buffer) },
+    [ColumnType.PROPERTY_NULL]: { size: 1, wrap: (buffer) => new Uint8Array(buffer), read: () => null },
+    // Microseconds from the epoch, which is what a JS Date counts in milliseconds; the
+    // count is handed over as it arrived so no precision is lost on the way
+    [ColumnType.DATE_TIME]: { size: 8, wrap: (buffer) => new BigInt64Array(buffer) },
+    [ColumnType.DURATION]: { size: 8, wrap: (buffer) => new BigInt64Array(buffer) },
+    [ColumnType.POINT]: { size: POINT_SIZE, wrap: (buffer) => new DataView(buffer), read: (view, index) => readPoint(view, index * POINT_SIZE) },
+};
+
+// Strings are decoded with one TextDecoder call over the whole column and sliced by
+// the decoder's UTF-16 offsets. If the decoded length disagrees (invalid UTF-8 was
+// replaced with U+FFFD), each string is decoded from its own bytes instead.
+function makeStringReader(bytes, byteOffsets, utf16Offsets) {
+    let text = null;
+    let perString = false;
+
+    return (index) => {
+        if (text === null) {
+            text = utf8Decoder.decode(bytes);
+            perString = text.length !== utf16Offsets[utf16Offsets.length - 1];
+        }
+        if (perString) {
+            return utf8Decoder.decode(bytes.subarray(byteOffsets[index], byteOffsets[index + 1]));
+        }
+        return text.substring(utf16Offsets[index], utf16Offsets[index + 1]);
+    };
+}
+
+// Walks the decoder's flat list bytes: a list or a single element from a byte offset.
+// A cursor tracks the read position so a nested list or map resumes where its child ended.
+// Strings and map keys are referenced by index into the dataframe's nested string set.
+export class NestedReader {
+    constructor(bytes, strings) {
+        this._bytes = bytes;
+        this._view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+        this._readString = makeStringReader(strings.values, new Uint32Array(strings.offsets.buffer), new Uint32Array(strings.utf16Offsets.buffer));
+        this._cursor = 0;
+    }
+
+    readListAt(offset) {
+        this._cursor = offset;
+        return this._readList();
+    }
+
+    readElementAt(offset) {
+        this._cursor = offset;
+        return this._readElement();
+    }
+
+    readMapAt(offset) {
+        this._cursor = offset;
+        return this._readMap();
+    }
+
+    _readList() {
+        const count = this._view.getUint32(this._cursor, true);
+        this._cursor += 4;
+
+        const values = new Array(count);
+        for (let index = 0; index < count; index++) {
+            values[index] = this._readElement();
+        }
+        return values;
+    }
+
+    // An entry is its key's string index, then its value laid out as a list element.
+    _readMap() {
+        const count = this._view.getUint32(this._cursor, true);
+        this._cursor += 4;
+
+        const entries = new Array(count);
+        for (let index = 0; index < count; index++) {
+            const key = this._readString(this._view.getUint32(this._cursor, true));
+            this._cursor += 4;
+            entries[index] = [key, this._readElement()];
+        }
+
+        // fromEntries defines each key as an own property, so a "__proto__" key stays a key
+        return Object.fromEntries(entries);
+    }
+
+    _readElement() {
+        const tag = this._bytes[this._cursor];
+        const payload = this._cursor + 1;
+
+        switch (tag) {
+            case CELL_TAG_INT:
+                this._cursor = payload + 8;
+                return this._view.getBigInt64(payload, true);
+            case CELL_TAG_UINT:
+            case CELL_TAG_NODE_ID:
+            case CELL_TAG_EDGE_ID:
+                this._cursor = payload + 8;
+                return this._view.getBigUint64(payload, true);
+            case CELL_TAG_DATETIME:
+            case CELL_TAG_DURATION:
+                this._cursor = payload + 8;
+                return this._view.getBigInt64(payload, true);
+            case CELL_TAG_DOUBLE:
+                this._cursor = payload + 8;
+                return this._view.getFloat64(payload, true);
+            case CELL_TAG_POINT:
+                this._cursor = payload + POINT_SIZE;
+                return readPoint(this._view, payload);
+            case CELL_TAG_BOOL:
+                this._cursor = payload + 1;
+                return this._bytes[payload] !== 0;
+            case CELL_TAG_NULL:
+                this._cursor = payload + 1;
+                return null;
+            case CELL_TAG_STRING:
+                this._cursor = payload + 4;
+                return this._readString(this._view.getUint32(payload, true));
+            case CELL_TAG_EMBEDDING: {
+                const size = this._view.getUint32(payload, true);
+                const start = payload + 4;
+                this._cursor = start + size;
+                // slice() lands the floats in a fresh, aligned buffer.
+                return new Float32Array(this._bytes.slice(start, start + size).buffer);
+            }
+            case CELL_TAG_PATH: {
+                const size = this._view.getUint32(payload, true);
+                const start = payload + 4;
+                this._cursor = start + size;
+                return Array.from(new BigUint64Array(this._bytes.slice(start, start + size).buffer));
+            }
+            case CELL_TAG_LIST_VIEW:
+                this._cursor = payload;
+                return this._readList();
+            case CELL_TAG_MAP_VIEW:
+                this._cursor = payload;
+                return this._readMap();
+            default:
+                throw new TuringQueryError("DECODE_ERROR", `Unknown list element tag ${tag}`);
+        }
+    }
+}
+
+// Builds the item reader for a column's buffers: { read: (itemIndex) => JS value,
+// values: the typed array over fixed-width values or null, direct: whether values[i]
+// already is the JS value }.
+function makeItemReader(buffers, nestedReader) {
+    const typeCode = buffers.typeCode;
+    const fixed = FIXED_WIDTH_KINDS[typeCode];
+
+    if (fixed !== undefined) {
+        if (buffers.elementSize !== fixed.size) {
+            throw new TuringQueryError("DECODE_ERROR", `Column type ${typeCode} has element size ${buffers.elementSize}, expected ${fixed.size}`);
+        }
+        const values = fixed.wrap(buffers.values.buffer);
+        const read = fixed.read ?? ((array, index) => array[index]);
+        return { read: (index) => read(values, index), values: values instanceof DataView ? null : values, direct: fixed.read === undefined };
+    }
+
+    const offsets = buffers.offsets !== undefined ? new Uint32Array(buffers.offsets.buffer) : null;
+    const variable = (read) => ({ read, values: null, direct: false });
+
+    switch (typeCode) {
+        case ColumnType.STRING:
+            return variable(makeStringReader(buffers.values, offsets, new Uint32Array(buffers.utf16Offsets.buffer)));
+        case ColumnType.EMBEDDING:
+            return variable((index) => new Float32Array(buffers.values.buffer, offsets[index], (offsets[index + 1] - offsets[index]) / 4));
+        case ColumnType.GRAPH_PATH:
+            return variable((index) => Array.from(new BigUint64Array(buffers.values.buffer, offsets[index], (offsets[index + 1] - offsets[index]) / 8)));
+        case ColumnType.LIST_VIEW:
+            return variable((index) => nestedReader.readListAt(offsets[index]));
+        case ColumnType.CELL_VIEW:
+            return variable((index) => nestedReader.readElementAt(offsets[index]));
+        case ColumnType.MAP_VIEW:
+            return variable((index) => nestedReader.readMapAt(offsets[index]));
+        default:
+            throw new TuringQueryError("DECODE_ERROR", `Unsupported column type ${typeCode}`);
+    }
+}
+
+function bigIntToNumberDeep(value) {
+    if (typeof value === "bigint") {
+        return Number(value);
+    }
+    if (Array.isArray(value)) {
+        return value.map((item) => bigIntToNumberDeep(item));
+    }
+    if (typeof value === "object" && value !== null && Object.getPrototypeOf(value) === Object.prototype) {
+        return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, bigIntToNumberDeep(entry)]));
+    }
+    return value;
+}
+
+// One decoded column: the flat buffers the decoder handed over, read row by row on
+// demand. 64-bit integers and IDs read as BigInt; a missing optional reads as null.
+export class Column {
+    constructor(name, buffers, nestedReader, rowCount) {
+        this.name = name;
+        this.typeCode = buffers.typeCode;
+        this.encoding = buffers.encoding;
+        this.length = rowCount;
+        this._buffers = buffers;
+        this._itemCount = buffers.count;
+        this._validity = buffers.validity ?? null;
+
+        const reader = makeItemReader(buffers, nestedReader);
+        this._read = reader.read;
+        this._typedValues = reader.values;
+        this._direct = reader.direct;
+    }
+
+    get isConstant() {
+        return this.encoding === ColumnEncoding.CONSTANT || this.encoding === ColumnEncoding.OPTIONAL_CONSTANT;
+    }
+
+    get isOptional() {
+        return this.encoding === ColumnEncoding.OPTIONAL_VECTOR || this.encoding === ColumnEncoding.OPTIONAL_CONSTANT;
+    }
+
+    // Fixed-width vector columns as their typed array (Float64Array, BigUint64Array, ...),
+    // one element per row with no per-row work; null for constants, variable-width kinds
+    // and points, which no typed array holds. A missing optional row holds 0 here: consult
+    // validity.
+    get values() {
+        return this.isConstant ? null : this._typedValues;
+    }
+
+    // One bit per row, LSB first, set where the row has a value. Optional encodings carry
+    // it, and so does a path column, whose null arrives as the path with no node.
+    get validity() {
+        return this._validity;
+    }
+
+    get(row) {
+        return this._item(this.isConstant ? 0 : row, this._read);
+    }
+
+    toArray() {
+        if (!this._direct || this.isConstant || this._validity !== null) {
+            return this._rows(this._read);
+        }
+
+        // An indexed copy: Array.from over a typed array goes through the iterator and is
+        // several times slower.
+        const values = this._typedValues;
+        const out = new Array(this.length);
+        for (let row = 0; row < this.length; row++) {
+            out[row] = values[row];
+        }
+        return out;
+    }
+
+    // Every row with 64-bit integers and IDs as Number (past 2^53 the precision is lost),
+    // inside lists and paths too.
+    toNumberArray() {
+        const fixed = FIXED_WIDTH_KINDS[this.typeCode];
+        if (fixed === undefined) {
+            return this.toArray().map((value) => bigIntToNumberDeep(value));
+        }
+        if (fixed.size !== 8 || this.typeCode === ColumnType.DOUBLE) {
+            return this.toArray();
+        }
+
+        // Two 32-bit halves per value: no BigInt allocated per row.
+        const halves = new Uint32Array(this._buffers.values.buffer);
+        const signed = this.typeCode === ColumnType.INT64;
+        return this._rows((index) => {
+            const low = halves[2 * index];
+            const high = halves[2 * index + 1];
+            return (signed ? high | 0 : high) * 4294967296 + low;
+        });
+    }
+
+    _item(index, read) {
+        if (index >= this._itemCount) {
+            return undefined;
+        }
+        if (this._validity !== null && ((this._validity[index >> 3] >> (index & 7)) & 1) === 0) {
+            return null;
+        }
+        return read(index);
+    }
+
+    _rows(read) {
+        const out = new Array(this.length);
+        if (this.isConstant) {
+            return out.fill(this._item(0, read));
+        }
+        for (let row = 0; row < this.length; row++) {
+            out[row] = this._item(row, read);
+        }
+        return out;
+    }
+}
+
+// Reads the decoder's current dataframe: one Column per decoded column, all sized to the
+// row count the chunk's footer declared.
+function readDataframe(decoder) {
+    const columnCount = decoder.getColumnCount();
+    const rowCount = decoder.getRowCount();
+    const names = [];
+    const buffers = [];
+
+    for (let index = 0; index < columnCount; index++) {
+        names.push(decoder.getColumnName(index));
+        buffers.push(decoder.getColumnBuffers(index));
+    }
+
+    const hasNested = buffers.some((column) => NESTED_COLUMN_TYPES.includes(column.typeCode));
+    const nestedReader = hasNested ? new NestedReader(decoder.getNestedBytes(), decoder.getNestedStrings()) : null;
+
+    const columns = buffers.map((columnBuffers, index) => new Column(names[index], columnBuffers, nestedReader, rowCount));
+    return { names, columns };
+}
+
+// END packet payload: the query execution time as a little-endian f32, milliseconds.
+function readExecTime(packet) {
+    if (packet.length < PROTO_HEADER_SIZE + 4) {
+        return null;
+    }
+    return new DataView(packet.buffer, packet.byteOffset + PROTO_HEADER_SIZE, 4).getFloat32(0, true);
+}
+
+// Request body, read by TuringProtoQueryRequest on the server:
+// [queryLen u32le][query UTF-8][paramLen u32le][param bytes]. No parameters: paramLen 0.
+function encodeRequestBody(cypher, parameters) {
+    const query = utf8Encoder.encode(cypher);
+    const parameterMap = encodeParameters(parameters);
+    const body = new Uint8Array(4 + query.length + 4 + parameterMap.length);
+    const view = new DataView(body.buffer);
+    view.setUint32(0, query.length, true);
+    body.set(query, 4);
+    view.setUint32(4 + query.length, parameterMap.length, true);
+    body.set(parameterMap, 8 + query.length);
+    return body;
+}
+
+// ERROR packet payload: one QueryStatus byte followed by the UTF-8 message.
+function addErrorPacket(error, packet) {
+    const payload = packet.subarray(PROTO_HEADER_SIZE);
+    if (error !== null) {
+        error.message.bytes(payload);
+        return error;
+    }
+
+    const statusCode = payload.length > 0 ? payload[0] : 0;
+    const status = QUERY_STATUS_NAMES[statusCode] ?? `STATUS_${statusCode}`;
+    const message = new ByteWriter();
+    message.bytes(payload.subarray(1));
+    return { status, message };
+}
+
+// A C++ TuringException crossing the embind boundary is not a JS Error; recover its
+// message through the exception handling helpers when the module exports them.
+function describeWasmError(module, raised) {
+    if (raised instanceof Error) {
+        return raised.message;
+    }
+    if (typeof module.getExceptionMessage === "function") {
+        try {
+            const [type, message] = module.getExceptionMessage(raised);
+            return message ? `${type}: ${message}` : String(type);
+        } catch {
+            // fall through to the generic stringification
+        }
+    }
+    return String(raised);
+}
+
+// The decoder module is an implementation detail: the package does not export it, so
+// the client instantiates it on first use. One instance is shared by every client -
+// compiling the wasm twice in a page costs a megabyte of memory for nothing, and each
+// query gets its own TuringDecoder off it anyway. The import is dynamic so a bundler
+// splits the decoder out and a page that never queries never fetches the wasm.
+let decoderModulePromise = null;
+
+function loadDecoderModule(moduleOptions) {
+    if (!decoderModulePromise) {
+        decoderModulePromise = import("./turing_wasm_decoder.mjs")
+            .then((loaded) => loaded.default(moduleOptions));
+    }
+
+    return decoderModulePromise;
+}
+
+export class TuringClient {
+    // options: { url, graph, authToken, bufferCapacity, fetch, wasmUrl }.
+    constructor(options = {}) {
+        this._module = null;
+        this._wasmUrl = options.wasmUrl ?? null;
+        this._url = options.url ?? "/query";
+        this._graph = options.graph ?? "default";
+        this._change = "head";
+        this._commit = "head";
+        this._authToken = options.authToken ?? null;
+        this._bufferCapacity = options.bufferCapacity ?? 1 << 20;
+        this._fetch = options.fetch ?? ((...args) => fetch(...args));
+    }
+
+    setGraph(name) {
+        this._graph = name;
+    }
+
+    getGraph() {
+        return this._graph;
+    }
+
+    setChange(change) {
+        this._change = normalizeRef(change, 10);
+    }
+
+    setCommit(commit) {
+        this._commit = normalizeRef(commit, 16);
+    }
+
+    setAuthToken(token) {
+        this._authToken = token;
+    }
+
+    // Runs one Cypher query. Resolves to { chunks, execTimeMs } where chunks holds one
+    // entry per streamed dataframe: { names, columns }, every column a Column.
+    // options: { parameters } binds $name to parameters.name; { graph, change, commit,
+    // signal } override the client state for this call.
+    async query(cypher, options = {}) {
+        const graph = options.graph ?? this._graph;
+        const change = options.change !== undefined ? normalizeRef(options.change, 10) : this._change;
+        const commit = options.commit !== undefined ? normalizeRef(options.commit, 16) : this._commit;
+
+        const url = `${this._url}?graph=${encodeURIComponent(graph)}`
+            + `&commit=${encodeURIComponent(commit)}&change=${encodeURIComponent(change)}`;
+
+        const headers = { "Content-Type": "application/turing-proto" };
+        if (this._authToken) {
+            headers["Authorization"] = `Bearer ${this._authToken}`;
+        }
+
+        const response = await this._fetch(url, {
+            method: "POST",
+            headers,
+            body: encodeRequestBody(cypher, options.parameters),
+            signal: options.signal,
+        });
+        const reader = response.body?.getReader();
+        try {
+            const contentType = response.headers?.get("content-type") ?? "";
+            const carriesPackets = contentType.toLowerCase().startsWith("application/turing-proto");
+            if (!response.ok && !carriesPackets) {
+                throw new TuringQueryError("HTTP_ERROR", `Server returned HTTP ${response.status}`);
+            }
+
+            const module = await this._decoderModule();
+            const decoder = new module.TuringDecoder(this._bufferCapacity);
+            try {
+                return await this._decodeResponse(decoder, reader);
+            } finally {
+                decoder.delete();
+            }
+        } catch (raised) {
+            reader?.cancel().catch(() => {});
+            throw raised;
+        }
+    }
+
+    // Chunks x columns x row values, 64-bit integers as Number: past 2^53 the precision
+    // is lost, so use query() to keep BigInt. An empty result is one chunk of empty columns.
+    async queryData(cypher, options = {}) {
+        const { chunks } = await this.query(cypher, options);
+        return chunks.map((chunk) => chunk.columns.map((column) => column.toNumberArray()));
+    }
+
+    async _decoderModule() {
+        if (!this._module) {
+            const moduleOptions = this._wasmUrl ? {locateFile: () => this._wasmUrl} : {};
+            this._module = await loadDecoderModule(moduleOptions);
+        }
+
+        return this._module;
+    }
+
+    async _decodeResponse(decoder, reader) {
+        const assembler = new PacketAssembler();
+        const chunks = [];
+        let sawEndChunk = false;
+        let sawEnd = false;
+        let execTimeMs = null;
+        let error = null;
+        let protocolError = null;
+
+        while (true) {
+            const packet = assembler.nextPacket();
+            if (packet === null) {
+                const { value, done } = await reader.read();
+                if (done) {
+                    break;
+                }
+                assembler.push(value);
+                continue;
+            }
+
+            const type = packet[0];
+            const continuesProtocolError = protocolError !== null && type === MESSAGE_PROTOCOL_ERROR;
+            if ((sawEnd || protocolError !== null) && !continuesProtocolError) {
+                throw new TuringQueryError("PROTOCOL_ERROR", "Unexpected packet after END");
+            }
+
+            if (type === MESSAGE_CHUNK_HEADER || type === MESSAGE_CHUNK) {
+                this._decodePacket(decoder, packet);
+            } else if (type === MESSAGE_END_CHUNK) {
+                // One dataframe is complete: its footer states the row count, so the
+                // packet goes to the decoder before the frame is read out. Then drop the
+                // rows while keeping the columns — the server sends one CHUNK_HEADER per
+                // response and streams every dataframe through the same columns.
+                this._decodePacket(decoder, packet);
+                chunks.push(this._readDataframe(decoder));
+                decoder.endChunk();
+                sawEndChunk = true;
+            } else if (type === MESSAGE_END) {
+                if (!sawEndChunk) {
+                    chunks.push(this._readDataframe(decoder));
+                }
+                execTimeMs = readExecTime(packet);
+                sawEnd = true;
+            } else if (type === MESSAGE_ERROR) {
+                error = addErrorPacket(error, packet);
+            } else if (type === MESSAGE_PROTOCOL_ERROR) {
+                protocolError ??= new ByteWriter();
+                protocolError.bytes(packet.subarray(PROTO_HEADER_SIZE));
+            } else {
+                throw new TuringQueryError("PROTOCOL_ERROR", `Unknown packet type ${type}`);
+            }
+        }
+
+        if (protocolError !== null) {
+            throw new TuringQueryError("PROTOCOL_ERROR", utf8Decoder.decode(protocolError.toUint8Array()));
+        } else if (!sawEnd) {
+            throw new TuringQueryError("PROTOCOL_ERROR", "Response ended before the END packet");
+        } else if (error !== null) {
+            throw new TuringQueryError(error.status, utf8Decoder.decode(error.message.toUint8Array()));
+        }
+
+        return { chunks, execTimeMs };
+    }
+
+    _decodePacket(decoder, packet) {
+        try {
+            decoder.decodePacket(packet);
+        } catch (raised) {
+            throw new TuringQueryError("DECODE_ERROR", describeWasmError(this._module, raised));
+        }
+    }
+
+    _readDataframe(decoder) {
+        try {
+            return readDataframe(decoder);
+        } catch (raised) {
+            if (raised instanceof TuringQueryError) {
+                throw raised;
+            }
+            throw new TuringQueryError("DECODE_ERROR", describeWasmError(this._module, raised));
+        }
+    }
+}

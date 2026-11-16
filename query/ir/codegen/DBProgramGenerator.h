@@ -1,6 +1,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -20,10 +21,13 @@
 #include "DBPasses.h"
 #include "DBTypes.h"
 #include "expr/CaseExpr.h"
+#include "stmt/SetItem.h"
 #include "metadata/DateTime.h"
-#include "stmt/CallSubqueryStmt.h"
+#include "metadata/Point.h"
+#include "metadata/ValueComponent.h"
 
 #include "ExplainRequest.h"
+#include "InsertionOrderedMap.h"
 
 #include "VariableDependencyGraph.h"
 
@@ -59,12 +63,16 @@ class ListLiteral;
 class ListComprehensionExpr;
 class ListPredicateExpr;
 class ReduceExpr;
+class AllReduceExpr;
+class MapProjectionExpr;
 class ExistsExpr;
 class CountSubqueryExpr;
 class CollectSubqueryExpr;
 class ListSliceExpr;
 class LoadCSVStmt;
 class MapLiteral;
+class ParameterDecl;
+class ParameterExpr;
 class MatchStmt;
 class MergeStmt;
 class NodePattern;
@@ -83,6 +91,8 @@ class VariableDependency;
 class DependencyEdge;
 class SetStmt;
 class RemoveStmt;
+class CallSubqueryStmt;
+class RegularQuery;
 class SinglePartQuery;
 class UnionQuery;
 class ConditionalQuery;
@@ -97,15 +107,16 @@ class YieldItems;
 class DBProgramGenerator {
 public:
     using VariableIdentities = std::vector<mlir::TypedValue<mlir::Type>>;
-    using VariableIdentityMap = std::unordered_map<const VariableDependency*, VariableIdentities>;
+    using VariableIdentityMap = InsertionOrderedMap<const VariableDependency*, VariableIdentities>;
     using DefinedVars = std::unordered_set<const VariableDependency*>;
-    using ExprValueMap = std::unordered_map<const Expr*, mlir::Value>;
-    using ProjectedColumnMap = std::unordered_map<const VarDecl*, mlir::Value>;
-    using ElementColumnMap = std::unordered_map<const VarDecl*, mlir::Value>;
-    using EdgeTypeColumnMap = std::unordered_map<const VariableDependency*, mlir::Value>;
+    using ExprValueMap = InsertionOrderedMap<const Expr*, mlir::Value>;
+    using ProjectedColumnMap = InsertionOrderedMap<const VarDecl*, mlir::Value>;
+    using ElementColumnMap = InsertionOrderedMap<const VarDecl*, mlir::Value>;
+    using EdgeTypeColumnMap = InsertionOrderedMap<const VariableDependency*, mlir::Value>;
     using ColumnPredicate = llvm::function_ref<bool(mlir::Value)>;
     using VariableColumnBinding = llvm::function_ref<void(const VarDecl*, std::string_view, mlir::Value)>;
     using CaseRegionGenerator = llvm::function_ref<mlir::Value(mlir::Value)>;
+    using FoldBodyGenerator = llvm::function_ref<void()>;
     using LabelSetCheck = llvm::function_ref<mlir::Value(const SymbolChain*)>;
 
     // Maps a Cypher variable to the last column defined for it, the one the projection
@@ -214,14 +225,18 @@ private:
             std::unordered_map<std::string_view, mlir::Value> _properties;
         };
 
-        using CreatedEntityMap = std::unordered_map<const VarDecl*, CreatedEntity>;
+        using CreatedEntityMap = InsertionOrderedMap<const VarDecl*, CreatedEntity>;
 
         CreatedEntityMap _createdEntities;
 
-        // The aggregate that reduced the rows the part matched, once one has. The columns
-        // bound above it hold those rows and are no longer the rows in flight, which are
-        // the groups: an op emitted below can carry only what this op bound or later.
+        // The aggregate that grouped the rows the part matched, once one has: the grouped
+        // columns are the ones it bound, under the expressions they compute.
         mlir::Operation* _aggregateOp {nullptr};
+
+        // The op that reduced the rows the part matched, once one has: the aggregate, or the
+        // dedup of a DISTINCT. The columns bound above it hold the rows it read and are no
+        // longer the rows in flight: an op emitted below can carry only what it bound or later.
+        mlir::Operation* _rowReductionOp {nullptr};
 
         // What a part cut leaves of an entity the query wrote: every row of it that is not
         // null names one this change has not committed, so a read goes to the write buffer,
@@ -274,28 +289,17 @@ private:
             bool readsAsItsEdges() const { return _kind == mlir::storage::PathExpansionKind::Edges && !_reversed && _steps == 1; }
         };
 
-        std::unordered_map<const VarDecl*, PathBinding> _pathBindings;
+        InsertionOrderedMap<const VarDecl*, PathBinding> _pathBindings;
 
-        // The walk a `MATCH p = ...` names when its element is one quantified relationship:
-        // the variable holding the seeds and the one holding the handles, which is the
-        // relationship's own column. The path is built from the two where it is read, so
-        // the rows carry a handle rather than a sequence of their own.
-        struct NamedPathWalk {
-            const VariableDependency* _seed {nullptr};
-            const VariableDependency* _path {nullptr};
-            bool _reversed {false};
-        };
+        using NamedPathMap = InsertionOrderedMap<const VarDecl*, mlir::Value>;
 
-        std::unordered_map<const VarDecl*, NamedPathWalk> _namedPathWalks;
-
-        // The entity sequence each `MATCH p = ...` built for an element that names no
-        // single walk. A path variable appears in no pattern, so it is no VDG variable and
-        // cannot live in _varMap.
-        std::unordered_map<const VarDecl*, mlir::Value> _namedPaths;
+        // The path each `MATCH p = ...` built. A path variable appears in no pattern, so it
+        // is no VDG variable and cannot live in _varMap.
+        NamedPathMap _namedPaths;
 
         // The quantified edge pattern each variable-length variable was declared by, whose
         // hop constraints the exploration's region is generated from
-        std::unordered_map<const VarDecl*, const EdgePattern*> _quantifiedEdges;
+        InsertionOrderedMap<const VarDecl*, const EdgePattern*> _quantifiedEdges;
 
         // The block arguments of the hop region being generated, under the declarations of
         // the hop's entities; empty outside a region
@@ -316,6 +320,9 @@ private:
     // column is walked once rather than once per clause
     llvm::DenseMap<mlir::Value, bool> _constantColumns;
 
+    // The argument of main each parameter is bound to
+    llvm::DenseMap<const ParameterDecl*, mlir::Value> _parameterArguments;
+
     // The branches of a union in a subquery body start from the rows of that body, so each
     // branch block being generated maps to the body block whose columns are in flight in it
     std::unordered_map<mlir::Block*, mlir::Block*> _unionBranchRowBlocks;
@@ -324,9 +331,19 @@ private:
     // handed the field's column with it
     std::unordered_map<const VarDecl*, std::string_view> _csvFieldRows;
 
-    // The columns of the row the CALL body being generated runs for, as its block
-    // arguments and the constants it reads where they are bound
-    llvm::SmallVector<PublishedColumn> _subqueryRowColumns;
+    // An import of a body as the body binds it: its column, its pending mask and the fields
+    // of a CSV row, and what a write ahead of the body knows of it
+    struct RunConstant {
+        llvm::SmallVector<PublishedColumn> _columns;
+        std::optional<PartScope::WrittenEntity> _written;
+    };
+
+    using RunConstantMap = InsertionOrderedMap<const VarDecl*, RunConstant>;
+
+    // The constant imports of every body, by the declaration the body reads them under. In a
+    // body run once per row each import holds one value for the run, and a barrier of that
+    // body that drops one declares it again, bound again from here.
+    RunConstantMap _runConstants;
 
     // The LOAD CSV rows the subquery body being generated imports. A body that groups or
     // dedups runs one input row at a time, so such a row holds one record there and the
@@ -348,7 +365,7 @@ private:
 
     [[noreturn]] void throwError(std::string_view msg, const void* obj = nullptr) const;
 
-    void createMain();
+    void createMain(std::span<ParameterDecl* const> parameters);
 
     // What being one branch of a union asks of a query body's result: its projected
     // constants laid out over its rows, so every branch emits the result table's columns
@@ -366,7 +383,9 @@ private:
     // body in its own right
     void generateUnion(const UnionQuery* unionQuery);
 
-    void generateConditionalQuery(const ConditionalQuery* query);
+    // Emits a UNION or a WHEN whose branches yield their rows into one result, and the
+    // db.output of the columns its RETURN names. @param branch is null outside a union.
+    void generateBodyOutput(const RegularQuery* body, const UnionBranch* branch);
 
     void generateQueryParts(const SinglePartQuery* query);
 
@@ -382,6 +401,16 @@ private:
     // One query part: the statements between two WITH barriers
     void generatePart(std::span<Stmt* const> stmts);
 
+    // The variables the patterns of @param stmts bind through a db.checked_cast, added to
+    // @param casts when it does not hold them yet
+    static void collectCheckedCasts(std::span<Stmt* const> stmts, llvm::SmallVectorImpl<const VarDecl*>& casts);
+
+    // Binds each of those casts to the db.checked_cast of its value's column, once, as a part
+    // opens on @param stmts. A part opens on the statement that first casts a value, so the
+    // value is bound by then; a cast an earlier part bound is left as it is.
+    void bindCheckedCasts(std::span<Stmt* const> stmts);
+    mlir::Value checkedCastColumn(const VarDecl* cast, mlir::Value value);
+
     // Emits the db.call_subquery of one CALL { ... }: the columns in flight become the
     // inputs its body reads through block arguments, the body is generated into the op's
     // region as a query of its own, and - for a returning body - the op's results, the
@@ -389,8 +418,8 @@ private:
     void generateCallSubquery(const CallSubqueryStmt* subquery);
 
     void generateNextSegment(const NextSegmentStmt* segment);
-    void generateUnionSegment(const CallSubqueryStmt* body);
-    void generateConditionalSegment(const CallSubqueryStmt* body);
+    void generateUnionSegment(const NextSegmentStmt* segment);
+    void generateConditionalSegment(const NextSegmentStmt* segment);
     void generateUpdatingSegment(const NextSegmentStmt* segment);
 
     void splitConstantColumns(llvm::ArrayRef<PublishedColumn> columns,
@@ -575,32 +604,58 @@ private:
 
     void bindReturnedEntities(CarriedEntities& returnedEntities);
 
-    // The scope one branch of a CALL body opens with: the imports it names, read through
+    // The scope a query of a subquery body opens with, and what the query around wrote
+    // that it reads under the declarations of its own
+    struct BranchScope {
+        llvm::SmallVector<PublishedColumn> _columns;
+        CarriedEntities _importedEntities;
+    };
+
+    // The scope of each query of a body that reads the row it runs for: each single
+    // query, and each WHEN, whose predicates read it
+    using BodyScopes = InsertionOrderedMap<const RegularQuery*, BranchScope>;
+
+    static const BranchScope& findBranchScope(const BodyScopes& scopes, const RegularQuery* query);
+
+    // The scope a query of a CALL body opens with: the imports it names, read through
     // @param inputArguments or where they are bound as constants, and - for a body carrying
     // the scope - every input under a hidden name
-    void collectSubqueryBranchScope(const CallSubqueryStmt::Branch& branch,
+    void collectSubqueryBranchScope(const RegularQuery* query,
                                     llvm::ArrayRef<PublishedColumn> inputs,
                                     llvm::ArrayRef<mlir::Value> inputArguments,
                                     mlir::Value tagArgument,
                                     llvm::ArrayRef<PublishedColumn> constants,
                                     bool bindsHidden,
-                                    llvm::SmallVectorImpl<PublishedColumn>& scope,
-                                    CarriedEntities& importedEntities) const;
+                                    BranchScope& scope) const;
 
-    // Emits the db.union of a CALL or COUNT body that is a UNION, and fills @param yielded
-    // with its results under the names and declarations the body returns them as
-    void generateSubqueryUnion(llvm::ArrayRef<const SinglePartQuery*> branches,
-                               size_t dedupedBranches,
-                               std::span<const llvm::SmallVector<PublishedColumn>> branchScopes,
-                               std::span<const CarriedEntities> importedEntities,
+    // collectSubqueryBranchScope for every query of @param body that reads its row
+    void collectBodyScopes(const RegularQuery* body,
+                           llvm::ArrayRef<PublishedColumn> inputs,
+                           llvm::ArrayRef<mlir::Value> inputArguments,
+                           mlir::Value tagArgument,
+                           llvm::ArrayRef<PublishedColumn> constants,
+                           bool bindsHidden,
+                           BodyScopes& scopes) const;
+
+    // Emits the db.union or the db.conditional of a body that is a UNION or a WHEN, its
+    // branches generated under @param scopes, and fills @param yielded with its results
+    // under the names and declarations the body returns them as. With @param answersRows,
+    // a single query of the body returning nothing yields a column of its rows.
+    void generateSubqueryBody(const RegularQuery* body,
+                              const BodyScopes& scopes,
+                              bool answersRows,
+                              llvm::SmallVectorImpl<PublishedColumn>& yielded,
+                              CarriedEntities& returnedEntities);
+
+    void generateSubqueryUnion(const UnionQuery* unionQuery,
+                               const BodyScopes& scopes,
+                               bool answersRows,
                                llvm::SmallVectorImpl<PublishedColumn>& yielded,
                                CarriedEntities& returnedEntities);
 
-    // Emits the db.conditional of a WHEN body and fills @param yielded as
-    // generateSubqueryUnion does
-    void generateSubqueryConditional(llvm::ArrayRef<CallSubqueryStmt::Branch> branches,
-                                     std::span<const llvm::SmallVector<PublishedColumn>> branchScopes,
-                                     std::span<const CarriedEntities> importedEntities,
+    void generateSubqueryConditional(const ConditionalQuery* conditional,
+                                     const BodyScopes& scopes,
+                                     bool answersRows,
                                      llvm::SmallVectorImpl<PublishedColumn>& yielded,
                                      CarriedEntities& returnedEntities);
 
@@ -612,7 +667,19 @@ private:
         std::vector<std::vector<std::optional<PartScope::WrittenEntity>>> _writtenColumns;
     };
 
-    void rebindSubqueryBranchScope(llvm::ArrayRef<PublishedColumn> scope, const CarriedEntities& importedEntities);
+    void rebindSubqueryBranchScope(const BranchScope& scope);
+
+    // A body run once per row reads each argument of @param bodyBlock that @param scopes
+    // bind as the constant it is for the run: a db.row_constant at the top of the body
+    void readArgumentsAsRunConstants(mlir::Block* bodyBlock, BodyScopes& scopes);
+
+    // Records the constant imports @param scope binds in _runConstants
+    void registerRunConstants(const BranchScope& scope);
+
+    // Appends to @param published the columns each import of @param redeclared is bound
+    // through for the run: a barrier dropped it, and the analyzer declared it again behind
+    void appendRedeclaredImports(std::span<const VarDecl* const> redeclared,
+                                 llvm::SmallVectorImpl<PublishedColumn>& published) const;
 
     void generateConditionRegion(const Expr* predicate,
                                  mlir::Block* bodyBlock,
@@ -622,10 +689,15 @@ private:
 
     // Generates one branch into @param block, opened by openSubqueryBranch, ending in a
     // db.yield of what its RETURN publishes, none for a branch ending on a write
-    void generateSubqueryBranch(const SinglePartQuery* query,
+    void generateSubqueryBranch(const RegularQuery* query,
+                                const BodyScopes& scopes,
+                                bool answersRows,
                                 mlir::Block* block,
-                                mlir::Block* bodyBlock,
+                                mlir::Block* rowBlock,
                                 SubqueryBranchResults& branchResults);
+
+    // The block whose rows a branch generated into @param block starts from
+    mlir::Block* findRowBlock(mlir::Block* block) const;
 
     void generateUnionOverBranches(mlir::Value distinctSet,
                                    size_t dedupedBranches,
@@ -667,7 +739,7 @@ private:
                               mlir::Value column,
                               std::span<const LabelRef> labels,
                               const EdgeTypeRef& edgeType,
-                              llvm::ArrayRef<llvm::StringRef> propNames,
+                              std::span<const EntityPropertyConstraint> constraints,
                               llvm::ArrayRef<mlir::Value> propValues);
 
     // The chain of one MERGE pattern, as db.merge carries it: one entry per node and
@@ -734,6 +806,7 @@ private:
     // grouping bound - the key columns a sort key reads, under the expressions naming them
     void collectGroupedColumns(CarrySet& carrySet);
     void rebindCarrySet(mlir::ValueRange columns, size_t firstColumn, const CarrySet& carrySet);
+    void carryProjectedColumns(CarrySet& carrySet);
 
     // Moves every projected column the carry set took along onto the column standing for
     // it here: @param from and @param to are the columns as they were bound and as they
@@ -765,6 +838,12 @@ private:
     void generatePropertyWrite(const PropertyExpr* propertyExpr,
                                mlir::Value valueColumn,
                                mlir::Value rows);
+
+    void generatePropertiesWrite(const SetItem::EntityPropertiesAssign& assign,
+                                 mlir::Value mapColumn,
+                                 mlir::Value rows);
+
+    mlir::Value assignedColumn(const Expr* value, ValueType propertyType);
 
     void generateSetItems(const SetStmt* setStmt, mlir::Value rows);
 
@@ -817,9 +896,8 @@ private:
 
     void generateMatchFilter(const MatchStmt* matchStmt);
 
-    // Binds every element a `MATCH p = ...` named: to the walk when the element is one
-    // quantified relationship, and otherwise to the entity sequence built here out of the
-    // columns its entities are bound to
+    // Binds every element a `MATCH p = ...` named to the path built here out of the columns
+    // its entities are bound to
     void generateNamedPaths(const MatchStmt* matchStmt);
     void generateNamedPath(const PatternElement* element, const VarDecl* pathDecl);
 
@@ -831,18 +909,11 @@ private:
     // contributes to the path its element is named by
     mlir::Value pathHandleColumn(const VarDecl* edgeDecl);
 
-    // Builds the path of a walk out of its seeds and its handles, at the point it is read
-    mlir::Value namedPathColumn(const PartScope::NamedPathWalk& walk);
     mlir::Value makePathColumn(llvm::ArrayRef<mlir::Value> entities, llvm::ArrayRef<int64_t> reversedPaths = {});
 
-    // The entities a walk stands for, for an aggregate that reads its input's values rather
-    // than counting the rows the handles are
+    // The entities a walk stands for, which an expression or an aggregate reading a variable
+    // bound to the walk's handles takes rather than the handles
     mlir::Value readWalkEntities(const Expr* argExpr, mlir::Value column);
-
-    // Builds the path of every named-path item a projection publishes or outputs. A handle
-    // column says nothing about which of a path's lists it stands for, so the sink would
-    // read it as the walk's edges.
-    void buildNamedPathItems(const Projection* projection, llvm::SmallVectorImpl<mlir::Value>& projected);
 
     // Emits the Sort a MATCH's ORDER BY asks for, over everything in flight: the rows the
     // rest of the query reads are then the ordered ones.
@@ -976,6 +1047,10 @@ private:
     // or an OPTIONAL MATCH carries are the query's choice and not the addresses'
     void collectPublishedColumns(llvm::SmallVectorImpl<PublishedColumn>& published);
 
+    // In an ORDER BY the alias of a projected item names its column, over any variable of
+    // the same name
+    void publishProjectedAliases(llvm::SmallVectorImpl<PublishedColumn>& published) const;
+
     // Drops the scope and opens a fresh one holding these columns alone: what a barrier or
     // a cut publishes, and what an OPTIONAL MATCH hands to its pattern and then to the rest
     // of the query
@@ -1088,8 +1163,11 @@ private:
 
     mlir::Value nullConstantColumn();
 
-    // The one-element list a column makes, the shape a scalar takes to join a list
-    mlir::Value singletonList(mlir::Value column);
+    mlir::Value createCase(mlir::ValueRange conditions, mlir::ValueRange values, mlir::Value defaultValue);
+
+    // The list a scalar joins a list as under '+': the one-element list it makes, and null
+    // where it is null
+    mlir::Value joinedListOperand(mlir::Value column);
 
     // The comparison of two types that can never hold equal values: false where both
     // operands hold a value, and null where either is absent, since nothing compares to a
@@ -1136,6 +1214,7 @@ private:
     void applyPredicateFilters(std::span<const Expr* const> predicates);
 
     void generateGroupAggregate(const Projection* projection);
+    void recordAggregate(mlir::Operation* aggregateOp);
 
     // Publishes the grouped column of every grouping key and aggregate result an ORDER BY
     // key reads, so the key computes over one value per group rather than over the
@@ -1154,10 +1233,13 @@ private:
                                     llvm::ArrayRef<mlir::Value> aggregateColumns = {},
                                     llvm::ArrayRef<mlir::storage::GroupAggregateKind> aggregateKinds = {});
 
-    // The collects a keyless projection returns, built as one op so a single drain emits
-    // them all. One collect needs no help: its own translation is that op.
-    void emitKeylessCollect(llvm::ArrayRef<const FunctionInvocationExpr*> collectExprs,
-                            llvm::ArrayRef<AggregateArguments> collectArguments);
+    // Every aggregate of a keyless projection that gathers values, built as one db.collect
+    // as a grouped projection's are: the lists and the reductions beside them read the rows
+    // of one accumulator, and a single drain emits them all.
+    void emitKeylessCollect(llvm::ArrayRef<const FunctionInvocationExpr*> aggregateExprs,
+                            llvm::ArrayRef<AggregateArguments> arguments);
+
+    mlir::storage::GroupAggregateKind groupAggregateKind(const FunctionInvocation* invocation) const;
 
     // What an aggregate gathering its values answers from @param listColumn, the list of a
     // group's values: collect the list itself, percentileCont and percentileDisc its percentile.
@@ -1207,12 +1289,11 @@ private:
     void translateCollectSubqueryExpr(const Expr* expr, const CollectSubqueryExpr* collectExpr);
 
     // Emits the db.exists_subquery, db.count_subquery or db.collect_subquery of @param
-    // branches: the columns in flight become the inputs it reads through block arguments,
-    // one query is generated into the op's region as a correlated query of its own, or the
-    // db.union of several, and the op's one result is returned
+    // body: the columns in flight become the inputs it reads through block arguments, the
+    // body is generated into the op's region as a correlated query of its own, and the
+    // op's one result is returned
     template <typename SubqueryOp, typename YieldOp>
-    mlir::Value generateSubqueryExpression(llvm::ArrayRef<const SinglePartQuery*> branches,
-                                           size_t dedupedBranches,
+    mlir::Value generateSubqueryExpression(const RegularQuery* body,
                                            mlir::Type resultType,
                                            std::string_view tagName);
 
@@ -1229,6 +1310,27 @@ private:
     // initial value columns, the columns in flight its body reads as its carry set, and a
     // body region binding the element and the accumulator, yielding the next accumulator
     void translateReduceExpr(const Expr* expr, const ReduceExpr* reduce);
+
+    // Emits the db.all_reduce of `allReduce(acc = init, x IN xs | f(acc, x), p(acc, x))`:
+    // db.reduce's operands and body, and a predicate region over the same arguments
+    void translateAllReduceExpr(const Expr* expr, const AllReduceExpr* allReduce);
+
+    // Emits a map projection as a db.lazy_case computing the map only on the rows whose base
+    // is not null
+    void translateMapProjectionExpr(const Expr* expr, const MapProjectionExpr* projection);
+
+    // The map a projection builds: a db.make_map of its entries, merged over the base's
+    // db.properties where it reads every property, so an entry wins wherever `.*` stands
+    mlir::Value projectedMap(const MapProjectionExpr* projection);
+
+    // Generates a region of a db.reduce or a db.all_reduce: the entry block binds the
+    // element and the accumulator to their variables and takes the carry set, and
+    // @param generateBody emits what the region computes and its yield over them
+    void generateFoldRegion(mlir::Region& region,
+                            const CarrySet& carrySet,
+                            const VarDecl* itemDecl,
+                            const VarDecl* accumulatorDecl,
+                            FoldBodyGenerator generateBody);
 
     // The columns an op over the elements of one row's list may carry: every column in
     // flight, since the body reads the elements rather than the rows
@@ -1257,14 +1359,19 @@ private:
     void translatePatternComprehensionExpr(const Expr* expr,
                                            const PatternComprehensionExpr* comprehension);
 
-    // Generates one region of a db.lazy_case: its block takes @param carried, the carry set
-    // and the subject when it is carried, and yields what @param generateValue computes
-    // over them, handed the subject as the region sees it
+    // Generates one region of a db.lazy_case or a db.coalesce: its block takes @param carried,
+    // the carry set and the subject when it is carried, and yields what @param generateValue
+    // computes over them, handed the subject as the region sees it
     void generateCaseRegion(mlir::Region& region,
                             llvm::ArrayRef<mlir::Value> carried,
                             const CarrySet& carrySet,
                             mlir::Value subject,
                             CaseRegionGenerator generateValue);
+
+    // The result of a db.lazy_case or a db.coalesce whose regions are generated, typed as
+    // the values it selects, once the carried columns no region reads are dropped
+    template <typename SelectionOp>
+    mlir::Value selectionResult(SelectionOp selection);
 
     // The condition one WHEN value puts on a row: the value itself in the generic form,
     // and the comparison of @param subject against it in the simple one
@@ -1280,14 +1387,14 @@ private:
 
     void translateFunctionExpr(const Expr* expr, const FunctionInvocation* invocation);
 
-    // coalesce over @param args, emitted as the selection it is: every argument but the
-    // last guarded by its own presence, the last standing as the default
     void translateCoalesce(const Expr* expr, const ExprChain* args);
 
     void translateRange(const Expr* expr, const ExprChain* args);
     void translateSubstring(const Expr* expr, const ExprChain* args);
     void translateSplit(const Expr* expr, const ExprChain* args);
     void translateReplace(const Expr* expr, const ExprChain* args);
+    void translatePointDistance(const Expr* expr, const ExprChain* args);
+    void translatePointWithinBBox(const Expr* expr, const ExprChain* args);
 
     template <typename StringEndOp>
     void translateStringEnd(const Expr* expr, const ExprChain* args);
@@ -1297,9 +1404,10 @@ private:
 
     mlir::Value translateArg(const Expr* argExpr);
     mlir::Value translateLiteralExpr(const Literal* literal);
+    mlir::Value translateParameterExpr(const ParameterExpr* parameterExpr);
+    mlir::Type parameterType(const ParameterDecl* decl);
     mlir::Type propertyValueType(ValueType valueType);
     mlir::Value translatePropertyExpr(const PropertyExpr* propExpr);
-    mlir::Value emitComponentOf(const PropertyExpr* propExpr, mlir::Value value);
 
     // The instant a dotted access reads, before any component is taken off it: a field of
     // a loaded row, a property of an entity, or the column a value variable was bound to
@@ -1307,8 +1415,10 @@ private:
     mlir::Value translatePropertyLookupExpr(const PropertyLookupExpr* lookupExpr);
     mlir::Value emitStaticMapKey(mlir::Value map, std::string_view key);
     mlir::Value emitDynamicMapKey(mlir::Value map, mlir::Value key);
-    mlir::Value emitDateTimeComponent(DateTimePart part, mlir::Value instant);
-    mlir::Value emitDurationComponent(DurationPart part, mlir::Value duration);
+    mlir::Value emitComponent(const ValueComponent& component, mlir::Value value);
+    mlir::Value emitComponent(DateTimePart part, mlir::Value instant);
+    mlir::Value emitComponent(DurationPart part, mlir::Value duration);
+    mlir::Value emitComponent(PointPart part, mlir::Value point);
     mlir::Value translateEntityTypeExpr(const EntityTypeExpr* typeExpr);
 
     // labels() / type() of an entity the CREATE wrote, as the constant string it reads:
@@ -1344,14 +1454,17 @@ private:
     mlir::Value translateListLiteral(const ListLiteral* list);
 
     mlir::Value translateMapLiteral(const MapLiteral* map);
-    void translateMapEntries(const MapLiteral* map,
-                             llvm::SmallVectorImpl<mlir::NamedAttribute>& entries);
+    void translateMapEntries(const MapLiteral* map, mlir::NamedAttrList& entries);
 
     // The column of the lists a db.make_list builds out of the column each item rides:
     // what a list whose items are not all literals evaluates to
     mlir::Value translateListOfColumns(const ListLiteral* list);
 
     mlir::Value translateMapOfColumns(const MapLiteral* map);
+
+    // The db.make_map of @param entries, each a key and the expression its value is read
+    // from, no two under one key. The constant empty map when there is none.
+    mlir::Value emitMakeMap(std::span<const std::pair<std::string_view, const Expr*>> entries);
 
     void addScanNodes(const VariableDependency* var);
 
@@ -1378,6 +1491,10 @@ private:
     void filterConstantScope(mlir::Value predicate);
 
     void applyConstraints(const VariableDependency* var);
+
+    // Drops the rows where a bound node a pattern names is null, unless a check of the
+    // pattern already does: a null is no node, so the pattern matches nothing from it
+    void filterNullNode(const VariableDependency* var);
 
     void addMergeFilter(const VariableDependency* var,
                         std::vector<const VariableDependency*>& carriedSet);
@@ -1427,16 +1544,19 @@ private:
     // @param decl
     mlir::Value listColumnOf(const VarDecl* decl, mlir::Value column);
 
-    // The column a variable leaves its scope as: a path column goes out as its list unless
-    // it reads as its edges, the one reading a path column keeps once its binding is gone
+    // The variables the query names that are read off a walk's handles in flight, each with
+    // the list or the path it stands for, which is what an op keeping rows across chunks
+    // carries in place of the handles
+    void collectWalkReads(llvm::SmallVectorImpl<PublishedColumn>& walkReads);
+
+    // The column a variable leaves its scope as: a path column goes out as its list, or as
+    // the path a named path builds off it, unless it reads as its edges, the one reading a
+    // path column keeps once its binding is gone
     mlir::Value columnLeavingScope(const VarDecl* decl, mlir::Value column);
 
     // Expands every projected path column into its list, for the consumers that key on
     // the projection's rows
     void expandPathItems(const Projection* projection, llvm::SmallVectorImpl<mlir::Value>& projected);
-
-    // The column size() reads over a path column: the hop count of each path
-    mlir::Value pathLengthColumn(const Expr* argExpr, mlir::Value column);
 
     // The column nodes(), relationships() or length() reads over a named path
     mlir::Value pathElementsColumn(mlir::Value column, mlir::storage::PathElementsKind kind);

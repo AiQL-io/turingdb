@@ -7,6 +7,7 @@ include "mlir/Interfaces/InferTypeOpInterface.td"
 include "mlir/IR/BuiltinAttributeInterfaces.td"
 
 include "DBDialect.td"
+include "DBInterfaces.td"
 include "DBTypes.td"
 include "DBSystemOps.td"
 
@@ -104,7 +105,7 @@ def ConstScanNodes : TuringOp<"const_scan_nodes", [Pure]> {
 /**
 * FetchNodes
 */
-def FetchNodes : TuringOp<"fetch_nodes", [Pure]> {
+def FetchNodes : TuringOp<"fetch_nodes", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet"]>]> {
   let summary = "Produce for each row the node its ID cell names, dropping the rows naming none";
 
   let description = [{
@@ -343,7 +344,7 @@ def VectorSearch : TuringOp<"vector_search", [Pure]> {
 /**
 * Unwind
 */
-def Unwind : TuringOp<"unwind", [Pure]> {
+def Unwind : TuringOp<"unwind", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet"]>]> {
   let summary = "Produce one row per element of a value computed for each input row";
 
   let description = [{
@@ -385,7 +386,7 @@ def Unwind : TuringOp<"unwind", [Pure]> {
 /**
 * UnwindRange
 */
-def UnwindRange : TuringOp<"unwind_range", [NoMemoryEffect, AttrSizedOperandSegments, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def UnwindRange : TuringOp<"unwind_range", [MayRaise, AttrSizedOperandSegments, DeclareOpInterfaceMethods<ConditionallySpeculatable>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet"]>]> {
   let summary = "Produce one row per integer a row's range bounds span, without building the list";
 
   let description = [{
@@ -434,7 +435,7 @@ def UnwindRange : TuringOp<"unwind_range", [NoMemoryEffect, AttrSizedOperandSegm
 /**
 * UnwindComputed
 */
-def UnwindComputed : TuringOp<"unwind_computed", [Pure]> {
+def UnwindComputed : TuringOp<"unwind_computed", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet", "collectCarriedColumns"]>]> {
   let summary = "Produce one row per element of a value its region computes for each input row";
 
   let description = [{
@@ -555,26 +556,58 @@ def MakeMap : TuringOp<"make_map", [Pure, ConstantThroughOperands]> {
 }
 
 /**
+* MergeMaps
+*/
+def MergeMaps : TuringOp<"merge_maps", [Pure, ConstantThroughOperands]> {
+  let summary = "Merge the maps of each row, a later operand's entry replacing an earlier one's";
+
+  let description = [{
+    The map projection `p {.*, name: 'x'}`: the properties of p, with the entry of a later
+    item replacing the one under the same key. Row r of the result holds every key the
+    operands' maps hold at row r, each under the value of the last operand holding it:
+
+      %m = db.merge_maps(%properties, %entries)
+             : (!db.column<none>, !db.column<!storage.map>) -> !db.column<none>
+
+    A row where an operand holds no map gets no map, as a function of a null is null. An
+    operand holding one map for every row is laid out over the rows during lowering. The
+    result is a map column, nullable where an operand is, resolved during lowering.
+  }];
+
+  let arguments = (ins Variadic<Column>:$maps);
+  let results   = (outs Column:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $maps `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+/**
 * StaticMapKey
 */
-def StaticMapKey : TuringOp<"static_map_key", [Pure, ConstantThroughOperands]> {
+def StaticMapKey : TuringOp<"static_map_key", [MayRaise, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Row-wise read of one value of a map column, by a key known at plan time";
 
   let description = [{
     `m.name`, or `n.attrs.name`. The key is spelled in the query, so it rides an attribute
     rather than a column:
 
-      %v = db.static_map_key %m key "name" : (!db.column<none>) -> !db.column<map_element>
+      %v = db.static_map_key %m key "name" : (!db.column<none>) -> !db.column<any>
 
-    Row r of the result is the entry row r's map holds under the key. A row whose map holds
-    no such key - and a row holding no map at all - reads back as a null entry, since a map
-    value carries its null in its own tag. The map column is a column of tagged cells where
-    the map was itself read out of a list or a map. A cell holding a node or an edge reads
-    that entity's property under the key, as `n.name` does.
+    Row r of the result is the value row r's map holds under the key, a tagged cell. A row
+    whose map holds no such key - and a null row - reads back as a Null-tagged cell. The
+    map column is a column of tagged cells where the map was itself read out of a list or a
+    map. A cell holding a node or an edge reads that entity's property under the key, as
+    `n.name` does, and one holding a datetime or a duration reads the component the key
+    names, as `d.year` does. A cell holding any other value, or a datetime or a duration
+    with no such component, raises. A column of nodes or edges reads each entity's
+    property under the key, which is how a property whose type the program decides as it
+    runs - one only a write of tagged cells creates - is read.
   }];
 
   let arguments = (ins Column:$map, StrAttr:$key);
-  let results   = (outs ColumnMapElements:$result);
+  let results   = (outs ColumnCells:$result);
 
   let assemblyFormat = "$map `key` $key attr-dict `:` functional-type(operands, results)";
 }
@@ -582,7 +615,7 @@ def StaticMapKey : TuringOp<"static_map_key", [Pure, ConstantThroughOperands]> {
 /**
 * Range
 */
-def Range : TuringOp<"range", [NoMemoryEffect, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def Range : TuringOp<"range", [MayRaise, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Build one list of the integers a row's bounds span";
 
   let description = [{
@@ -595,8 +628,8 @@ def Range : TuringOp<"range", [NoMemoryEffect, ConstantThroughOperands, DeclareO
     Row r's list counts from row r of `start` to row r of `end`, both included, by
     `step` - 1 where it is absent, and negative to count down. A step walking away from
     `end` gives the empty list; a step of 0 is the error the row raises, as is a row
-    spanning more than 100000 integers. A bound holding no value gives its row no list,
-    which is what Cypher reads `range(null, 3)` as.
+    spanning more than 100000 integers or a type-erased bound holding no integer. A bound
+    holding no value gives its row no list, which is what Cypher reads `range(null, 3)` as.
 
     The elements are integers whatever the bounds were, so the result element type is
     written here rather than inferred, unlike db.make_list's homogeneity verdict. A bound
@@ -618,7 +651,7 @@ def Range : TuringOp<"range", [NoMemoryEffect, ConstantThroughOperands, DeclareO
 /**
 * ListSlice
 */
-def ListSlice : TuringOp<"list_slice", [Pure, ConstantThroughOperands, AttrSizedOperandSegments]> {
+def ListSlice : TuringOp<"list_slice", [MayRaise, ConstantThroughOperands, AttrSizedOperandSegments, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Read the run of each row's list that its bounds span";
 
   let description = [{
@@ -632,8 +665,9 @@ def ListSlice : TuringOp<"list_slice", [Pure, ConstantThroughOperands, AttrSized
 
     A bound is absent where the query left it out, which runs from the start or to the
     end. A negative bound counts from the end, and one running past the list is clamped to
-    it, so no row errors on a bound; a row whose list or whose bound is null gets a null
-    cell, which is what Cypher reads `null[1..2]` as.
+    it, so no row errors on an integer bound; a row whose list or whose bound is null gets a
+    null cell, which is what Cypher reads `null[1..2]` as. A list or a bound read out of a
+    type-erased cell may hold another value, which raises.
 
     The elements are the ones the list already holds, so the result element type is the
     input's and is resolved during lowering, as db.list_comprehension's is.
@@ -660,7 +694,7 @@ def ListSlice : TuringOp<"list_slice", [Pure, ConstantThroughOperands, AttrSized
 // element that is no number - which is why the op is not speculatable.
 //
 //   %m = db.percentile_cont(%values, %p) : (!db.column<none>, !db.column<f64>) -> !db.column<none>
-class PercentileOp<string mnemonic> : TuringOp<mnemonic, [NoMemoryEffect, ConstantThroughOperands]> {
+class PercentileOp<string mnemonic> : TuringOp<mnemonic, [MayRaise, ConstantThroughOperands]> {
   let summary = "Read a percentile of the numbers each row's list holds";
 
   let arguments = (ins Column:$list, Column:$percentile);
@@ -677,7 +711,7 @@ def PercentileDisc : PercentileOp<"percentile_disc">;
 /**
 * ListComprehension
 */
-def ListComprehension : TuringOp<"list_comprehension", [Pure, ConstantThroughOperands]> {
+def ListComprehension : TuringOp<"list_comprehension", [Pure, ConstantThroughOperands, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getRegionCarrySet"]>]> {
   let summary = "Build one list per row out of the elements of that row's list, filtered and projected";
 
   let description = [{
@@ -732,7 +766,7 @@ def ListComprehension : TuringOp<"list_comprehension", [Pure, ConstantThroughOpe
 /**
 * ListPredicate
 */
-def ListPredicate : TuringOp<"list_predicate", [Pure, ConstantThroughOperands]> {
+def ListPredicate : TuringOp<"list_predicate", [Pure, ConstantThroughOperands, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getRegionCarrySet"]>]> {
   let summary = "Decide, per row, whether a predicate holds for the elements of that row's list";
 
   let description = [{
@@ -773,7 +807,7 @@ def ListPredicate : TuringOp<"list_predicate", [Pure, ConstantThroughOperands]> 
 /**
 * Reduce
 */
-def Reduce : TuringOp<"reduce", [Pure, ConstantThroughOperands]> {
+def Reduce : TuringOp<"reduce", [Pure, ConstantThroughOperands, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getRegionCarrySet"]>]> {
   let summary = "Fold the elements of each row's list into one value per row";
 
   let description = [{
@@ -814,8 +848,8 @@ def Reduce : TuringOp<"reduce", [Pure, ConstantThroughOperands]> {
 /**
 * ReduceYield
 */
-def ReduceYield : TuringOp<"reduce_yield", [Pure, Terminator, HasParent<"Reduce">]> {
-  let summary = "Name the accumulator a db.reduce's body computed for each element";
+def ReduceYield : TuringOp<"reduce_yield", [Pure, Terminator, ParentOneOf<["Reduce", "AllReduce"]>]> {
+  let summary = "Name the accumulator a db.reduce's or a db.all_reduce's body computed for each element";
 
   let arguments = (ins Column:$value);
 
@@ -825,9 +859,66 @@ def ReduceYield : TuringOp<"reduce_yield", [Pure, Terminator, HasParent<"Reduce"
 }
 
 /**
+* AllReduce
+*/
+def AllReduce : TuringOp<"all_reduce", [Pure, ConstantThroughOperands, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getRegionCarrySet"]>]> {
+  let summary = "Decide, per row, whether a predicate holds after every step of a fold over that row's list";
+
+  let description = [{
+    Cypher's `allReduce(acc = init, x IN xs | f(acc, x), p(acc, x))`. The op folds each
+    row's list as db.reduce does, and produces one boolean per row: whether the predicate
+    held on the accumulator after every step.
+
+      %ok = db.all_reduce(%xs, %zero, {%n}) ({
+        ^bb0(%x: !db.column<none>, %acc: !db.column<none>, %nIn: !db.column<!storage.node_id>):
+          %next = db.add %acc, %x : (!db.column<none>, !db.column<none>) -> !db.column<none>
+          db.reduce_yield %next : !db.column<none>
+      }) predicate ({
+        ^bb0(%x: !db.column<none>, %acc: !db.column<none>, %nIn: !db.column<!storage.node_id>):
+          %holds = db.lt %acc, %ten : (!db.column<none>, !db.column<none>) -> !db.column<!storage.bool>
+          db.all_reduce_yield %holds : !db.column<!storage.bool>
+      }) : (!db.column<none>, !db.column<none>, !db.column<!storage.node_id>) -> !db.column<!storage.bool>
+
+    The body is db.reduce's. The predicate region takes the same arguments, its
+    accumulator the one the body just computed, as the fold holds it, and yields whether
+    the predicate holds on it. The initial value is never tested. A row stops folding at
+    the first step whose predicate is false, and gets false. A row with no false step gets
+    null when one was null, and true otherwise, so an empty list gets true. A row whose
+    source cell is null gets null.
+  }];
+
+  let arguments = (ins Column:$source, Column:$initial_value, Variadic<Column>:$columns_to_filter);
+  let results   = (outs ColumnBools:$result);
+
+  // Exactly one block each, the body ending in a db.reduce_yield and the predicate in a
+  // db.all_reduce_yield.
+  let regions = (region SizedRegion<1>:$body, SizedRegion<1>:$predicate);
+
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $source `,` $initial_value `,` `{` $columns_to_filter `}` `)` $body `predicate` $predicate attr-dict `:`
+    functional-type(operands, results)
+  }];
+}
+
+/**
+* AllReduceYield
+*/
+def AllReduceYield : TuringOp<"all_reduce_yield", [Pure, Terminator, HasParent<"AllReduce">]> {
+  let summary = "Name whether a db.all_reduce's predicate holds on the accumulator each element left";
+
+  let arguments = (ins Column:$holds);
+
+  let assemblyFormat = [{
+    $holds attr-dict `:` qualified(type($holds))
+  }];
+}
+
+/**
 * PatternComprehension
 */
-def PatternComprehension : TuringOp<"pattern_comprehension", [Pure]> {
+def PatternComprehension : TuringOp<"pattern_comprehension", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getRegionCarrySet"]>]> {
   let summary = "Build one list per row out of the matches a pattern finds for that row";
 
   let description = [{
@@ -1225,7 +1316,7 @@ def ScanInEdgesByLabelSrcTgt : TuringOp<"scan_in_edges_by_label_src_tgt", [Pure,
 /**
 * GetOutEdges
 */
-def GetOutEdges : TuringOp<"get_out_edges", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+def GetOutEdges : TuringOp<"get_out_edges", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet", "getRowSource"]>]> {
   let summary = "Fetch node and edge successors of input, filtering carried columns alongside";
 
   let description = [{
@@ -1259,7 +1350,7 @@ def GetOutEdges : TuringOp<"get_out_edges", [Pure, DeclareOpInterfaceMethods<OpA
 /**
 * GetInEdges
 */
-def GetInEdges : TuringOp<"get_in_edges", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+def GetInEdges : TuringOp<"get_in_edges", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet", "getRowSource"]>]> {
   let summary = "Fetch node and edge predecessors of input, filtering carried columns alongside";
 
   let description = [{
@@ -1298,7 +1389,7 @@ def GetInEdges : TuringOp<"get_in_edges", [Pure, DeclareOpInterfaceMethods<OpAsm
 /**
 * GetEdges
 */
-def GetEdges : TuringOp<"get_edges", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+def GetEdges : TuringOp<"get_edges", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet", "getRowSource"]>]> {
   let summary = "Fetch the neighbours of input over an edge in either direction, filtering carried columns alongside";
 
   let description = [{
@@ -1323,7 +1414,7 @@ def GetEdges : TuringOp<"get_edges", [Pure, DeclareOpInterfaceMethods<OpAsmOpInt
 /**
 * GetOutEdgesByType
 */
-def GetOutEdgesByType : TuringOp<"get_out_edges_by_type", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+def GetOutEdgesByType : TuringOp<"get_out_edges_by_type", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet", "getRowSource"]>]> {
   let summary = "Fetch the out-edges of the named types, filtering carried columns alongside";
 
   let description = [{
@@ -1373,7 +1464,7 @@ def GetOutEdgesByType : TuringOp<"get_out_edges_by_type", [Pure, DeclareOpInterf
 /**
 * GetInEdgesByType
 */
-def GetInEdgesByType : TuringOp<"get_in_edges_by_type", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+def GetInEdgesByType : TuringOp<"get_in_edges_by_type", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet", "getRowSource"]>]> {
   let summary = "Fetch the in-edges of the named types, filtering carried columns alongside";
 
   let description = [{
@@ -1407,7 +1498,7 @@ def GetInEdgesByType : TuringOp<"get_in_edges_by_type", [Pure, DeclareOpInterfac
 /**
 * GetOutEdgesByLabel
 */
-def GetOutEdgesByLabel : TuringOp<"get_out_edges_by_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+def GetOutEdgesByLabel : TuringOp<"get_out_edges_by_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet", "getRowSource"]>]> {
   let summary = "Fetch the out-edges arriving at the nodes carrying every given label, filtering carried columns alongside";
 
   let description = [{
@@ -1455,7 +1546,7 @@ def GetOutEdgesByLabel : TuringOp<"get_out_edges_by_label", [Pure, DeclareOpInte
 /**
 * GetInEdgesByLabel
 */
-def GetInEdgesByLabel : TuringOp<"get_in_edges_by_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+def GetInEdgesByLabel : TuringOp<"get_in_edges_by_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet", "getRowSource"]>]> {
   let summary = "Fetch the in-edges leaving the nodes carrying every given label, filtering carried columns alongside";
 
   let description = [{
@@ -1490,7 +1581,7 @@ def GetInEdgesByLabel : TuringOp<"get_in_edges_by_label", [Pure, DeclareOpInterf
 /**
 * GetOutEdgesByTypeAndLabel
 */
-def GetOutEdgesByTypeAndLabel : TuringOp<"get_out_edges_by_type_and_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+def GetOutEdgesByTypeAndLabel : TuringOp<"get_out_edges_by_type_and_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet", "getRowSource"]>]> {
   let summary = "Fetch the out-edges of the named types arriving at the nodes carrying every given label, filtering carried columns alongside";
 
   let description = [{
@@ -1524,7 +1615,7 @@ def GetOutEdgesByTypeAndLabel : TuringOp<"get_out_edges_by_type_and_label", [Pur
 /**
 * GetInEdgesByTypeAndLabel
 */
-def GetInEdgesByTypeAndLabel : TuringOp<"get_in_edges_by_type_and_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+def GetInEdgesByTypeAndLabel : TuringOp<"get_in_edges_by_type_and_label", [Pure, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet", "getRowSource"]>]> {
   let summary = "Fetch the in-edges of the named types leaving the nodes carrying every given label, filtering carried columns alongside";
 
   let description = [{
@@ -1556,7 +1647,7 @@ def GetInEdgesByTypeAndLabel : TuringOp<"get_in_edges_by_type_and_label", [Pure,
 /**
 * ExplorePaths
 */
-def ExplorePaths : TuringOp<"explore_paths", [Pure, AttrSizedOperandSegments, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>]> {
+def ExplorePaths : TuringOp<"explore_paths", [Pure, AttrSizedOperandSegments, DeclareOpInterfaceMethods<OpAsmOpInterface, ["getAsmResultNames"]>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet", "getRowSource"]>]> {
   let summary = "Enumerate the variable-length paths leaving each input node, filtering carried columns alongside";
 
   let description = [{
@@ -1755,65 +1846,78 @@ def ExpandPath : TuringOp<"expand_path", [Pure]> {
 * PathLength
 */
 def PathLength : TuringOp<"path_length", [Pure]> {
-  let summary = "Read the number of edges of each path";
+  let summary = "Read the number of edges, or of nodes, of each path";
 
   let description = [{
     The `size(e)` of a path variable: one unsigned count per row, read off the handle
-    without expanding the path.
+    without expanding the path. The fuse_path_length pass rewrites the db.size of a
+    db.expand_path into one.
 
       %n = db.path_length(%p) : (!db.column<!storage.path_ref>) -> !db.column<ui64>
+
+    `steps n` reads a walk repeating a body of `n` steps, the way db.expand_path's
+    `step k of n` does: the count is the repetitions, one per entity a group variable binds.
+
+      %n = db.path_length(%p) steps 2 : (!db.column<!storage.path_ref>) -> !db.column<ui64>
+
+    `nodes` counts the entries of db.expand_path's `kind nodes` list instead: the seed and
+    the end of each hop, one more than the hops.
+
+      %n = db.path_length(%p) nodes : (!db.column<!storage.path_ref>) -> !db.column<ui64>
   }];
 
-  let arguments = (ins ColumnPathRefs:$paths);
+  let arguments = (ins ColumnPathRefs:$paths, OptionalAttr<UI64Attr>:$steps, UnitAttr:$nodes);
   let results   = (outs Column:$result);
 
   let assemblyFormat = [{
-    `(` $paths `)` attr-dict `:` functional-type(operands, results)
+    `(` $paths `)` (`steps` $steps^)? (`nodes` $nodes^)? attr-dict `:` functional-type(operands, results)
   }];
+
+  let hasVerifier = 1;
 }
 
 /**
 * MakePath
 */
 def MakePath : TuringOp<"make_path", [Pure]> {
-  let summary = "Build the path a named pattern element binds, one entity sequence per row";
+  let summary = "Build the path a named pattern element binds, one path per row";
 
   let description = [{
     `MATCH p = (a)-[x]->(b)` binds `p` to the path the element spells out. This op lays
-    that path out as one sequence of graph entities per row - the nodes and the edges it
-    runs through, in the order they are written, each entry saying which of the two it is.
+    that path out as one path per row - the nodes and the edges it runs through, in the
+    order they are written.
 
       %p = db.make_path(%a, %x, %b)
              : (!db.column<!storage.node_id>, !db.column<!storage.edge_id>, !db.column<!storage.node_id>)
-               -> !db.column<!storage.entity_list>
+               -> !db.column<!storage.path>
 
     The operands are the element's entities in written order. A node column contributes
-    one node entry, an edge column one edge entry, and a path column - what a quantified
-    relationship binds - the whole walk it stands for: one edge entry and one node entry
-    per hop, its seed left out because the node operand ahead of it already holds it. So
+    one node, an edge column one edge, and a path column - what a quantified relationship
+    binds - the whole walk it stands for: one edge and one node per hop, its seed left
+    out because the node operand ahead of it already holds it. So
     `MATCH p = (a)-[e]->+(b)` is `db.make_path(%a, %pe)`, with no operand for `b`: the
     last node the walk reaches is `b`.
 
-      %p = db.make_path(%a, %pe) : (...) -> !db.column<!storage.entity_list>
-      %p = db.make_path(%a, %x, %b, %pe) : (...) -> !db.column<!storage.entity_list>
+      %p = db.make_path(%a, %pe) : (...) -> !db.column<!storage.path>
+      %p = db.make_path(%a, %x, %b, %pe) : (...) -> !db.column<!storage.path>
 
-    A path of no hops contributes no entry, so `MATCH p = (a)-[e]->*(m)` reads back as
+    A path of no hops contributes nothing, so `MATCH p = (a)-[e]->*(m)` reads back as
     the single node `a` on the rows where the walk stayed put.
 
     `reversed_paths` lists the path operands the exploration walked against the pattern,
     because the pattern's far end was bound first and seeding there was cheaper. Such an
     operand contributes its hops from the far end back - the node an edge lands on, then
-    that edge - so the sequence still reads the way the pattern is written. The node the
+    that edge - so the path still reads the way the pattern is written. The node the
     walk seeded from is written after the path rather than before it. Written after a
     node, the path writes over that node, which is the one the walk ended at.
 
-      %p = db.make_path(%pe, %b) {reversed_paths = [0]} : (...) -> !db.column<!storage.entity_list>
-      %p = db.make_path(%a, %x, %k, %pe, %b) {reversed_paths = [3]} : (...) -> !db.column<!storage.entity_list>
+      %p = db.make_path(%pe, %b) {reversed_paths = [0]} : (...) -> !db.column<!storage.path>
+      %p = db.make_path(%a, %x, %k, %pe, %b) {reversed_paths = [3]} : (...) -> !db.column<!storage.path>
   }];
 
   let arguments = (ins Variadic<Column>:$entities,
                        OptionalAttr<I64ArrayAttr>:$reversed_paths);
-  let results   = (outs ColumnEntityList:$result);
+  let results   = (outs ColumnPath:$result);
 
   let assemblyFormat = [{
     `(` $entities `)` attr-dict `:` functional-type(operands, results)
@@ -1825,27 +1929,32 @@ def MakePath : TuringOp<"make_path", [Pure]> {
 /**
 * PathElements
 */
-def PathElements : TuringOp<"path_elements", [Pure]> {
+def PathElements : TuringOp<"path_elements", [NoMemoryEffect,
+                                               DeclareOpInterfaceMethods<ConditionallySpeculatable>,
+                                               ConstantThroughOperands]> {
   let summary = "Read the nodes, the relationships or the length of each named path";
 
   let description = [{
     `nodes(p)`, `relationships(p)` and `length(p)` over the path a named pattern
     element binds: one list of node IDs, one list of edge IDs or one hop count per row,
-    read off the entity sequence db.make_path laid out, or off the path db.shortest_path
-    found.
+    read off the path db.make_path laid out, or off the path db.shortest_path
+    found. A path held in a list reaches it too, as the element a reduce or a
+    comprehension binds, whose column type lowering resolves, or as a tagged cell: a
+    tagged cell holding anything but a path or a null raises, so the op is speculatable
+    over a path column alone.
 
       %ns = db.path_elements(%p) kind nodes
-              : (!db.column<!storage.entity_list>) -> !db.column<!storage.nullable<!storage.list<!storage.node_id>>>
+              : (!db.column<!storage.path>) -> !db.column<!storage.nullable<!storage.list<!storage.node_id>>>
       %n = db.path_elements(%p) kind length
-              : (!db.column<!storage.entity_list>) -> !db.column<!storage.nullable<ui64>>
+              : (!db.column<!storage.path>) -> !db.column<!storage.nullable<ui64>>
 
-    A path an OPTIONAL MATCH missed is an empty sequence, and each function of it is
+    A path an OPTIONAL MATCH missed is null, and each function of it is
     null, so the results are nullable. Over the path of one node and one walk,
     fuse_path_elements answers from the walk's handles instead: db.path_length for the
     length and db.expand_path for the two lists.
   }];
 
-  let arguments = (ins AnyTypeOf<[ColumnEntityList, ColumnPath]>:$path, PathElementsKind:$kind);
+  let arguments = (ins Column:$path, PathElementsKind:$kind);
   let results   = (outs Column:$result);
 
   let assemblyFormat = [{
@@ -1853,12 +1962,18 @@ def PathElements : TuringOp<"path_elements", [Pure]> {
   }];
 
   let hasVerifier = 1;
+
+  let extraClassDefinition = [{
+    ::mlir::Speculation::Speculatability $cppClass::getSpeculatability() {
+      return speculatableOverElement<::mlir::storage::PathType>(getPath());
+    }
+  }];
 }
 
 /**
 * GetNodeProperties
 */
-def GetNodeProperties : TuringOp<"get_node_properties", [Pure]> {
+def GetNodeProperties : TuringOp<"get_node_properties", [Pure, ConstantThroughOperands]> {
   let summary = "Read one named property of each node as a column of values";
 
   let description = [{
@@ -1877,10 +1992,10 @@ def GetNodeProperties : TuringOp<"get_node_properties", [Pure]> {
     property is a deterministic read of the graph, so the op is Pure.
 
     `pending`, when present, is the mask a db.merge produced beside its node
-    column: those rows hold an offset into the change's write buffer rather than
-    an ID the graph knows, so their value is read out of that buffer instead of off
-    whatever node the offset would collide with - null there when the write set the
-    property on none of them.
+    column: those rows name a node this change wrote by the ID it will commit as,
+    past every node the graph holds, so their value is read out of the change's write
+    buffer rather than off the graph - null there when the write set the property on
+    none of them.
 
       %v = db.get_node_properties(%n, "age") pending %mask
              : (!db.column<!storage.node_id>, !db.column<!storage.bool>) -> !db.column<!storage.nullable<i64>>
@@ -1914,7 +2029,7 @@ def GetNodeProperties : TuringOp<"get_node_properties", [Pure]> {
 /**
 * GetEdgeProperties
 */
-def GetEdgeProperties : TuringOp<"get_edge_properties", [Pure]> {
+def GetEdgeProperties : TuringOp<"get_edge_properties", [Pure, ConstantThroughOperands]> {
   let summary = "Read one named property of each edge as a column of values";
 
   let description = [{
@@ -1931,7 +2046,8 @@ def GetEdgeProperties : TuringOp<"get_edge_properties", [Pure]> {
     get_node_properties' is.
 
     `pending` is get_node_properties' mask, over edges: a row a db.merge wrote
-    holds a write-buffer offset, and its value is read out of the write buffer.
+    names the edge by the ID it will commit as, and its value is read out of the
+    write buffer.
     `all_pending` is its maskless form, which a db.create_edge's column is.
   }];
 
@@ -2045,7 +2161,7 @@ def CheckEdgeTypeConstraint : TuringOp<"check_edge_type_constraint", [Pure]> {
 /**
 * CrossProduct
 */
-def CrossProduct : TuringOp<"cross_product", [Pure]> {
+def CrossProduct : TuringOp<"cross_product", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getRowSource", "getYieldedResultOffset"]>]> {
   let summary = "Cross every row of one column dataflow with every row of another";
 
   let description = [{
@@ -2100,7 +2216,7 @@ def CrossProduct : TuringOp<"cross_product", [Pure]> {
 /**
 * HashJoin
 */
-def HashJoin : TuringOp<"hash_join", [Pure]> {
+def HashJoin : TuringOp<"hash_join", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getRowSource", "getYieldedResultOffset"]>]> {
   let summary = "Cross two column dataflows, keeping the rows their key columns agree on";
 
   let description = [{
@@ -2122,9 +2238,10 @@ def HashJoin : TuringOp<"hash_join", [Pure]> {
 
     `on` names the key column of each side as an index into that factor's
     db.yield - the left factor's first, the right factor's second. A result row
-    pairs a left row with a right row whose keys hold the same value. A row whose
-    key is null joins with nothing, which is what the equality it replaces did:
-    `=` against a null gives null and the filter keeps only the true rows.
+    pairs a left row with a right row whose keys `=` holds equal, so the two keys
+    need not share a type: 32 joins 32.0. A row whose key is null joins with
+    nothing, which is what the equality it replaces did: `=` against a null gives
+    null and the filter keeps only the true rows.
 
     The right factor is the built side and the left the probed one, so a left
     row's matches come out together and in right-factor order, however either
@@ -2198,7 +2315,7 @@ def Yield : TuringOp<"yield", [Pure, Terminator, ParentOneOf<["CrossProduct", "H
 /**
 * CallProcedure
 */
-def CallProcedure : TuringOp<"call_procedure", [AttrSizedOperandSegments]> {
+def CallProcedure : TuringOp<"call_procedure", [AttrSizedOperandSegments, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet"]>]> {
   let summary = "Call a registered procedure, yielding the return values named";
 
   let description = [{
@@ -2296,7 +2413,7 @@ def Output : TuringOp<"output"> {
 /**
 * Limit
 */
-def Limit : TuringOp<"limit", [Pure]> {
+def Limit : TuringOp<"limit", [Pure, KeepsRowsByPosition, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet"]>]> {
   let summary = "Take the first N rows of a column dataflow";
   let description = [{
     The declarative counterpart of a Cypher RETURN ... LIMIT N. Caps the result
@@ -2333,7 +2450,7 @@ def Limit : TuringOp<"limit", [Pure]> {
 /**
 * Skip
 */
-def Skip : TuringOp<"skip", [Pure]> {
+def Skip : TuringOp<"skip", [Pure, KeepsRowsByPosition, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet"]>]> {
   let summary = "Drop the first M rows of a column dataflow";
   let description = [{
     The declarative counterpart of a Cypher RETURN ... SKIP M. Drops the first M
@@ -2364,7 +2481,7 @@ def Skip : TuringOp<"skip", [Pure]> {
 /**
 * Sort
 */
-def Sort : TuringOp<"sort", [Pure]> {
+def Sort : TuringOp<"sort", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet"]>]> {
   let summary = "Reorder the rows of a column set by one or more key columns";
   let description = [{
     The declarative counterpart of a Cypher RETURN ... ORDER BY. Takes the whole
@@ -2418,7 +2535,7 @@ def Sort : TuringOp<"sort", [Pure]> {
 */
 // NOT Pure: it records each row it emits in a seen-set, so it must run where it sits and
 // must not be hoisted, CSE'd or eliminated (like nl.distinct_filter, which it lowers to).
-def RemoveDuplicates : TuringOp<"remove_duplicates", [AttrSizedOperandSegments]> {
+def RemoveDuplicates : TuringOp<"remove_duplicates", [AttrSizedOperandSegments, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet"]>]> {
   let summary = "Emit each distinct row of a column set once";
   let description = [{
     The declarative counterpart of a Cypher RETURN DISTINCT / WITH DISTINCT. Takes
@@ -2529,7 +2646,7 @@ def Materialize : TuringOp<"materialize", [Pure]> {
 /**
 * ScanMaterialized
 */
-def ScanMaterialized : TuringOp<"scan_materialized", [Pure]> {
+def ScanMaterialized : TuringOp<"scan_materialized", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns"]>]> {
   let summary = "Walk every row a db.materialize holds";
   let description = [{
     A source like a scan: it opens a loop over the rows `rows` holds, in the order they
@@ -2549,7 +2666,7 @@ def ScanMaterialized : TuringOp<"scan_materialized", [Pure]> {
 /**
 * Union
 */
-def Union : TuringOp<"union", [NoTerminator]> {
+def Union : TuringOp<"union", [NoTerminator, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns"]>]> {
   let summary = "Emit the results of several query bodies as one result table";
   let description = [{
     The declarative counterpart of Cypher's UNION and UNION ALL. Holds one region per
@@ -2790,7 +2907,7 @@ def CountScanRows : TuringOp<"count_scan_rows", [Pure]> {
 // Unlike count(*), which tallies rows regardless of value and so accepts an ID
 // column, these reduce the values themselves, so the input must be a property
 // value column. The result value type follows Cypher and is resolved during
-// lowering: sum and min/max keep the input's type, avg is always a float, and the
+// lowering: sum and min/max keep the input's type, avg is a float over numbers, and the
 // result is null when no non-null row was seen (except sum, which is 0). Like
 // db.count the input and result types are unrelated, so there is no verifier.
 //
@@ -2833,7 +2950,7 @@ def Avg : AggregateOp<"avg">;
 def StDev : AggregateOp<"stdev">;
 def StDevP : AggregateOp<"stdevp">;
 
-class UnaryFunctionOp<string mnemonic, list<Trait> traits = [Pure]>
+class UnaryFunctionOp<string mnemonic, list<Trait> traits>
     : TuringOp<mnemonic, !listconcat(traits, [ConstantThroughOperands])> {
   let summary = "Apply a unary function row-wise to a value column";
 
@@ -2849,10 +2966,21 @@ class UnaryFunctionOp<string mnemonic, list<Trait> traits = [Pure]>
 // column of type-erased cells or of an unresolved type can: it is speculatable over a
 // column of the types it reads alone
 class TypedUnaryFunctionOp<string mnemonic, string readTypes>
-    : UnaryFunctionOp<mnemonic, [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+    : UnaryFunctionOp<mnemonic, [MayRaise, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let extraClassDefinition = [{
     ::mlir::Speculation::Speculatability $cppClass::getSpeculatability() {
       return speculatableOverElement<}] # readTypes # [{>(getInput());
+    }
+  }];
+}
+
+// A conversion raises on a type-erased cell holding a value it has no rule for. The analyzer
+// turns away a column of one type it has no rule for, so only such a cell can raise
+class ConversionFunctionOp<string mnemonic>
+    : UnaryFunctionOp<mnemonic, [MayRaise, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let extraClassDefinition = [{
+    ::mlir::Speculation::Speculatability $cppClass::getSpeculatability() {
+      return speculatableOverKnownTypes(getInput());
     }
   }];
 }
@@ -2872,17 +3000,21 @@ def PropertyMap : TypedUnaryFunctionOp<"properties", "::mlir::storage::NodeIDTyp
 def StartNode : TypedUnaryFunctionOp<"start_node", "::mlir::storage::EdgeIDType">;
 def EndNode : TypedUnaryFunctionOp<"end_node", "::mlir::storage::EdgeIDType">;
 
-def ToInteger : UnaryFunctionOp<"to_integer">;
-def ToFloat : UnaryFunctionOp<"to_float">;
-def ToBoolean : UnaryFunctionOp<"to_boolean">;
-def ToDateTime : UnaryFunctionOp<"to_datetime">;
+def ToInteger : ConversionFunctionOp<"to_integer">;
+def ToFloat : ConversionFunctionOp<"to_float">;
+def ToBoolean : ConversionFunctionOp<"to_boolean">;
+def ToDateTime : TypedUnaryFunctionOp<"to_datetime", "::mlir::storage::StringType">;
 def ToDuration : TypedUnaryFunctionOp<"to_duration", "::mlir::IntegerType">;
-def ToString : UnaryFunctionOp<"to_string">;
 
-def ToIntegerOrNull : UnaryFunctionOp<"to_integer_or_null">;
-def ToFloatOrNull : UnaryFunctionOp<"to_float_or_null">;
-def ToBooleanOrNull : UnaryFunctionOp<"to_boolean_or_null">;
-def ToStringOrNull : UnaryFunctionOp<"to_string_or_null">;
+// Any map can name an invalid point - a latitude past 90, an unknown crs - so it is never
+// speculatable
+def ToPoint : UnaryFunctionOp<"to_point", [MayRaise]>;
+def ToString : ConversionFunctionOp<"to_string">;
+
+def ToIntegerOrNull : UnaryFunctionOp<"to_integer_or_null", [Pure]>;
+def ToFloatOrNull : UnaryFunctionOp<"to_float_or_null", [Pure]>;
+def ToBooleanOrNull : UnaryFunctionOp<"to_boolean_or_null", [Pure]>;
+def ToStringOrNull : UnaryFunctionOp<"to_string_or_null", [Pure]>;
 
 // The calendar fields of an instant, as integer columns. The sub-second pair reads the
 // fraction of the second truncated to its own precision, so .123456 of a second in is a
@@ -2916,6 +3048,18 @@ def DurationSecondsOfMinute : TypedUnaryFunctionOp<"duration_seconds_of_minute",
 def DurationMillisecondsOfSecond : TypedUnaryFunctionOp<"duration_milliseconds_of_second", "::mlir::storage::DurationType">;
 def DurationMicrosecondsOfSecond : TypedUnaryFunctionOp<"duration_microseconds_of_second", "::mlir::storage::DurationType">;
 
+// The fields of a point: its coordinates as float columns, the name of its CRS as a string
+// column and its SRID as an integer column. A 2D point has no z or height and a cartesian
+// one no longitude, latitude or height, so those four raise over a column of points too.
+def PointX : TypedUnaryFunctionOp<"point_x", "::mlir::storage::PointType">;
+def PointY : TypedUnaryFunctionOp<"point_y", "::mlir::storage::PointType">;
+def PointZ : UnaryFunctionOp<"point_z", [MayRaise]>;
+def PointLongitude : UnaryFunctionOp<"point_longitude", [MayRaise]>;
+def PointLatitude : UnaryFunctionOp<"point_latitude", [MayRaise]>;
+def PointHeight : UnaryFunctionOp<"point_height", [MayRaise]>;
+def PointCRSName : TypedUnaryFunctionOp<"point_crs", "::mlir::storage::PointType">;
+def PointSRID : TypedUnaryFunctionOp<"point_srid", "::mlir::storage::PointType">;
+
 def CurrentDateTime : TuringOp<"current_datetime", [Pure, ConstantThroughOperands]> {
   let summary = "The instant the query runs, as a constant column";
   let description = [{
@@ -2943,6 +3087,7 @@ def CurrentDateTime : TuringOp<"current_datetime", [Pure, ConstantThroughOperand
 def ElementID : TypedUnaryFunctionOp<"element_id", "::mlir::storage::NodeIDType, ::mlir::storage::EdgeIDType">;
 
 def Size : TypedUnaryFunctionOp<"size", "::mlir::storage::StringType, ::mlir::storage::ListType">;
+def IsEmpty : TypedUnaryFunctionOp<"is_empty", "::mlir::storage::StringType, ::mlir::storage::ListType, ::mlir::storage::MapType">;
 def CharLength : TextFunctionOp<"char_length">;
 def Head : ListFunctionOp<"head">;
 def Last : ListFunctionOp<"last">;
@@ -2993,7 +3138,7 @@ class NormalFormFunctionOp<string mnemonic> : TextFunctionOp<mnemonic> {
 def Normalize : NormalFormFunctionOp<"normalize">;
 def IsNormalized : NormalFormFunctionOp<"is_normalized">;
 
-def Substring : TuringOp<"substring", [NoMemoryEffect, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def Substring : TuringOp<"substring", [MayRaise, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Take the run of each row's string its start and length span";
 
   let description = [{
@@ -3009,12 +3154,15 @@ def Substring : TuringOp<"substring", [NoMemoryEffect, ConstantThroughOperands, 
   }];
 }
 
-def Split : TuringOp<"split", [NoMemoryEffect, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
-  let summary = "Split on delimiter";
+def Split : TuringOp<"split", [MayRaise, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Split on a delimiter, or on every delimiter of a list";
 
   let description = [{
       %parts = db.split(%name, %delimiter) : (!db.column<!storage.string>, !db.column<!storage.string>)
                                            -> !db.column<!storage.list<!storage.string>>
+      %parts = db.split(%name, %delimiters) : (!db.column<!storage.string>,
+                                               !db.column<!storage.list<!storage.string>>)
+                                            -> !db.column<!storage.list<!storage.string>>
   }];
 
   let arguments = (ins Column:$string, Column:$delimiter);
@@ -3026,7 +3174,7 @@ def Split : TuringOp<"split", [NoMemoryEffect, ConstantThroughOperands, DeclareO
   }];
 }
 
-class StringEndOp<string mnemonic> : TuringOp<mnemonic, [NoMemoryEffect, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+class StringEndOp<string mnemonic> : TuringOp<mnemonic, [MayRaise, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Take the run of characters at one end of each row's string";
 
   let description = [{
@@ -3055,7 +3203,7 @@ class StringEndOp<string mnemonic> : TuringOp<mnemonic, [NoMemoryEffect, Constan
 def Left : StringEndOp<"left">;
 def Right : StringEndOp<"right">;
 
-def Replace : TuringOp<"replace", [NoMemoryEffect, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def Replace : TuringOp<"replace", [MayRaise, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Replace every occurrence of a search string in each row's string";
 
   let description = [{
@@ -3069,6 +3217,47 @@ def Replace : TuringOp<"replace", [NoMemoryEffect, ConstantThroughOperands, Decl
 
   let assemblyFormat = [{
     `(` $string `,` $search `,` $replacement `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def PointDistance : TuringOp<"point_distance", [MayRaise, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "The distance between the points of each row, null for two points in different CRSs";
+
+  let description = [{
+      Euclidean between two cartesian points, and great-circle metres between two
+      geographic ones. It raises on a tagged cell holding no point.
+
+      %d = db.point_distance(%a, %b) : (!db.column<!storage.point>, !db.column<!storage.point>)
+                                       -> !db.column<f64>
+  }];
+
+  let arguments = (ins Column:$lhs, Column:$rhs);
+  let results   = (outs Column:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $lhs `,` $rhs `)` attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def PointWithinBBox : TuringOp<"point_within_bbox", [MayRaise, ConstantThroughOperands, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Whether each row's point lies in its box, null unless the three share a CRS";
+
+  let description = [{
+      The box is bounded by its lower left and upper right corners, both included. It
+      raises on a tagged cell holding no point.
+
+      %in = db.point_within_bbox(%p, %lowerLeft, %upperRight)
+          : (!db.column<!storage.point>, !db.column<!storage.point>, !db.column<!storage.point>)
+            -> !db.column<!storage.bool>
+  }];
+
+  let arguments = (ins Column:$point, Column:$lowerLeft, Column:$upperRight);
+  let results   = (outs Column:$result);
+  let hasVerifier = 1;
+
+  let assemblyFormat = [{
+    `(` $point `,` $lowerLeft `,` $upperRight `)` attr-dict `:` functional-type(operands, results)
   }];
 }
 
@@ -3100,7 +3289,7 @@ def ConstantOp : TuringOp<"constant", [Pure, ConstantLike, DeclareOpInterfaceMet
   let assemblyFormat = "`(` $value `)` attr-dict";
 }
 
-def BroadcastConstant : TuringOp<"broadcast_constant", [Pure]> {
+def BroadcastConstant : TuringOp<"broadcast_constant", [Pure, AllTypesMatch<["value", "result"]>, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns"]>]> {
   let summary = "Lay a constant column's single value out over the rows of a relation";
   let description = [{
     A constant column holds one value standing for every row rather than one per row,
@@ -3111,7 +3300,7 @@ def BroadcastConstant : TuringOp<"broadcast_constant", [Pure]> {
 
       %p = db.scan_nodes() : !db.column<!storage.node_id>
       %c = db.constant(1 : i64) : !db.column<i64>
-      %x = db.broadcast_constant(%c, %p) : (!db.column<i64>, !db.column<!storage.node_id>) -> !db.column<none>
+      %x = db.broadcast_constant(%c, %p) : (!db.column<i64>, !db.column<!storage.node_id>) -> !db.column<i64>
 
     It is what a WITH publishing constants alone emits: `MATCH (p:Person) WITH 1 AS x`
     publishes one row per Person, not the single row the literal is, so the statements
@@ -3122,10 +3311,9 @@ def BroadcastConstant : TuringOp<"broadcast_constant", [Pure]> {
     the constants are - `WITH 1 AS x WHERE x > 100`, whose one row the filter drops - so
     the value is laid out over that row:
 
-      %x = db.broadcast_constant(%c) : (!db.column<i64>) -> !db.column<none>
+      %x = db.broadcast_constant(%c) : (!db.column<i64>) -> !db.column<i64>
 
-    The result element type is resolved during lowering, as for the arithmetic ops:
-    the rows are laid out as a nullable value column, present in every row.
+    The result holds the value it lays out, so it has the value's type.
   }];
 
   // The driver is the only optional operand, so MLIR tells it from the value without
@@ -3138,13 +3326,67 @@ def BroadcastConstant : TuringOp<"broadcast_constant", [Pure]> {
   }];
 }
 
-def ToNullable : TuringOp<"to_nullable", [Pure, ConstantThroughOperands]> {
+def RowConstant : TuringOp<"row_constant", [Pure, ConstantResult, SameOperandsAndResultType, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns"]>]> {
+  let summary = "Read an argument of a body run once per row as a constant";
+  let description = [{
+    A db.call_subquery, db.exists_subquery, db.count_subquery or db.collect_subquery
+    without `carries_scope` runs its body once per input row, so each argument of that
+    body holds one value for the whole run. This reads such an argument as the constant
+    it is, as Postgres reads a correlated parameter of a subplan: no op carries it
+    through the body, and an op reading it per row has it laid out over its own rows.
+
+      %r:2 = db.call_subquery(%p) {
+      ^bb0(%pIn: !db.column<!storage.node_id>):
+        %pc = db.row_constant %pIn : !db.column<!storage.node_id>
+        %s, %e, %et, %i = db.get_out_edges(%pc, {}) : ...
+        %name = db.get_node_properties(%pc, "name") : ...
+        db.subquery_yield {%name, %i} : ...
+      } : ...
+
+    The operand is an argument of a body run once per row.
+  }];
+
+  let arguments = (ins Column:$row);
+  let results = (outs Column:$result);
+
+  let assemblyFormat = "$row attr-dict `:` type($row)";
+
+  let hasVerifier = 1;
+}
+
+def ToNullable : TuringOp<"to_nullable", [Pure, ConstantThroughOperands, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns"]>]> {
   let summary = "Read a column as the nullable column of its values, holding a value in every row";
   let description = [{
     What a rewrite answering a nullable column with a plain one wraps it in, so that
     every reader of the column keeps the type it was built against:
 
       %l = db.to_nullable %n : (!db.column<ui64>) -> !db.column<!storage.nullable<ui64>>
+  }];
+
+  let arguments = (ins Column:$operand);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
+
+  let hasVerifier = 1;
+}
+
+def CheckedCast : TuringOp<"checked_cast", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+  let summary = "Read the node or the relationship each row's value holds";
+  let description = [{
+    A pattern naming a variable whose type is known per row - a value read out of a map, a
+    mixed list or a CASE - reads the entity each row holds as a column of IDs:
+
+      %p = db.checked_cast %v : (!db.column<!storage.any>) -> !db.column<!storage.node_id>
+
+    Row r of the result is the node, or the relationship for an edge_id result, that row r's
+    tagged cell holds. A null cell reads as the invalid ID an entity column spells its null
+    with, from which a pattern matches nothing, and a cell holding any other value is the
+    type error the row raises. The null literal reads as that invalid ID on every row, and
+    a column already holding the entities reads as itself.
+
+    It may raise, so it is computed over the rows reaching it: a constant operand is laid
+    out over them first.
   }];
 
   let arguments = (ins Column:$operand);
@@ -3162,22 +3404,22 @@ class PredicateOp<string mnemonic, list<Trait> traits = []>
   let assemblyFormat = "$lhs`,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def AndOp : PredicateOp<"and", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def AndOp : PredicateOp<"and", [MayRaise, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Performs row-wise logical AND on its two input columns";
   let arguments = (ins Column : $lhs, Column : $rhs);
 }
 
-def OrOp : PredicateOp<"or", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def OrOp : PredicateOp<"or", [MayRaise, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Performs row-wise logical OR on its two input columns";
   let arguments = (ins Column : $lhs, Column : $rhs);
 }
 
-def XorOp : PredicateOp<"xor", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def XorOp : PredicateOp<"xor", [MayRaise, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Performs row-wise logical XOR on its two input boolean columns";
   let arguments = (ins Column : $lhs, Column : $rhs);
 }
 
-def NotOp : TuringOp<"not", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>, ConstantThroughOperands]> {
+def NotOp : TuringOp<"not", [MayRaise, DeclareOpInterfaceMethods<ConditionallySpeculatable>, ConstantThroughOperands]> {
   let summary = "Row-wise logical NOT of a boolean column";
   let arguments = (ins Column:$operand);
   let results   = (outs ColumnBools:$result);
@@ -3190,23 +3432,63 @@ def EqOp : PredicateOp<"eq", [Pure]> {
       Result is always an abstraction over a (possibly nullable) mask (bool vector).
 
       %r = db.eq %x, %y : (!db.column<i64>, !db.column<i64>) -> !db.column<bool>
+
+      Neither operand is the null literal: a comparison with it is null on every row, which
+      is the null itself, and a test for a null is db.is_null.
   }];
+
+  let hasVerifier = 1;
 }
 
 def NeqOp : PredicateOp<"neq", [Pure]> {
   let summary = "Row-wise inequality of two value columns";
+
+  let hasVerifier = 1;
 }
 
-def AddOp : BinaryOp<"add", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
-  let summary = "Row-wise addition of two value columns";
+def IsNullOp : TuringOp<"is_null", [Pure, ConstantThroughOperands]> {
+  let summary = "Row-wise test of whether a column holds no value";
+  let description = [{
+      `x IS NULL`: true on the rows where the operand holds no value - an absent value, the
+      invalid ID of an entity an OPTIONAL MATCH missed, the null path, a list or map cell
+      holding null - and false on every other row. The result is never null.
 
+      %r = db.is_null %x : (!db.column<!storage.nullable<i64>>) -> !db.column<!storage.bool>
+  }];
+
+  let arguments = (ins Column:$operand);
+  let results   = (outs ColumnBools:$result);
+  let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
+}
+
+def IsNotNullOp : TuringOp<"is_not_null", [Pure, ConstantThroughOperands]> {
+  let summary = "Row-wise test of whether a column holds a value";
+  let description = [{
+      `x IS NOT NULL`, the negation of db.is_null. The result is never null.
+
+      %r = db.is_not_null %x : (!db.column<!storage.node_id>) -> !db.column<!storage.bool>
+  }];
+
+  let arguments = (ins Column:$operand);
+  let results   = (outs ColumnBools:$result);
+  let assemblyFormat = "$operand attr-dict `:` functional-type(operands, results)";
+}
+
+// An arithmetic operator may raise on a type-erased cell holding a value it does not compute
+// over, on a zero divisor, or on an overflow: each op says which operands rule them out
+class ArithmeticOp<string mnemonic>
+    : BinaryOp<mnemonic, [MayRaise, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let arguments = (ins Column:$lhs, Column:$rhs);
   let results   = (outs Column:$result);
 
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def ConcatOp : BinaryOp<"concat", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def AddOp : ArithmeticOp<"add"> {
+  let summary = "Row-wise addition of two value columns";
+}
+
+def ConcatOp : BinaryOp<"concat", [MayRaise, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Row-wise concatenation of two string or two list columns";
 
   let arguments = (ins Column:$lhs, Column:$rhs);
@@ -3215,13 +3497,16 @@ def ConcatOp : BinaryOp<"concat", [NoMemoryEffect, DeclareOpInterfaceMethods<Con
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def ListIndex : BinaryOp<"list_index", [Pure]> {
+def ListIndex : BinaryOp<"list_index", [MayRaise, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Row-wise read of one element of a list column, by position";
 
   let description = [{
     `[1, 3, 4][2]`
 
       %e = db.list_index %xs, %i : (!db.column<none>, !db.column<i64>) -> !db.column<none>
+
+    A position past either end of the list reads null. A list read out of a type-erased
+    cell may hold another value, which raises; a cell holding null reads null.
   }];
 
   let arguments = (ins Column:$lhs, Column:$rhs);
@@ -3230,71 +3515,90 @@ def ListIndex : BinaryOp<"list_index", [Pure]> {
   let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def DynamicMapKey : BinaryOp<"dynamic_map_key", [Pure]> {
+def IndexOf : BinaryOp<"index_of", [Pure]> {
+  let summary = "Row-wise position of the first element of a list equal to a value";
+
+  let description = [{
+    `coll.indexOf(['a', 'b'], 'b')`
+
+      %i = db.index_of %xs, %x : (!db.column<none>, !db.column<!storage.string>) -> !db.column<none>
+
+    Row r of the result is the 0-based position of the first element of row r's list equal
+    to row r's value, and -1 where no element is. It is null where the list or the value is
+    null. A null element matches nothing, where db.in answers null over it.
+  }];
+
+  let arguments = (ins Column:$list, Column:$value);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = "$list `,` $value attr-dict `:` functional-type(operands, results)";
+}
+
+def DynamicMapKey : BinaryOp<"dynamic_map_key", [MayRaise, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
   let summary = "Row-wise read of one value of a map column, by a key computed per row";
 
   let description = [{
     `m[k]`. The key is an expression rather than a name spelled in the query, so it rides a
     column rather than the attribute db.static_map_key carries:
 
-      %v = db.dynamic_map_key %m, %k : (!db.column<none>, !db.column<none>) -> !db.column<map_element>
+      %v = db.dynamic_map_key %m, %k : (!db.column<none>, !db.column<none>) -> !db.column<any>
 
-    Row r of the result is the entry row r's map holds under row r's key. A row whose map
-    holds no such key - and a row holding no map at all - reads back as a null entry, as
+    Row r of the result is the value row r's map holds under row r's key, a tagged cell. A
+    row whose map holds no such key - and a null row - reads back as a Null-tagged cell, as
     db.static_map_key's does. The map column is a column of tagged cells where the map was
     itself read out of a list or a map, and a cell holding a node or an edge reads that
-    entity's property under the key.
+    entity's property under the key. A cell holding any other value raises: a datetime and
+    a duration have components, which only `d.year` reads.
   }];
 
   let arguments = (ins Column:$map, Column:$key);
-  let results   = (outs ColumnMapElements:$result);
+  let results   = (outs ColumnCells:$result);
 
   let assemblyFormat = "$map`,` $key attr-dict `:` functional-type(operands, results)";
 }
 
-def SubOp : BinaryOp<"sub", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def ContainerIndex : BinaryOp<"container_index", [MayRaise]> {
+  let summary = "Row-wise read of an element of a list or a value of a map, by an index whose kind each row decides";
+
+  let description = [{
+    `c[i]` where `i` is a type-erased cell, so only the row says whether it is a position or
+    a key. Neo4j's ContainerIndex expression dispatches the same way at run time.
+
+      %e = db.container_index %c, %i : (!db.column<none>, !db.column<!storage.any>) -> !db.column<none>
+
+    Row r reads what db.list_index reads where row r's base holds a list and its index an
+    integer, and what db.dynamic_map_key reads where the base holds a map, a node or an edge
+    and the index a string. A null base or a null index reads null. Any other pair raises,
+    so the op is never speculatable.
+
+    A list hands its elements out as db.list_index does, and any other base a tagged cell.
+    Lowering resolves the result type.
+  }];
+
+  let arguments = (ins Column:$base, Column:$index);
+  let results   = (outs Column:$result);
+
+  let assemblyFormat = "$base `,` $index attr-dict `:` functional-type(operands, results)";
+}
+
+def SubOp : ArithmeticOp<"sub"> {
   let summary = "Row-wise subtraction of two value columns";
-
-  let arguments = (ins Column:$lhs, Column:$rhs);
-  let results   = (outs Column:$result);
-
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def MulOp : BinaryOp<"mul", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def MulOp : ArithmeticOp<"mul"> {
   let summary = "Row-wise multiplication of two value columns";
-
-  let arguments = (ins Column:$lhs, Column:$rhs);
-  let results   = (outs Column:$result);
-
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def DivOp : BinaryOp<"div", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def DivOp : ArithmeticOp<"div"> {
   let summary = "Row-wise division of two value columns";
-
-  let arguments = (ins Column:$lhs, Column:$rhs);
-  let results   = (outs Column:$result);
-
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def ModOp : BinaryOp<"mod", [NoMemoryEffect, DeclareOpInterfaceMethods<ConditionallySpeculatable>]> {
+def ModOp : ArithmeticOp<"mod"> {
   let summary = "Row-wise modulo of two value columns";
-
-  let arguments = (ins Column:$lhs, Column:$rhs);
-  let results   = (outs Column:$result);
-
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
-def PowOp : BinaryOp<"pow", [Pure]> {
+def PowOp : ArithmeticOp<"pow"> {
   let summary = "Row-wise exponentiation of two value columns";
-
-  let arguments = (ins Column:$lhs, Column:$rhs);
-  let results   = (outs Column:$result);
-
-  let assemblyFormat = "$lhs `,` $rhs attr-dict `:` functional-type(operands, results)";
 }
 
 def GtOp : PredicateOp<"gt", [Pure]> {
@@ -3327,13 +3631,18 @@ def ContainsOp : PredicateOp<"contains", [Pure]> {
 
 def InOp : PredicateOp<"in", [Pure]> {
   let summary = "Row-wise test of whether each value is an element of the given list";
+
+  let description = [{
+    A type-erased cell on the right is iterated as db.unwind iterates its source: the list
+    it holds, or a list of one where it holds any other value.
+  }];
 }
 
-def Case : TuringOp<"case", [Pure, ConstantThroughOperands, AttrSizedOperandSegments]> {
+def Case : TuringOp<"case", [Pure, ConstantThroughOperands, AttrSizedOperandSegments, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns"]>]> {
   let summary = "Row-wise selection of the first branch whose condition holds";
 
   let description = [{
-    A selection between columns computed for every row, which is what coalesce() emits.
+    A selection between columns computed for every row.
     `conditions` and `values` are parallel: a row takes the value of the first branch
     whose condition is true, the default when none is, and null when there is no default.
 
@@ -3341,21 +3650,28 @@ def Case : TuringOp<"case", [Pure, ConstantThroughOperands, AttrSizedOperandSegm
              : (!db.column<!storage.bool>, !db.column<!storage.bool>,
                 !db.column<i64>, !db.column<i64>, !db.column<i64>) -> !db.column<none>
 
-    A Cypher CASE is a db.lazy_case instead, which computes a branch only over the rows
-    that reach it.
+    A Cypher CASE is a db.lazy_case instead, and a coalesce() a db.coalesce, which compute
+    a branch or an argument only over the rows that reach it.
 
-    The result element type is resolved during lowering, as for the arithmetic ops: the
-    branches promote against each other into one nullable value column, or - when they are
-    all nodes, or all edges - into the entity column they already are, which carries the
-    null of an unmatched row in its ID. A selection walks rows, so - unlike the arithmetic
-    ops - it is not constant through its operands: the constants among them are laid out
-    over the driving relation during lowering.
+    The result is the one element every value holds, nullable unless it holds its own
+    null, the null literal holding whatever the others do. Nodes, edges and paths are
+    selected into the column they already are, which carries the null of an unmatched row
+    in a value of its own. A result of none is resolved during lowering, as for the
+    arithmetic ops: the branches promote against each other into one nullable value
+    column. A selection walks rows, so - unlike the arithmetic ops - it is not constant
+    through its operands: the constants among them are laid out over the driving relation
+    during lowering.
   }];
 
   let arguments = (ins Variadic<Column>:$conditions,
                        Variadic<Column>:$values,
                        Optional<Column>:$defaultValue);
   let results = (outs Column:$result);
+
+  let extraClassDeclaration = [{
+    // The value of every branch, then the default
+    void collectSelectedValues(::llvm::SmallVectorImpl<::mlir::Value>& values);
+  }];
 
   let hasVerifier = 1;
 
@@ -3365,7 +3681,7 @@ def Case : TuringOp<"case", [Pure, ConstantThroughOperands, AttrSizedOperandSegm
   }];
 }
 
-def LazyCase : TuringOp<"lazy_case", [Pure, ConstantThroughOperands]> {
+def LazyCase : TuringOp<"lazy_case", [Pure, ConstantThroughOperands, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns", "getRegionCarrySet"]>]> {
   let summary = "A Cypher CASE, whose conditions and values are computed only over the rows reaching them";
 
   let description = [{
@@ -3398,7 +3714,7 @@ def LazyCase : TuringOp<"lazy_case", [Pure, ConstantThroughOperands]> {
     subject against each WHEN value as the condition. The subject is computed once over
     every row and, unless it is a constant, carried as the last column.
 
-    The result element type is resolved during lowering, as db.case's is.
+    The result is typed as db.case's is, over the values the value regions yield.
   }];
 
   let arguments = (ins Variadic<Column>:$columns_to_filter);
@@ -3406,15 +3722,74 @@ def LazyCase : TuringOp<"lazy_case", [Pure, ConstantThroughOperands]> {
 
   let regions = (region VariadicRegion<SizedRegion<1>>:$branches);
 
+  let extraClassDeclaration = [{
+    // The value each WHEN's value region yields, then the ELSE's
+    void collectSelectedValues(::llvm::SmallVectorImpl<::mlir::Value>& values);
+  }];
+
   let hasVerifier = 1;
+  let hasRegionVerifier = 1;
 
   let assemblyFormat = [{
     `(` `{` $columns_to_filter `}` `)` $branches attr-dict `:` functional-type(operands, results)
   }];
 }
 
-def CaseYield : TuringOp<"case_yield", [Pure, Terminator, HasParent<"LazyCase">]> {
-  let summary = "Name the condition or the value a region of a db.lazy_case computes";
+def Coalesce : TuringOp<"coalesce", [RecursiveMemoryEffects, MayRaise, DeclareOpInterfaceMethods<ConditionallySpeculatable>, ConstantThroughOperands, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns", "getRegionCarrySet"]>]> {
+  let summary = "A coalesce(), whose arguments are computed only over the rows every earlier one left null";
+
+  let description = [{
+    The arguments are regions rather than operands, one per argument in their order, so
+    that what a row does not reach is never computed for it:
+    `coalesce(CASE WHEN t = 0 THEN 0 END, 10 / t)` divides by no zero.
+
+      %r = db.coalesce({%t}) {
+        ^bb0(%tIn: !db.column<i64>):
+          %z = db.lazy_case({%tIn}) { ... } : (!db.column<i64>) -> !db.column<!storage.nullable<i64>>
+          db.case_yield %z : !db.column<!storage.nullable<i64>>
+      }, {
+        ^bb0(%tIn: !db.column<i64>):
+          %q = db.div %ten, %tIn : (!db.column<i64>, !db.column<i64>) -> !db.column<none>
+          db.case_yield %q : !db.column<none>
+      } : (!db.column<i64>) -> !db.column<none>
+
+    Every region takes one argument per carried column, as db.lazy_case's regions do. The
+    first region sees every row, and each later one the rows every earlier region yielded
+    null for. A row takes the first value that is not null, and null when every region
+    yields null.
+
+    The result is typed as db.case's is, over the values the regions yield. The op has the
+    effects of its regions, and raises where any op nested in them may, however deep: a
+    Pure db.lazy_case reports no raise of the ops it holds. So one nothing reads stays
+    where a row may raise on an argument it reaches.
+
+    The canonical form holds no region yielding the null literal, but for one holding an
+    op that may raise, and, where the result names its element, none behind a region
+    yielding a literal that is not null. A coalesce left with one region is the value that
+    region yields, where the value has the coalesce's type.
+  }];
+
+  let arguments = (ins Variadic<Column>:$columns_to_filter);
+  let results   = (outs Column:$result);
+
+  let regions = (region VariadicRegion<SizedRegion<1>>:$arguments);
+
+  let extraClassDeclaration = [{
+    // The value each region yields, in the order of the regions
+    void collectSelectedValues(::llvm::SmallVectorImpl<::mlir::Value>& values);
+  }];
+
+  let hasVerifier = 1;
+  let hasRegionVerifier = 1;
+  let hasCanonicalizer = 1;
+
+  let assemblyFormat = [{
+    `(` `{` $columns_to_filter `}` `)` $arguments attr-dict `:` functional-type(operands, results)
+  }];
+}
+
+def CaseYield : TuringOp<"case_yield", [Pure, Terminator, ParentOneOf<["LazyCase", "Coalesce"]>]> {
+  let summary = "Name the condition or the value a region of a db.lazy_case or a db.coalesce computes";
 
   let arguments = (ins Column:$value);
 
@@ -3423,7 +3798,7 @@ def CaseYield : TuringOp<"case_yield", [Pure, Terminator, HasParent<"LazyCase">]
   }];
 }
 
-def FilterOp : TuringOp<"filter", [Pure]> {
+def FilterOp : TuringOp<"filter", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet"]>]> {
   let summary = "Keep only the rows where the mask is true, filtering carried columns alongside";
 
   let description = [{
@@ -3555,12 +3930,12 @@ def Merge : TuringOp<"merge", [AttrSizedOperandSegments]> {
 
     The results pair each entity the op looks up with a boolean mask, nodes in chain
     order then hops: the entity's ID column, then the rows of it that are pending -
-    written by this change and not committed, so an offset into the write buffer rather
-    than an ID the graph holds. A bound node has no pair of its own: its rows came in
-    through `bound_nodes` and come back through the carry set, re-indexed like every
-    other column in flight. After those pairs comes the boolean column saying which rows
-    the op wrote the whole pattern for - what ON CREATE and ON MATCH select on - then the
-    carry set.
+    written by this change and not committed, so named by the ID they will commit as,
+    which the graph holds nothing under. A bound node has no pair of its own: its rows
+    came in through `bound_nodes` and come back through the carry set, re-indexed like
+    every other column in flight. After those pairs comes the boolean column saying
+    which rows the op wrote the whole pattern for - what ON CREATE and ON MATCH select
+    on - then the carry set.
     `carried_columns` mirrors db.get_out_edges': the columns in flight, handed back
     re-indexed onto the rows the merge emitted, so a row the op emitted twice repeats
     them and one it emitted nothing for drops them.
@@ -3653,6 +4028,64 @@ def SetEdgeProperty : TuringOp<"set_edge_property", [AttrSizedOperandSegments]> 
   let hasVerifier = 1;
 }
 
+def SetNodeProperties : TuringOp<"set_node_properties", [AttrSizedOperandSegments]> {
+  let summary = "Write the entries of a row-aligned map as the properties of each input node";
+
+  let description = [{
+      %n = db.scan_nodes_by_label(["Person"]) : !db.column<!storage.node_id>
+      %m = db.constant({age = 32 : i64, name = "Remy" : !storage.string})
+      db.set_node_properties(%n, %m) replaces
+        : (!db.column<!storage.node_id>, !db.column<!storage.map>) -> ()
+
+    Cypher's SET n = m, and SET n += m without `replaces`. Each entry of the row's map
+    sets the property its key names, and an entry holding null removes it. `replaces`
+    also removes every property the node holds that the map does not name. A row holding
+    a null map writes an empty one. `creates` gives the element type of each property a
+    map literal names and the graph may not hold yet.
+  }];
+
+  let arguments = (ins Column:$input_nodes,
+                       Column:$value,
+                       Optional<Column>:$pending,
+                       Optional<Column>:$rows,
+                       UnitAttr:$all_pending,
+                       UnitAttr:$replaces,
+                       OptionalAttr<DictionaryAttr>:$created_types);
+
+  let assemblyFormat = [{
+    `(` $input_nodes `,` $value `)` (`pending` $pending^)? (`rows` $rows^)?
+    (`all_pending` $all_pending^)? (`replaces` $replaces^)? (`creates` $created_types^)?
+    attr-dict `:` functional-type(operands, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
+def SetEdgeProperties : TuringOp<"set_edge_properties", [AttrSizedOperandSegments]> {
+  let summary = "Write the entries of a row-aligned map as the properties of each input edge";
+
+  let description = [{
+      db.set_edge_properties(%e, %m) replaces
+        : (!db.column<!storage.edge_id>, !db.column<!storage.map>) -> ()
+  }];
+
+  let arguments = (ins Column:$input_edges,
+                       Column:$value,
+                       Optional<Column>:$pending,
+                       Optional<Column>:$rows,
+                       UnitAttr:$all_pending,
+                       UnitAttr:$replaces,
+                       OptionalAttr<DictionaryAttr>:$created_types);
+
+  let assemblyFormat = [{
+    `(` $input_edges `,` $value `)` (`pending` $pending^)? (`rows` $rows^)?
+    (`all_pending` $all_pending^)? (`replaces` $replaces^)? (`creates` $created_types^)?
+    attr-dict `:` functional-type(operands, results)
+  }];
+
+  let hasVerifier = 1;
+}
+
 def DeleteNode : TuringOp<"delete_node"> {
   let summary = "Delete each input node, optionally detaching its incident edges";
 
@@ -3662,8 +4095,8 @@ def DeleteNode : TuringOp<"delete_node"> {
       db.delete_node(%n) detach : (!db.column<!storage.node_id>) -> ()
 
     `pending` is the mask a db.merge produced beside its node column: those rows
-    hold an offset into the change's write buffer rather than an ID the graph
-    knows, so the change drops the write instead of tombstoning an ID.
+    name a node this change wrote by the ID it will commit as, so the change drops
+    the write instead of tombstoning an ID.
     `all_pending` says that of every row, which a db.create_node's column is.
   }];
 
@@ -3698,7 +4131,7 @@ def DeleteEdge : TuringOp<"delete_edge"> {
 /**
 * GroupAggregate
 */
-def GroupAggregate : TuringOp<"group_aggregate", [Pure]> {
+def GroupAggregate : TuringOp<"group_aggregate", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet"]>]> {
   let summary = "Group rows by a key tuple and reduce each group to one row";
   let description = [{
     The declarative counterpart of a Cypher aggregating RETURN / WITH with
@@ -3725,7 +4158,7 @@ def GroupAggregate : TuringOp<"group_aggregate", [Pure]> {
 
     The results are the grouping-key columns (in operand order, same types) then
     one column per aggregate: count and count_distinct are ui64 counts, sum/min/max
-    keep the input's value type and avg widens to f64 - all resolved during lowering,
+    keep the input's value type and avg widens numbers to f64 - all resolved during lowering,
     the distinct kinds exactly as the kinds they mirror,
     so - like db.count - the aggregate result types are unconstrained here. count(*)
     is expressed by a count over a never-null column (node IDs).
@@ -3767,7 +4200,7 @@ def GroupAggregate : TuringOp<"group_aggregate", [Pure]> {
 /**
 * Collect
 */
-def Collect : TuringOp<"collect", [Pure]> {
+def Collect : TuringOp<"collect", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["getCarrySet"]>]> {
   let summary = "Group rows by a key tuple and collect one column per group into a list";
   let description = [{
     Cypher `WITH k..., collect(x) AS xs`. Emits one row per distinct grouping-key
@@ -3871,7 +4304,7 @@ def ShortestPath : TuringOp<"shortest_path", [Pure]> {
 /**
 * OptionalMatch
 */
-def OptionalMatch : TuringOp<"optional_match", [Pure]> {
+def OptionalMatch : TuringOp<"optional_match", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns", "getRegionCarrySet"]>]> {
   let summary = "Match a pattern against the rows in flight, keeping the rows it does not match";
 
   let description = [{
@@ -3905,6 +4338,11 @@ def OptionalMatch : TuringOp<"optional_match", [Pure]> {
     those are the ones a row the pattern missed comes back with null. A null node
     or edge is an invalid ID (`ID::isValid()`), which reads as null through a
     property fetch and renders as null, so no column type changes here.
+
+    sink_into_optional_match moves the size of a variable's list, and nodes(),
+    relationships() or length() of its path, into the pattern: each is null when the
+    variable is, so the padding carries its result rather than the list or path.
+    trim_unread_columns drops a variable nothing past the op reads.
 
     Reading the graph is deterministic and the op writes nothing, so it is Pure -
     which says nothing about the row count, and this op changes it.
@@ -3952,7 +4390,7 @@ def OptionalYield : TuringOp<"optional_yield", [Pure, Terminator, AttrSizedOpera
 /**
 * CallSubquery
 */
-def CallSubquery : TuringOp<"call_subquery", []> {
+def CallSubquery : TuringOp<"call_subquery", [DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns", "getRegionCarrySet", "getYieldedResultOffset"]>]> {
   let summary = "Run a query of its own once per row in flight";
 
   let description = [{
@@ -4036,7 +4474,7 @@ def SubqueryYield : TuringOp<"subquery_yield", [Pure, Terminator, AttrSizedOpera
 /**
 * ExistsSubquery
 */
-def ExistsSubquery : TuringOp<"exists_subquery", [Pure]> {
+def ExistsSubquery : TuringOp<"exists_subquery", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns", "getRegionCarrySet"]>]> {
   let summary = "Answer, per row in flight, whether a body produces a row of its own for it";
 
   let description = [{
@@ -4111,7 +4549,7 @@ def ExistsYield : TuringOp<"exists_yield", [Pure, Terminator, AttrSizedOperandSe
 /**
 * CountSubquery
 */
-def CountSubquery : TuringOp<"count_subquery", [Pure]> {
+def CountSubquery : TuringOp<"count_subquery", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns", "getRegionCarrySet"]>]> {
   let summary = "Answer, per row in flight, how many rows a body produces for it";
 
   let description = [{
@@ -4172,7 +4610,7 @@ def CountSubqueryYield : TuringOp<"count_subquery_yield", [Pure, Terminator, Att
 /**
 * CollectSubquery
 */
-def CollectSubquery : TuringOp<"collect_subquery", [Pure]> {
+def CollectSubquery : TuringOp<"collect_subquery", [Pure, DeclareOpInterfaceMethods<ColumnCarrierOpInterface, ["collectCarriedColumns", "getRegionCarrySet"]>]> {
   let summary = "Build, per row in flight, the list of what a body returns for it";
 
   let description = [{
@@ -4192,7 +4630,7 @@ def CollectSubquery : TuringOp<"collect_subquery", [Pure]> {
         ^bb0(%pIn: !db.column<!storage.node_id>, %tag: !db.column<ui64>):
           %s, %e, %et, %k, %tag2 = db.get_out_edges(%pIn, {%tag}) : ...
           %name = db.get_node_properties(%k) {property = "name"} : ...
-          db.collect_subquery_yield %tag2, %name, {} : !db.column<none>
+          db.collect_subquery_yield tag %tag2, %name, {} : !db.column<none>
       }) : (!db.column<!storage.node_id>) -> !db.column<none>
 
     The result's type is the body's to decide and is resolved during lowering, as
@@ -4233,8 +4671,10 @@ def CollectSubqueryYield : TuringOp<"collect_subquery_yield", [Pure, Terminator,
 
   let arguments = (ins Optional<ColumnRowTags>:$tag, Column:$value, Variadic<Column>:$columns);
 
+  // The tag and the value are both operands, so the tag is spelled behind a keyword that
+  // tells the parser which of the two it is reading
   let assemblyFormat = [{
-    ($tag^ `,`)? $value `,` `{` $columns `}` attr-dict `:` qualified(type($value))
+    (`tag` $tag^ `,`)? $value `,` `{` $columns `}` attr-dict `:` qualified(type($value))
     (`,` `{` qualified(type($columns))^ `}`)?
   }];
 }

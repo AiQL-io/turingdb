@@ -213,25 +213,27 @@ MapLiteral* MapLiteral::create(CypherAST* ast) {
     return literal;
 }
 
-void MapLiteral::set(Symbol* key, Expr* value) {
-    const std::string_view name = key->getName();
-
-    for (std::pair<Symbol*, Expr*>& entry : _entries) {
-        if (entry.first->getName() == name) {
-            entry.second = value;
-            return;
-        }
-    }
-
+void MapLiteral::addEntry(Symbol* key, Expr* value) {
     _entries.emplace_back(key, value);
+
+    const std::string_view name = key->getName();
+    const auto heldIt = std::ranges::find_if(_heldEntries, [name](const Entry& held) {
+        return held.first->getName() == name;
+    });
+
+    if (heldIt != _heldEntries.end()) {
+        *heldIt = Entry {key, value};
+    } else {
+        _heldEntries.emplace_back(key, value);
+    }
 }
 
 bool MapLiteral::isLiteralTree() const {
-    const auto isLiteralEntry = [](const std::pair<Symbol*, Expr*>& entry) {
+    const auto isLiteralEntry = [](const Entry& entry) {
         return isLiteralTreeExpr(entry.second);
     };
 
-    return std::ranges::all_of(_entries, isLiteralEntry);
+    return std::ranges::all_of(_heldEntries, isLiteralEntry);
 }
 
 EmbeddingLiteral::EmbeddingLiteral()

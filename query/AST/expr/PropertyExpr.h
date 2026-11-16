@@ -1,8 +1,11 @@
 #pragma once
 
+#include <optional>
+
 #include "Expr.h"
 
 #include "metadata/PropertyType.h"
+#include "metadata/ValueComponent.h"
 
 namespace db {
 
@@ -35,19 +38,11 @@ public:
         _stringTableHeaderAccess = csvHeaderAccess;
     }
 
-    // A calendar field read off an instant - d.year, or n.createdAt.year, whose property
-    // name is still createdAt. The part is meaningless unless this says so.
-    bool readsADateTimeComponent() const { return _readsADateTimeComponent; }
-    DateTimePart getDateTimePart() const { return _dateTimePart; }
-    void setDateTimePart(DateTimePart part);
+    // The component read off a variable bound to an instant, a duration or a point: d.year
+    const std::optional<ValueComponent>& getComponent() const { return _component; }
+    void setComponent(ValueComponent component) { _component = component; }
 
-    bool readsADurationComponent() const { return _readsADurationComponent; }
-    bool readsAComponent() const { return _readsADateTimeComponent || _readsADurationComponent; }
-    DurationPart getDurationPart() const { return _durationPart; }
-    void setDurationPart(DurationPart part);
-
-    // The key a map value is read under - m.key, or n.attrs.key, whose property name is
-    // still attrs. The key is meaningless unless this says so.
+    // The key a map variable is read under, m.key. The key is meaningless unless this says so.
     bool readsAMapKey() const { return _readsAMapKey; }
     std::string_view getMapKey() const { return _mapKey; }
     void setMapKey(std::string_view key);
@@ -66,11 +61,8 @@ private:
     std::string_view _propName;
     std::string_view _mapKey;
     ValueType _valueType {ValueType::Invalid};
-    DateTimePart _dateTimePart {DateTimePart::Year};
-    DurationPart _durationPart {DurationPart::Years};
+    std::optional<ValueComponent> _component;
     bool _stringTableHeaderAccess {false};
-    bool _readsADateTimeComponent {false};
-    bool _readsADurationComponent {false};
     bool _readsAMapKey {false};
 
     PropertyExpr(QualifiedName* name)

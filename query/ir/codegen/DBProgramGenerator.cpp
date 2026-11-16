@@ -3,6 +3,7 @@
 #include <ctype.h>
 #include <algorithm>
 #include <array>
+#include <map>
 #include <memory>
 #include <numbers>
 #include <optional>
@@ -33,11 +34,13 @@
 #include "mlir/Pass/PassManager.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Support/SaveAndRestore.h"
 
+#include "DBColumnElement.h"
 #include "DBDialect.h"
 #include "DBOps.h"
 #include "DBPassPipeline.h"
@@ -49,6 +52,7 @@
 #include "StorageEnums.h"
 #include "StorageTypes.h"
 #include "PathHopArguments.h"
+#include "NullLiteralType.h"
 #include "IRConstantColumn.h"
 #include "IRLiteralList.h"
 #include "IRValueTypes.h"
@@ -80,6 +84,7 @@
 #include "stmt/StmtContainer.h"
 #include "decl/DeclContext.h"
 #include "decl/EvaluatedType.h"
+#include "decl/ParameterDecl.h"
 #include "decl/PatternData.h"
 #include "decl/VarDecl.h"
 #include "FunctionInvocation.h"
@@ -99,10 +104,13 @@
 #include "expr/ListComprehensionExpr.h"
 #include "expr/ListPredicateExpr.h"
 #include "expr/ReduceExpr.h"
+#include "expr/AllReduceExpr.h"
+#include "expr/MapProjectionExpr.h"
 #include "expr/ListExpr.h"
 #include "expr/ListSliceExpr.h"
 #include "expr/LiteralExpr.h"
 #include "expr/LogicalExpr.h"
+#include "expr/ParameterExpr.h"
 #include "expr/PatternComprehensionExpr.h"
 #include "expr/PropertyExpr.h"
 #include "expr/PropertyLookupExpr.h"
@@ -172,17 +180,17 @@ mlir::storage::UnicodeNormalForm toStorageNormalForm(UnicodeNormalForm form) {
     }
 }
 
-// Whether @param column is one @param aggregateOp bound, or one computed from what it
-// bound: anything computed before it holds the matched rows the aggregate consumed. A
-// column of another block is one the body being generated binds, which no aggregate reduced
-bool boundAtOrAfter(mlir::Value column, mlir::Operation* aggregateOp) {
+// Whether @param column is one @param reductionOp bound, or one computed from what it
+// bound: anything computed before it holds the matched rows the reduction consumed. A
+// column of another block is one the body being generated binds, which no reduction reduced
+bool boundAtOrAfter(mlir::Value column, mlir::Operation* reductionOp) {
     mlir::Operation* const definingOp = column.getDefiningOp();
 
-    if (!definingOp || definingOp->getBlock() != aggregateOp->getBlock()) {
+    if (!definingOp || definingOp->getBlock() != reductionOp->getBlock()) {
         return true;
     }
 
-    return definingOp == aggregateOp || aggregateOp->isBeforeInBlock(definingOp);
+    return definingOp == reductionOp || reductionOp->isBeforeInBlock(definingOp);
 }
 
 // Whether @param lhs is computed before @param rhs in the block both are bound in: a block
@@ -213,11 +221,10 @@ bool computedBefore(mlir::Value lhs, mlir::Value rhs) {
 }
 
 // Puts @param keys in the order the program computes the columns @param columns maps them
-// to. A map hands its entries out in address order, so the same query would otherwise
-// compile to a different operand order from one run to the next.
+// to. Keys sharing a column keep the order the map holds them in.
 template <typename Key, typename Map>
 void sortByProgramOrder(llvm::SmallVectorImpl<Key>& keys, const Map& columns) {
-    std::ranges::sort(keys, [&columns](const Key& lhs, const Key& rhs) {
+    std::ranges::stable_sort(keys, [&columns](const Key& lhs, const Key& rhs) {
         return computedBefore(columns.at(lhs), columns.at(rhs));
     });
 }
@@ -240,14 +247,39 @@ const VarDecl* projectedVariable(const Projection::ReturnItem& item) {
 
 // The untyped null column the null literal compiles to: nullable with no value type of
 // its own, so nothing about it says which column would carry a value
+bool isUntypedNullColumnType(mlir::Type type) {
+    const auto columnType = mlir::dyn_cast<mlir::db::ColumnType>(type);
+
+    return columnType && mlir::isNullLiteralType(columnType.getType());
+}
+
 bool isUntypedNullColumn(mlir::Value column) {
-    const auto columnType = mlir::dyn_cast<mlir::db::ColumnType>(column.getType());
-    if (!columnType) {
-        return false;
+    return isUntypedNullColumnType(column.getType());
+}
+
+// The branches of @param body when it is a UNION, and @param body itself otherwise
+void collectUnionBranches(const RegularQuery* body, llvm::SmallVectorImpl<const RegularQuery*>& branches) {
+    if (body->getKind() != QueryCommand::Kind::UNION_QUERY) {
+        branches.push_back(body);
+        return;
     }
 
-    const auto nullableType = mlir::dyn_cast<mlir::storage::NullableType>(columnType.getType());
-    return nullableType && mlir::isa<mlir::NoneType>(nullableType.getValueType());
+    for (const UnionQuery::Branch& branch : static_cast<const UnionQuery*>(body)->branches()) {
+        branches.push_back(branch._query);
+    }
+}
+
+// The queries whose rows add up to the rows of @param body: the branches of a UNION ALL, and
+// @param body itself otherwise
+void collectUnionAllBranches(const RegularQuery* body, llvm::SmallVectorImpl<const RegularQuery*>& branches) {
+    const bool unionAll = body->getKind() == QueryCommand::Kind::UNION_QUERY
+                       && static_cast<const UnionQuery*>(body)->getDedupedBranchCount() == 0;
+
+    if (unionAll) {
+        collectUnionBranches(body, branches);
+    } else {
+        branches.push_back(body);
+    }
 }
 
 mlir::Type pathElementsType(mlir::MLIRContext* context, mlir::storage::PathElementsKind kind) {
@@ -380,6 +412,10 @@ constexpr std::string_view countTagName {"`hidden_`count_tag"};
 
 constexpr std::string_view collectTagName {"`hidden_`collect_tag"};
 
+// What a single query of an EXISTS or COUNT body returning nothing yields when the body is a
+// UNION or a WHEN: one constant column, so the op holding its branches has rows to count
+constexpr std::string_view ANSWER_COLUMN_NAME {"`hidden_`answer"};
+
 // The mask of an entity a MERGE wrote is bound past a WITH under the entity's name behind
 // this prefix. No hidden name starts with it, so a barrier publishing no entity drops it
 constexpr std::string_view pendingMaskPrefix {"`pending_"};
@@ -477,8 +513,10 @@ const std::unordered_map<std::string_view, UnaryFunctionEmitter> unaryFunctionEm
     {"toBooleanOrNull", &emitUnaryFunction<mlir::db::ToBooleanOrNull>},
     {"datetime", &emitUnaryFunction<mlir::db::ToDateTime>},
     {"duration", &emitUnaryFunction<mlir::db::ToDuration>},
+    {"point", &emitUnaryFunction<mlir::db::ToPoint>},
     {"size", &emitUnaryFunction<mlir::db::Size>},
     {"length", &emitUnaryFunction<mlir::db::Size>},
+    {"isEmpty", &emitUnaryFunction<mlir::db::IsEmpty>},
     {"char_length", &emitUnaryFunction<mlir::db::CharLength>},
     {"character_length", &emitUnaryFunction<mlir::db::CharLength>},
     {"head", &emitUnaryFunction<mlir::db::Head>},
@@ -529,11 +567,37 @@ mlir::Value emitBinaryFunction(mlir::OpBuilder& builder,
 const std::unordered_map<std::string_view, BinaryFunctionEmitter> binaryFunctionEmitters = {
     {"cosine_similarity", &emitBinaryFunction<mlir::db::CosineSimilarity>},
     {"euclidean_distance", &emitBinaryFunction<mlir::db::EuclideanDistance>},
+    {"coll.indexOf", &emitBinaryFunction<mlir::db::IndexOf>},
 };
 
 // The list a literal UNWIND spreads, null for the one literal that is no list and still
 // analyzes - `UNWIND null`, which spreads into no row. Anything else here is a statement
 // the analyzer let through and neither of the sources built from one can lower.
+// The type a list of @param shape is read under, as a literal of that shape infers it: the
+// leaf's own type, none for a leaf no element names, any where the elements share none,
+// under one list per level
+mlir::Type listShapeType(mlir::OpBuilder& builder, const ListShape& shape) {
+    mlir::MLIRContext* const context = builder.getContext();
+    const EvaluatedType leaf = shape.getLeafType();
+    const bool sharesNoType = leaf == EvaluatedType::Invalid;
+    const std::optional<ValueType> leafValueType = sharesNoType ? std::nullopt : toValueType(leaf);
+
+    mlir::Type element;
+    if (leaf == EvaluatedType::Null) {
+        element = mlir::NoneType::get(context);
+    } else if (leafValueType) {
+        element = valueTypeToElementType(builder, *leafValueType);
+    } else {
+        element = mlir::storage::AnyType::get(context);
+    }
+
+    for (size_t level = 0; level < shape.getDepth(); level++) {
+        element = mlir::storage::ListType::get(context, element);
+    }
+
+    return element;
+}
+
 const ListLiteral* literalUnwindList(const DiagnosticsManager* diagnostics, const UnwindStmt* unwind) {
     const LiteralExpr* literalExpr = dynamic_cast<const LiteralExpr*>(unwind->arg());
     if (!literalExpr) {
@@ -702,11 +766,6 @@ bool isPathColumn(mlir::Value column) {
     return columnType && mlir::isa<mlir::storage::PathRefType>(columnType.getType());
 }
 
-bool isListColumn(mlir::Value column) {
-    const auto columnType = mlir::dyn_cast<mlir::db::ColumnType>(column.getType());
-    return columnType && mlir::isa<mlir::storage::ListType>(columnType.getType());
-}
-
 const VarDecl* declOfReturnItem(const Projection::ReturnItem& item) {
     const auto declOf = [](auto&& projected) -> const VarDecl* {
         using Type = std::remove_cvref_t<decltype(projected)>;
@@ -840,7 +899,7 @@ mlir::Type sharedColumnElement(mlir::MLIRContext* context, llvm::ArrayRef<mlir::
 mlir::Value findVarOrThrow(const DBProgramGenerator::VariableIdentityMap& map,
                         const VariableDependency* var) {
     const auto findIt = map.find(var);
-    bioassert(findIt != end(map), "Missing value for {}.", var->getName());
+    bioassert(findIt != map.end(), "Missing value for {}.", var->getName());
     const DBProgramGenerator::VariableIdentities& identities = findIt->second;
     bioassert(!identities.empty(), "Missing identity for {}.", var->getName());
     return identities.back();
@@ -1030,19 +1089,16 @@ void DBProgramGenerator::rebindYieldedColumn(const VarDecl* decl, mlir::TypedVal
 }
 
 void DBProgramGenerator::rebindNamedPath(const VarDecl* decl, mlir::Value column) {
-    const bool namesAPath = _part._namedPaths.contains(decl) || _part._namedPathWalks.contains(decl);
-    if (!namesAPath) {
+    if (!_part._namedPaths.contains(decl)) {
         return;
     }
 
-    // The column is a built path now, no longer the walk's handle
-    _part._namedPathWalks.erase(decl);
     _part._namedPaths[decl] = column;
 }
 
 void DBProgramGenerator::rebindGroupVariable(const VarDecl* decl, mlir::Value column) {
     const auto bindingIt = _part._pathBindings.find(decl);
-    if (bindingIt == end(_part._pathBindings)) {
+    if (bindingIt == _part._pathBindings.end()) {
         return;
     }
 
@@ -1127,8 +1183,8 @@ void DBProgramGenerator::addUnwindConst(const VariableDependency* var, const Unw
     const mlir::ArrayAttr elementsAttr = _opBuilder.getArrayAttr(elements);
 
     const mlir::Type sharedType = sharedLiteralElementType(elementsAttr);
-    const mlir::Type elementType = sharedType ? sharedType
-                                              : mlir::storage::AnyType::get(_mlirCtxt);
+    const mlir::Type elementType = mlir::isa<mlir::NoneType>(sharedType) ? mlir::storage::AnyType::get(_mlirCtxt)
+                                                                         : sharedType;
 
     const mlir::db::ColumnType resultType = allocColumnType(elementType);
 
@@ -1171,10 +1227,10 @@ mlir::Attribute DBProgramGenerator::literalAttr(const Literal* literal) {
     } else if (kind == Literal::Kind::MAP) {
         const MapLiteral* nested = static_cast<const MapLiteral*>(literal);
 
-        llvm::SmallVector<mlir::NamedAttribute> nestedEntries;
+        mlir::NamedAttrList nestedEntries;
         translateMapEntries(nested, nestedEntries);
 
-        return _opBuilder.getDictionaryAttr(nestedEntries);
+        return nestedEntries.getDictionary(_mlirCtxt);
     }
 
     return scalarLiteralAttr(literal);
@@ -1209,15 +1265,19 @@ mlir::Value DBProgramGenerator::translateListLiteral(const ListLiteral* list) {
     return constant.getResult();
 }
 
-mlir::Value DBProgramGenerator::singletonList(mlir::Value column) {
+mlir::Value DBProgramGenerator::joinedListOperand(mlir::Value column) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
     const mlir::Type elementType = mlir::cast<mlir::db::ColumnType>(column.getType()).getType();
     const mlir::Type listType = mlir::storage::ListType::get(_mlirCtxt, elementType);
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
 
-    mlir::db::MakeList makeList = _opBuilder.create<mlir::db::MakeList>(_opBuilder.getUnknownLoc(),
+    mlir::db::MakeList makeList = _opBuilder.create<mlir::db::MakeList>(loc,
                                                                         allocColumnType(listType),
                                                                         mlir::ValueRange {column});
 
-    return makeList.getResult();
+    const mlir::Value holdsAValue = _opBuilder.create<mlir::db::IsNotNullOp>(loc, boolType, column).getResult();
+
+    return createCase(mlir::ValueRange {holdsAValue}, mlir::ValueRange {makeList.getResult()}, mlir::Value {});
 }
 
 mlir::Value DBProgramGenerator::translateListOfColumns(const ListLiteral* list) {
@@ -1241,38 +1301,51 @@ mlir::Value DBProgramGenerator::translateMapLiteral(const MapLiteral* map) {
         return translateMapOfColumns(map);
     }
 
-    llvm::SmallVector<mlir::NamedAttribute> entries;
+    mlir::NamedAttrList entries;
     translateMapEntries(map, entries);
 
     // DictionaryAttr canonicalises by sorting on key name, so the entries reach the
     // interpreter sorted rather than in the order MapLiteral holds them.
     mlir::db::ConstantOp constant = _opBuilder.create<mlir::db::ConstantOp>(_opBuilder.getUnknownLoc(),
-                                                                            _opBuilder.getDictionaryAttr(entries));
+                                                                            entries.getDictionary(_mlirCtxt));
 
     return constant.getResult();
 }
 
 mlir::Value DBProgramGenerator::translateMapOfColumns(const MapLiteral* map) {
-    llvm::SmallVector<std::pair<std::string_view, const Expr*>> entries;
-    entries.reserve(map->size());
+    const std::span<const MapLiteral::Entry> heldEntries = map->getHeldEntries();
 
-    for (const auto& [key, valueExpr] : *map) {
+    llvm::SmallVector<std::pair<std::string_view, const Expr*>> entries;
+    entries.reserve(heldEntries.size());
+
+    for (const auto& [key, valueExpr] : heldEntries) {
         entries.emplace_back(key->getName(), valueExpr);
     }
 
+    return emitMakeMap(entries);
+}
+
+mlir::Value DBProgramGenerator::emitMakeMap(std::span<const std::pair<std::string_view, const Expr*>> entries) {
+    if (entries.empty()) {
+        mlir::db::ConstantOp empty = _opBuilder.create<mlir::db::ConstantOp>(_opBuilder.getUnknownLoc(),
+                                                                             _opBuilder.getDictionaryAttr({}));
+        return empty.getResult();
+    }
+
     // Sorted on key name, as the DictionaryAttr of a constant map is
-    std::sort(entries.begin(), entries.end(), [](const auto& lhs, const auto& rhs) {
-        return lhs.first < rhs.first;
-    });
+    std::map<std::string_view, mlir::Value> columnsByKey;
+    for (const auto& [keyName, valueExpr] : entries) {
+        columnsByKey.emplace(keyName, getOrTranslateExprColumn(valueExpr));
+    }
 
     llvm::SmallVector<mlir::Attribute> keys;
     llvm::SmallVector<mlir::Value> valueColumns;
-    keys.reserve(entries.size());
-    valueColumns.reserve(entries.size());
+    keys.reserve(columnsByKey.size());
+    valueColumns.reserve(columnsByKey.size());
 
-    for (const auto& [keyName, valueExpr] : entries) {
+    for (const auto& [keyName, column] : columnsByKey) {
         keys.push_back(_opBuilder.getStringAttr(llvm::StringRef(keyName.data(), keyName.size())));
-        valueColumns.push_back(getOrTranslateExprColumn(valueExpr));
+        valueColumns.push_back(column);
     }
 
     mlir::db::MakeMap makeMap = _opBuilder.create<mlir::db::MakeMap>(_opBuilder.getUnknownLoc(),
@@ -1282,11 +1355,11 @@ mlir::Value DBProgramGenerator::translateMapOfColumns(const MapLiteral* map) {
     return makeMap.getResult();
 }
 
-void DBProgramGenerator::translateMapEntries(const MapLiteral* map,
-                                             llvm::SmallVectorImpl<mlir::NamedAttribute>& entries) {
-    entries.reserve(map->size());
+void DBProgramGenerator::translateMapEntries(const MapLiteral* map, mlir::NamedAttrList& entries) {
+    const std::span<const MapLiteral::Entry> heldEntries = map->getHeldEntries();
+    entries.reserve(heldEntries.size());
 
-    for (const auto& [key, valueExpr] : *map) {
+    for (const auto& [key, valueExpr] : heldEntries) {
         const LiteralExpr* literalExpr = dynamic_cast<const LiteralExpr*>(valueExpr);
 
         if (!literalExpr) {
@@ -1303,8 +1376,7 @@ void DBProgramGenerator::translateMapEntries(const MapLiteral* map,
         }
 
         const std::string_view keyName = key->getName();
-        entries.emplace_back(_opBuilder.getStringAttr(llvm::StringRef(keyName.data(), keyName.size())),
-                             value);
+        entries.append(_opBuilder.getStringAttr(llvm::StringRef(keyName.data(), keyName.size())), value);
     }
 }
 
@@ -1340,14 +1412,12 @@ void DBProgramGenerator::walkEdge(const VariableDependency* src,
     bioassert(src, "Null source");
     bioassert(tgt, "Null target");
 
-    bioassert(_part._varMap.contains(src), "Edge traversal without source");
-
     const auto srcs = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
     const auto eids = allocColumnType(mlir::storage::EdgeIDType::get(_mlirCtxt));
     const auto etypes = allocColumnType(mlir::storage::EdgeTypeIDType::get(_mlirCtxt));
     const auto tgts = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
 
-    const mlir::Value input = _part._varMap[src].back();
+    const mlir::Value input = findVarOrThrow(_part._varMap, src);
 
     InFlightColumns carried;
     collectHopCarrySet(src, carrySet, carried);
@@ -1355,27 +1425,6 @@ void DBProgramGenerator::walkEdge(const VariableDependency* src,
     llvm::SmallVector<mlir::Value> operands {input};
     llvm::SmallVector<mlir::Type> results {srcs, eids, etypes, tgts};
     for (const mlir::Value column : carried._columns) {
-        operands.push_back(column);
-        results.push_back(column.getType());
-    }
-
-    // A column a barrier published rides the expansion too, when the traversal it drives is
-    // generated where that column was bound: the hop replicates a row once per edge, so it
-    // comes along or it stops matching the rows beside it. A published pattern variable is
-    // walked by the component instead and is already in the carry set.
-    llvm::SmallVector<const VariableDependency*> carriedBound;
-    for (const VariableDependency* var : _vdg.boundVars()) {
-        const bool walkedHere = var == src || llvm::is_contained(carrySet, var);
-        if (walkedHere) {
-            continue;
-        }
-
-        const mlir::Value column = _part._varMap[var].back();
-        if (!isRowAlignedHere(column) || yieldsConstantColumn(column, _constantColumns)) {
-            continue;
-        }
-
-        carriedBound.push_back(var);
         operands.push_back(column);
         results.push_back(column.getType());
     }
@@ -1416,7 +1465,7 @@ void DBProgramGenerator::collectHopCarrySet(const VariableDependency* src,
             continue;
         }
 
-        inFlight._columns.push_back(_part._varMap[var].back());
+        inFlight._columns.push_back(findVarOrThrow(_part._varMap, var));
         inFlight._variables.push_back(var);
     }
 
@@ -1430,7 +1479,7 @@ void DBProgramGenerator::collectHopCarrySet(const VariableDependency* src,
             continue;
         }
 
-        const mlir::Value column = _part._varMap[var].back();
+        const mlir::Value column = findVarOrThrow(_part._varMap, var);
         if (!isRowAlignedHere(column) || yieldsConstantColumn(column, _constantColumns)) {
             continue;
         }
@@ -1477,7 +1526,6 @@ void DBProgramGenerator::addExplorePaths(const VariableDependency* src,
                                          mlir::Value* joinedTarget) {
     bioassert(src, "Null source");
     bioassert(tgt, "Null target");
-    bioassert(_part._varMap.contains(src), "Path exploration without source");
 
     const VarDecl* edgeDecl = edge->getDecl();
     bioassert(edgeDecl, "Path exploration over an edge without a declaration");
@@ -1485,7 +1533,7 @@ void DBProgramGenerator::addExplorePaths(const VariableDependency* src,
     const mlir::db::ColumnType nodeType = allocColumnType(mlir::storage::NodeIDType::get(_mlirCtxt));
     const mlir::db::ColumnType pathType = allocColumnType(mlir::storage::PathRefType::get(_mlirCtxt));
 
-    const mlir::Value input = _part._varMap[src].back();
+    const mlir::Value input = findVarOrThrow(_part._varMap, src);
 
     InFlightColumns carried;
     collectHopCarrySet(src, carrySet, carried);
@@ -1496,7 +1544,7 @@ void DBProgramGenerator::addExplorePaths(const VariableDependency* src,
     }
 
     const auto patternIt = _part._quantifiedEdges.find(edgeDecl);
-    bioassert(patternIt != end(_part._quantifiedEdges), "Path exploration over a walk the part does not hold");
+    bioassert(patternIt != _part._quantifiedEdges.end(), "Path exploration over a walk the part does not hold");
     const EdgePattern* pattern = patternIt->second;
 
     llvm::SmallVector<const VarDecl*> hopImports;
@@ -1667,10 +1715,10 @@ void DBProgramGenerator::generateHopRegion(mlir::db::ExplorePaths exploration,
     const size_t lastStep = hopCount - 1;
 
     // A name the pattern gives two of its nodes is read at the first of them the walk takes
-    std::unordered_map<const VarDecl*, size_t> declPositions;
+    InsertionOrderedMap<const VarDecl*, size_t> declPositions;
     const auto placeDecl = [&declPositions, hopCount, reversed](const VarDecl* decl, size_t patternPosition) {
         const size_t walkPosition = walkPositionOf(patternPosition, hopCount, reversed);
-        const auto [placed, inserted] = declPositions.emplace(decl, walkPosition);
+        const auto [placed, inserted] = declPositions.try_emplace(decl, walkPosition);
         if (!inserted) {
             placed->second = std::min(placed->second, walkPosition);
         }
@@ -1769,21 +1817,16 @@ mlir::Value DBProgramGenerator::listColumnOf(const VarDecl* decl, mlir::Value co
         return column;
     }
 
-    const auto walkIt = _part._namedPathWalks.find(decl);
-    if (walkIt != end(_part._namedPathWalks)) {
-        return namedPathColumn(walkIt->second);
-    }
-
     // A path a WITH published carries no binding of its own: it reads as its edges
     PartScope::PathBinding binding;
     const auto bindingIt = _part._pathBindings.find(decl);
-    if (bindingIt != end(_part._pathBindings)) {
+    if (bindingIt != _part._pathBindings.end()) {
         binding = bindingIt->second;
     }
 
     mlir::Value seeds;
     if (binding._seed) {
-        seeds = _part._varMap.at(binding._seed).back();
+        seeds = findVarOrThrow(_part._varMap, binding._seed);
     }
 
     const bool expandsEdges = binding._kind == mlir::storage::PathExpansionKind::Edges;
@@ -1812,7 +1855,7 @@ mlir::Value DBProgramGenerator::listColumnOf(const VarDecl* decl, mlir::Value co
 
 mlir::Value DBProgramGenerator::columnLeavingScope(const VarDecl* decl, mlir::Value column) {
     const auto bindingIt = _part._pathBindings.find(decl);
-    const bool readsOtherThanItsEdges = bindingIt != end(_part._pathBindings) && !bindingIt->second.readsAsItsEdges();
+    const bool readsOtherThanItsEdges = bindingIt != _part._pathBindings.end() && !bindingIt->second.readsAsItsEdges();
 
     return readsOtherThanItsEdges ? listColumnOf(decl, column) : column;
 }
@@ -1832,44 +1875,7 @@ void DBProgramGenerator::expandPathItems(const Projection* projection, llvm::Sma
     }
 }
 
-void DBProgramGenerator::buildNamedPathItems(const Projection* projection, llvm::SmallVectorImpl<mlir::Value>& projected) {
-    if (_part._namedPathWalks.empty()) {
-        return;
-    }
-
-    const auto& items = projection->items();
-    bioassert(projected.size() == items.size(), "One projected column per return item expected");
-
-    size_t itemIndex = 0;
-    for (const Projection::ReturnItem& item : items) {
-        const VarDecl* decl = declOfReturnItem(item);
-        const mlir::Value column = projected[itemIndex];
-
-        const bool namesAWalk = decl && _part._namedPathWalks.contains(decl);
-        if (namesAWalk && isPathColumn(column)) {
-            projected[itemIndex] = listColumnOf(decl, column);
-        }
-
-        itemIndex++;
-    }
-}
-
-mlir::Value DBProgramGenerator::pathLengthColumn(const Expr* argExpr, mlir::Value column) {
-    if (!isPathColumn(column)) {
-        throw TuringException("size() reads the length of a variable-length path: its argument is a single entity");
-    }
-
-    const mlir::IntegerType countType = mlir::IntegerType::get(_mlirCtxt, 64, mlir::IntegerType::Unsigned);
-    const mlir::db::ColumnType resultType = allocColumnType(countType);
-
-    return _opBuilder.create<mlir::db::PathLength>(_opBuilder.getUnknownLoc(), resultType, column).getResult();
-}
-
 mlir::Value DBProgramGenerator::pathElementsColumn(mlir::Value column, mlir::storage::PathElementsKind kind) {
-    const auto columnType = mlir::dyn_cast<mlir::db::ColumnType>(column.getType());
-    const bool readsAPath = columnType && mlir::isa<mlir::storage::EntityListType, mlir::storage::PathType>(columnType.getType());
-    bioassert(readsAPath, "A named path is read off the entity sequence its element built or the path a SHORTESTPATH found");
-
     const mlir::Type resultType = pathElementsType(_mlirCtxt, kind);
     const mlir::db::ColumnType nullableType =
         allocColumnType(mlir::storage::NullableType::get(_mlirCtxt, resultType));
@@ -1877,7 +1883,7 @@ mlir::Value DBProgramGenerator::pathElementsColumn(mlir::Value column, mlir::sto
     return _opBuilder.create<mlir::db::PathElements>(_opBuilder.getUnknownLoc(), nullableType, column, kind).getResult();
 }
 
-void DBProgramGenerator::createMain() {
+void DBProgramGenerator::createMain(std::span<ParameterDecl* const> parameters) {
     bioassert(_module, "Null module");
     bioassert(_mlirCtxt, "Null context");
 
@@ -1885,11 +1891,26 @@ void DBProgramGenerator::createMain() {
     _mlirCtxt->loadDialect<mlir::storage::Storage>();
     _mlirCtxt->loadDialect<mlir::func::FuncDialect>();
 
+    llvm::SmallVector<mlir::Type> argumentTypes;
+    llvm::SmallVector<mlir::Attribute> argumentAttributes;
+    for (const ParameterDecl* decl : parameters) {
+        argumentTypes.push_back(allocColumnType(parameterType(decl)));
+
+        const mlir::StringAttr name = _opBuilder.getStringAttr(decl->getName());
+        argumentAttributes.push_back(_opBuilder.getDictionaryAttr(_opBuilder.getNamedAttr(mlir::storage::PARAMETER_NAME_ATTRIBUTE, name)));
+    }
+
     _opBuilder.setInsertionPointToEnd(_module->getBody());
 
-    const mlir::FunctionType funcType = mlir::FunctionType::get(_mlirCtxt, {}, {});
+    const mlir::FunctionType funcType = mlir::FunctionType::get(_mlirCtxt, argumentTypes, {});
     auto func = _opBuilder.create<mlir::func::FuncOp>(_opBuilder.getUnknownLoc(), "main", funcType);
+    func.setAllArgAttrs(argumentAttributes);
     mlir::Block& block = *func.addEntryBlock();
+
+    _parameterArguments.clear();
+    for (const auto [decl, argument] : llvm::zip_equal(parameters, block.getArguments())) {
+        _parameterArguments[decl] = argument;
+    }
 
     _opBuilder.setInsertionPointToStart(&block);
 }
@@ -1899,7 +1920,7 @@ void DBProgramGenerator::generate(const CypherAST* ast) {
     _constantColumns.clear();
     _vdg.setDiagnosticsManager(ast->getDiagnosticsManager());
 
-    createMain();
+    createMain(ast->parameterDecls());
 
     const mlir::Location uloc = _opBuilder.getUnknownLoc();
 
@@ -1923,7 +1944,7 @@ void DBProgramGenerator::generate(const CypherAST* ast) {
     if (kind == QueryCommand::Kind::UNION_QUERY) {
         generateUnion(static_cast<const UnionQuery*>(command));
     } else if (kind == QueryCommand::Kind::CONDITIONAL_QUERY) {
-        generateConditionalQuery(static_cast<const ConditionalQuery*>(command));
+        generateBodyOutput(static_cast<const ConditionalQuery*>(command), nullptr);
     } else if (kind == QueryCommand::Kind::SINGLE_PART_QUERY) {
         generateQuery(static_cast<const SinglePartQuery*>(command), nullptr);
     } else {
@@ -1940,7 +1961,7 @@ void DBProgramGenerator::generate(const CypherAST* ast) {
 }
 
 void DBProgramGenerator::generateExplainResult(const ExplainReport& report) {
-    createMain();
+    createMain({});
 
     const mlir::Location uloc = _opBuilder.getUnknownLoc();
     const mlir::db::ColumnType stringColumn = allocColumnType(mlir::storage::StringType::get(_mlirCtxt));
@@ -2005,7 +2026,7 @@ void DBProgramGenerator::generateQuery(const SinglePartQuery* query, const Union
 // between them the way a barrier drops them.
 void DBProgramGenerator::generateUnion(const UnionQuery* unionQuery) {
     const UnionQuery::Branches& branches = unionQuery->branches();
-    const size_t dedupedBranches = UnionQuery::getDedupedBranchCount(branches);
+    const size_t dedupedBranches = unionQuery->getDedupedBranchCount();
 
     const mlir::Location loc = _opBuilder.getUnknownLoc();
 
@@ -2025,23 +2046,26 @@ void DBProgramGenerator::generateUnion(const UnionQuery* unionQuery) {
         const bool dedupsWithTheBranchesBeforeIt = branchIndex < dedupedBranches;
         const UnionBranch branch {dedupsWithTheBranchesBeforeIt ? distinctSet : mlir::Value()};
 
-        generateQuery(branches[branchIndex]._query, &branch);
+        const RegularQuery* branchQuery = branches[branchIndex]._query;
+
+        if (branchQuery->getKind() == QueryCommand::Kind::SINGLE_PART_QUERY) {
+            generateQuery(static_cast<const SinglePartQuery*>(branchQuery), &branch);
+        } else {
+            generateBodyOutput(branchQuery, &branch);
+        }
     }
 
     _opBuilder.setInsertionPointAfter(unionOp);
 }
 
-void DBProgramGenerator::generateConditionalQuery(const ConditionalQuery* query) {
-    const CallSubqueryStmt::Branches& branches = query->getBody()->branches();
-
-    const std::vector<llvm::SmallVector<PublishedColumn>> branchScopes(branches.size());
-    const std::vector<CarriedEntities> importedEntities(branches.size());
+void DBProgramGenerator::generateBodyOutput(const RegularQuery* body, const UnionBranch* branch) {
+    const BodyScopes scopes;
 
     llvm::SmallVector<PublishedColumn> yielded;
     CarriedEntities returnedEntities;
-    generateSubqueryConditional(branches, branchScopes, importedEntities, yielded, returnedEntities);
+    generateSubqueryBody(body, scopes, /*answersRows=*/false, yielded, returnedEntities);
 
-    const ReturnStmt* returnStmt = branches.front()._query->getReturnStmt();
+    const ReturnStmt* returnStmt = body->getFirstSingleQuery()->getReturnStmt();
     if (!returnStmt) {
         return;
     }
@@ -2050,10 +2074,18 @@ void DBProgramGenerator::generateConditionalQuery(const ConditionalQuery* query)
     llvm::SmallVector<llvm::StringRef> names;
     for (const VarDecl* decl : returnStmt->getProjection()->publishedDecls()) {
         const auto columnIt = std::ranges::find(yielded, decl, &PublishedColumn::_decl);
-        bioassert(columnIt != yielded.end(), "Column '{}' of a WHEN not yielded by its branches", decl->getName());
+        bioassert(columnIt != yielded.end(), "Column '{}' not yielded by the branches", decl->getName());
 
         columns.push_back(columnIt->_column);
         names.push_back(columnIt->_name);
+    }
+
+    if (branch) {
+        broadcastUnionProjection(columns);
+
+        if (branch->_distinctSet) {
+            dedupUnionBranch(branch->_distinctSet, columns);
+        }
     }
 
     _opBuilder.create<mlir::db::Output>(_opBuilder.getUnknownLoc(),
@@ -2070,10 +2102,23 @@ void DBProgramGenerator::generateQueryParts(const SinglePartQuery* query) {
     const std::span<Stmt* const> stmts {queryStmts->stmts()};
 
     // A WITH closes a query part: the statements before it feed its projection, and the
-    // columns that projection publishes are all the statements after it can read
+    // columns that projection publishes are all the statements after it can read. A
+    // statement casting a value opens a part too, so that a row the clauses before it
+    // dropped never reaches the cast, which would raise on it
+    llvm::SmallVector<const VarDecl*> casts;
     size_t partBegin = 0;
     for (size_t index = 0; index < stmts.size(); index++) {
         const Stmt* stmt = stmts[index];
+
+        const size_t castCount = casts.size();
+        collectCheckedCasts(stmts.subspan(index, 1), casts);
+
+        const bool castsAValueFirst = casts.size() > castCount;
+        if (castsAValueFirst && index > partBegin) {
+            generatePartStatements(stmts.subspan(partBegin, index - partBegin));
+            publishInFlightColumns();
+            partBegin = index;
+        }
 
         if (stmt->getKind() == Stmt::Kind::WITH) {
             generatePartStatements(stmts.subspan(partBegin, index - partBegin));
@@ -2097,6 +2142,8 @@ void DBProgramGenerator::generateQueryParts(const SinglePartQuery* query) {
 // so the whole traversal is generated before the first write. The analyzer has already
 // rejected a part that reads again after writing, so the split is a single cut
 void DBProgramGenerator::generatePartStatements(std::span<Stmt* const> stmts) {
+    bindCheckedCasts(stmts);
+
     const auto isUpdating = [](const Stmt* stmt) {
         return Stmt::isUpdating(stmt);
     };
@@ -2177,6 +2224,86 @@ bool DBProgramGenerator::closesPartOnItsCut(const Stmt* stmt, std::span<Stmt* co
     }
 
     return false;
+}
+
+void DBProgramGenerator::collectCheckedCasts(std::span<Stmt* const> stmts, llvm::SmallVectorImpl<const VarDecl*>& casts) {
+    const auto collect = [&casts](const VarDecl* decl) {
+        const bool isACast = decl && decl->getCastSource();
+        if (isACast && !llvm::is_contained(casts, decl)) {
+            casts.push_back(decl);
+        }
+    };
+
+    for (const Stmt* stmt : stmts) {
+        const Stmt::Kind kind = stmt->getKind();
+        const Pattern* pattern = nullptr;
+
+        if (kind == Stmt::Kind::MATCH) {
+            pattern = static_cast<const MatchStmt*>(stmt)->getPattern();
+        } else if (kind == Stmt::Kind::CREATE) {
+            pattern = static_cast<const CreateStmt*>(stmt)->getPattern();
+        } else if (kind == Stmt::Kind::MERGE) {
+            pattern = static_cast<const MergeStmt*>(stmt)->getPattern();
+        } else if (kind == Stmt::Kind::SHORTESTPATH) {
+            const ShortestPathStmt* shortestPath = static_cast<const ShortestPathStmt*>(stmt);
+            collect(shortestPath->getSourceDecl());
+            collect(shortestPath->getTargetDecl());
+        }
+
+        if (!pattern) {
+            continue;
+        }
+
+        for (const PatternElement* element : pattern->elements()) {
+            for (const EntityPattern* entity : element->getEntities()) {
+                collect(entity->getDecl());
+            }
+        }
+    }
+}
+
+void DBProgramGenerator::bindCheckedCasts(std::span<Stmt* const> stmts) {
+    llvm::SmallVector<const VarDecl*> casts;
+    collectCheckedCasts(stmts, casts);
+
+    const VariableDependencyGraph::BoundVars& boundVars = _vdg.boundVars();
+
+    for (const VarDecl* cast : casts) {
+        const auto bindsTheCast = [cast](const VariableDependency* var) {
+            return var->getDecl() == cast;
+        };
+
+        if (llvm::any_of(boundVars, bindsTheCast)) {
+            continue;
+        }
+
+        const VarDecl* source = cast->getCastSource();
+        const auto bindsTheSource = [source](const VariableDependency* var) {
+            return var->getDecl() == source;
+        };
+
+        const auto boundSourceIt = llvm::find_if(boundVars, bindsTheSource);
+        bioassert(boundSourceIt != boundVars.end(), "Value cast as '{}' not bound when its part opens", cast->getName());
+
+        const mlir::Value column = checkedCastColumn(cast, findVarOrThrow(_part._varMap, *boundSourceIt));
+        const VariableDependency* var = _vdg.registerBoundVariable(cast->getName(), cast);
+        registerValue(var, column);
+    }
+}
+
+mlir::Value DBProgramGenerator::checkedCastColumn(const VarDecl* cast, mlir::Value value) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    mlir::Value perRow = value;
+    if (yieldsConstantColumn(value, _constantColumns)) {
+        perRow = _opBuilder.create<mlir::db::BroadcastConstant>(loc, value, resolveRowCarryingColumn()).getResult();
+    }
+
+    const bool castsANode = cast->getType() == EvaluatedType::NodePattern;
+    const mlir::Type entityType = castsANode ? mlir::Type(mlir::storage::NodeIDType::get(_mlirCtxt))
+                                             : mlir::Type(mlir::storage::EdgeIDType::get(_mlirCtxt));
+
+    return _opBuilder.create<mlir::db::CheckedCast>(loc, allocColumnType(entityType), perRow).getResult();
 }
 
 void DBProgramGenerator::generatePart(std::span<Stmt* const> stmts) {
@@ -2424,7 +2551,7 @@ void DBProgramGenerator::generateTraversal(std::span<Stmt* const> stmts) {
         for (const VariableDependency* var : bound) {
             defined.insert(var);
 
-            if (!yieldsConstantColumn(_part._varMap.at(var).back(), _constantColumns)) {
+            if (!yieldsConstantColumn(findVarOrThrow(_part._varMap, var), _constantColumns)) {
                 mainComponent._vars.push_back(var);
             }
         }
@@ -2471,8 +2598,7 @@ void DBProgramGenerator::generateTraversal(std::span<Stmt* const> stmts) {
         }
 
         for (const VariableDependency* var : component._vars) {
-            bioassert(_part._varMap.contains(var), "Component var {} not registered", var->getName());
-            component._columns.push_back(_part._varMap[var].back());
+            component._columns.push_back(findVarOrThrow(_part._varMap, var));
         }
     }
 
@@ -2530,6 +2656,10 @@ void DBProgramGenerator::generateTraversal(std::span<Stmt* const> stmts) {
 // enclosing block holds a different row set. Stricter than dominance on purpose: such
 // a value does dominate here, it is just the wrong rows.
 bool DBProgramGenerator::isRowAlignedHere(mlir::Value column) const {
+    if (isFunctionArgument(column)) {
+        return true;
+    }
+
     mlir::Operation* const definingOp = column.getDefiningOp();
     mlir::Block* const definingBlock = definingOp
         ? definingOp->getBlock()
@@ -2546,14 +2676,13 @@ bool DBProgramGenerator::isRowAlignedHere(mlir::Value column) const {
 }
 
 // Whether @param column holds the rows in flight here: the rows of the block the insertion
-// point is in, and the groups rather than what the grouping consumed where an aggregate has
-// reduced them
+// point is in, and what an aggregate or a dedup kept rather than the rows it consumed
 bool DBProgramGenerator::holdsTheRowsInFlight(mlir::Value column) const {
     if (!isRowAlignedHere(column)) {
         return false;
     }
 
-    return !_part._aggregateOp || boundAtOrAfter(column, _part._aggregateOp);
+    return !_part._rowReductionOp || boundAtOrAfter(column, _part._rowReductionOp);
 }
 
 void DBProgramGenerator::collectInFlightColumns(InFlightColumns& inFlight) {
@@ -2583,7 +2712,7 @@ void DBProgramGenerator::collectInFlightColumns(InFlightColumns& inFlight) {
     }
 
     for (auto& [decl, column] : _part._namedPaths) {
-        if (!isRowAlignedHere(column)) {
+        if (!holdsTheRowsInFlight(column)) {
             continue;
         }
 
@@ -2721,18 +2850,15 @@ void DBProgramGenerator::filterConstantScope(mlir::Value predicate) {
     }
 
     const mlir::Location loc = _opBuilder.getUnknownLoc();
-    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
     const mlir::Value noDriver;
 
-    const mlir::Value mask =
-        _opBuilder.create<mlir::db::BroadcastConstant>(loc, noneType, predicate, noDriver).getResult();
+    const mlir::Value mask = _opBuilder.create<mlir::db::BroadcastConstant>(loc, predicate, noDriver).getResult();
 
     llvm::SmallVector<mlir::Value> columnsToFilter;
     llvm::SmallVector<mlir::Type> resultTypes;
     for (const VariableDependency* var : constantVars) {
-        const mlir::Value column = _part._varMap.at(var).back();
-        const mlir::Value laidOut =
-            _opBuilder.create<mlir::db::BroadcastConstant>(loc, noneType, column, noDriver).getResult();
+        const mlir::Value column = findVarOrThrow(_part._varMap, var);
+        const mlir::Value laidOut = _opBuilder.create<mlir::db::BroadcastConstant>(loc, column, noDriver).getResult();
 
         columnsToFilter.push_back(laidOut);
         resultTypes.push_back(laidOut.getType());
@@ -2858,7 +2984,7 @@ void DBProgramGenerator::extendBoundDataflow(DefinedVars& defined,
     for (const VariableDependency* var : bound) {
         defined.insert(var);
 
-        if (!yieldsConstantColumn(_part._varMap.at(var).back(), _constantColumns)) {
+        if (!yieldsConstantColumn(findVarOrThrow(_part._varMap, var), _constantColumns)) {
             carriedSet.push_back(var);
             dataflowVars.push_back(var);
         }
@@ -2866,6 +2992,7 @@ void DBProgramGenerator::extendBoundDataflow(DefinedVars& defined,
 
     for (const VariableDependency* var : bound) {
         applyConstraints(var);
+        filterNullNode(var);
     }
 
     for (const VariableDependency* var : bound) {
@@ -2951,7 +3078,7 @@ void DBProgramGenerator::resolveYieldedIdentities() {
     const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
 
     for (const YieldedIdentity& identity : identities) {
-        const mlir::Value patternColumn = _part._varMap.at(identity._variable).back();
+        const mlir::Value patternColumn = findVarOrThrow(_part._varMap, identity._variable);
         const mlir::Value yieldedColumn = _part._yieldedColumns[identity._yieldedIndex]._column;
 
         const bool patternAligned = isRowAlignedHere(patternColumn);
@@ -3064,6 +3191,7 @@ void DBProgramGenerator::openComponent(const VariableDependency* root) {
 
     if (yieldedColumn) {
         addYieldedColumn(root, yieldedColumn);
+        filterNullNode(root);
     } else if (unwindIt != unwindSources.end()) {
         const VarDecl* const decl = root->getDecl();
         const bool seedsAPatternNode = decl && decl->getType() == EvaluatedType::NodePattern;
@@ -3148,7 +3276,7 @@ bool DBProgramGenerator::walkReadsAnotherComponent(const DefinedVars& componentV
                     continue;
                 }
 
-                const bool holdsRows = !holdsColumn(var) || !yieldsConstantColumn(_part._varMap.at(var).back(), _constantColumns);
+                const bool holdsRows = !holdsColumn(var) || !yieldsConstantColumn(findVarOrThrow(_part._varMap, var), _constantColumns);
                 if (holdsRows) {
                     return true;
                 }
@@ -3386,8 +3514,7 @@ void DBProgramGenerator::expandComponent(const VariableDependency* root,
 
 void DBProgramGenerator::takeMainDataflow(mlir::Block* mainBlock, TranslatedComponent& component) {
     for (const VariableDependency* var : component._vars) {
-        bioassert(holdsColumn(var), "Main dataflow var {} not registered", var->getName());
-        component._columns.push_back(_part._varMap.at(var).back());
+        component._columns.push_back(findVarOrThrow(_part._varMap, var));
     }
 
     component._region = std::make_unique<mlir::Region>();
@@ -3651,14 +3778,23 @@ void DBProgramGenerator::generateNamedPaths(const MatchStmt* matchStmt) {
 }
 
 void DBProgramGenerator::generateNamedPath(const PatternElement* element, const VarDecl* pathDecl) {
-    // A walk already holds its path: the rows carry its handles, and p is another name for
-    // that column until something reads it
+    // Over one walk the path is built from its seed and its handles alone, the form
+    // fuse_path_elements matches
     if (const EdgePattern* walked = singleQuantifiedRelationship(element)) {
         const auto bindingIt = _part._pathBindings.find(walked->getDecl());
-        bioassert(bindingIt != end(_part._pathBindings), "Quantified relationship without a path column");
+        bioassert(bindingIt != _part._pathBindings.end(), "Quantified relationship without a path column");
 
         const PartScope::PathBinding& binding = bindingIt->second;
-        _part._namedPathWalks[pathDecl] = PartScope::NamedPathWalk {binding._seed, binding._path, binding._reversed};
+        const mlir::Value seedColumn = findVarOrThrow(_part._varMap, binding._seed);
+        const mlir::Value pathColumn = findVarOrThrow(_part._varMap, binding._path);
+
+        // A walk taken against the pattern ends on the node the pattern opens with, so its
+        // hops come first and the node it seeded from is the element's last entity
+        if (binding._reversed) {
+            _part._namedPaths[pathDecl] = makePathColumn({pathColumn, seedColumn}, {0});
+        } else {
+            _part._namedPaths[pathDecl] = makePathColumn({seedColumn, pathColumn});
+        }
 
         return;
     }
@@ -3696,7 +3832,7 @@ void DBProgramGenerator::generateNamedPath(const PatternElement* element, const 
 }
 
 mlir::Value DBProgramGenerator::makePathColumn(llvm::ArrayRef<mlir::Value> entities, llvm::ArrayRef<int64_t> reversedPaths) {
-    const mlir::db::ColumnType pathType = allocColumnType(mlir::storage::EntityListType::get(_mlirCtxt));
+    const mlir::db::ColumnType pathType = allocColumnType(mlir::storage::PathType::get(_mlirCtxt));
     const mlir::ArrayAttr reversedAttr = reversedPaths.empty() ? mlir::ArrayAttr() : _opBuilder.getI64ArrayAttr(reversedPaths);
 
     return _opBuilder.create<mlir::db::MakePath>(_opBuilder.getUnknownLoc(), pathType, entities, reversedAttr).getResult();
@@ -3715,29 +3851,9 @@ const EdgePattern* DBProgramGenerator::singleQuantifiedRelationship(const Patter
 
 mlir::Value DBProgramGenerator::pathHandleColumn(const VarDecl* edgeDecl) {
     const auto bindingIt = _part._pathBindings.find(edgeDecl);
-    bioassert(bindingIt != end(_part._pathBindings), "Quantified relationship without a path column");
+    bioassert(bindingIt != _part._pathBindings.end(), "Quantified relationship without a path column");
 
-    return _part._varMap.at(bindingIt->second._path).back();
-}
-
-mlir::Value DBProgramGenerator::namedPathColumn(const PartScope::NamedPathWalk& walk) {
-    const mlir::Value seedColumn = _part._varMap.at(walk._seed).back();
-    const mlir::Value pathColumn = _part._varMap.at(walk._path).back();
-
-    // A walk taken against the pattern ends on the node the pattern opens with, so its hops
-    // come first and the node it seeded from is the element's last entity
-    llvm::SmallVector<mlir::Value, 2> entities;
-    mlir::ArrayAttr reversedPaths;
-    if (walk._reversed) {
-        entities = {pathColumn, seedColumn};
-        reversedPaths = _opBuilder.getI64ArrayAttr({0});
-    } else {
-        entities = {seedColumn, pathColumn};
-    }
-
-    const mlir::db::ColumnType pathType = allocColumnType(mlir::storage::EntityListType::get(_mlirCtxt));
-
-    return _opBuilder.create<mlir::db::MakePath>(_opBuilder.getUnknownLoc(), pathType, entities, reversedPaths).getResult();
+    return findVarOrThrow(_part._varMap, bindingIt->second._path);
 }
 
 void DBProgramGenerator::generateMatchOrderBy(const MatchStmt* matchStmt) {
@@ -3789,6 +3905,16 @@ void DBProgramGenerator::generateMatchOrderBy(const MatchStmt* matchStmt) {
         return;
     }
 
+    // The sort keeps rows across chunks, and a walk's handles hold for the chunk that
+    // emitted them
+    llvm::SmallVector<PublishedColumn> walkReads;
+    collectWalkReads(walkReads);
+
+    const size_t firstWalkRead = sorted.size();
+    for (const PublishedColumn& walkRead : walkReads) {
+        sorted.push_back(walkRead._column);
+    }
+
     llvm::SmallVector<mlir::Type> sortResultTypes;
     for (const mlir::Value column : sorted) {
         sortResultTypes.push_back(column.getType());
@@ -3801,7 +3927,32 @@ void DBProgramGenerator::generateMatchOrderBy(const MatchStmt* matchStmt) {
                                                     keyColumns,
                                                     keyAscending);
 
-    rebindInFlightColumns(sortOp.getResults(), /*firstResult=*/0, inFlight);
+    const mlir::ResultRange results = sortOp.getResults();
+    rebindInFlightColumns(results, /*firstResult=*/0, inFlight);
+
+    for (size_t readIndex = 0; readIndex < walkReads.size(); readIndex++) {
+        const VarDecl* decl = walkReads[readIndex]._decl;
+        const mlir::Value column = results[firstWalkRead + readIndex];
+
+        rebindVariableColumn(decl, column);
+    }
+}
+
+void DBProgramGenerator::collectWalkReads(llvm::SmallVectorImpl<PublishedColumn>& walkReads) {
+    forEachVariableColumn([this, &walkReads](const VarDecl* decl, std::string_view name, mlir::Value column) {
+        const bool readsAWalk = decl && !decl->isUnnamed() && isPathColumn(column) && holdsTheRowsInFlight(column);
+        const bool alreadyRead = std::ranges::any_of(walkReads, [decl](const PublishedColumn& walkRead) {
+            return walkRead._decl == decl;
+        });
+
+        if (readsAWalk && !alreadyRead) {
+            walkReads.push_back({decl, std::string(name), column});
+        }
+    });
+
+    for (PublishedColumn& walkRead : walkReads) {
+        walkRead._column = listColumnOf(walkRead._decl, walkRead._column);
+    }
 }
 
 void DBProgramGenerator::generateMatchWindow(const MatchStmt* matchStmt) {
@@ -4225,7 +4376,7 @@ void DBProgramGenerator::generateYieldFilter(const YieldItems* yieldItems) {
     translateExprOverRows(predicateExpr);
 
     const auto findIt = _part._exprMap.find(predicateExpr);
-    bioassert(findIt != end(_part._exprMap), "Failed to get value for YIELD WHERE expr");
+    bioassert(findIt != _part._exprMap.end(), "Failed to get value for YIELD WHERE expr");
 
     filterAllColumns(findIt->second);
 }
@@ -4354,9 +4505,9 @@ void DBProgramGenerator::publishCreatedEntity(const VarDecl* decl,
                                               mlir::Value column,
                                               std::span<const LabelRef> labels,
                                               const EdgeTypeRef& edgeType,
-                                              llvm::ArrayRef<llvm::StringRef> propNames,
+                                              std::span<const EntityPropertyConstraint> constraints,
                                               llvm::ArrayRef<mlir::Value> propValues) {
-    bioassert(propNames.size() == propValues.size(), "One value per created property expected");
+    bioassert(constraints.size() == propValues.size(), "One value per created property expected");
 
     PartScope::CreatedEntity& created = _part._createdEntities[decl];
     created._column = column;
@@ -4375,9 +4526,14 @@ void DBProgramGenerator::publishCreatedEntity(const VarDecl* decl,
     written._edgeTypeKnown = !edgeType._isParameter;
     written._edgeType.assign(edgeType._isParameter ? std::string_view {} : edgeType._name);
 
-    for (size_t index = 0; index < propNames.size(); index++) {
-        const llvm::StringRef propName = propNames[index];
-        created._properties[std::string_view {propName.data(), propName.size()}] = propValues[index];
+    for (size_t index = 0; index < constraints.size(); index++) {
+        const EntityPropertyConstraint& constraint = constraints[index];
+
+        // A value held in a tagged cell is stored as the type the write gives the property,
+        // which the column does not hold, so a read of it goes to the written entity instead
+        if (constraint._expr->getCommonType() != EvaluatedType::Any) {
+            created._properties[constraint._propTypeName] = propValues[index];
+        }
     }
 }
 
@@ -4396,11 +4552,18 @@ const DBProgramGenerator::PartScope::WrittenEntity* DBProgramGenerator::findWrit
     }
 
     const auto findIt = _part._writtenEntities.find(decl);
-    if (findIt == end(_part._writtenEntities)) {
-        return nullptr;
+    if (findIt != end(_part._writtenEntities)) {
+        return &findIt->second;
     }
 
-    return &findIt->second;
+    // An import of a body run once per row is what the write ahead of the body left it,
+    // past every barrier of the body
+    const auto runConstantIt = _runConstants.find(decl);
+    if (runConstantIt != _runConstants.end() && runConstantIt->second._written) {
+        return &*runConstantIt->second._written;
+    }
+
+    return nullptr;
 }
 
 bool DBProgramGenerator::isPendingThroughout(const VarDecl* decl) const {
@@ -4409,7 +4572,7 @@ bool DBProgramGenerator::isPendingThroughout(const VarDecl* decl) const {
 
 mlir::Value DBProgramGenerator::findPendingMask(const VarDecl* decl) const {
     const auto createdIt = _part._createdEntities.find(decl);
-    if (createdIt != end(_part._createdEntities)) {
+    if (createdIt != _part._createdEntities.end()) {
         return createdIt->second._pending;
     }
 
@@ -4418,14 +4581,14 @@ mlir::Value DBProgramGenerator::findPendingMask(const VarDecl* decl) const {
         return mlir::Value {};
     }
 
-    return _part._varMap.at(maskIt->second).back();
+    return findVarOrThrow(_part._varMap, maskIt->second);
 }
 
 void DBProgramGenerator::rebindGroupedWrittenEntity(const VarDecl* decl,
                                                     mlir::Value column,
                                                     mlir::Value pending) {
     const auto createdIt = _part._createdEntities.find(decl);
-    if (createdIt != end(_part._createdEntities)) {
+    if (createdIt != _part._createdEntities.end()) {
         PartScope::CreatedEntity& created = createdIt->second;
 
         created._column = column;
@@ -4605,8 +4768,8 @@ void DBProgramGenerator::collectMergeNode(const NodePattern* nodePattern, MergeP
         mlir::Value pending = findPendingMask(node._decl);
 
         // A CREATE's entities are provisional and in no graph a merge reads, so the merge
-        // is told every row is one: unmasked, it would match against whichever committed
-        // node the provisional ID collides with
+        // is told every row is one: unmasked, it would look each up in the graph, which
+        // holds no node under the ID it will commit as
         if (!pending && isPendingThroughout(node._decl)) {
             pending = constantBool(true);
         }
@@ -4656,7 +4819,7 @@ void DBProgramGenerator::collectMergeProperties(const PatternData* data, MergeEn
 
         const std::string_view propName = constraint._propTypeName;
         entity._propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
-        entity._propValues.push_back(_part._exprMap.at(constraint._expr));
+        entity._propValues.push_back(assignedColumn(constraint._expr, constraint._valueType));
     }
 }
 
@@ -4713,18 +4876,6 @@ void DBProgramGenerator::collectCarrySet(CarrySet& carrySet) {
 
         std::ranges::sort(carried._propNames);
 
-        carrySet._writtenEntities.push_back(carried);
-    }
-
-    // Ordered by the name the query gave each entity, so the carry set a program carries
-    // is the query's choice and not the addresses'
-    std::ranges::sort(carrySet._writtenEntities, [](const CarriedEntity& lhs, const CarriedEntity& rhs) {
-        return lhs._decl->getName() < rhs._decl->getName();
-    });
-
-    for (const CarriedEntity& carried : carrySet._writtenEntities) {
-        const PartScope::CreatedEntity& written = _part._createdEntities.at(carried._decl);
-
         carrySet._columns.push_back(written._column);
 
         if (written._pending) {
@@ -4734,6 +4885,8 @@ void DBProgramGenerator::collectCarrySet(CarrySet& carrySet) {
         for (const std::string_view propName : carried._propNames) {
             carrySet._columns.push_back(written._properties.at(propName));
         }
+
+        carrySet._writtenEntities.push_back(carried);
     }
 }
 
@@ -4741,9 +4894,9 @@ void DBProgramGenerator::collectGroupedColumns(CarrySet& carrySet) {
     InFlightColumns& inFlight = carrySet._inFlight;
     const ExprValueMap& exprMap = _part._exprMap;
 
-    // No grouping reduced the elements of a list, so a comprehension this one sits inside
-    // still holds its element here
-    collectElementColumns(inFlight);
+    // The grouping rebinds a key held by a variable, a named path or a yielded column outside
+    // the expression map, and leaves a comprehension this one sits inside its element
+    collectInFlightColumns(inFlight);
 
     for (const auto& [expr, column] : exprMap) {
         const bool holdsTheGroupedRows = isRowAlignedHere(column)
@@ -4788,6 +4941,24 @@ void DBProgramGenerator::rebindCarrySet(mlir::ValueRange columns,
     }
 }
 
+void DBProgramGenerator::carryProjectedColumns(CarrySet& carrySet) {
+    llvm::SmallVector<mlir::Value> projectedColumns;
+    for (const auto& [decl, column] : _part._projectedColumns) {
+        const bool isCarriedAlready = llvm::is_contained(carrySet._columns, column)
+                                   || llvm::is_contained(projectedColumns, column);
+        const bool needsCarrying = holdsTheRowsInFlight(column)
+                                && !yieldsConstantColumn(column, _constantColumns)
+                                && !isCarriedAlready;
+
+        if (needsCarrying) {
+            projectedColumns.push_back(column);
+        }
+    }
+
+    std::ranges::sort(projectedColumns, computedBefore);
+    carrySet._columns.append(projectedColumns.begin(), projectedColumns.end());
+}
+
 // A projected item publishes its column under the declaration its alias shares with it, and
 // a symbol reads that column before any variable of the same name. The binding has to
 // follow the carried columns into a body, or a read there answers with the outer rows.
@@ -4825,7 +4996,7 @@ void DBProgramGenerator::generateMergeActions(const MergeStmt* mergeStmt, mlir::
 void DBProgramGenerator::generateCreateStmt(const CreateStmt* createStmt) {
     // Collect the columns a MATCH bound or a CALL yielded, by variable, so CREATE
     // patterns can reference them.
-    std::unordered_map<const VarDecl*, mlir::Value> knownVars;
+    InsertionOrderedMap<const VarDecl*, mlir::Value> knownVars;
     for (const auto& [var, identities] : _part._varMap) {
         const VarDecl* decl = var->getDecl();
         if (decl && !identities.empty()) {
@@ -4843,10 +5014,8 @@ void DBProgramGenerator::generateCreateStmt(const CreateStmt* createStmt) {
         knownVars[writtenDecl] = written._column;
     }
 
-    // The pattern's own order picks the column, since reading an arbitrary bucket of
-    // knownVars would make the number of nodes written depend on where a name hashed. A
-    // scope of nothing but yielded columns has no such order to read, so it falls back on
-    // one of them
+    // The pattern's own order picks the column. A scope where no column holds the rows in
+    // flight has no such order to read, so it falls back on the first variable it knows
     mlir::Value matchCardinality = resolveWildcardColumn();
     if (!matchCardinality && !knownVars.empty()) {
         matchCardinality = knownVars.begin()->second;
@@ -4868,15 +5037,18 @@ void DBProgramGenerator::generateCreateStmt(const CreateStmt* createStmt) {
         const NodePatternData* data = node->getData();
         const std::span<const LabelRef> labels = data ? data->labelConstraints() : std::span<const LabelRef> {};
 
+        std::span<const EntityPropertyConstraint> constraints;
+        if (data) {
+            constraints = data->exprConstraints();
+        }
+
         llvm::SmallVector<llvm::StringRef> propNames;
         llvm::SmallVector<mlir::Value> propValues;
-        if (data) {
-            for (const EntityPropertyConstraint& constraint : data->exprConstraints()) {
-                translateExprOverRows(constraint._expr);
-                const std::string_view propName = constraint._propTypeName;
-                propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
-                propValues.push_back(_part._exprMap.at(constraint._expr));
-            }
+        for (const EntityPropertyConstraint& constraint : constraints) {
+            translateExprOverRows(constraint._expr);
+            const std::string_view propName = constraint._propTypeName;
+            propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
+            propValues.push_back(assignedColumn(constraint._expr, constraint._valueType));
         }
 
         const mlir::Value cardinality = matchCardinality;
@@ -4892,7 +5064,7 @@ void DBProgramGenerator::generateCreateStmt(const CreateStmt* createStmt) {
 
         if (decl) {
             knownVars[decl] = nodeValue;
-            publishCreatedEntity(decl, nodeValue, labels, EdgeTypeRef {}, propNames, propValues);
+            publishCreatedEntity(decl, nodeValue, labels, EdgeTypeRef {}, constraints, propValues);
         }
 
         return nodeValue;
@@ -4916,20 +5088,21 @@ void DBProgramGenerator::generateCreateStmt(const CreateStmt* createStmt) {
         for (auto [edge, targetNode] : element->getElementChain()) {
             const mlir::Value rhsValue = resolveOrCreateNode(targetNode);
 
-            propNames.clear();
-            propValues.clear();
             const EdgePatternData* edgeData = edge->getData();
-            if (edgeData) {
-                for (const EntityPropertyConstraint& constraint : edgeData->exprConstraints()) {
-                    translateExprOverRows(constraint._expr);
-                    const std::string_view propName = constraint._propTypeName;
-                    propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
-                    propValues.push_back(_part._exprMap.at(constraint._expr));
-                }
-            }
-
             bioassert(edgeData && !edgeData->edgeTypeConstraints().empty(),
                       "CREATE edge must have an edge type");
+
+            const std::span<const EntityPropertyConstraint> edgeConstraints = edgeData->exprConstraints();
+
+            propNames.clear();
+            propValues.clear();
+            for (const EntityPropertyConstraint& constraint : edgeConstraints) {
+                translateExprOverRows(constraint._expr);
+                const std::string_view propName = constraint._propTypeName;
+                propNames.push_back(llvm::StringRef(propName.data(), propName.size()));
+                propValues.push_back(assignedColumn(constraint._expr, constraint._valueType));
+            }
+
             const EdgeTypeRef& edgeType = edgeData->edgeTypeConstraints().front();
 
             const bool backward = edge->getDirection() == EdgePattern::Direction::Backward;
@@ -4957,7 +5130,7 @@ void DBProgramGenerator::generateCreateStmt(const CreateStmt* createStmt) {
                                      createEdge.getResult(),
                                      {},
                                      edgeType,
-                                     propNames,
+                                     edgeConstraints,
                                      propValues);
             }
 
@@ -4978,7 +5151,7 @@ mlir::Value DBProgramGenerator::resolveEntityColumn(const VarDecl* decl) {
     // The element a list comprehension bound rides the block argument of its body, which
     // stands only while that body is translated
     const auto elementIt = _part._comprehensionElements.find(decl);
-    if (elementIt != end(_part._comprehensionElements)) {
+    if (elementIt != _part._comprehensionElements.end()) {
         return elementIt->second;
     }
 
@@ -4998,29 +5171,29 @@ mlir::Value DBProgramGenerator::resolveEntityColumn(const VarDecl* decl) {
     const bool foundEdgeIdentity = findIt != edgeIdentities.end() && !findIt->second.empty();
     if (foundEdgeIdentity) {
         const VariableDependency* representative = findIt->second.front();
-        return _part._varMap.at(representative).back();
+        return findVarOrThrow(_part._varMap, representative);
     }
 
     const auto createdIt = _part._createdEntities.find(decl);
-    if (createdIt != end(_part._createdEntities)) {
+    if (createdIt != _part._createdEntities.end()) {
         return createdIt->second._column;
     }
 
-    const auto walkIt = _part._namedPathWalks.find(decl);
-    if (walkIt != end(_part._namedPathWalks)) {
-        return namedPathColumn(walkIt->second);
-    }
-
     const auto namedPathIt = _part._namedPaths.find(decl);
-    if (namedPathIt != end(_part._namedPaths)) {
+    if (namedPathIt != _part._namedPaths.end()) {
         return namedPathIt->second;
     }
 
     // A group variable of a quantified pattern is the list of one entity per repetition,
     // read off the paths of its walk
     const auto pathIt = _part._pathBindings.find(decl);
-    if (pathIt != end(_part._pathBindings) && pathIt->second._path) {
-        return listColumnOf(decl, _part._varMap.at(pathIt->second._path).back());
+    if (pathIt != _part._pathBindings.end() && pathIt->second._path) {
+        return listColumnOf(decl, findVarOrThrow(_part._varMap, pathIt->second._path));
+    }
+
+    const auto projectedIt = _part._projectedColumns.find(decl);
+    if (projectedIt != _part._projectedColumns.end()) {
+        return projectedIt->second;
     }
 
     return findYieldedColumn(decl);
@@ -5204,6 +5377,7 @@ mlir::Value DBProgramGenerator::translateAggregateInput(const Expr* argExpr,
     // An aggregate reads the rows ahead of every reduction, one an earlier aggregate of the
     // same projection emitted included
     const llvm::SaveAndRestore<mlir::Operation*> readsTheRowsAhead(_part._aggregateOp, nullptr);
+    const llvm::SaveAndRestore<mlir::Operation*> readsTheRowsReduced(_part._rowReductionOp, nullptr);
 
     const EvaluatedType argType = argExpr->getType();
 
@@ -5213,12 +5387,16 @@ mlir::Value DBProgramGenerator::translateAggregateInput(const Expr* argExpr,
 
     const bool isEntity = argType == EvaluatedType::NodePattern || argType == EvaluatedType::EdgePattern;
 
-    if (isEntity) {
+    // A group of a walk is a variable, which reads as the list its walk's handle expands to
+    const bool namesAGroup = argExpr->getKind() == Expr::Kind::SYMBOL
+                          && _part._pathBindings.contains(argExpr->getExprVarDecl());
+
+    if (isEntity || namesAGroup) {
         if (variableColumns) {
-            return getOrTranslateBoundColumn(*variableColumns, argExpr);
+            return getOrTranslateExprColumn(*variableColumns, argExpr);
         }
 
-        return getOrTranslateBoundColumn(argExpr);
+        return getOrTranslateExprColumn(argExpr);
     } else if (argType != EvaluatedType::Wildcard) {
         translateExprOverRows(argExpr);
 
@@ -5243,12 +5421,12 @@ mlir::Value DBProgramGenerator::translateAggregateInput(const Expr* argExpr,
 
 mlir::Value DBProgramGenerator::resolveRowCarryingColumn() {
     const mlir::Value column = resolveColumnInScope([this](mlir::Value column) { return !yieldsConstantColumn(column, _constantColumns); });
-    if (column || !_part._aggregateOp) {
+    if (column || !_part._rowReductionOp) {
         return column;
     }
 
-    // Under a grouping key no variable names, the groups are held by the aggregate's results alone
-    return _part._aggregateOp->getResult(0);
+    // With no variable holding the rows in flight, the reduction's results alone hold them
+    return _part._rowReductionOp->getResult(0);
 }
 
 mlir::Value DBProgramGenerator::alignConstantToDriver(mlir::Value column) {
@@ -5261,9 +5439,7 @@ mlir::Value DBProgramGenerator::alignConstantToDriver(mlir::Value column) {
         return column;
     }
 
-    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
-
-    return _opBuilder.create<mlir::db::BroadcastConstant>(_opBuilder.getUnknownLoc(), noneType, column, driver).getResult();
+    return _opBuilder.create<mlir::db::BroadcastConstant>(_opBuilder.getUnknownLoc(), column, driver).getResult();
 }
 
 void DBProgramGenerator::alignConstantOperandsToDriver(mlir::Block::iterator first, mlir::Block::iterator last) {
@@ -5275,7 +5451,6 @@ void DBProgramGenerator::alignConstantOperandsToDriver(mlir::Block::iterator fir
     const auto isConstant = [this](mlir::Value value) { return yieldsConstantColumn(value, _constantColumns); };
 
     const mlir::Location loc = _opBuilder.getUnknownLoc();
-    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
     const mlir::OpBuilder::InsertionGuard insertionGuard(_opBuilder);
 
     for (mlir::Operation& op : llvm::make_range(first, last)) {
@@ -5287,7 +5462,7 @@ void DBProgramGenerator::alignConstantOperandsToDriver(mlir::Block::iterator fir
 
         _opBuilder.setInsertionPoint(&op);
         for (mlir::OpOperand& operand : op.getOpOperands()) {
-            operand.set(_opBuilder.create<mlir::db::BroadcastConstant>(loc, noneType, operand.get(), driver).getResult());
+            operand.set(_opBuilder.create<mlir::db::BroadcastConstant>(loc, operand.get(), driver).getResult());
         }
     }
 }
@@ -5326,7 +5501,7 @@ void DBProgramGenerator::generatePropertyWrite(const PropertyExpr* propertyExpr,
 
     // if there was a previous write to this property within this query, erase it
     const auto createdIt = _part._createdEntities.find(entityDecl);
-    if (createdIt != end(_part._createdEntities)) {
+    if (createdIt != _part._createdEntities.end()) {
         createdIt->second._properties.erase(propName);
     }
 
@@ -5360,18 +5535,99 @@ void DBProgramGenerator::generatePropertyWrite(const PropertyExpr* propertyExpr,
     }
 }
 
+void DBProgramGenerator::generatePropertiesWrite(const SetItem::EntityPropertiesAssign& assign,
+                                                 mlir::Value mapColumn,
+                                                 mlir::Value rows) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+
+    const VarDecl* entityDecl = assign._entity->getDecl();
+    const std::string_view varName = entityDecl->getName();
+
+    const mlir::Value entityColumn = resolveEntityColumn(entityDecl);
+    bioassert(entityColumn, "Properties write on unknown variable: {}", varName);
+
+    const auto createdIt = _part._createdEntities.find(entityDecl);
+    if (createdIt != _part._createdEntities.end()) {
+        createdIt->second._properties.clear();
+    }
+
+    const mlir::Value pending = findPendingMask(entityDecl);
+    const bool allPending = isPendingThroughout(entityDecl);
+    const bool replaces = assign._replaces;
+
+    llvm::SmallVector<mlir::NamedAttribute> createdTypes;
+    for (const EntityPropertyConstraint& created : assign._createdProperties) {
+        const mlir::Type elementType = valueTypeToElementType(_opBuilder, created._valueType);
+        createdTypes.push_back(_opBuilder.getNamedAttr(created._propTypeName, mlir::TypeAttr::get(elementType)));
+    }
+
+    const mlir::DictionaryAttr createdTypesAttr = createdTypes.empty() ? mlir::DictionaryAttr {}
+                                                                       : _opBuilder.getDictionaryAttr(createdTypes);
+
+    const EvaluatedType entityType = entityDecl->getType();
+    const bool isNode = entityType == EvaluatedType::NodePattern;
+    const bool isEdge = entityType == EvaluatedType::EdgePattern;
+    bioassert(isNode || isEdge, "Properties write on non-entity variable: {}", varName);
+
+    const auto createWrite = [&]<typename SetProperties>() {
+        _opBuilder.create<SetProperties>(loc,
+                                         entityColumn,
+                                         mapColumn,
+                                         pending,
+                                         rows,
+                                         allPending,
+                                         replaces,
+                                         createdTypesAttr);
+    };
+
+    if (isNode) {
+        createWrite.template operator()<mlir::db::SetNodeProperties>();
+    } else /* (isEdge) */ {
+        createWrite.template operator()<mlir::db::SetEdgeProperties>();
+    }
+}
+
 void DBProgramGenerator::generateSetItems(const SetStmt* setStmt, mlir::Value rows) {
     for (const SetItem* item : setStmt->getItems()) {
-        const SetItem::PropertyExprAssign* assign =
-            std::get_if<SetItem::PropertyExprAssign>(&item->item());
-        bioassert(assign, "Only property-assignment SET items are supported");
+        const SetItem::Variant& variant = item->item();
+        const SetItem::PropertyExprAssign* assign = std::get_if<SetItem::PropertyExprAssign>(&variant);
+        const SetItem::EntityPropertiesAssign* propertiesAssign = std::get_if<SetItem::EntityPropertiesAssign>(&variant);
 
-        translateExprOverRows(assign->_propValueExpr);
+        if (assign) {
+            translateExprOverRows(assign->_propValueExpr);
 
-        generatePropertyWrite(assign->_propTypeExpr,
-                              _part._exprMap.at(assign->_propValueExpr),
-                              rows);
+            const PropertyExpr* propertyExpr = assign->_propTypeExpr;
+            generatePropertyWrite(propertyExpr,
+                                  assignedColumn(assign->_propValueExpr, propertyExpr->getValueType()),
+                                  rows);
+        } else if (propertiesAssign) {
+            translateExprOverRows(propertiesAssign->_value);
+
+            generatePropertiesWrite(*propertiesAssign,
+                                    _part._exprMap.at(propertiesAssign->_value),
+                                    rows);
+        } else {
+            bioassert(false, "Only property and properties assignment SET items are supported");
+        }
     }
+}
+
+// A value whose type varies per row and whose common type is the property's is converted to
+// it before it is written, as SQL casts a value to the column it is assigned to. commonType
+// widens only an integer beside a double, so that type is Double.
+mlir::Value DBProgramGenerator::assignedColumn(const Expr* value, ValueType propertyType) {
+    const mlir::Value column = _part._exprMap.at(value);
+
+    const bool convertsToTheProperty = value->getType() == EvaluatedType::Any
+                                    && value->getCommonType() == EvaluatedType::Double
+                                    && propertyType == ValueType::Double;
+    if (!convertsToTheProperty) {
+        return column;
+    }
+
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    return _opBuilder.create<mlir::db::ToFloat>(_opBuilder.getUnknownLoc(), noneType, column).getResult();
 }
 
 void DBProgramGenerator::generateRemoveProperties(const RemoveStmt* removeStmt) {
@@ -5486,7 +5742,6 @@ void DBProgramGenerator::generateOutput(const Projection* projection, const Unio
 
     broadcastConstantProjection(outputted);
 
-    buildNamedPathItems(projection, outputted);
     expandPathItems(projection, outputted);
 
     translateProjectionTail(projection, variableColumns, outputted, {});
@@ -5506,13 +5761,12 @@ void DBProgramGenerator::generateOutput(const Projection* projection, const Unio
 
 void DBProgramGenerator::broadcastUnionProjection(llvm::SmallVectorImpl<mlir::Value>& projected) {
     const mlir::Location loc = _opBuilder.getUnknownLoc();
-    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
 
     const mlir::Value driver = resolveProjectionDriver(projected);
 
     for (mlir::Value& column : projected) {
         if (yieldsConstantColumn(column, _constantColumns)) {
-            column = _opBuilder.create<mlir::db::BroadcastConstant>(loc, noneType, column, driver).getResult();
+            column = _opBuilder.create<mlir::db::BroadcastConstant>(loc, column, driver).getResult();
         }
     }
 }
@@ -5620,14 +5874,16 @@ void DBProgramGenerator::publishProjection(const Projection* projection,
 
     broadcastConstantProjection(projected);
 
-    buildNamedPathItems(projection, projected);
-
     if (with && !projection->isAggregate()) {
         collectFilterColumns(with->filterImports(), variableColumns, carriedColumns);
     }
 
     if (carriesPendingMasks) {
         collectPendingMasks(projection, names, carriedColumns);
+    }
+
+    if (with) {
+        appendRedeclaredImports(with->redeclaredImports(), carriedColumns);
     }
 
     translateProjectionTail(projection, variableColumns, projected, carriedColumns);
@@ -5826,16 +6082,17 @@ void DBProgramGenerator::generateNextSegment(const NextSegmentStmt* segment) {
 
     if (!body->isReturning()) {
         generateUpdatingSegment(segment);
-    } else if (body->isConditional()) {
-        generateConditionalSegment(body);
+    } else if (body->getBody()->getKind() == QueryCommand::Kind::CONDITIONAL_QUERY) {
+        generateConditionalSegment(segment);
     } else {
-        generateUnionSegment(body);
+        generateUnionSegment(segment);
     }
 }
 
-void DBProgramGenerator::generateUnionSegment(const CallSubqueryStmt* body) {
-    const CallSubqueryStmt::Branches& branches = body->branches();
-    const size_t dedupedBranches = body->getDedupedBranchCount();
+void DBProgramGenerator::generateUnionSegment(const NextSegmentStmt* segment) {
+    const UnionQuery* unionQuery = static_cast<const UnionQuery*>(segment->getBody()->getBody());
+    const UnionQuery::Branches& branches = unionQuery->branches();
+    const size_t dedupedBranches = unionQuery->getDedupedBranchCount();
     mlir::Block* const outerBlock = _opBuilder.getInsertionBlock();
 
     SegmentTable table;
@@ -5847,31 +6104,32 @@ void DBProgramGenerator::generateUnionSegment(const CallSubqueryStmt* body) {
     }
 
     SubqueryBranchResults branchResults;
-    std::vector<llvm::SmallVector<PublishedColumn>> branchScopes(branches.size());
-    std::vector<CarriedEntities> importedEntities(branches.size());
+    BodyScopes scopes;
 
-    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
+    for (const UnionQuery::Branch& branch : branches) {
         llvm::SmallVector<mlir::Value> scanned;
         scanTable(table, openSubqueryBranch(branchResults), scanned);
 
-        collectSubqueryBranchScope(branches[branchIndex],
-                                   table._rowColumns,
-                                   scanned,
-                                   mlir::Value(),
-                                   table._constants,
-                                   /*bindsHidden=*/false,
-                                   branchScopes[branchIndex],
-                                   importedEntities[branchIndex]);
+        collectBodyScopes(branch._query,
+                          table._rowColumns,
+                          scanned,
+                          mlir::Value(),
+                          table._constants,
+                          /*bindsHidden=*/false,
+                          scopes);
     }
 
     std::unordered_set<std::string_view> outerImportedCSVRows;
     std::swap(_importedCSVRows, outerImportedCSVRows);
 
     for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
-        rebindSubqueryBranchScope(branchScopes[branchIndex], importedEntities[branchIndex]);
-
         mlir::Block* const block = &branchResults._regions[branchIndex]->front();
-        generateSubqueryBranch(branches[branchIndex]._query, block, outerBlock, branchResults);
+        generateSubqueryBranch(branches[branchIndex]._query,
+                               scopes,
+                               /*answersRows=*/false,
+                               block,
+                               block,
+                               branchResults);
     }
 
     llvm::SmallVector<PublishedColumn> yielded;
@@ -5880,15 +6138,19 @@ void DBProgramGenerator::generateUnionSegment(const CallSubqueryStmt* body) {
 
     std::swap(_importedCSVRows, outerImportedCSVRows);
 
+    appendRedeclaredImports(segment->redeclaredImports(), yielded);
+
     rebindScope(yielded);
     bindReturnedEntities(returnedEntities);
 }
 
 // What a branch returns replaces the row, so a name the row held and the branch returns
 // again is bound afresh rather than beside the input it came from
-void DBProgramGenerator::generateConditionalSegment(const CallSubqueryStmt* body) {
+void DBProgramGenerator::generateConditionalSegment(const NextSegmentStmt* segment) {
     SubqueryResults results;
-    emitCallSubquery(body, results);
+    emitCallSubquery(segment->getBody(), results);
+
+    appendRedeclaredImports(segment->redeclaredImports(), results._returned);
 
     rebindScope(results._returned);
     bindReturnedEntities(results._returnedEntities);
@@ -5914,7 +6176,9 @@ void DBProgramGenerator::generateUpdatingSegment(const NextSegmentStmt* segment)
     std::unordered_set<std::string_view> outerImportedCSVRows;
     std::swap(_importedCSVRows, outerImportedCSVRows);
 
-    if (body->isConditional()) {
+    const RegularQuery* bodyQuery = body->getBody();
+
+    if (bodyQuery->getKind() == QueryCommand::Kind::CONDITIONAL_QUERY) {
         llvm::SmallVector<PublishedColumn> scope;
         for (size_t columnIndex = 0; columnIndex < scanned.size(); columnIndex++) {
             const PublishedColumn& rowColumn = table._rowColumns[columnIndex];
@@ -5929,22 +6193,20 @@ void DBProgramGenerator::generateUpdatingSegment(const NextSegmentStmt* segment)
         SubqueryResults results;
         emitCallSubquery(body, results);
     } else {
-        const CallSubqueryStmt::Branch& branch = body->branches().front();
+        const SinglePartQuery* query = static_cast<const SinglePartQuery*>(bodyQuery);
 
-        llvm::SmallVector<PublishedColumn> scope;
-        CarriedEntities importedEntities;
-        collectSubqueryBranchScope(branch,
+        BranchScope scope;
+        collectSubqueryBranchScope(query,
                                    table._rowColumns,
                                    scanned,
                                    mlir::Value(),
                                    table._constants,
                                    /*bindsHidden=*/false,
-                                   scope,
-                                   importedEntities);
+                                   scope);
 
         _opBuilder.setInsertionPointToEnd(bodyBlock);
-        rebindSubqueryBranchScope(scope, importedEntities);
-        generateQueryParts(branch._query);
+        rebindSubqueryBranchScope(scope);
+        generateQueryParts(query);
     }
 
     _opBuilder.create<mlir::db::SubqueryYield>(loc, mlir::Value(), mlir::ValueRange {});
@@ -5961,16 +6223,10 @@ void DBProgramGenerator::generateUpdatingSegment(const NextSegmentStmt* segment)
                                                                              /*optional=*/false);
     callOp.getBody().takeBody(bodyRegion);
 
-    llvm::SmallVector<PublishedColumn> carried;
-    for (const VarDecl* decl : segment->getCarriedImports()) {
-        const std::string_view name = decl->getName();
-        const auto columnIt = std::ranges::find(_subqueryRowColumns, name, &PublishedColumn::_name);
-        bioassert(columnIt != _subqueryRowColumns.end(), "Import '{}' of no CALL row", name);
+    llvm::SmallVector<PublishedColumn> redeclared;
+    appendRedeclaredImports(segment->redeclaredImports(), redeclared);
 
-        carried.push_back({decl, std::string(name), columnIt->_column});
-    }
-
-    rebindScope(carried);
+    rebindScopeKeepingWrittenEntities(redeclared);
 }
 
 void DBProgramGenerator::materializeTable(SegmentTable& table) {
@@ -6032,16 +6288,14 @@ void DBProgramGenerator::splitConstantColumns(llvm::ArrayRef<PublishedColumn> co
 }
 
 void DBProgramGenerator::emitCallSubquery(const CallSubqueryStmt* subquery, SubqueryResults& results) {
-    const CallSubqueryStmt::Branches& branches = subquery->branches();
+    const RegularQuery* body = subquery->getBody();
     const bool returning = subquery->isReturning();
     const bool optional = returning && subquery->isOptional();
-    const bool conditional = subquery->isConditional();
-    const bool isUnion = subquery->isUnion();
 
     // A UNION dedups the rows of each input row on their own, and a WHEN decides per input
     // row which branch runs, so either body runs one input row at a time
-    const bool runsPerRow = isUnion || conditional;
-    const bool carriesScope = !runsPerRow && subqueryCarriesRows(branches.front()._query);
+    const bool runsPerRow = body->getKind() != QueryCommand::Kind::SINGLE_PART_QUERY;
+    const bool carriesScope = !runsPerRow && subqueryCarriesRows(static_cast<const SinglePartQuery*>(body));
 
     llvm::SmallVector<PublishedColumn> scopeColumns;
     collectPublishedColumns(scopeColumns);
@@ -6078,19 +6332,8 @@ void DBProgramGenerator::emitCallSubquery(const CallSubqueryStmt* subquery, Subq
         tagArgument = bodyBlock->addArgument(tagType, loc);
     }
 
-    std::vector<llvm::SmallVector<PublishedColumn>> branchScopes(branches.size());
-    std::vector<CarriedEntities> importedEntities(branches.size());
-
-    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
-        collectSubqueryBranchScope(branches[branchIndex],
-                                   inputs,
-                                   inputArguments,
-                                   tagArgument,
-                                   constants,
-                                   carriesScope,
-                                   branchScopes[branchIndex],
-                                   importedEntities[branchIndex]);
-    }
+    BodyScopes scopes;
+    collectBodyScopes(body, inputs, inputArguments, tagArgument, constants, carriesScope, scopes);
 
     // What the query holds is set aside while the body builds a scope of its own. A unit
     // body leaves the rows as they were, so it all comes back; a returning body's results
@@ -6101,43 +6344,29 @@ void DBProgramGenerator::emitCallSubquery(const CallSubqueryStmt* subquery, Subq
     std::unordered_set<std::string_view> outerImportedCSVRows;
     std::swap(_importedCSVRows, outerImportedCSVRows);
 
-    llvm::SmallVector<PublishedColumn> rowColumns(constants.begin(), constants.end());
-    for (size_t inputIndex = 0; inputIndex < inputs.size(); inputIndex++) {
-        const PublishedColumn& input = inputs[inputIndex];
-        rowColumns.push_back({input._decl, input._name, inputArguments[inputIndex]});
-    }
-
-    std::swap(_subqueryRowColumns, rowColumns);
+    const RunConstantMap outerRunConstants = _runConstants;
 
     _opBuilder.setInsertionPointToStart(bodyBlock);
+
+    if (!carriesScope) {
+        readArgumentsAsRunConstants(bodyBlock, scopes);
+    }
 
     llvm::SmallVector<PublishedColumn> yielded;
     CarriedEntities returnedEntities;
     mlir::Value yieldedTag;
 
-    if (conditional) {
-        generateSubqueryConditional(branches, branchScopes, importedEntities, yielded, returnedEntities);
-    } else if (isUnion) {
-        llvm::SmallVector<const SinglePartQuery*> queries;
-        for (const CallSubqueryStmt::Branch& branch : branches) {
-            queries.push_back(branch._query);
-        }
-
-        generateSubqueryUnion(queries,
-                              subquery->getDedupedBranchCount(),
-                              branchScopes,
-                              importedEntities,
-                              yielded,
-                              returnedEntities);
+    if (runsPerRow) {
+        generateSubqueryBody(body, scopes, /*answersRows=*/false, yielded, returnedEntities);
     } else {
-        const SinglePartQuery* body = branches.front()._query;
+        const SinglePartQuery* query = static_cast<const SinglePartQuery*>(body);
 
-        rebindSubqueryBranchScope(branchScopes.front(), importedEntities.front());
+        rebindSubqueryBranchScope(findBranchScope(scopes, query));
 
-        generateQueryParts(body);
+        generateQueryParts(query);
 
         if (returning) {
-            publishProjection(body->getReturnStmt()->getProjection(), nullptr, true);
+            publishProjection(query->getReturnStmt()->getProjection(), nullptr, true);
 
             llvm::SmallVector<PublishedColumn> bodyColumns;
             collectPublishedColumns(bodyColumns);
@@ -6207,7 +6436,7 @@ void DBProgramGenerator::emitCallSubquery(const CallSubqueryStmt* subquery, Subq
     _vdg = std::move(outerGraph);
 
     std::swap(_importedCSVRows, outerImportedCSVRows);
-    std::swap(_subqueryRowColumns, rowColumns);
+    _runConstants = outerRunConstants;
 
     if (!returning) {
         return;
@@ -6248,15 +6477,50 @@ void DBProgramGenerator::emitCallSubquery(const CallSubqueryStmt* subquery, Subq
     results._returnedEntities = std::move(returnedEntities);
 }
 
-void DBProgramGenerator::collectSubqueryBranchScope(const CallSubqueryStmt::Branch& branch,
+const DBProgramGenerator::BranchScope& DBProgramGenerator::findBranchScope(const BodyScopes& scopes,
+                                                                          const RegularQuery* query) {
+    static const BranchScope noScope;
+
+    const auto scopeIt = scopes.find(query);
+
+    return scopeIt != scopes.end() ? scopeIt->second : noScope;
+}
+
+void DBProgramGenerator::collectBodyScopes(const RegularQuery* body,
+                                           llvm::ArrayRef<PublishedColumn> inputs,
+                                           llvm::ArrayRef<mlir::Value> inputArguments,
+                                           mlir::Value tagArgument,
+                                           llvm::ArrayRef<PublishedColumn> constants,
+                                           bool bindsHidden,
+                                           BodyScopes& scopes) const {
+    std::vector<const RegularQuery*> queries;
+    RegularQuery::collectQueries(body, queries);
+
+    for (const RegularQuery* query : queries) {
+        if (query->getKind() == QueryCommand::Kind::UNION_QUERY) {
+            continue;
+        }
+
+        collectSubqueryBranchScope(query,
+                                   inputs,
+                                   inputArguments,
+                                   tagArgument,
+                                   constants,
+                                   bindsHidden,
+                                   scopes[query]);
+    }
+}
+
+void DBProgramGenerator::collectSubqueryBranchScope(const RegularQuery* query,
                                                     llvm::ArrayRef<PublishedColumn> inputs,
                                                     llvm::ArrayRef<mlir::Value> inputArguments,
                                                     mlir::Value tagArgument,
                                                     llvm::ArrayRef<PublishedColumn> constants,
                                                     bool bindsHidden,
-                                                    llvm::SmallVectorImpl<PublishedColumn>& scope,
-                                                    CarriedEntities& importedEntities) const {
-    const std::vector<const VarDecl*>& importDecls = branch._importDecls;
+                                                    BranchScope& branchScope) const {
+    const RegularQuery::ImportDecls& importDecls = query->getImportDecls();
+    llvm::SmallVector<PublishedColumn>& scope = branchScope._columns;
+    CarriedEntities& importedEntities = branchScope._importedEntities;
 
     const auto importedDecl = [&importDecls](std::string_view name) -> const VarDecl* {
         const auto importIt = std::ranges::find(importDecls, name, &VarDecl::getName);
@@ -6308,17 +6572,33 @@ void DBProgramGenerator::collectSubqueryBranchScope(const CallSubqueryStmt::Bran
     }
 }
 
+void DBProgramGenerator::generateSubqueryBody(const RegularQuery* body,
+                                              const BodyScopes& scopes,
+                                              bool answersRows,
+                                              llvm::SmallVectorImpl<PublishedColumn>& yielded,
+                                              CarriedEntities& returnedEntities) {
+    if (body->getKind() == QueryCommand::Kind::UNION_QUERY) {
+        generateSubqueryUnion(static_cast<const UnionQuery*>(body), scopes, answersRows, yielded, returnedEntities);
+    } else {
+        generateSubqueryConditional(static_cast<const ConditionalQuery*>(body),
+                                    scopes,
+                                    answersRows,
+                                    yielded,
+                                    returnedEntities);
+    }
+}
+
 // Each branch is generated into a region of its own under the imports it names, as the
 // branches of a top-level UNION are. Every branch publishes its columns under the
 // declarations the analyzer gave the first one, so they come out in the same order.
-void DBProgramGenerator::generateSubqueryUnion(llvm::ArrayRef<const SinglePartQuery*> branches,
-                                               size_t dedupedBranches,
-                                               std::span<const llvm::SmallVector<PublishedColumn>> branchScopes,
-                                               std::span<const CarriedEntities> importedEntities,
+void DBProgramGenerator::generateSubqueryUnion(const UnionQuery* unionQuery,
+                                               const BodyScopes& scopes,
+                                               bool answersRows,
                                                llvm::SmallVectorImpl<PublishedColumn>& yielded,
                                                CarriedEntities& returnedEntities) {
     const mlir::Location loc = _opBuilder.getUnknownLoc();
     mlir::Block* const bodyBlock = _opBuilder.getInsertionBlock();
+    const size_t dedupedBranches = unionQuery->getDedupedBranchCount();
 
     mlir::Value distinctSet;
     if (dedupedBranches > 0) {
@@ -6327,9 +6607,13 @@ void DBProgramGenerator::generateSubqueryUnion(llvm::ArrayRef<const SinglePartQu
 
     SubqueryBranchResults branchResults;
 
-    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
-        rebindSubqueryBranchScope(branchScopes[branchIndex], importedEntities[branchIndex]);
-        generateSubqueryBranch(branches[branchIndex], openSubqueryBranch(branchResults), bodyBlock, branchResults);
+    for (const UnionQuery::Branch& branch : unionQuery->branches()) {
+        generateSubqueryBranch(branch._query,
+                               scopes,
+                               answersRows,
+                               openSubqueryBranch(branchResults),
+                               bodyBlock,
+                               branchResults);
     }
 
     generateUnionOverBranches(distinctSet, dedupedBranches, bodyBlock, branchResults, yielded, returnedEntities);
@@ -6367,31 +6651,33 @@ void DBProgramGenerator::generateUnionOverBranches(mlir::Value distinctSet,
     publishSubqueryBranchResults(unionOp.getResults(), branchResults, yielded, returnedEntities);
 }
 
-void DBProgramGenerator::generateSubqueryConditional(llvm::ArrayRef<CallSubqueryStmt::Branch> branches,
-                                                     std::span<const llvm::SmallVector<PublishedColumn>> branchScopes,
-                                                     std::span<const CarriedEntities> importedEntities,
+void DBProgramGenerator::generateSubqueryConditional(const ConditionalQuery* conditional,
+                                                     const BodyScopes& scopes,
+                                                     bool answersRows,
                                                      llvm::SmallVectorImpl<PublishedColumn>& yielded,
                                                      CarriedEntities& returnedEntities) {
     const mlir::Location loc = _opBuilder.getUnknownLoc();
     mlir::Block* const bodyBlock = _opBuilder.getInsertionBlock();
+    const ConditionalQuery::Branches& branches = conditional->branches();
+    const BranchScope& predicateScope = findBranchScope(scopes, conditional);
 
     std::vector<std::unique_ptr<mlir::Region>> conditionRegions;
     SubqueryBranchResults branchResults;
 
     // A condition's region does not dominate its branch's, so the branch rebinds the scope
     // rather than read a value the condition bound
-    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
-        const CallSubqueryStmt::Branch& branch = branches[branchIndex];
-        const llvm::SmallVector<PublishedColumn>& scope = branchScopes[branchIndex];
-        const CarriedEntities& entities = importedEntities[branchIndex];
-
+    for (const ConditionalQuery::Branch& branch : branches) {
         if (const Expr* predicate = branch._condition) {
-            rebindSubqueryBranchScope(scope, entities);
+            rebindSubqueryBranchScope(predicateScope);
             generateConditionRegion(predicate, bodyBlock, conditionRegions);
         }
 
-        rebindSubqueryBranchScope(scope, entities);
-        generateSubqueryBranch(branch._query, openSubqueryBranch(branchResults), bodyBlock, branchResults);
+        generateSubqueryBranch(branch._query,
+                               scopes,
+                               answersRows,
+                               openSubqueryBranch(branchResults),
+                               bodyBlock,
+                               branchResults);
     }
 
     yieldEveryPendingMask(branchResults);
@@ -6400,10 +6686,10 @@ void DBProgramGenerator::generateSubqueryConditional(llvm::ArrayRef<CallSubquery
     _opBuilder.setInsertionPointToEnd(bodyBlock);
 
     const size_t regionCount = conditionRegions.size() + branches.size();
-    mlir::db::Conditional conditional = _opBuilder.create<mlir::db::Conditional>(loc,
-                                                                                 branchResults._resultTypes,
-                                                                                 regionCount);
-    const mlir::MutableArrayRef<mlir::Region> regions = conditional.getBranches();
+    mlir::db::Conditional conditionalOp = _opBuilder.create<mlir::db::Conditional>(loc,
+                                                                                   branchResults._resultTypes,
+                                                                                   regionCount);
+    const mlir::MutableArrayRef<mlir::Region> regions = conditionalOp.getBranches();
 
     size_t regionIndex = 0;
     for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
@@ -6416,7 +6702,7 @@ void DBProgramGenerator::generateSubqueryConditional(llvm::ArrayRef<CallSubquery
         regionIndex++;
     }
 
-    publishSubqueryBranchResults(conditional.getResults(), branchResults, yielded, returnedEntities);
+    publishSubqueryBranchResults(conditionalOp.getResults(), branchResults, yielded, returnedEntities);
 }
 
 void DBProgramGenerator::generateConditionRegion(const Expr* predicate,
@@ -6426,7 +6712,7 @@ void DBProgramGenerator::generateConditionRegion(const Expr* predicate,
     mlir::Block* const block = new mlir::Block(); // Region destructor frees it
     region->push_back(block);
 
-    _unionBranchRowBlocks[block] = bodyBlock;
+    _unionBranchRowBlocks[block] = findRowBlock(bodyBlock);
 
     _opBuilder.setInsertionPointToStart(block);
     translateExpr(predicate);
@@ -6437,17 +6723,18 @@ void DBProgramGenerator::generateConditionRegion(const Expr* predicate,
     _unionBranchRowBlocks.erase(block);
 }
 
-void DBProgramGenerator::rebindSubqueryBranchScope(llvm::ArrayRef<PublishedColumn> scope,
-                                                   const CarriedEntities& importedEntities) {
-    rebindScope(scope);
+void DBProgramGenerator::rebindSubqueryBranchScope(const BranchScope& scope) {
+    rebindScope(scope._columns);
 
-    for (const auto& [decl, written] : importedEntities) {
+    for (const auto& [decl, written] : scope._importedEntities) {
         _part._writtenEntities[decl] = written;
     }
 
+    registerRunConstants(scope);
+
     _importedCSVRows.clear();
 
-    for (const PublishedColumn& column : scope) {
+    for (const PublishedColumn& column : scope._columns) {
         const VarDecl* decl = column._decl;
         const std::string_view fieldRow = findCSVFieldRow(decl);
 
@@ -6459,6 +6746,99 @@ void DBProgramGenerator::rebindSubqueryBranchScope(llvm::ArrayRef<PublishedColum
     }
 }
 
+void DBProgramGenerator::readArgumentsAsRunConstants(mlir::Block* bodyBlock, BodyScopes& scopes) {
+    llvm::SmallVector<bool> read(bodyBlock->getNumArguments(), false);
+
+    for (const auto& [query, scope] : scopes) {
+        for (const PublishedColumn& column : scope._columns) {
+            const auto argument = mlir::dyn_cast<mlir::BlockArgument>(column._column);
+            if (argument && argument.getOwner() == bodyBlock) {
+                read[argument.getArgNumber()] = true;
+            }
+        }
+    }
+
+    llvm::DenseMap<mlir::Value, mlir::Value> constants;
+    for (const mlir::BlockArgument argument : bodyBlock->getArguments()) {
+        if (read[argument.getArgNumber()]) {
+            constants[argument] = _opBuilder.create<mlir::db::RowConstant>(_opBuilder.getUnknownLoc(), argument).getResult();
+        }
+    }
+
+    for (auto& [query, scope] : scopes) {
+        for (PublishedColumn& column : scope._columns) {
+            const auto constantIt = constants.find(column._column);
+            if (constantIt != constants.end()) {
+                column._column = constantIt->second;
+            }
+        }
+    }
+}
+
+void DBProgramGenerator::registerRunConstants(const BranchScope& scope) {
+    for (const PublishedColumn& column : scope._columns) {
+        if (column._decl && yieldsConstantColumn(column._column, _constantColumns)) {
+            _runConstants[column._decl] = RunConstant {{column}, std::nullopt};
+        }
+    }
+
+    // A mask is read beside the entity it is the mask of, so it is bound with that entity
+    for (const PublishedColumn& column : scope._columns) {
+        const std::string_view name = column._name;
+        if (!name.starts_with(pendingMaskPrefix) || !yieldsConstantColumn(column._column, _constantColumns)) {
+            continue;
+        }
+
+        const std::string_view entityName = name.substr(pendingMaskPrefix.size());
+        const auto entityIt = std::ranges::find(scope._columns, entityName, &PublishedColumn::_name);
+        const auto runConstantIt = entityIt != scope._columns.end() ? _runConstants.find(entityIt->_decl)
+                                                                    : _runConstants.end();
+
+        if (runConstantIt != _runConstants.end()) {
+            runConstantIt->second._columns.push_back(column);
+        }
+    }
+
+    for (const auto& [decl, written] : scope._importedEntities) {
+        const auto runConstantIt = _runConstants.find(decl);
+        if (runConstantIt != _runConstants.end()) {
+            runConstantIt->second._written = written;
+        }
+    }
+}
+
+void DBProgramGenerator::appendRedeclaredImports(std::span<const VarDecl* const> redeclared,
+                                                 llvm::SmallVectorImpl<PublishedColumn>& published) const {
+    const auto append = [&published](const RunConstant& runConstant) {
+        for (const PublishedColumn& column : runConstant._columns) {
+            if (std::ranges::find(published, column._name, &PublishedColumn::_name) == published.end()) {
+                published.push_back(column);
+            }
+        }
+    };
+
+    for (const VarDecl* decl : redeclared) {
+        // A CSV row is bound through the columns of the fields it is read through, each
+        // under the field's declaration
+        if (decl->getType() == EvaluatedType::StringTable) {
+            for (const auto& [fieldDecl, runConstant] : _runConstants) {
+                if (findCSVFieldRow(fieldDecl) == decl->getName()) {
+                    append(runConstant);
+                }
+            }
+
+            continue;
+        }
+
+        const auto runConstantIt = _runConstants.find(decl);
+        bioassert(runConstantIt != _runConstants.end(),
+                  "Import '{}' declared again past a barrier, with no constant for the run",
+                  decl->getName());
+
+        append(runConstantIt->second);
+    }
+}
+
 mlir::Block* DBProgramGenerator::openSubqueryBranch(SubqueryBranchResults& branchResults) {
     std::unique_ptr<mlir::Region>& region = branchResults._regions.emplace_back(std::make_unique<mlir::Region>());
     mlir::Block* const block = new mlir::Block(); // Region destructor frees it
@@ -6467,37 +6847,72 @@ mlir::Block* DBProgramGenerator::openSubqueryBranch(SubqueryBranchResults& branc
     return block;
 }
 
-void DBProgramGenerator::generateSubqueryBranch(const SinglePartQuery* query,
+// A branch that is a UNION or a WHEN of its own nests the op holding its branches in the
+// branch's region, and those branches start from the rows the outermost one does
+void DBProgramGenerator::generateSubqueryBranch(const RegularQuery* query,
+                                                const BodyScopes& scopes,
+                                                bool answersRows,
                                                 mlir::Block* block,
-                                                mlir::Block* bodyBlock,
+                                                mlir::Block* rowBlock,
                                                 SubqueryBranchResults& branchResults) {
     const mlir::Location loc = _opBuilder.getUnknownLoc();
 
-    _unionBranchRowBlocks[block] = bodyBlock;
+    _unionBranchRowBlocks[block] = findRowBlock(rowBlock);
 
     _opBuilder.setInsertionPointToEnd(block);
-    generateQueryParts(query);
 
     llvm::SmallVector<PublishedColumn>& branchColumns = branchResults._branchColumns.emplace_back();
-    if (const ReturnStmt* returnStmt = query->getReturnStmt()) {
-        publishProjection(returnStmt->getProjection(), nullptr, true);
-        collectPublishedColumns(branchColumns);
-    }
-
     std::vector<std::optional<PartScope::WrittenEntity>>& writtenColumns = branchResults._writtenColumns.emplace_back();
+
+    if (query->getKind() == QueryCommand::Kind::SINGLE_PART_QUERY) {
+        const SinglePartQuery* single = static_cast<const SinglePartQuery*>(query);
+
+        rebindSubqueryBranchScope(findBranchScope(scopes, single));
+        generateQueryParts(single);
+
+        if (const ReturnStmt* returnStmt = single->getReturnStmt()) {
+            publishProjection(returnStmt->getProjection(), nullptr, true);
+            collectPublishedColumns(branchColumns);
+        } else if (answersRows) {
+            llvm::SmallVector<mlir::Value> answer {constantBool(true)};
+            broadcastConstantProjection(answer);
+
+            branchColumns.push_back({nullptr, std::string(ANSWER_COLUMN_NAME), answer.front()});
+        }
+
+        for (const PublishedColumn& column : branchColumns) {
+            std::optional<PartScope::WrittenEntity>& written = writtenColumns.emplace_back();
+            if (const PartScope::WrittenEntity* entity = findWrittenEntity(column._decl)) {
+                written = *entity;
+            }
+        }
+    } else {
+        CarriedEntities returnedEntities;
+        generateSubqueryBody(query, scopes, answersRows, branchColumns, returnedEntities);
+
+        for (const PublishedColumn& column : branchColumns) {
+            std::optional<PartScope::WrittenEntity>& written = writtenColumns.emplace_back();
+
+            const auto returnedIt = std::ranges::find(returnedEntities, column._decl, &CarriedEntities::value_type::first);
+            if (returnedIt != returnedEntities.end()) {
+                written = returnedIt->second;
+            }
+        }
+    }
 
     llvm::SmallVector<mlir::Value> projected;
     for (const PublishedColumn& column : branchColumns) {
         projected.push_back(column._column);
-
-        std::optional<PartScope::WrittenEntity>& written = writtenColumns.emplace_back();
-        if (const PartScope::WrittenEntity* entity = findWrittenEntity(column._decl)) {
-            written = *entity;
-        }
     }
 
     _opBuilder.create<mlir::db::Yield>(loc, mlir::ValueRange {projected});
     _unionBranchRowBlocks.erase(block);
+}
+
+mlir::Block* DBProgramGenerator::findRowBlock(mlir::Block* block) const {
+    const auto rowBlockIt = _unionBranchRowBlocks.find(block);
+
+    return rowBlockIt != _unionBranchRowBlocks.end() ? rowBlockIt->second : block;
 }
 
 void DBProgramGenerator::dedupSubqueryBranch(mlir::Value distinctSet,
@@ -6625,7 +7040,7 @@ void DBProgramGenerator::typeSubqueryBranchResults(SubqueryBranchResults& branch
     for (const llvm::SmallVector<PublishedColumn>& branchColumns : branchResults._branchColumns) {
         for (size_t columnIndex = 0; columnIndex < branchColumns.size(); columnIndex++) {
             const mlir::db::ColumnType resultType = mlir::cast<mlir::db::ColumnType>(resultTypes[columnIndex]);
-            if (mlir::isa<mlir::NoneType>(resultType.getType())) {
+            if (mlir::isa<mlir::NoneType>(resultType.getType()) || isUntypedNullColumnType(resultType)) {
                 resultTypes[columnIndex] = branchColumns[columnIndex]._column.getType();
             }
         }
@@ -6787,7 +7202,7 @@ void DBProgramGenerator::generateOptionalMatch(std::span<Stmt* const> stmt) {
         resultTypes.push_back(column._column.getType());
     }
 
-    const mlir::Value carriedTag = tagsRows ? _part._varMap.at(tagVariable).back() : mlir::Value();
+    const mlir::Value carriedTag = tagsRows ? findVarOrThrow(_part._varMap, tagVariable) : mlir::Value();
     _opBuilder.create<mlir::db::OptionalYield>(loc, carriedTag, yieldedColumns);
 
     _opBuilder.setInsertionPointToEnd(outerBlock);
@@ -6824,10 +7239,9 @@ void DBProgramGenerator::broadcastConstantProjection(llvm::SmallVectorImpl<mlir:
     }
 
     const mlir::Location loc = _opBuilder.getUnknownLoc();
-    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
 
     for (mlir::Value& column : projected) {
-        column = _opBuilder.create<mlir::db::BroadcastConstant>(loc, noneType, column, driver).getResult();
+        column = _opBuilder.create<mlir::db::BroadcastConstant>(loc, column, driver).getResult();
     }
 }
 
@@ -6991,15 +7405,21 @@ void DBProgramGenerator::collectPublishedColumns(llvm::SmallVectorImpl<Published
 
         const auto foundIt = std::ranges::find_if(published, sameName);
         if (foundIt != published.end()) {
-            foundIt->_decl = decl;
-            foundIt->_column = column;
+            // A pattern casting a variable binds its name to the cast, in place of the value
+            const bool castsTheVariable = foundIt->_decl && foundIt->_decl->getCastSource() == decl;
+            if (!castsTheVariable) {
+                foundIt->_decl = decl;
+                foundIt->_column = column;
+            }
+
             return;
         }
 
         published.push_back({decl, std::string(name), column});
     });
 
-    // Under a name order rather than the map's, so the same query generates the same IR
+    // Under a name order rather than the map's, so every branch of a union publishes its
+    // columns in the one order the union's results are typed and read in
     std::ranges::sort(published, [](const PublishedColumn& left, const PublishedColumn& right) {
         return left._name < right._name;
     });
@@ -7007,6 +7427,28 @@ void DBProgramGenerator::collectPublishedColumns(llvm::SmallVectorImpl<Published
     for (PublishedColumn& column : published) {
         column._column = columnLeavingScope(column._decl, column._column);
     }
+}
+
+void DBProgramGenerator::publishProjectedAliases(llvm::SmallVectorImpl<PublishedColumn>& published) const {
+    for (const auto& [decl, column] : _part._projectedColumns) {
+        const bool publishedAlready = std::ranges::find(published, decl, &PublishedColumn::_decl) != published.end();
+
+        if (decl->isUnnamed() || publishedAlready) {
+            continue;
+        }
+
+        const std::string_view name = decl->getName();
+        const PublishedColumn alias {decl, std::string(name), column};
+        const auto shadowedIt = std::ranges::find(published, name, &PublishedColumn::_name);
+
+        if (shadowedIt != published.end()) {
+            *shadowedIt = alias;
+        } else {
+            published.push_back(alias);
+        }
+    }
+
+    std::ranges::sort(published, {}, &PublishedColumn::_name);
 }
 
 void DBProgramGenerator::publishInFlightColumns() {
@@ -7017,7 +7459,30 @@ void DBProgramGenerator::publishInFlightColumns() {
 }
 
 void DBProgramGenerator::forEachVariableColumn(const VariableColumnBinding& bind) const {
+    const auto namesTheWalk = [](const VarDecl* groupDecl, const PartScope::PathBinding& binding) {
+        return !binding._path || binding._path->getDecl() == groupDecl;
+    };
+
+    // An occurrence of a named edge, and the walk a group variable stands for, holds a column
+    // the query names below, and is bound under that name alone
+    llvm::SmallPtrSet<const VariableDependency*, 8> namedBelow;
+    for (const auto& [decl, vars] : _vdg.edgeIdentities()) {
+        if (!vars.empty() && holdsColumn(vars.front())) {
+            namedBelow.insert(vars.begin(), vars.end());
+        }
+    }
+
+    for (const auto& [groupDecl, binding] : _part._pathBindings) {
+        if (!namesTheWalk(groupDecl, binding)) {
+            namedBelow.insert(binding._path);
+        }
+    }
+
     for (const auto& [cypherVar, mlirCol] : _part._varMap) {
+        if (namedBelow.contains(cypherVar)) {
+            continue;
+        }
+
         const std::string_view varName = cypherVar->getName();
 
         bioassert(not mlirCol.empty(), "No definitions for {}", varName);
@@ -7035,13 +7500,7 @@ void DBProgramGenerator::forEachVariableColumn(const VariableColumnBinding& bind
         bind(createdDecl, createdDecl->getName(), created._column);
     }
 
-    // So is the path a `MATCH p = ...` named, declared by its pattern element. One over a
-    // walk is another name for the handle column that walk bound, and is built where it is
-    // read; any other shape was built when its element was matched.
-    for (const auto& [pathDecl, walk] : _part._namedPathWalks) {
-        bind(pathDecl, pathDecl->getName(), _part._varMap.at(walk._path).back());
-    }
-
+    // So is the path a `MATCH p = ...` named, declared by its pattern element
     for (const auto& [pathDecl, pathColumn] : _part._namedPaths) {
         bind(pathDecl, pathDecl->getName(), pathColumn);
     }
@@ -7049,12 +7508,11 @@ void DBProgramGenerator::forEachVariableColumn(const VariableColumnBinding& bind
     // So is each group variable of a quantified pattern, another name for the handle column
     // of its walk
     for (const auto& [groupDecl, binding] : _part._pathBindings) {
-        const bool namesTheWalk = !binding._path || binding._path->getDecl() == groupDecl;
-        if (namesTheWalk) {
+        if (namesTheWalk(groupDecl, binding)) {
             continue;
         }
 
-        bind(groupDecl, groupDecl->getName(), _part._varMap.at(binding._path).back());
+        bind(groupDecl, groupDecl->getName(), findVarOrThrow(_part._varMap, binding._path));
     }
 
     // And so is the element a list comprehension bound, inside its body
@@ -7070,7 +7528,7 @@ void DBProgramGenerator::forEachVariableColumn(const VariableColumnBinding& bind
             continue;
         }
 
-        bind(decl, decl->getName(), _part._varMap.at(representative).back());
+        bind(decl, decl->getName(), findVarOrThrow(_part._varMap, representative));
     }
 }
 
@@ -7248,6 +7706,8 @@ void DBProgramGenerator::translateDistinct(const Projection* projection,
         llvm::SmallVector<mlir::Value> deduped;
         emitRemoveDuplicates(dedupedColumns, mlir::Value(), deduped);
 
+        _part._rowReductionOp = deduped.front().getDefiningOp();
+
         // The dedup hands back one column per column it read, so its results take the place
         // of the ones it was given and the constant columns stay as they were
         for (size_t resultIndex = 0; resultIndex < dedupedItems.size(); resultIndex++) {
@@ -7306,6 +7766,7 @@ void DBProgramGenerator::rebindDistinctColumns(const Projection* projection,
 
 void DBProgramGenerator::rebindVariableColumn(const VarDecl* decl, mlir::Value column) {
     rebindYieldedColumn(decl, column);
+    rebindNamedPath(decl, column);
     rebindGroupVariable(decl, column);
 
     // An edge identity has no variable of its own: its column is published under the
@@ -7354,6 +7815,7 @@ void DBProgramGenerator::translateDistinctOverConstants(const Projection* projec
 
     const mlir::Location loc = _opBuilder.getUnknownLoc();
     auto limitOp = _opBuilder.create<mlir::db::Limit>(loc, cappedTypes, mlir::ValueRange{capped}, keptRowCount);
+    _part._rowReductionOp = limitOp.getOperation();
 
     const mlir::ResultRange results = limitOp.getResults();
     for (size_t resultIndex = 0; resultIndex < cappedItems.size(); resultIndex++) {
@@ -7613,6 +8075,47 @@ void DBProgramGenerator::applyConstraints(const VariableDependency* var) {
     }
 }
 
+void DBProgramGenerator::filterNullNode(const VariableDependency* var) {
+    const VarDecl* decl = var->getDecl();
+    const bool isANode = decl && decl->getType() == EvaluatedType::NodePattern;
+    const bool isNamedByAPattern = var->isNamedByAPattern();
+
+    if (!isANode || !isNamedByAPattern) {
+        return;
+    }
+
+    // A label check and a hop crossing an edge already reject a null. A negated label holds
+    // on one, and a hop of zero edges pairs a null with itself. A hop's length sits on the
+    // link from its source to its edge variable, which its target reaches through that variable
+    const bool checksALabel = var->constraints().has_value();
+
+    const auto mayCrossNoEdge = [](const DependencyEdge* link) {
+        const EdgeMetadata data = link->data();
+        return data.isQuantified() && data.getMinHops() == 0;
+    };
+
+    bool crossesAnEdge = false;
+    for (const DependencyEdge* edge : var->edges()) {
+        const VariableDependency* hop = edge->src() == var ? edge->tgt() : edge->src();
+
+        bool hopMayCrossNoEdge = mayCrossNoEdge(edge);
+        for (const DependencyEdge* hopLink : hop->edges()) {
+            hopMayCrossNoEdge = hopMayCrossNoEdge || mayCrossNoEdge(hopLink);
+        }
+
+        crossesAnEdge = crossesAnEdge || !hopMayCrossNoEdge;
+    }
+
+    if (checksALabel || crossesAnEdge) {
+        return;
+    }
+
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+    const mlir::Value column = findVarOrThrow(_part._varMap, var);
+
+    filterAllColumns(_opBuilder.create<mlir::db::IsNotNullOp>(_opBuilder.getUnknownLoc(), boolType, column).getResult());
+}
+
 void DBProgramGenerator::translateExpr(const Expr* expr) {
     if (_part._exprMap.contains(expr)) {
         return;
@@ -7660,7 +8163,7 @@ void DBProgramGenerator::translateExpr(const Expr* expr) {
             // where that column comes from
             const auto projectedIt = _part._projectedColumns.find(decl);
 
-            if (projectedIt != end(_part._projectedColumns)) {
+            if (projectedIt != _part._projectedColumns.end()) {
                 _part._exprMap[expr] = projectedIt->second;
             } else {
                 const mlir::Value entityColumn = resolveEntityColumn(decl);
@@ -7687,6 +8190,8 @@ void DBProgramGenerator::translateExpr(const Expr* expr) {
             }
 
             bioassert(bound, "Symbol refers to unknown variable: {}", varName);
+
+            _part._exprMap[expr] = readWalkEntities(expr, _part._exprMap.at(expr));
         }
         break;
 
@@ -7773,10 +8278,26 @@ void DBProgramGenerator::translateExpr(const Expr* expr) {
         }
         break;
 
+        case Expr::Kind::ALL_REDUCE: {
+            const AllReduceExpr* allReduce = static_cast<const AllReduceExpr*>(expr);
+            translateAllReduceExpr(expr, allReduce);
+        }
+        break;
+
+        case Expr::Kind::MAP_PROJECTION: {
+            const MapProjectionExpr* projection = static_cast<const MapProjectionExpr*>(expr);
+            translateMapProjectionExpr(expr, projection);
+        }
+        break;
+
         case Expr::Kind::LIST:
             throwError(fmt::format("Unsupported expression: {}",
                                    ExprKindDescription::value(kind)),
                        expr);
+        break;
+
+        case Expr::Kind::PARAMETER:
+            _part._exprMap[expr] = translateParameterExpr(static_cast<const ParameterExpr*>(expr));
         break;
 
         case Expr::Kind::_SIZE:
@@ -7912,6 +8433,118 @@ void DBProgramGenerator::translateReduceExpr(const Expr* expr, const ReduceExpr*
                                                         initialValue,
                                                         carrySet._columns);
 
+    generateFoldRegion(reduceOp.getBody(), carrySet, reduce->getItemDecl(), reduce->getAccumulatorDecl(), [&]() {
+        const mlir::Value value = getOrTranslateExprColumn(reduce->getExpression());
+        _opBuilder.create<mlir::db::ReduceYield>(loc, value);
+    });
+
+    dropUnreadCarriedColumns(reduceOp, reduceOp.getColumnsToFilter());
+
+    _part._exprMap[expr] = reduceOp.getResult();
+}
+
+void DBProgramGenerator::translateAllReduceExpr(const Expr* expr, const AllReduceExpr* allReduce) {
+    const mlir::Value initialValue = getOrTranslateExprColumn(allReduce->getInitialValue());
+    const mlir::Value source = getOrTranslateExprColumn(allReduce->getSource());
+
+    CarrySet carrySet;
+    collectElementCarrySet(carrySet);
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+
+    auto allReduceOp = _opBuilder.create<mlir::db::AllReduce>(loc,
+                                                              boolType,
+                                                              source,
+                                                              initialValue,
+                                                              carrySet._columns);
+
+    const VarDecl* const itemDecl = allReduce->getItemDecl();
+    const VarDecl* const accumulatorDecl = allReduce->getAccumulatorDecl();
+
+    generateFoldRegion(allReduceOp.getBody(), carrySet, itemDecl, accumulatorDecl, [&]() {
+        const mlir::Value value = getOrTranslateExprColumn(allReduce->getExpression());
+        _opBuilder.create<mlir::db::ReduceYield>(loc, value);
+    });
+
+    generateFoldRegion(allReduceOp.getPredicate(), carrySet, itemDecl, accumulatorDecl, [&]() {
+        const mlir::Value holds = getOrTranslateExprColumn(allReduce->getPredicate());
+        _opBuilder.create<mlir::db::AllReduceYield>(loc, holds);
+    });
+
+    dropUnreadCarriedColumns(allReduceOp, allReduceOp.getColumnsToFilter());
+
+    _part._exprMap[expr] = allReduceOp.getResult();
+}
+
+void DBProgramGenerator::translateMapProjectionExpr(const Expr* expr, const MapProjectionExpr* projection) {
+    if (projection->getType() == EvaluatedType::Null) {
+        _part._exprMap[expr] = nullConstantColumn();
+        return;
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    CarrySet carrySet;
+    collectElementCarrySet(carrySet);
+
+    const llvm::SmallVector<mlir::Value> carried(carrySet._columns.begin(), carrySet._columns.end());
+
+    auto caseOp = _opBuilder.create<mlir::db::LazyCase>(loc, noneType, carried, 2u);
+    const mlir::MutableArrayRef<mlir::Region> regions = caseOp.getBranches();
+
+    generateCaseRegion(regions[0], carried, carrySet, mlir::Value {}, [&](mlir::Value) {
+        const mlir::Value base = getOrTranslateExprColumn(projection->getBase());
+        return _opBuilder.create<mlir::db::IsNotNullOp>(loc, boolType, base).getResult();
+    });
+
+    generateCaseRegion(regions[1], carried, carrySet, mlir::Value {}, [&](mlir::Value) {
+        return projectedMap(projection);
+    });
+
+    _part._exprMap[expr] = selectionResult(caseOp);
+}
+
+mlir::Value DBProgramGenerator::projectedMap(const MapProjectionExpr* projection) {
+    bool readsEveryProperty = false;
+    llvm::SmallVector<std::pair<std::string_view, const Expr*>> entries;
+
+    for (const MapProjectionExpr::Item& item : projection->getItems()) {
+        if (item._kind == MapProjectionExpr::ItemKind::AllProperties) {
+            readsEveryProperty = true;
+        } else if (!item._shadowed) {
+            entries.emplace_back(item._key->getName(), item._value);
+        }
+    }
+
+    if (!readsEveryProperty) {
+        return emitMakeMap(entries);
+    }
+
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+    const mlir::Value base = getOrTranslateExprColumn(projection->getBase());
+
+    const mlir::Value properties = _opBuilder.create<mlir::db::PropertyMap>(loc, noneType, base).getResult();
+    if (entries.empty()) {
+        return properties;
+    }
+
+    const mlir::Value written = emitMakeMap(entries);
+
+    return _opBuilder.create<mlir::db::MergeMaps>(loc, noneType, mlir::ValueRange {properties, written}).getResult();
+}
+
+void DBProgramGenerator::generateFoldRegion(mlir::Region& region,
+                                            const CarrySet& carrySet,
+                                            const VarDecl* itemDecl,
+                                            const VarDecl* accumulatorDecl,
+                                            FoldBodyGenerator generateBody) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
     llvm::SmallVector<mlir::Type> argumentTypes {noneType, noneType};
     llvm::SmallVector<mlir::Location> argumentLocations {loc, loc};
 
@@ -7921,7 +8554,7 @@ void DBProgramGenerator::translateReduceExpr(const Expr* expr, const ReduceExpr*
     }
 
     const mlir::OpBuilder::InsertionGuard guard(_opBuilder);
-    mlir::Block* const bodyBlock = _opBuilder.createBlock(&reduceOp.getBody(), {}, argumentTypes, argumentLocations);
+    mlir::Block* const bodyBlock = _opBuilder.createBlock(&region, {}, argumentTypes, argumentLocations);
 
     const VariableIdentityMap outerVarMap = _part._varMap;
     const EdgeTypeColumnMap outerEdgeTypeMap = _part._edgeTypeMap;
@@ -7930,18 +8563,17 @@ void DBProgramGenerator::translateReduceExpr(const Expr* expr, const ReduceExpr*
     const PartScope::CreatedEntityMap outerCreatedEntities = _part._createdEntities;
     const ExprValueMap outerExprMap = _part._exprMap;
     const ProjectedColumnMap outerProjectedColumns = _part._projectedColumns;
-    const std::unordered_map<const VarDecl*, mlir::Value> outerNamedPaths = _part._namedPaths;
+    const PartScope::NamedPathMap outerNamedPaths = _part._namedPaths;
 
     const mlir::Block::BlockArgListType carriedArguments = bodyBlock->getArguments().drop_front(2);
 
     _part._exprMap.clear();
     rebindCarrySet(carriedArguments, /*firstColumn=*/0, carrySet);
     rebindProjectedColumns(carrySet._columns, carriedArguments);
-    _part._comprehensionElements[reduce->getItemDecl()] = bodyBlock->getArgument(0);
-    _part._comprehensionElements[reduce->getAccumulatorDecl()] = bodyBlock->getArgument(1);
+    _part._comprehensionElements[itemDecl] = bodyBlock->getArgument(0);
+    _part._comprehensionElements[accumulatorDecl] = bodyBlock->getArgument(1);
 
-    const mlir::Value value = getOrTranslateExprColumn(reduce->getExpression());
-    _opBuilder.create<mlir::db::ReduceYield>(loc, value);
+    generateBody();
 
     _part._varMap = outerVarMap;
     _part._edgeTypeMap = outerEdgeTypeMap;
@@ -7951,10 +8583,6 @@ void DBProgramGenerator::translateReduceExpr(const Expr* expr, const ReduceExpr*
     _part._exprMap = outerExprMap;
     _part._projectedColumns = outerProjectedColumns;
     _part._namedPaths = outerNamedPaths;
-
-    dropUnreadCarriedColumns(reduceOp, reduceOp.getColumnsToFilter());
-
-    _part._exprMap[expr] = reduceOp.getResult();
 }
 
 void DBProgramGenerator::collectElementCarrySet(CarrySet& carrySet) {
@@ -7968,21 +8596,7 @@ void DBProgramGenerator::collectElementCarrySet(CarrySet& carrySet) {
         collectCarrySet(carrySet);
     }
 
-    llvm::SmallVector<mlir::Value> projectedColumns;
-    for (const auto& [decl, column] : _part._projectedColumns) {
-        const bool isCarriedAlready = llvm::is_contained(carrySet._columns, column)
-                                   || llvm::is_contained(projectedColumns, column);
-        const bool needsCarrying = holdsTheRowsInFlight(column)
-                                && !yieldsConstantColumn(column, _constantColumns)
-                                && !isCarriedAlready;
-
-        if (needsCarrying) {
-            projectedColumns.push_back(column);
-        }
-    }
-
-    std::ranges::sort(projectedColumns, computedBefore);
-    carrySet._columns.append(projectedColumns.begin(), projectedColumns.end());
+    carryProjectedColumns(carrySet);
 }
 
 void DBProgramGenerator::generateElementRegion(mlir::Region& region,
@@ -8013,7 +8627,7 @@ void DBProgramGenerator::generateElementRegion(mlir::Region& region,
     const PartScope::CreatedEntityMap outerCreatedEntities = _part._createdEntities;
     const ExprValueMap outerExprMap = _part._exprMap;
     const ProjectedColumnMap outerProjectedColumns = _part._projectedColumns;
-    const std::unordered_map<const VarDecl*, mlir::Value> outerNamedPaths = _part._namedPaths;
+    const PartScope::NamedPathMap outerNamedPaths = _part._namedPaths;
 
     const VarDecl* const itemDecl = comprehension->getDecl();
 
@@ -8140,10 +8754,7 @@ void DBProgramGenerator::dropUnreadFilteredColumns(mlir::db::FilterOp filter) {
         keptResults[keptIndex].replaceAllUsesWith(trimmed.getResult(keptIndex));
     }
 
-    for (const mlir::Value result : results) {
-        _constantColumns.erase(result);
-    }
-
+    forgetErasedValues(filter, _constantColumns);
     filter.erase();
 }
 
@@ -8157,6 +8768,10 @@ void DBProgramGenerator::translatePatternComprehensionExpr(const Expr* expr,
     // to the op: the pattern joins onto the ones it names and carries the rest along
     CarrySet carrySet;
     collectCarrySet(carrySet);
+
+    if (_part._orderingProjection) {
+        carryProjectedColumns(carrySet);
+    }
 
     const mlir::Location loc = _opBuilder.getUnknownLoc();
     const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
@@ -8197,6 +8812,11 @@ void DBProgramGenerator::translatePatternComprehensionExpr(const Expr* expr,
     llvm::SmallVector<PublishedColumn> patternScope;
     collectPublishedColumns(patternScope);
 
+    if (_part._orderingProjection) {
+        rebindProjectedColumns(carrySet._columns, patternBlock->getArguments());
+        publishProjectedAliases(patternScope);
+    }
+
     // The pattern is a MATCH of its own and is walked over a dependency graph of its own;
     // the one the query is being generated from is put back once it has been.
     VariableDependencyGraph outerVdg = std::move(_vdg);
@@ -8211,10 +8831,11 @@ void DBProgramGenerator::translatePatternComprehensionExpr(const Expr* expr,
     }
 
     Stmt* const patternStatements[] = {match};
+    bindCheckedCasts(patternStatements);
     generatePart(patternStatements);
 
     const mlir::Value value = getOrTranslateExprColumn(comprehension->getProjection());
-    const mlir::Value rowTags = tagsRows ? _part._varMap.at(tagVariable).back() : mlir::Value {};
+    const mlir::Value rowTags = tagsRows ? findVarOrThrow(_part._varMap, tagVariable) : mlir::Value {};
 
     _opBuilder.create<mlir::db::ComprehensionYield>(loc, rowTags, value);
 
@@ -8230,11 +8851,13 @@ void DBProgramGenerator::translateExistsExpr(const Expr* expr, const ExistsExpr*
     const mlir::Location loc = _opBuilder.getUnknownLoc();
     const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
 
+    llvm::SmallVector<const RegularQuery*> branches;
+    collectUnionBranches(existsExpr->getBody(), branches);
+
     mlir::Value exists;
-    for (const SinglePartQuery* branch : existsExpr->branches()) {
+    for (const RegularQuery* branch : branches) {
         const mlir::Value branchExists =
-            generateSubqueryExpression<mlir::db::ExistsSubquery, mlir::db::ExistsYield>(llvm::ArrayRef(branch),
-                                                                                        0,
+            generateSubqueryExpression<mlir::db::ExistsSubquery, mlir::db::ExistsYield>(branch,
                                                                                         boolType,
                                                                                         existsTagName);
 
@@ -8249,33 +8872,17 @@ void DBProgramGenerator::translateExistsExpr(const Expr* expr, const ExistsExpr*
 }
 
 void DBProgramGenerator::translateCountSubqueryExpr(const Expr* expr, const CountSubqueryExpr* countExpr) {
-    const CountSubqueryExpr::Branches& countBranches = countExpr->getBranches();
-
-    llvm::SmallVector<const SinglePartQuery*> branches;
-    for (const UnionQuery::Branch& branch : countBranches) {
-        branches.push_back(branch._query);
-    }
-
-    const mlir::db::ColumnType countType = allocColumnType(_opBuilder.getIntegerType(64, /*isSigned=*/false));
-
-    const size_t dedupedBranches = UnionQuery::getDedupedBranchCount(countBranches);
-    if (dedupedBranches > 0) {
-        _part._exprMap[expr] =
-            generateSubqueryExpression<mlir::db::CountSubquery, mlir::db::CountSubqueryYield>(branches,
-                                                                                              dedupedBranches,
-                                                                                              countType,
-                                                                                              countTagName);
-        return;
-    }
-
     const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType countType = allocColumnType(_opBuilder.getIntegerType(64, /*isSigned=*/false));
     const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
 
+    llvm::SmallVector<const RegularQuery*> branches;
+    collectUnionAllBranches(countExpr->getBody(), branches);
+
     mlir::Value count;
-    for (const SinglePartQuery* branch : branches) {
+    for (const RegularQuery* branch : branches) {
         const mlir::Value branchCount =
-            generateSubqueryExpression<mlir::db::CountSubquery, mlir::db::CountSubqueryYield>(llvm::ArrayRef(branch),
-                                                                                              0,
+            generateSubqueryExpression<mlir::db::CountSubquery, mlir::db::CountSubqueryYield>(branch,
                                                                                               countType,
                                                                                               countTagName);
 
@@ -8292,32 +8899,16 @@ void DBProgramGenerator::translateCountSubqueryExpr(const Expr* expr, const Coun
 // A UNION ALL holds a row's values from every branch, one after the other, so each branch
 // is a COLLECT of its own and the lists are concatenated in branch order
 void DBProgramGenerator::translateCollectSubqueryExpr(const Expr* expr, const CollectSubqueryExpr* collectExpr) {
-    const CollectSubqueryExpr::Branches& collectBranches = collectExpr->getBranches();
-
-    llvm::SmallVector<const SinglePartQuery*> branches;
-    for (const UnionQuery::Branch& branch : collectBranches) {
-        branches.push_back(branch._query);
-    }
-
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
     const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
 
-    const size_t dedupedBranches = UnionQuery::getDedupedBranchCount(collectBranches);
-    if (dedupedBranches > 0) {
-        _part._exprMap[expr] =
-            generateSubqueryExpression<mlir::db::CollectSubquery, mlir::db::CollectSubqueryYield>(branches,
-                                                                                                  dedupedBranches,
-                                                                                                  noneType,
-                                                                                                  collectTagName);
-        return;
-    }
-
-    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    llvm::SmallVector<const RegularQuery*> branches;
+    collectUnionAllBranches(collectExpr->getBody(), branches);
 
     mlir::Value lists;
-    for (const SinglePartQuery* branch : branches) {
+    for (const RegularQuery* branch : branches) {
         const mlir::Value branchLists =
-            generateSubqueryExpression<mlir::db::CollectSubquery, mlir::db::CollectSubqueryYield>(llvm::ArrayRef(branch),
-                                                                                                  0,
+            generateSubqueryExpression<mlir::db::CollectSubquery, mlir::db::CollectSubqueryYield>(branch,
                                                                                                   noneType,
                                                                                                   collectTagName);
 
@@ -8332,14 +8923,16 @@ void DBProgramGenerator::translateCollectSubqueryExpr(const Expr* expr, const Co
 }
 
 template <typename SubqueryOp, typename YieldOp>
-mlir::Value DBProgramGenerator::generateSubqueryExpression(llvm::ArrayRef<const SinglePartQuery*> branches,
-                                                           size_t dedupedBranches,
+mlir::Value DBProgramGenerator::generateSubqueryExpression(const RegularQuery* body,
                                                            mlir::Type resultType,
                                                            std::string_view tagName) {
-    // A UNION dedups the rows of each input row on their own, so a union body runs one
-    // input row at a time
-    const bool isUnion = branches.size() > 1;
-    const bool carriesScope = !isUnion && subqueryCarriesRows(branches.front());
+    // A UNION dedups the rows of each input row on their own, and a WHEN decides per input
+    // row which branch runs, so either body runs one input row at a time
+    const bool runsPerRow = body->getKind() != QueryCommand::Kind::SINGLE_PART_QUERY;
+    const bool carriesScope = !runsPerRow && subqueryCarriesRows(static_cast<const SinglePartQuery*>(body));
+
+    std::vector<const RegularQuery*> queries;
+    RegularQuery::collectQueries(body, queries);
 
     llvm::SmallVector<PublishedColumn> scopeColumns;
     collectPublishedColumns(scopeColumns);
@@ -8348,8 +8941,8 @@ mlir::Value DBProgramGenerator::generateSubqueryExpression(llvm::ArrayRef<const 
     if (_part._orderingProjection) {
         bool appended = false;
 
-        for (const SinglePartQuery* branch : branches) {
-            for (const VarDecl* decl : branch->getDeclContext()->decls()) {
+        for (const RegularQuery* query : queries) {
+            for (const VarDecl* decl : query->getDeclContext()->decls()) {
                 const VarDecl* source = decl->getImportSource();
                 const auto projectedIt = _part._projectedColumns.find(source);
 
@@ -8383,16 +8976,17 @@ mlir::Value DBProgramGenerator::generateSubqueryExpression(llvm::ArrayRef<const 
     mlir::Value consumedColumn;
 
     for (const PublishedColumn& column : scopeColumns) {
-        const bool consumedByTheAggregate = _part._aggregateOp
-                                         && !boundAtOrAfter(column._column, _part._aggregateOp);
+        const bool consumedByTheReduction = _part._rowReductionOp
+                                         && !boundAtOrAfter(column._column, _part._rowReductionOp);
 
         if (yieldsConstantColumn(column._column, _constantColumns)) {
             constants.push_back(column);
-        } else if (!consumedByTheAggregate) {
+        } else if (!consumedByTheReduction) {
             inputs.push_back(column);
         } else {
-            // A group holds no one value of a variable the aggregate consumed, and the analyzer
-            // turns away a body reading one: a WITH or a RETURN * in the body only carries it
+            // A group or a distinct row holds no one value of a variable the reduction consumed,
+            // and the analyzer turns away a body reading one: a WITH or a RETURN * in the body
+            // only carries it
             if (!consumedColumn) {
                 consumedColumn = nullConstantColumn();
             }
@@ -8401,10 +8995,10 @@ mlir::Value DBProgramGenerator::generateSubqueryExpression(llvm::ArrayRef<const 
         }
     }
 
-    // Under a grouping key no variable names, the groups are held by the aggregate's
-    // results alone, which the body then answers for under no name
-    if (inputs.empty() && _part._aggregateOp) {
-        for (const mlir::Value result : _part._aggregateOp->getResults()) {
+    // With no variable holding the rows in flight, the reduction's results alone hold them,
+    // and the body then answers for them under no name
+    if (inputs.empty() && _part._rowReductionOp) {
+        for (const mlir::Value result : _part._rowReductionOp->getResults()) {
             inputs.push_back({nullptr, std::string(), result});
         }
     }
@@ -8438,16 +9032,22 @@ mlir::Value DBProgramGenerator::generateSubqueryExpression(llvm::ArrayRef<const 
                                                          argumentTypes,
                                                          argumentLocations);
 
-    // The body is correlated: it reads every variable in flight, under the declaration its
-    // own context holds for it
-    std::vector<llvm::SmallVector<PublishedColumn>> branchScopes(branches.size());
+    // The body is correlated: each of its queries reads every variable in flight, under the
+    // declaration its own context holds for it
+    BodyScopes scopes;
 
-    for (size_t branchIndex = 0; branchIndex < branches.size(); branchIndex++) {
-        const DeclContext* bodyContext = branches[branchIndex]->getDeclContext();
-        llvm::SmallVector<PublishedColumn>& scope = branchScopes[branchIndex];
+    for (const RegularQuery* query : queries) {
+        if (query->getKind() == QueryCommand::Kind::UNION_QUERY) {
+            continue;
+        }
 
+        const DeclContext* bodyContext = query->getDeclContext();
+        llvm::SmallVector<PublishedColumn>& scope = scopes[query]._columns;
+
+        // A pattern of the body casting an import binds the import's name to the cast
         const auto importedDecl = [bodyContext](std::string_view name) -> const VarDecl* {
-            const VarDecl* decl = bodyContext->getDecl(name);
+            const VarDecl* named = bodyContext->getDecl(name);
+            const VarDecl* decl = named ? named->getCastSourceOrSelf() : nullptr;
 
             return decl && decl->getImportSource() ? decl : nullptr;
         };
@@ -8478,6 +9078,10 @@ mlir::Value DBProgramGenerator::generateSubqueryExpression(llvm::ArrayRef<const 
         }
     }
 
+    if (!carriesScope) {
+        readArgumentsAsRunConstants(bodyBlock, scopes);
+    }
+
     // What the query holds is set aside while the body builds a scope of its own: the body
     // binds nothing the query goes on to read, the op handing back one column and no other
     PartScope outerPart = std::move(_part);
@@ -8486,28 +9090,23 @@ mlir::Value DBProgramGenerator::generateSubqueryExpression(llvm::ArrayRef<const 
     std::unordered_set<std::string_view> outerImportedCSVRows;
     std::swap(_importedCSVRows, outerImportedCSVRows);
 
+    const RunConstantMap outerRunConstants = _runConstants;
+
     llvm::SmallVector<PublishedColumn> held;
 
-    if (isUnion) {
-        std::vector<CarriedEntities> importedEntities(branches.size());
+    if (runsPerRow) {
         CarriedEntities returnedEntities;
-
-        generateSubqueryUnion(branches,
-                              dedupedBranches,
-                              branchScopes,
-                              importedEntities,
-                              held,
-                              returnedEntities);
+        generateSubqueryBody(body, scopes, !body->isReturning(), held, returnedEntities);
     } else {
-        const SinglePartQuery* body = branches.front();
+        const SinglePartQuery* query = static_cast<const SinglePartQuery*>(body);
 
-        rebindSubqueryBranchScope(branchScopes.front(), CarriedEntities {});
+        rebindSubqueryBranchScope(findBranchScope(scopes, query));
 
-        generateQueryParts(body);
+        generateQueryParts(query);
 
         // A RETURN answers for no column here, but its cut does: SKIP can empty a body that
         // matched, so the projection is emitted and the rows it leaves are the ones answered for
-        if (const ReturnStmt* returnStmt = body->getReturnStmt()) {
+        if (const ReturnStmt* returnStmt = query->getReturnStmt()) {
             publishProjection(returnStmt->getProjection());
         }
 
@@ -8547,6 +9146,7 @@ mlir::Value DBProgramGenerator::generateSubqueryExpression(llvm::ArrayRef<const 
     _vdg = std::move(outerGraph);
 
     std::swap(_importedCSVRows, outerImportedCSVRows);
+    _runConstants = outerRunConstants;
 
     return subqueryOp.getResult();
 }
@@ -8623,9 +9223,7 @@ void DBProgramGenerator::translateCaseExpr(const Expr* expr, const CaseExpr* cas
         });
     }
 
-    dropUnreadCarriedColumns(caseOp, caseOp.getColumnsToFilter());
-
-    _part._exprMap[expr] = caseOp.getResult();
+    _part._exprMap[expr] = selectionResult(caseOp);
 }
 
 void DBProgramGenerator::generateCaseRegion(mlir::Region& region,
@@ -8660,6 +9258,19 @@ void DBProgramGenerator::generateCaseRegion(mlir::Region& region,
     _part = outerPart;
 }
 
+template <typename SelectionOp>
+mlir::Value DBProgramGenerator::selectionResult(SelectionOp selection) {
+    dropUnreadCarriedColumns(selection, selection.getColumnsToFilter());
+
+    llvm::SmallVector<mlir::Value> selected;
+    selection.collectSelectedValues(selected);
+
+    mlir::Value result = selection.getResult();
+    result.setType(allocColumnType(selectedColumnElement(_mlirCtxt, selected)));
+
+    return result;
+}
+
 mlir::Value DBProgramGenerator::disjointComparison(mlir::Value lhs, mlir::Value rhs, bool equality) {
     const mlir::Location loc = _opBuilder.getUnknownLoc();
     const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
@@ -8681,9 +9292,9 @@ mlir::Value DBProgramGenerator::disjointComparison(mlir::Value lhs, mlir::Value 
     for (const mlir::Value column : columns) {
         mlir::Value test;
         if (equality) {
-            test = _opBuilder.create<mlir::db::EqOp>(loc, boolType, column, nullConstantColumn()).getResult();
+            test = _opBuilder.create<mlir::db::IsNullOp>(loc, boolType, column).getResult();
         } else {
-            test = _opBuilder.create<mlir::db::NeqOp>(loc, boolType, column, nullConstantColumn()).getResult();
+            test = _opBuilder.create<mlir::db::IsNotNullOp>(loc, boolType, column).getResult();
         }
 
         if (!condition) {
@@ -8718,13 +9329,13 @@ mlir::Value DBProgramGenerator::translateCaseTest(const Expr* subjectExpr,
             return constantBool(true);
         }
 
-        return _opBuilder.create<mlir::db::EqOp>(loc, boolType, subject, nullConstantColumn()).getResult();
+        return _opBuilder.create<mlir::db::IsNullOp>(loc, boolType, subject).getResult();
     } else if (test._kind == CaseExpr::TestKind::IsNotNull) {
         if (subjectIsNull) {
             return constantBool(false);
         }
 
-        return _opBuilder.create<mlir::db::NeqOp>(loc, boolType, subject, nullConstantColumn()).getResult();
+        return _opBuilder.create<mlir::db::IsNotNullOp>(loc, boolType, subject).getResult();
     }
 
     translateExpr(test._value);
@@ -8733,16 +9344,14 @@ mlir::Value DBProgramGenerator::translateCaseTest(const Expr* subjectExpr,
     const mlir::Value value = _part._exprMap.at(test._value);
     const EvaluatedType valueType = test._value->getType();
 
-    // Null is equal to nothing, itself included, and an ordering between two types with
-    // no order between them is null, so a branch comparing across either is never taken.
+    // A test the analyzer typed Null is null on every row - a comparison with a null, an
+    // ordering across types with no order between them - so its branch is never taken.
     // IS NULL above is how a Cypher CASE tests for a null
-    const bool comparesAgainstNull = subjectIsNull || valueType == EvaluatedType::Null;
+    const bool neverTaken = test._resultType == EvaluatedType::Null;
     const bool comparesDisjointTypes = subjectExpr && comparesAsDisjointTypes(subjectType, valueType);
-    const bool ordersDisjointTypes = subjectExpr && ordersAsDisjointTypes(subjectType, valueType);
 
     const bool testsEquality = test._operator == BinaryOperator::Equal
                                || test._operator == BinaryOperator::NotEqual;
-    const bool neverTaken = comparesAgainstNull || (ordersDisjointTypes && !testsEquality);
 
     if (!subject) {
         return value;
@@ -8864,14 +9473,14 @@ void DBProgramGenerator::translateBinaryExpr(const Expr* expr, const BinaryExpr*
             if (testsKnownNull) {
                 _part._exprMap[expr] = constantBool(true);
             } else {
-                _part._exprMap[expr] = _opBuilder.create<mlir::db::EqOp>(loc, boolType, lhs, rhs).getResult();
+                _part._exprMap[expr] = _opBuilder.create<mlir::db::IsNullOp>(loc, boolType, lhs).getResult();
             }
         break;
         case BinaryOperator::IsNotNull:
             if (testsKnownNull) {
                 _part._exprMap[expr] = constantBool(false);
             } else {
-                _part._exprMap[expr] = _opBuilder.create<mlir::db::NeqOp>(loc, boolType, lhs, rhs).getResult();
+                _part._exprMap[expr] = _opBuilder.create<mlir::db::IsNotNullOp>(loc, boolType, lhs).getResult();
             }
         break;
         case BinaryOperator::Add: {
@@ -8886,14 +9495,14 @@ void DBProgramGenerator::translateBinaryExpr(const Expr* expr, const BinaryExpr*
             const bool isConcatenation = !addsACell && (joinsAsText || joinsAsList);
 
             if (isConcatenation) {
-                // A scalar concatenated with a list joins it as the one-element list it
-                // stands for, so both sides of the concatenation are lists
+                // A scalar concatenated with a list joins it as the list it stands for, so
+                // both sides of the concatenation are lists
                 const bool concatenatesLists = resultType == EvaluatedType::List;
                 const bool lhsJoinsAList = concatenatesLists && lhsExpr->getType() != EvaluatedType::List;
                 const bool rhsJoinsAList = concatenatesLists && rhsExpr->getType() != EvaluatedType::List;
 
-                const mlir::Value lhsColumn = lhsJoinsAList ? singletonList(lhs) : lhs;
-                const mlir::Value rhsColumn = rhsJoinsAList ? singletonList(rhs) : rhs;
+                const mlir::Value lhsColumn = lhsJoinsAList ? joinedListOperand(lhs) : lhs;
+                const mlir::Value rhsColumn = rhsJoinsAList ? joinedListOperand(rhs) : rhs;
 
                 _part._exprMap[expr] = _opBuilder.create<mlir::db::ConcatOp>(loc, noneType, lhsColumn, rhsColumn).getResult();
             } else {
@@ -8975,6 +9584,13 @@ void DBProgramGenerator::translateIndexExpr(const Expr* expr, const IndexExpr* i
     const Expr* base = indexExpr->getBase();
     const Expr* index = indexExpr->getIndexExpr();
 
+    if (const Expr* dottedForm = indexExpr->getDottedForm()) {
+        translateExpr(dottedForm);
+
+        _part._exprMap[expr] = _part._exprMap.at(dottedForm);
+        return;
+    }
+
     // A null index reads nothing, whatever it names, so the analyzer types such a read Null.
     // Both operands are still emitted: an aggregate under one of them is not this layer's
     // to drop, and a pass prunes the columns nothing reads.
@@ -9006,22 +9622,26 @@ void DBProgramGenerator::translateIndexExpr(const Expr* expr, const IndexExpr* i
     bioassert(_part._exprMap.contains(base), "Index read with unknown base.");
     bioassert(_part._exprMap.contains(index), "Index read with unknown index.");
 
-    //translate map indexing
-    if (indexExpr->readsAMapKey()) {
-        _part._exprMap[expr] = emitDynamicMapKey(_part._exprMap.at(base), _part._exprMap.at(index));
+    const mlir::Value baseColumn = _part._exprMap.at(base);
+    const mlir::Value indexColumn = _part._exprMap.at(index);
+    const IndexExpr::ReadKind readKind = indexExpr->getReadKind();
+
+    if (readKind == IndexExpr::ReadKind::MapKey) {
+        _part._exprMap[expr] = emitDynamicMapKey(baseColumn, indexColumn);
         return;
     }
 
     //translate list or path indexing
-    const mlir::Value list = readWalkEntities(base, _part._exprMap.at(base));
+    const mlir::Value container = readWalkEntities(base, baseColumn);
 
     const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
     const mlir::Location loc = _opBuilder.getUnknownLoc();
 
-    _part._exprMap[expr] = _opBuilder.create<mlir::db::ListIndex>(loc,
-                                                                  noneType,
-                                                                  list,
-                                                                  _part._exprMap.at(index)).getResult();
+    if (readKind == IndexExpr::ReadKind::ContainerElement) {
+        _part._exprMap[expr] = _opBuilder.create<mlir::db::ContainerIndex>(loc, noneType, container, indexColumn).getResult();
+    } else {
+        _part._exprMap[expr] = _opBuilder.create<mlir::db::ListIndex>(loc, noneType, container, indexColumn).getResult();
+    }
 }
 
 void DBProgramGenerator::translateStringExpr(const Expr* expr) {
@@ -9140,6 +9760,25 @@ mlir::Value DBProgramGenerator::translateLiteralExpr(const Literal* literal) {
     return _opBuilder.create<mlir::db::ConstantOp>(uloc, resultType, valueAttr).getResult();
 }
 
+mlir::Value DBProgramGenerator::translateParameterExpr(const ParameterExpr* parameterExpr) {
+    const auto argumentIt = _parameterArguments.find(parameterExpr->getDecl());
+    bioassert(argumentIt != _parameterArguments.end(), "A parameter reached codegen with no argument of main.");
+
+    return argumentIt->second;
+}
+
+// A parameter with a value has the type its literal would have; a null has the null literal's
+mlir::Type DBProgramGenerator::parameterType(const ParameterDecl* decl) {
+    const std::optional<ValueType> valueType = decl->getValueType();
+    if (!valueType) {
+        return mlir::storage::NullableType::get(_mlirCtxt, mlir::NoneType::get(_mlirCtxt));
+    } else if (*valueType == ValueType::List) {
+        return listShapeType(_opBuilder, decl->getListShape());
+    }
+
+    return valueTypeToElementType(_opBuilder, *valueType);
+}
+
 // The column of a null in every row, the shape translateLiteralExpr gives the null literal
 mlir::Value DBProgramGenerator::nullConstantColumn() {
     const mlir::Type nullableType = mlir::storage::NullableType::get(_mlirCtxt,
@@ -9148,6 +9787,21 @@ mlir::Value DBProgramGenerator::nullConstantColumn() {
     const mlir::db::ColumnType resultType = allocColumnType(valueAttr.getType());
 
     return _opBuilder.create<mlir::db::ConstantOp>(_opBuilder.getUnknownLoc(), resultType, valueAttr).getResult();
+}
+
+mlir::Value DBProgramGenerator::createCase(mlir::ValueRange conditions, mlir::ValueRange values, mlir::Value defaultValue) {
+    llvm::SmallVector<mlir::Value> selected(values.begin(), values.end());
+    if (defaultValue) {
+        selected.push_back(defaultValue);
+    }
+
+    const mlir::db::ColumnType resultType = allocColumnType(selectedColumnElement(_mlirCtxt, selected));
+
+    return _opBuilder.create<mlir::db::Case>(_opBuilder.getUnknownLoc(),
+                                             resultType,
+                                             conditions,
+                                             values,
+                                             defaultValue).getResult();
 }
 
 mlir::Value DBProgramGenerator::constantBool(bool value) {
@@ -9193,29 +9847,21 @@ mlir::Type DBProgramGenerator::propertyValueType(ValueType valueType) {
 }
 
 mlir::Value DBProgramGenerator::translatePropertyExpr(const PropertyExpr* propExpr) {
-    return emitComponentOf(propExpr, translatePropertyRead(propExpr));
-}
+    const mlir::Value value = translatePropertyRead(propExpr);
+    const std::optional<ValueComponent>& component = propExpr->getComponent();
 
-mlir::Value DBProgramGenerator::emitComponentOf(const PropertyExpr* propExpr, mlir::Value value) {
-    // A component of a name no property in the graph carries is the null that read is,
-    // with no value for the component op to read off
-    const bool readsNull = propExpr->getType() == EvaluatedType::Null;
-
-    if (readsNull) {
-        return value;
-    } else if (propExpr->readsAMapKey()) {
+    if (propExpr->readsAMapKey()) {
         return emitStaticMapKey(value, propExpr->getMapKey());
-    } else if (propExpr->readsADateTimeComponent()) {
-        return emitDateTimeComponent(propExpr->getDateTimePart(), value);
-    } else if (propExpr->readsADurationComponent()) {
-        return emitDurationComponent(propExpr->getDurationPart(), value);
+    } else if (component) {
+        return emitComponent(*component, value);
     }
 
     return value;
 }
 
 mlir::Value DBProgramGenerator::translatePropertyLookupExpr(const PropertyLookupExpr* lookupExpr) {
-    if (lookupExpr->getType() == EvaluatedType::Null) {
+    const EvaluatedType readType = lookupExpr->getType();
+    if (readType == EvaluatedType::Null) {
         return nullConstantColumn();
     }
 
@@ -9225,15 +9871,16 @@ mlir::Value DBProgramGenerator::translatePropertyLookupExpr(const PropertyLookup
     bioassert(_part._exprMap.contains(base), "Property lookup with unknown base.");
 
     const mlir::Value baseColumn = _part._exprMap.at(base);
+    const std::optional<ValueComponent>& component = lookupExpr->getComponent();
 
     if (lookupExpr->readsAMapKey()) {
         return emitStaticMapKey(baseColumn, lookupExpr->getPropName());
     }
 
-    if (lookupExpr->readsADateTimeComponent()) {
-        return emitDateTimeComponent(lookupExpr->getDateTimePart(), baseColumn);
-    } else if (lookupExpr->readsADurationComponent()) {
-        return emitDurationComponent(lookupExpr->getDurationPart(), baseColumn);
+    if (component) {
+        return emitComponent(*component, baseColumn);
+    } else if (readType == EvaluatedType::Any) {
+        return emitStaticMapKey(baseColumn, lookupExpr->getPropName());
     }
 
     const mlir::Location loc = _opBuilder.getUnknownLoc();
@@ -9261,20 +9908,24 @@ mlir::Value DBProgramGenerator::translatePropertyLookupExpr(const PropertyLookup
 
 mlir::Value DBProgramGenerator::emitStaticMapKey(mlir::Value map, std::string_view key) {
     const mlir::Location loc = _opBuilder.getUnknownLoc();
-    const mlir::db::ColumnType entryType = allocColumnType(mlir::storage::MapElementType::get(_mlirCtxt));
+    const mlir::db::ColumnType cellType = allocColumnType(mlir::storage::AnyType::get(_mlirCtxt));
     const mlir::StringAttr keyAttr = _opBuilder.getStringAttr(llvm::StringRef(key.data(), key.size()));
 
-    return _opBuilder.create<mlir::db::StaticMapKey>(loc, entryType, map, keyAttr).getResult();
+    return _opBuilder.create<mlir::db::StaticMapKey>(loc, cellType, map, keyAttr).getResult();
 }
 
 mlir::Value DBProgramGenerator::emitDynamicMapKey(mlir::Value map, mlir::Value key) {
     const mlir::Location loc = _opBuilder.getUnknownLoc();
-    const mlir::db::ColumnType entryType = allocColumnType(mlir::storage::MapElementType::get(_mlirCtxt));
+    const mlir::db::ColumnType cellType = allocColumnType(mlir::storage::AnyType::get(_mlirCtxt));
 
-    return _opBuilder.create<mlir::db::DynamicMapKey>(loc, entryType, map, key).getResult();
+    return _opBuilder.create<mlir::db::DynamicMapKey>(loc, cellType, map, key).getResult();
 }
 
-mlir::Value DBProgramGenerator::emitDateTimeComponent(DateTimePart part, mlir::Value instant) {
+mlir::Value DBProgramGenerator::emitComponent(const ValueComponent& component, mlir::Value value) {
+    return std::visit([this, value](auto part) { return emitComponent(part, value); }, component);
+}
+
+mlir::Value DBProgramGenerator::emitComponent(DateTimePart part, mlir::Value instant) {
     const mlir::Location loc = _opBuilder.getUnknownLoc();
     const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
 
@@ -9315,7 +9966,48 @@ mlir::Value DBProgramGenerator::emitDateTimeComponent(DateTimePart part, mlir::V
     return mlir::Value();
 }
 
-mlir::Value DBProgramGenerator::emitDurationComponent(DurationPart part, mlir::Value duration) {
+mlir::Value DBProgramGenerator::emitComponent(PointPart part, mlir::Value point) {
+    const mlir::Location loc = _opBuilder.getUnknownLoc();
+    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
+
+    switch (part) {
+        case PointPart::X:
+            return _opBuilder.create<mlir::db::PointX>(loc, noneType, point).getResult();
+        break;
+
+        case PointPart::Y:
+            return _opBuilder.create<mlir::db::PointY>(loc, noneType, point).getResult();
+        break;
+
+        case PointPart::Z:
+            return _opBuilder.create<mlir::db::PointZ>(loc, noneType, point).getResult();
+        break;
+
+        case PointPart::Longitude:
+            return _opBuilder.create<mlir::db::PointLongitude>(loc, noneType, point).getResult();
+        break;
+
+        case PointPart::Latitude:
+            return _opBuilder.create<mlir::db::PointLatitude>(loc, noneType, point).getResult();
+        break;
+
+        case PointPart::Height:
+            return _opBuilder.create<mlir::db::PointHeight>(loc, noneType, point).getResult();
+        break;
+
+        case PointPart::CRS:
+            return _opBuilder.create<mlir::db::PointCRSName>(loc, noneType, point).getResult();
+        break;
+
+        case PointPart::SRID:
+            return _opBuilder.create<mlir::db::PointSRID>(loc, noneType, point).getResult();
+        break;
+    }
+
+    return mlir::Value();
+}
+
+mlir::Value DBProgramGenerator::emitComponent(DurationPart part, mlir::Value duration) {
     const mlir::Location loc = _opBuilder.getUnknownLoc();
     const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
 
@@ -9401,18 +10093,19 @@ mlir::Value DBProgramGenerator::translatePropertyRead(const PropertyExpr* propEx
     const std::string_view varName = entityDecl->getName();
     const std::string_view propName = propExpr->getPropName();
 
-    // d.year, d.hours and m.key name no property: the value the component or the key is
-    // read off is the column the variable itself was bound to
+    // d.year, d.hours, p.x and m.key name no property: the value the component or the key
+    // is read off is the column the variable itself was bound to
     const EvaluatedType entityType = entityDecl->getType();
 
     const bool readsOffTheVariableItself = entityType == EvaluatedType::DateTime
                                         || entityType == EvaluatedType::Duration
+                                        || entityType == EvaluatedType::Point
                                         || entityType == EvaluatedType::Map
                                         || entityType == EvaluatedType::Any;
 
     if (readsOffTheVariableItself) {
         const auto projectedIt = _part._projectedColumns.find(entityDecl);
-        const mlir::Value boundColumn = projectedIt != end(_part._projectedColumns)
+        const mlir::Value boundColumn = projectedIt != _part._projectedColumns.end()
                                       ? projectedIt->second
                                       : resolveEntityColumn(entityDecl);
 
@@ -9431,9 +10124,17 @@ mlir::Value DBProgramGenerator::translatePropertyRead(const PropertyExpr* propEx
     }
 
     // No property in the graph carries the name - the analyzer typed the read null for
-    // it - so there is nothing to fetch and every row reads null
-    if (propExpr->getType() == EvaluatedType::Null) {
+    // it - so there is nothing to fetch and every row reads null. A property only a write
+    // of tagged cells creates is typed as the program runs, so its value is read by name,
+    // as a tagged cell.
+    const EvaluatedType readType = propExpr->getType();
+    if (readType == EvaluatedType::Null) {
         return nullConstantColumn();
+    } else if (readType == EvaluatedType::Any) {
+        const mlir::Value entityColumn = resolveEntityColumn(entityDecl);
+        bioassert(entityColumn, "Property access on unknown variable: {}", varName);
+
+        return emitStaticMapKey(entityColumn, propName);
     }
 
     // The value of a property a CREATE wrote is the column it wrote it from, which saves
@@ -9441,7 +10142,7 @@ mlir::Value DBProgramGenerator::translatePropertyRead(const PropertyExpr* propEx
     // are a mixture, so they go through that fetch, which reads each row where its own
     // entity lives.
     const auto createdIt = _part._createdEntities.find(entityDecl);
-    const bool writtenByACreate = createdIt != end(_part._createdEntities) && !createdIt->second._pending;
+    const bool writtenByACreate = createdIt != _part._createdEntities.end() && !createdIt->second._pending;
     if (writtenByACreate) {
         const auto& properties = createdIt->second._properties;
         const auto propertyIt = properties.find(propName);
@@ -9552,11 +10253,9 @@ mlir::Value DBProgramGenerator::translateEntityTypeExpr(const EntityTypeExpr* ty
     const bool writtenTypesUnknown = written && !(isNode ? written->_labelsKnown : written->_edgeTypeKnown);
     const bool boundAtRuntime = labelExpr->holdsParameter() || writtenTypesUnknown;
     if (writtenTypesKnown && !boundAtRuntime) {
-        const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
         const mlir::Value answer = constantBool(writtenEntityPasses(*written, labelExpr, isNode));
 
         return _opBuilder.create<mlir::db::BroadcastConstant>(_opBuilder.getUnknownLoc(),
-                                                              noneType,
                                                               answer,
                                                               resolveEntityColumn(entityDecl)).getResult();
     }
@@ -9597,14 +10296,7 @@ void DBProgramGenerator::translateAggregateArguments(const FunctionInvocation* i
     bioassert(args && !args->empty(), "Aggregate function invocation with no arguments.");
 
     const Expr* argExpr = args->front();
-    const mlir::Value translated = translateAggregateInput(argExpr, variableColumns);
-
-    // A quantified pattern binds the handle of the walk. A count reads its rows off the
-    // handles unless it counts distinct walks, and every other aggregate the entities
-    // each one stands for
-    const std::string_view funcName = invocation->getSignature()->getFullName();
-    const bool countsHandles = funcName == "count" && !invocation->isDistinct();
-    arguments._values = countsHandles ? translated : readWalkEntities(argExpr, translated);
+    arguments._values = readWalkEntities(argExpr, translateAggregateInput(argExpr, variableColumns));
 
     arguments._rowPercentile = translateRowPercentile(invocation, arguments._values, variableColumns);
 }
@@ -9668,7 +10360,7 @@ void DBProgramGenerator::emitAggregate(const Expr* expr,
         throwError(fmt::format("Unsupported aggregate function: {}", funcName), expr);
     }
 
-    _part._aggregateOp = _part._exprMap.at(expr).getDefiningOp();
+    recordAggregate(_part._exprMap.at(expr).getDefiningOp());
 }
 
 mlir::Value DBProgramGenerator::translateArg(const Expr* argExpr) {
@@ -9728,30 +10420,7 @@ void DBProgramGenerator::translateFunctionExpr(const Expr* expr,
     if (funcName == "coalesce") {
         translateCoalesce(expr, args);
         return;
-    } else if (funcName == "size") {
-        if (!args || args->size() != 1) {
-            throw TuringException("size() expects 1 argument.");
-        }
-
-        const Expr* argExpr = args->front();
-        const EvaluatedType argType = argExpr->getType();
-
-        if (argType == EvaluatedType::EdgePattern || argType == EvaluatedType::NodePattern) {
-            const mlir::Value column = getOrTranslateBoundColumn(argExpr);
-
-            // An OPTIONAL MATCH hands a walk on as the list of its edges, which size() reads
-            // as it reads any other list. A walk's length counts a group's entities only when
-            // its body is one hop.
-            const auto bindingIt = _part._pathBindings.find(argExpr->getExprVarDecl());
-            const bool countsEveryHop = bindingIt == end(_part._pathBindings) || bindingIt->second._steps == 1;
-            if (!isListColumn(column) && countsEveryHop) {
-                _part._exprMap[expr] = pathLengthColumn(argExpr, column);
-                return;
-            }
-        }
-    }
-
-    if (funcName == "range") {
+    } else if (funcName == "range") {
         translateRange(expr, args);
         return;
     } else if (funcName == "substring") {
@@ -9769,6 +10438,12 @@ void DBProgramGenerator::translateFunctionExpr(const Expr* expr,
     } else if (funcName == "replace") {
         translateReplace(expr, args);
         return;
+    } else if (funcName == "point.distance") {
+        translatePointDistance(expr, args);
+        return;
+    } else if (funcName == "point.withinBBox") {
+        translatePointWithinBBox(expr, args);
+        return;
     } else if (funcName == "normalize") {
         translateNormalFormFunction<mlir::db::Normalize>(expr, args, mlir::storage::StringType::get(_mlirCtxt));
         return;
@@ -9785,12 +10460,14 @@ void DBProgramGenerator::translateFunctionExpr(const Expr* expr,
         return;
     }
 
+    // length() of a tagged cell reads a string or a list as well, so it is a size; nodes() and
+    // relationships() of one read a path or nothing
     const Expr* const pathExpr = args && args->size() == 1 ? args->front() : nullptr;
-    const bool readsANamedPath = pathExpr && pathExpr->getType() == EvaluatedType::GraphPath;
+    const EvaluatedType pathType = pathExpr ? pathExpr->getType() : EvaluatedType::Invalid;
+    const bool readsATaggedPath = pathType == EvaluatedType::Any && (funcName == "nodes" || funcName == "relationships");
+    const bool readsANamedPath = pathType == EvaluatedType::GraphPath || readsATaggedPath;
     if (readsANamedPath) {
-        // Beside `RETURN p` the path rides the handle column of its walk, which reads as
-        // the entities it runs through
-        const mlir::Value path = readWalkEntities(pathExpr, translateArg(pathExpr));
+        const mlir::Value path = translateArg(pathExpr);
 
         if (funcName == "length") {
             _part._exprMap[expr] = pathElementsColumn(path, mlir::storage::PathElementsKind::Length);
@@ -9857,6 +10534,42 @@ void DBProgramGenerator::translateFunctionExpr(const Expr* expr,
     }
 
     throwError(fmt::format("Unsupported function: {}", funcName), expr);
+}
+
+void DBProgramGenerator::translatePointDistance(const Expr* expr, const ExprChain* args) {
+    bioassert(args && args->size() == 2, "point.distance() takes 2 arguments.");
+
+    const ExprChain::ExprVector& argExprs = args->getExprs();
+
+    const mlir::Value lhs = translateArg(argExprs[0]);
+    const mlir::Value rhs = translateArg(argExprs[1]);
+
+    mlir::db::PointDistance distance = _opBuilder.create<mlir::db::PointDistance>(_opBuilder.getUnknownLoc(),
+                                                                                 allocColumnType(_opBuilder.getF64Type()),
+                                                                                 lhs,
+                                                                                 rhs);
+
+    _part._exprMap[expr] = distance.getResult();
+}
+
+void DBProgramGenerator::translatePointWithinBBox(const Expr* expr, const ExprChain* args) {
+    bioassert(args && args->size() == 3, "point.withinBBox() takes 3 arguments.");
+
+    const ExprChain::ExprVector& argExprs = args->getExprs();
+
+    const mlir::Value point = translateArg(argExprs[0]);
+    const mlir::Value lowerLeft = translateArg(argExprs[1]);
+    const mlir::Value upperRight = translateArg(argExprs[2]);
+
+    const mlir::Type boolType = mlir::storage::BoolType::get(_mlirCtxt);
+
+    mlir::db::PointWithinBBox within = _opBuilder.create<mlir::db::PointWithinBBox>(_opBuilder.getUnknownLoc(),
+                                                                                   allocColumnType(boolType),
+                                                                                   point,
+                                                                                   lowerLeft,
+                                                                                   upperRight);
+
+    _part._exprMap[expr] = within.getResult();
 }
 
 void DBProgramGenerator::translateRange(const Expr* expr, const ExprChain* args) {
@@ -9987,47 +10700,28 @@ void DBProgramGenerator::translateCoalesce(const Expr* expr, const ExprChain* ar
     bioassert(args && !args->empty(), "coalesce() with no arguments.");
 
     const ExprChain::ExprVector& argExprs = args->getExprs();
-
-    llvm::SmallVector<mlir::Value, 4> arguments;
-    for (const Expr* argExpr : argExprs) {
-        arguments.push_back(translateArg(argExpr));
-    }
-
-    if (arguments.size() == 1) {
-        _part._exprMap[expr] = arguments.front();
-        return;
-    }
-
-    const mlir::Location loc = _opBuilder.getUnknownLoc();
-    const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
     const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
 
-    const size_t branchCount = arguments.size() - 1;
+    CarrySet carrySet;
+    collectElementCarrySet(carrySet);
 
-    llvm::SmallVector<mlir::Value, 4> conditions;
-    for (size_t argIndex = 0; argIndex < branchCount; argIndex++) {
-        // The null literal is absent on every row, so the branch it guards is never taken
-        if (argExprs[argIndex]->getType() == EvaluatedType::Null) {
-            conditions.push_back(constantBool(false));
-            continue;
-        }
+    const llvm::SmallVector<mlir::Value> carried(carrySet._columns.begin(), carrySet._columns.end());
 
-        const mlir::Value present = _opBuilder.create<mlir::db::NeqOp>(loc,
-                                                                       boolType,
-                                                                       arguments[argIndex],
-                                                                       nullConstantColumn())
-                                        .getResult();
-        conditions.push_back(present);
+    auto coalesce = _opBuilder.create<mlir::db::Coalesce>(_opBuilder.getUnknownLoc(),
+                                                          noneType,
+                                                          carried,
+                                                          static_cast<unsigned>(argExprs.size()));
+    const mlir::MutableArrayRef<mlir::Region> regions = coalesce.getArguments();
+
+    for (size_t argumentIndex = 0; argumentIndex < argExprs.size(); argumentIndex++) {
+        const Expr* const argumentExpr = argExprs[argumentIndex];
+
+        generateCaseRegion(regions[argumentIndex], carried, carrySet, mlir::Value {}, [&](mlir::Value) {
+            return translateArg(argumentExpr);
+        });
     }
 
-    const llvm::ArrayRef<mlir::Value> branches = llvm::ArrayRef<mlir::Value>(arguments).drop_back();
-
-    _part._exprMap[expr] = _opBuilder.create<mlir::db::Case>(loc,
-                                                             noneType,
-                                                             conditions,
-                                                             branches,
-                                                             arguments.back())
-                               .getResult();
+    _part._exprMap[expr] = selectionResult(coalesce);
 }
 
 mlir::db::Collect DBProgramGenerator::createCollect(llvm::ArrayRef<mlir::Value> keyColumns,
@@ -10074,23 +10768,39 @@ mlir::db::Collect DBProgramGenerator::createCollect(llvm::ArrayRef<mlir::Value> 
                                                                        kindsAttr,
                                                                        distinctAttr);
 
-    _part._aggregateOp = collectOp.getOperation();
+    recordAggregate(collectOp.getOperation());
 
     return collectOp;
 }
 
-void DBProgramGenerator::emitKeylessCollect(llvm::ArrayRef<const FunctionInvocationExpr*> collectExprs,
-                                            llvm::ArrayRef<AggregateArguments> collectArguments) {
+void DBProgramGenerator::emitKeylessCollect(llvm::ArrayRef<const FunctionInvocationExpr*> aggregateExprs,
+                                            llvm::ArrayRef<AggregateArguments> arguments) {
+    llvm::SmallVector<const FunctionInvocationExpr*> collectExprs;
     llvm::SmallVector<mlir::Value> valueColumns;
     llvm::SmallVector<mlir::Value> percentileColumns;
     llvm::SmallVector<std::optional<size_t>> percentileIndices;
 
-    for (const AggregateArguments& arguments : collectArguments) {
-        valueColumns.push_back(arguments._values);
+    llvm::SmallVector<const FunctionInvocationExpr*> reductionExprs;
+    llvm::SmallVector<mlir::Value> aggregateColumns;
+    llvm::SmallVector<mlir::storage::GroupAggregateKind> aggregateKinds;
 
-        if (arguments._rowPercentile) {
+    for (size_t aggregateIndex = 0; aggregateIndex < aggregateExprs.size(); aggregateIndex++) {
+        const FunctionInvocationExpr* aggregateExpr = aggregateExprs[aggregateIndex];
+        const AggregateArguments& aggregateArguments = arguments[aggregateIndex];
+
+        if (!gathersItsValues(aggregateExpr)) {
+            reductionExprs.push_back(aggregateExpr);
+            aggregateColumns.push_back(aggregateArguments._values);
+            aggregateKinds.push_back(groupAggregateKind(aggregateExpr->getFunctionInvocation()));
+            continue;
+        }
+
+        collectExprs.push_back(aggregateExpr);
+        valueColumns.push_back(aggregateArguments._values);
+
+        if (aggregateArguments._rowPercentile) {
             percentileIndices.push_back(percentileColumns.size());
-            percentileColumns.push_back(arguments._rowPercentile);
+            percentileColumns.push_back(aggregateArguments._rowPercentile);
         } else {
             percentileIndices.push_back(std::nullopt);
         }
@@ -10099,16 +10809,19 @@ void DBProgramGenerator::emitKeylessCollect(llvm::ArrayRef<const FunctionInvocat
     llvm::SmallVector<int64_t> distinctValues;
     collectDistinctValueIndices(collectExprs, distinctValues);
 
-    const llvm::SmallVector<mlir::storage::GroupAggregateKind> percentileKinds(percentileColumns.size(),
-                                                                               mlir::storage::GroupAggregateKind::First);
+    aggregateColumns.append(percentileColumns.begin(), percentileColumns.end());
+    aggregateKinds.append(percentileColumns.size(), mlir::storage::GroupAggregateKind::First);
 
-    mlir::db::Collect collectOp = createCollect({}, valueColumns, distinctValues, percentileColumns, percentileKinds);
+    mlir::db::Collect collectOp = createCollect({}, valueColumns, distinctValues, aggregateColumns, aggregateKinds);
     const mlir::ResultRange results = collectOp.getResults();
 
-    for (size_t collectIndex = 0; collectIndex < collectExprs.size(); collectIndex++) {
+    const size_t collectCount = collectExprs.size();
+    const size_t reductionCount = reductionExprs.size();
+
+    for (size_t collectIndex = 0; collectIndex < collectCount; collectIndex++) {
         const FunctionInvocationExpr* collectExpr = collectExprs[collectIndex];
         const std::optional<size_t> percentileIndex = percentileIndices[collectIndex];
-        const mlir::Value groupPercentile = percentileIndex ? results[collectExprs.size() + *percentileIndex] : mlir::Value {};
+        const mlir::Value groupPercentile = percentileIndex ? results[collectCount + reductionCount + *percentileIndex] : mlir::Value {};
         const mlir::Value reducedColumn = reduceGatheredValues(collectExpr->getFunctionInvocation(),
                                                                results[collectIndex],
                                                                groupPercentile);
@@ -10122,6 +10835,46 @@ void DBProgramGenerator::emitKeylessCollect(llvm::ArrayRef<const FunctionInvocat
             _part._projectedColumns[collectDecl] = reducedColumn;
         }
     }
+
+    for (size_t reductionIndex = 0; reductionIndex < reductionCount; reductionIndex++) {
+        _part._exprMap[reductionExprs[reductionIndex]] = results[collectCount + reductionIndex];
+    }
+}
+
+mlir::storage::GroupAggregateKind DBProgramGenerator::groupAggregateKind(const FunctionInvocation* invocation) const {
+    const FunctionSignature* signature = invocation->getSignature();
+    const std::string_view funcName = signature->getFullName();
+
+    const ExprChain* arguments = invocation->getArguments();
+    const Expr* argExpr = arguments->front();
+
+    // Dropping repeated values cannot move an extremum, so min(DISTINCT x) is min(x)
+    // and takes the plain kind. The others reduce each of a group's distinct values
+    // once, which is a kind of its own, spelled as the function's name with the
+    // modifier appended
+    const bool isExtremum = funcName == "min" || funcName == "max";
+    const bool reducesDistinctValues = invocation->isDistinct() && !isExtremum;
+
+    const bool countsRows = argExpr->getType() == EvaluatedType::Wildcard;
+
+    // count(*) reads no value, so a null of the column it is anchored on is a row
+    // all the same: that is a kind of its own
+    std::string kindName {funcName};
+    std::ranges::transform(kindName, kindName.begin(), [](unsigned char letter) {
+        return static_cast<char>(tolower(letter));
+    });
+    if (countsRows) {
+        kindName += "_rows";
+    } else if (reducesDistinctValues) {
+        kindName += "_distinct";
+    }
+
+    const std::optional<mlir::storage::GroupAggregateKind> kind = mlir::storage::symbolizeGroupAggregateKind(kindName);
+    if (!kind) {
+        throwError(fmt::format("Unsupported aggregate function: {}", funcName), argExpr);
+    }
+
+    return *kind;
 }
 
 mlir::Value DBProgramGenerator::reduceGatheredValues(const FunctionInvocation* invocation,
@@ -10167,16 +10920,10 @@ mlir::Value DBProgramGenerator::translateRowPercentile(const FunctionInvocation*
 
     const mlir::Location loc = _opBuilder.getUnknownLoc();
     const mlir::db::ColumnType boolType = allocColumnType(mlir::storage::BoolType::get(_mlirCtxt));
-    const mlir::db::ColumnType noneType = allocColumnType(mlir::NoneType::get(_mlirCtxt));
 
-    const mlir::Value holdsAValue = _opBuilder.create<mlir::db::NeqOp>(loc, boolType, valueColumn, nullConstantColumn()).getResult();
+    const mlir::Value holdsAValue = _opBuilder.create<mlir::db::IsNotNullOp>(loc, boolType, valueColumn).getResult();
 
-    return _opBuilder.create<mlir::db::Case>(loc,
-                                             noneType,
-                                             mlir::ValueRange {holdsAValue},
-                                             mlir::ValueRange {percentile},
-                                             mlir::Value {})
-        .getResult();
+    return createCase(mlir::ValueRange {holdsAValue}, mlir::ValueRange {percentile}, mlir::Value {});
 }
 
 void DBProgramGenerator::generateKeylessAggregates(const Projection* projection) {
@@ -10200,26 +10947,17 @@ void DBProgramGenerator::generateKeylessAggregates(const Projection* projection)
                                     arguments[aggregateIndex]);
     }
 
-    llvm::SmallVector<const FunctionInvocationExpr*> collectExprs;
-    llvm::SmallVector<AggregateArguments> collectArguments;
-    for (size_t aggregateIndex = 0; aggregateIndex < aggregateExprs.size(); aggregateIndex++) {
-        if (gathersItsValues(aggregateExprs[aggregateIndex])) {
-            collectExprs.push_back(aggregateExprs[aggregateIndex]);
-            collectArguments.push_back(arguments[aggregateIndex]);
-        }
-    }
+    const bool gathersValues = llvm::any_of(aggregateExprs, [](const FunctionInvocationExpr* aggregateExpr) {
+        return gathersItsValues(aggregateExpr);
+    });
 
-    const bool collectsSeveralLists = collectExprs.size() > 1;
-    if (collectsSeveralLists) {
-        emitKeylessCollect(collectExprs, collectArguments);
+    if (gathersValues) {
+        emitKeylessCollect(aggregateExprs, arguments);
+        return;
     }
 
     for (size_t aggregateIndex = 0; aggregateIndex < aggregateExprs.size(); aggregateIndex++) {
         const FunctionInvocationExpr* aggregateExpr = aggregateExprs[aggregateIndex];
-        if (collectsSeveralLists && gathersItsValues(aggregateExpr)) {
-            continue;
-        }
-
         emitAggregate(aggregateExpr, aggregateExpr->getFunctionInvocation(), arguments[aggregateIndex]);
     }
 }
@@ -10282,7 +11020,7 @@ void DBProgramGenerator::generateGroupAggregate(const Projection* projection) {
             collectCSVRowVariables(projectedDecl, rowVars);
 
             for (const VariableDependency* rowVar : rowVars) {
-                keyColumns.push_back(_part._varMap.at(rowVar).back());
+                keyColumns.push_back(findVarOrThrow(_part._varMap, rowVar));
                 keyVarAtPos.push_back(rowVar);
                 keyVarDeclAtPos.push_back(projectedDecl);
                 keyExprAtPos.push_back(nullptr);
@@ -10366,18 +11104,10 @@ void DBProgramGenerator::generateGroupAggregate(const Projection* projection) {
         }
     }
 
-    // Every non-aggregate item was constant, so nothing tells the matched rows apart: the
-    // projection is the one keyless group, whichever way it spells its key - RETURN 1 AS
-    // x, count(n) counts the whole match, as RETURN count(n) does
-    if (keyColumns.empty()) {
-        generateKeylessAggregates(projection);
-        return;
-    }
-
     // A key may order the groups by an aggregate the projection does not return -
-    // RETURN a.name ORDER BY count(b) - which the aggregation has to compute all the same.
-    // Its result column is then read by the sort alone, and no db.output reads it, which is
-    // what keeps it out of the rows
+    // RETURN a.name, count(b) ORDER BY max(b.age) - which the aggregation has to compute
+    // all the same. Its result column is then read by the sort alone, and no db.output
+    // reads it, which is what keeps it out of the rows
     if (projection->hasOrderBy()) {
         llvm::SmallVector<const FunctionInvocationExpr*> keyInvocations;
         for (const OrderByItem* orderByItem : projection->getOrderBy()->getItems()) {
@@ -10423,37 +11153,12 @@ void DBProgramGenerator::generateGroupAggregate(const Projection* projection) {
             continue;
         }
 
-        // Dropping repeated values cannot move an extremum, so min(DISTINCT x) is min(x)
-        // and takes the plain kind. The others reduce each of a group's distinct values
-        // once, which is a kind of its own, spelled as the function's name with the
-        // modifier appended
-        const bool isExtremum = funcName == "min" || funcName == "max";
-        const bool reducesDistinctValues = invocation->isDistinct() && !isExtremum;
-
-        const bool countsRows = argExpr->getType() == EvaluatedType::Wildcard;
-
-        // count(*) reads no value, so a null of the column it is anchored on is a row
-        // all the same: that is a kind of its own
-        std::string kindName {funcName};
-        std::ranges::transform(kindName, kindName.begin(), [](unsigned char letter) {
-            return static_cast<char>(tolower(letter));
-        });
-        if (countsRows) {
-            kindName += "_rows";
-        } else if (reducesDistinctValues) {
-            kindName += "_distinct";
-        }
-
-        const std::optional<mlir::storage::GroupAggregateKind> kind = mlir::storage::symbolizeGroupAggregateKind(kindName);
-        if (!kind) {
-            throwError(fmt::format("Unsupported aggregate function: {}", funcName), argExpr);
-        }
+        const mlir::storage::GroupAggregateKind kind = groupAggregateKind(invocation);
 
         const mlir::Value inputColumn = translateAggregateInput(argExpr, &variableColumns);
-        const bool countsHandles = funcName == "count" && !invocation->isDistinct();
 
-        aggInputColumns.push_back(countsHandles ? inputColumn : readWalkEntities(argExpr, inputColumn));
-        aggKinds.push_back(*kind);
+        aggInputColumns.push_back(readWalkEntities(argExpr, inputColumn));
+        aggKinds.push_back(kind);
         aggFuncExprs.push_back(funcExpr);
     }
 
@@ -10492,6 +11197,12 @@ void DBProgramGenerator::generateGroupAggregate(const Projection* projection) {
             writtenKey._masked = true;
             keyColumns.push_back(pending);
         }
+    }
+
+    // Every key is constant, so the rows fall in one group. A group still needs a row:
+    // RETURN 1 AS x, count(n) over no match returns no row, where RETURN count(n) returns 0
+    if (keyColumns.empty()) {
+        keyColumns.push_back(constantBool(true));
     }
 
     const size_t keyCount = keyColumns.size();
@@ -10552,7 +11263,7 @@ void DBProgramGenerator::generateGroupAggregate(const Projection* projection) {
             llvm::ArrayRef<int64_t>{aggKindValues});
 
         aggregateOp = groupAgg.getOperation();
-        _part._aggregateOp = aggregateOp;
+        recordAggregate(aggregateOp);
     }
 
     const mlir::ResultRange results = aggregateOp->getResults();
@@ -10651,6 +11362,11 @@ void DBProgramGenerator::generateGroupAggregate(const Projection* projection) {
     bindOrderByKeyColumns(projection, groupedColumns);
 }
 
+void DBProgramGenerator::recordAggregate(mlir::Operation* aggregateOp) {
+    _part._aggregateOp = aggregateOp;
+    _part._rowReductionOp = aggregateOp;
+}
+
 void DBProgramGenerator::bindOrderByKeyColumns(const Projection* projection,
                                                const GroupedColumns& groupedColumns) {
     if (!projection->hasOrderBy() || groupedColumns.empty()) {
@@ -10675,17 +11391,6 @@ void DBProgramGenerator::bindGroupedKeyColumn(const Expr* expr, const GroupedCol
         if (StructuralExpressionComparator::equal(keyExpr, expr)) {
             _part._exprMap[expr] = keyColumn;
             return;
-        }
-    }
-
-    if (expr->getKind() == Expr::Kind::PROPERTY) {
-        const PropertyExpr* property = static_cast<const PropertyExpr*>(expr);
-
-        for (const auto& [keyExpr, keyColumn] : groupedColumns) {
-            if (StructuralExpressionComparator::readsThePropertyOfComponent(keyExpr, property)) {
-                _part._exprMap[expr] = emitComponentOf(property, keyColumn);
-                return;
-            }
         }
     }
 

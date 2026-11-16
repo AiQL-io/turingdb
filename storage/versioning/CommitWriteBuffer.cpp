@@ -60,6 +60,10 @@ struct PrimitiveToTag<types::Duration::Primitive> {
     using Type = types::Duration;
 };
 template <>
+struct PrimitiveToTag<types::Point::Primitive> {
+    using Type = types::Point;
+};
+template <>
 struct PrimitiveToTag<types::Embedding::OwningPrimitive> {
     using Type = types::Embedding;
 };
@@ -619,4 +623,22 @@ void CommitWriteBufferRebaser::rebaseIndexes(Commit::CommitSpan commitsSinceBran
     // Remove any duplicates that might be added due to intermediate COMMITs
     auto [newEnd, oldEnd] = std::ranges::unique(incomingIndexes);
     incomingIndexes.erase(newEnd, oldEnd);
+}
+
+size_t db::committedNodeCount(const GraphView* view) {
+    if (!view || !view->isValid()) {
+        return 0;
+    }
+
+    const GraphReader reader = view->read();
+    return reader.getTotalNodesAllocated();
+}
+
+size_t db::committedEdgeCount(const GraphView* view) {
+    if (!view || !view->isValid()) {
+        return 0;
+    }
+
+    const GraphReader reader = view->read();
+    return reader.getTotalEdgesAllocated();
 }
