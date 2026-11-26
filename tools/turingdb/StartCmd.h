@@ -35,6 +35,8 @@ private:
     bool _noVectorMmap {false};
     unsigned _port {6666};
     unsigned _uiPort {8080};
+    unsigned _historyRetentionHours {168};
+    unsigned _compactionIntervalMinutes {60};
 
     StartCmd();
 

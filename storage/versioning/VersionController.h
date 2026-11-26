@@ -69,6 +69,10 @@ public:
                                                           std::span<const CommitHash> openChangeBases,
                                                           std::vector<CommitHash>& squashed);
 
+    /// The newest commit that, like every commit before it, was created before @param cutoff,
+    /// when some commit comes before it. Squashing through it keeps the commits created later.
+    [[nodiscard]] std::optional<CommitHash> getSquashTipBefore(DateTime cutoff) const;
+
     [[nodiscard]] FrozenCommitTx openTransaction(CommitHash hash = CommitHash::head()) const;
     [[nodiscard]] CommitHash getHeadHash() const;
     [[nodiscard]] const Graph* getGraph() const { return _graph; }

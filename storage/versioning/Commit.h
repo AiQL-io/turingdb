@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "ArcManager.h"
+#include "metadata/DateTime.h"
 #include "versioning/CommitHash.h"
 #include "versioning/CommitData.h"
 
@@ -56,6 +57,7 @@ public:
     size_t getNumNodes() const { return _numNodes; }
     size_t getNumEdges() const { return _numEdges; }
     size_t getNumDataParts() const { return _numDataParts; }
+    DateTime getCreatedAt() const { return _createdAt; }
 
     const Commit* getPreviousCommit() const { return _prevCommit; }
     void setPreviousCommit(const Commit* prevCommit) { _prevCommit = prevCommit; }
@@ -77,6 +79,7 @@ private:
     size_t _numNodes {0};
     size_t _numEdges {0};
     size_t _numDataParts {0};
+    DateTime _createdAt {DateTime::now()};
 
     void setCommitData(const WeakArc<CommitData>& data) { _data = data;};
 };

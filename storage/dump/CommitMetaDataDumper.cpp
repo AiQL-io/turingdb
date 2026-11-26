@@ -29,6 +29,7 @@ DumpResult<void> CommitMetaDataDumper::dump(const Commit& commit,
         writer.write(dp->getID().get());
     }
 
+    writer.write(commit.getCreatedAt().getMicroseconds());
 
     return {};
 }

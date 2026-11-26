@@ -34,3 +34,31 @@ the command that reduces the number of data parts. Run `SQUASH COMMITS` after it
 commits, and with them the data parts, that the merge made unreachable.
 
 An open change on the graph being merged blocks the merge. Open changes on other graphs do not.
+
+## Background compaction
+
+The server runs both commands on every loaded graph, once an hour by default:
+
+- commits created more than 7 days ago are squashed into one, as `SQUASH COMMITS THROUGH`
+  the newest of them would. A commit inside the window is never squashed, so neither is any
+  commit after it;
+- a head commit that reads more than 16 data parts is merged, as `MERGE_DATAPARTS` would.
+
+A graph whose open change blocks either command is left as it is until the next run.
+
+```
+turingdb start -history-retention-hours 168     # 0 keeps all history
+turingdb start -compaction-interval-minutes 60  # 0 turns the background compaction off
+```
+
+Each commit stores the time it was created at the end of its `metadata` file. A commit
+written before that field existed reads as created at the epoch, so the first run after an
+upgrade squashes it with the other old commits. Older servers stop reading `metadata` before
+that field and still load the graph.
+
+## Disk use
+
+Graph files are written in pages of 1 MiB. The unused tail of a page is left unwritten, so a
+filesystem that supports holes (ext4, XFS) stores only the bytes in use. A file the server
+wrote before this kept its zero tails on disk; `fallocate --dig-holes <file>` frees them in
+place without changing the file's contents.

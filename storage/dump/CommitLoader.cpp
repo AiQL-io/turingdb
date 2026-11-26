@@ -159,10 +159,19 @@ DumpResult<std::unique_ptr<Commit>> CommitLoader::load(Graph* graph,
     const size_t numNodes = it.get<uint64_t>();
     const size_t numEdges = it.get<uint64_t>();
     const size_t numDataParts = it.get<uint64_t>();
+    const size_t numAllDataParts = it.get<uint64_t>();
+    it.advance(numAllDataParts * sizeof(uint64_t));
 
     commit->_numDataParts = numDataParts;
     commit->_numEdges = numEdges;
     commit->_numNodes = numNodes;
+
+    // Metadata written before commits carried a time reads as the epoch, older than any window
+    if (it.remainingBytes() >= sizeof(int64_t)) {
+        commit->_createdAt = DateTime {it.get<int64_t>()};
+    } else {
+        commit->_createdAt = DateTime {};
+    }
 
     return std::move(commit);
 }

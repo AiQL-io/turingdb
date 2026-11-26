@@ -27,11 +27,13 @@ using namespace db;
 
 SystemManager::SystemManager(const TuringConfig* config)
     : _config(config),
-    _graphManager(config)
+    _graphManager(config),
+    _compactor(this, config->getHistoryRetention())
 {
 }
 
 SystemManager::~SystemManager() {
+    _compactor.stop();
     SystemEventHandler::terminate();
 }
 
@@ -55,6 +57,8 @@ void SystemManager::init() {
     _extensions.init(&_procedures,
                      _config->getUserExtensionsDir(),
                      _config->getInstallExtensionsDir());
+
+    _compactor.start(_config->getCompactionInterval());
 }
 
 void SystemManager::initTuringDirectory() {

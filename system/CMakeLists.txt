@@ -4,6 +4,7 @@ set(system_sources
     LockFile.cpp
     LockFileResult.cpp
     SystemEventHandler.cpp
+    GraphCompactor.cpp
     GraphManager.cpp
     SystemManager.cpp
     SystemAccessor.cpp)

@@ -9,6 +9,7 @@
 #include "DateTimeSpec.h"
 #include "DurationSpec.h"
 #include "EmbeddingsSpec.h"
+#include "GraphCompactor.h"
 #include "GraphManager.h"
 
 #include "SystemAccessor.h"
@@ -89,6 +90,8 @@ private:
 
     // S3 Client
     std::unique_ptr<S3::TuringS3Client<S3::MinioS3ClientWrapper>> _s3Client {nullptr};
+
+    GraphCompactor _compactor;
 
     // System API - accessed through the friend SystemAccessor
 
