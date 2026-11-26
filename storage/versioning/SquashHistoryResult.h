@@ -13,6 +13,7 @@ enum class SquashHistoryErrorType : uint8_t {
     BLOCKED_BY_OPEN_CHANGE,
     COULD_NOT_LOAD_COMMITS,
     COULD_NOT_PERSIST,
+    COULD_NOT_SYNC_DISK,
     _SIZE,
 };
 
@@ -23,7 +24,8 @@ using SquashHistoryErrorTypeDescription = EnumToString<SquashHistoryErrorType>::
     EnumStringPair<SquashHistoryErrorType::COMMIT_NOT_LOADED, "A commit of the range is not loaded">,
     EnumStringPair<SquashHistoryErrorType::BLOCKED_BY_OPEN_CHANGE, "An open change is based on a commit that would be squashed away">,
     EnumStringPair<SquashHistoryErrorType::COULD_NOT_LOAD_COMMITS, "Could not load the commits of the range from disk">,
-    EnumStringPair<SquashHistoryErrorType::COULD_NOT_PERSIST, "The squash was applied in memory but could not be written to disk, so a restart brings the old history back">>;
+    EnumStringPair<SquashHistoryErrorType::COULD_NOT_PERSIST, "The squash was applied in memory but could not be written to disk, so a restart brings the old history back">,
+    EnumStringPair<SquashHistoryErrorType::COULD_NOT_SYNC_DISK, "The graph could not be written to disk before the squash, so nothing was squashed">>;
 
 class SquashHistoryError {
 public:

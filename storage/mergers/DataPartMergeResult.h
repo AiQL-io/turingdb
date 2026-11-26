@@ -7,14 +7,14 @@ namespace db {
 
 enum class DataPartMergeErrorType : uint8_t {
     MERGE_GRAPH_FAILED,
-    CHANGES_ON_MAIN,
+    BLOCKED_BY_OPEN_CHANGE,
     COULD_NOT_PERSIST,
     _SIZE,
 };
 
 using DataPartMergeErrorTypeDescription = EnumToString<DataPartMergeErrorType>::Create<
     EnumStringPair<DataPartMergeErrorType::MERGE_GRAPH_FAILED, "Could Not Build The Merged Graph">,
-    EnumStringPair<DataPartMergeErrorType::CHANGES_ON_MAIN, "Could Not Merge Graph With Changes On Main">,
+    EnumStringPair<DataPartMergeErrorType::BLOCKED_BY_OPEN_CHANGE, "Could Not Merge A Graph That Has An Open Change">,
     EnumStringPair<DataPartMergeErrorType::COULD_NOT_PERSIST, "Could Not Write The Merged Graph To Disk">>;
 
 class DataPartMergeError {

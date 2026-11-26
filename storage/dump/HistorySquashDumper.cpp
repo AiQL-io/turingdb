@@ -172,7 +172,15 @@ DumpResult<void> HistorySquashDumper::dump(const Commit& tip,
     const fs::Path preparedLogTemp {(graphDirectory / "commitlog.squash.tmp").string()};
     const StdPath preparedLog = graphDirectory / "commitlog.squash";
 
-    if (!std::filesystem::exists(tipDirectory)) {
+    std::vector<uint64_t> hashes;
+    if (auto res = CommitLogFile::read(fs::Path {(graphDirectory / "commitlog").string()}, hashes); !res) {
+        return res;
+    }
+
+    // A tip the log does not list was never dumped in full, and the log rewritten without the
+    // squashed commits would list nothing
+    const bool isTipListed = std::find(hashes.begin(), hashes.end(), tip.hash().get()) != hashes.end();
+    if (!isTipListed || !std::filesystem::exists(tipDirectory)) {
         return DumpError::result(DumpErrorType::COMMIT_HASH_NOT_FOUND);
     }
 
@@ -187,12 +195,6 @@ DumpResult<void> HistorySquashDumper::dump(const Commit& tip,
     }
 
     if (auto res = rewriteCommitFiles(tip, preparedDirectory); !res) {
-        discardPrepared(graphDirectory);
-        return res;
-    }
-
-    std::vector<uint64_t> hashes;
-    if (auto res = CommitLogFile::read(fs::Path {(graphDirectory / "commitlog").string()}, hashes); !res) {
         discardPrepared(graphDirectory);
         return res;
     }

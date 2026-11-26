@@ -16,6 +16,7 @@
 #include "CommitDumper.h"
 #include "GraphFileType.h"
 #include "FileUtils.h"
+#include "versioning/Commit.h"
 #include "versioning/Transaction.h"
 #include "versioning/VersionController.h"
 #include "FilePageReader.h"
@@ -59,6 +60,26 @@ DumpResult<void> removeUnreferenced(const StdPath& parent, const std::unordered_
     for (const StdPath& directory : unreferenced) {
         std::filesystem::remove_all(directory, error);
 
+        if (error) {
+            return DumpError::result(DumpErrorType::CANNOT_PRUNE_GRAPH);
+        }
+    }
+
+    return {};
+}
+
+// A commit the log does not list, and the data parts it brings, are what a dump that failed
+// half way left behind
+DumpResult<void> removeInterruptedDump(const Commit& commit, const StdPath& graphDirectory) {
+    std::error_code error;
+
+    std::filesystem::remove_all(graphDirectory / "commits" / std::to_string(commit.hash().get()), error);
+    if (error) {
+        return DumpError::result(DumpErrorType::CANNOT_PRUNE_GRAPH);
+    }
+
+    for (const auto& part : commit.data().commitDataparts()) {
+        std::filesystem::remove_all(graphDirectory / "dataparts" / std::to_string(part->getID().get()), error);
         if (error) {
             return DumpError::result(DumpErrorType::CANNOT_PRUNE_GRAPH);
         }
@@ -229,101 +250,65 @@ DumpResult<void> GraphDumper::dump(const Graph* graph, const fs::Path& graphDir)
 
 DumpResult<void> GraphDumper::dumpMissingCommits(const Graph* graph, const fs::Path& graphDir) {
     const fs::Path logFile = graphDir / "commitlog";
-    auto fileRes = fs::File::open(logFile);
-    if (!fileRes) {
-        return DumpError::result(DumpErrorType::CANNOT_OPEN_COMMIT_LOG, fileRes.error());
+    const fs::Path partsDir = graphDir / "dataparts";
+
+    std::vector<uint64_t> hashes;
+    if (auto res = CommitLogFile::read(logFile, hashes); !res) {
+        return res;
     }
 
-    // Both the writer and reader point to the same descriptor, once
-    // we finish reading to the end of the file we can start writing from there
-    fs::FileReader reader;
-    fs::FileWriter<> writer;
-    reader.setFile(&fileRes.value());
-    writer.setFile(&fileRes.value());
-
-    // read the file header
-    reader.read(sizeof(DumpConfig::ONE_BAD_CAFE) + sizeof(DumpConfig::VERSION));
-    if (reader.errorOccured()) {
-        return DumpError::result(DumpErrorType::COULD_NOT_READ_COMMIT_LOG,
-                                 *reader.error());
+    if (hashes.empty()) {
+        return DumpError::result(DumpErrorType::COMMIT_HASH_NOT_FOUND);
     }
 
-    fs::ByteBufferIterator headerIt = reader.iterateBuffer();
-    const auto fileHeaderRes = GraphDumpHelper::checkFileHeader(&headerIt);
+    const uint64_t lastDumpedHash = hashes.back();
 
-    if (!fileHeaderRes) {
-        return fileHeaderRes.get_unexpected();
+    std::vector<const Commit*> missingCommits;
+    const Commit* commit = graph->_versionController->_head.load();
+
+    while (commit && commit->hash().get() != lastDumpedHash) {
+        missingCommits.emplace_back(commit);
+        commit = commit->getPreviousCommit();
     }
 
-    //Seek to the end of the file to get the last commit in order to check if all the commits
-    //have been dumped already. This can happen with concurrent writes - we treat dumps
-    //on the same version of a branch as idempotent.
-    reader.file().seekEnd(-(off_t)sizeof(uint64_t));
-    reader.read(sizeof(uint64_t));
+    // The log ends on a commit the history in memory does not reach, so appending to it would
+    // describe a history that never existed
+    if (!commit) {
+        return DumpError::result(DumpErrorType::COMMIT_HASH_NOT_FOUND);
+    }
 
-    fs::ByteBufferIterator entryIt = reader.iterateBuffer();
-
-    const uint64_t prevCommitHash = entryIt.get<uint64_t>();
-    const Commit* headCommit = graph->_versionController->_head.load();
-
-    //Check if the last dumped commit is the current head commit - this means 
-    //we have already dumped all the commits in the branch and can return safely.
-    if(prevCommitHash == headCommit->hash().get()) {
+    if (missingCommits.empty()) {
         return {};
     }
 
-    std::vector<CommitHash> commitList;
-    // we know to dump all commits from the new head until (excluding) the last dumped commit.
-    // collect all the new commits so we can iterate and append them to file later
-    while (headCommit && headCommit->hash().get() != prevCommitHash) {
-        commitList.emplace_back(headCommit->hash());
+    const StdPath graphDirectory {graphDir.get()};
 
-        const std::string fileName = fmt::format("{}", headCommit->hash().get());
-        const fs::Path commitDir = graphDir / "commits" / fileName;
-        const fs::Path partsDir = graphDir / "dataparts";
+    for (const Commit* missingCommit : missingCommits | std::views::reverse) {
+        const fs::Path commitDir = graphDir / "commits" / std::to_string(missingCommit->hash().get());
 
-        if (commitDir.exists()) {
-            // commit shouldn't exist
-            return DumpError::result(DumpErrorType::COMMIT_ALREADY_EXISTS);
-        }
-
-        if (auto res = CommitDumper::dump(*headCommit, commitDir, partsDir); !res) {
+        if (auto res = removeInterruptedDump(*missingCommit, graphDirectory); !res) {
             return res;
         }
-        headCommit= headCommit->getPreviousCommit();
+
+        if (auto res = CommitDumper::dump(*missingCommit, commitDir, partsDir); !res) {
+            return res;
+        }
+
+        hashes.emplace_back(missingCommit->hash().get());
     }
 
-    //seek back to the offset right after the headers
-    writer.file().seek(DumpConfig::FILE_HEADER_STRIDE);
-    // update the total number of commits
-    writer.write(graph->_versionController->getNumCommits());
-    writer.flush();
+    const StdPath preparedLog = graphDirectory / "commitlog.tmp";
+    std::error_code error;
 
-    if (writer.errorOccured()) {
-        return DumpError::result(DumpErrorType::COULD_NOT_WRITE_COMMIT_LOG,
-                                 *writer.error());
+    std::filesystem::remove(preparedLog, error);
+    if (auto res = CommitLogFile::write(fs::Path {preparedLog.string()}, hashes); !res) {
+        return res;
     }
 
-    // Seek to EOF before appending new commit log entries
-    if (auto res = writer.file().seekEnd(0); !res) {
-        return DumpError::result(DumpErrorType::COULD_NOT_SEEK_COMMIT_LOG, res.error());
+    std::filesystem::rename(preparedLog, graphDirectory / "commitlog", error);
+    if (error) {
+        return DumpError::result(DumpErrorType::CANNOT_REPLACE_COMMIT_LOG);
     }
-
-    // Iterate through the list backwards to dump commits in ascending (by time of commit)
-    // order
-    for (const CommitHash hash : commitList | std::views::reverse) {
-        writer.write(hash.get());
-    }
-
-    // Flush new entries at the end of the file before seeking
-    writer.flush();
-
-    if (writer.errorOccured()) {
-        return DumpError::result(DumpErrorType::COULD_NOT_WRITE_COMMIT_LOG,
-                                 *writer.error());
-    }
-
-    writer.file().close();
 
     return {};
 }

@@ -26,8 +26,10 @@ Change* ChangeManager::createChange(Graph* graph, CommitHash baseHash) {
 DataPartMergeResult<void> ChangeManager::mergeDataParts(Graph* graph, JobSystem& jobSystem) {
     std::unique_lock guard(_changesLock);
 
-    if (!isEmpty()) {
-        return DataPartMergeError::result(DataPartMergeErrorType::CHANGES_ON_MAIN);
+    for (const auto& [pair, change] : _changes) {
+        if (pair._graph == graph) {
+            return DataPartMergeError::result(DataPartMergeErrorType::BLOCKED_BY_OPEN_CHANGE);
+        }
     }
 
     return graph->mergeDataParts(jobSystem);
