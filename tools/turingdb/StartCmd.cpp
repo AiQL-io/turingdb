@@ -55,6 +55,8 @@ int StartCmd::execute() {
     TuringConfig config;
     config.setSyncedOnDisk(!_inMemory);
     config.setMmapVectorIndexes(!_noVectorMmap);
+    config.setHistoryRetention(Duration {_historyRetentionHours * TuringConfig::MICROSECONDS_PER_HOUR});
+    config.setCompactionInterval(Duration {_compactionIntervalMinutes * TuringConfig::MICROSECONDS_PER_HOUR / 60});
 
     if (!_turingDir.empty()) {
         fs::Path absTuringDir(_turingDir);
@@ -276,4 +278,12 @@ void StartCmd::initialize() {
         .help("Read HNSW vector indexes into memory at startup instead of mapping the "
               "index file; a server that adds vectors reads them in anyway")
         .store_into(_noVectorMmap);
+    _argParser.add_argument("-history-retention-hours")
+        .metavar("hours")
+        .help("Squash commits older than this many hours into one (default: 168, 0 keeps all history)")
+        .store_into(_historyRetentionHours);
+    _argParser.add_argument("-compaction-interval-minutes")
+        .metavar("minutes")
+        .help("How often the background compaction runs (default: 60, 0 turns it off)")
+        .store_into(_compactionIntervalMinutes);
 }

@@ -55,6 +55,10 @@ public:
         return ByteBufferIterator {_buf, _buf.size()};
     }
 
+    [[nodiscard]] size_t remainingBytes() const {
+        return static_cast<size_t>(_buf.data() + _buf.size() - _data);
+    }
+
     void advance(size_t offset) {
         _data += offset;
     }

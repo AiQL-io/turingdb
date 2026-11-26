@@ -243,6 +243,25 @@ SquashHistoryResult<void> VersionController::resolveSquashRange(std::optional<Co
     return {};
 }
 
+std::optional<CommitHash> VersionController::getSquashTipBefore(DateTime cutoff) const {
+    std::shared_lock guard(_mutex);
+
+    size_t olderCommitCount = 0;
+    for (const auto& commit : _commits) {
+        if (commit->getCreatedAt() >= cutoff) {
+            break;
+        }
+
+        olderCommitCount++;
+    }
+
+    if (olderCommitCount < 2) {
+        return std::nullopt;
+    }
+
+    return _commits[olderCommitCount - 1]->hash();
+}
+
 SquashHistoryResult<void> VersionController::getSquashRange(std::optional<CommitHash> base,
                                                             CommitHash tip,
                                                             std::vector<CommitHash>& range) const {

@@ -27,7 +27,9 @@ public:
           _buffer(std::move(other._buffer)),
           _fd(other._fd),
           _reachedEnd(other._reachedEnd),
-          _written(other._written)
+          _written(other._written),
+          _offset(other._offset),
+          _fileEnd(other._fileEnd)
     {
         other._fd = -1;
     }
@@ -40,6 +42,8 @@ public:
             _fd = other._fd;
             _reachedEnd = other._reachedEnd;
             _written = other._written;
+            _offset = other._offset;
+            _fileEnd = other._fileEnd;
             other._fd = -1;
         }
         return *this;
@@ -102,6 +106,8 @@ private:
     int _fd {-1};
     bool _reachedEnd {false};
     size_t _written {0};
+    size_t _offset {0};
+    size_t _fileEnd {0};
 
     explicit FilePageWriter(int fd, size_t pageSize)
         : _buffer(pageSize),
