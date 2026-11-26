@@ -275,6 +275,15 @@ SquashHistoryResult<void> SystemManager::squashCommits(std::string_view graphNam
 
     const bool isSyncedOnDisk = _config->isSyncedOnDisk();
 
+    // The squash rewrites the on-disk commit log from itself, so every commit in memory has to
+    // be on disk first: one that is not would be dropped from the log with what it replaces
+    if (isSyncedOnDisk) {
+        if (const auto res = GraphDumper::dump(graph, graph->getPath()); !res) {
+            spdlog::error("Could not write graph {} to disk before squashing it: {}", graph->getName(), res.error().fmtMessage());
+            return SquashHistoryError::result(SquashHistoryErrorType::COULD_NOT_SYNC_DISK);
+        }
+    }
+
     // Only the head commit is in memory after a restart, and a squash needs the writes of
     // every commit of the range
     if (isSyncedOnDisk) {

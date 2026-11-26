@@ -202,6 +202,42 @@ TEST_F(CompactDataPartsTest, theCompactedGraphAcceptsNewCommits) {
     EXPECT_EQ(5, rows.size());
 }
 
+TEST_F(CompactDataPartsTest, squashingAloneKeepsEveryDataPart) {
+    const size_t partsBefore = countEntries("dataparts");
+    ASSERT_GT(partsBefore, 1);
+
+    ASSERT_TRUE(query("SQUASH COMMITS").isOk());
+
+    EXPECT_EQ(1, countEntries("commits"));
+    EXPECT_EQ(partsBefore, countEntries("dataparts"));
+}
+
+TEST_F(CompactDataPartsTest, anOpenChangeOnAnotherGraphDoesNotBlockTheMerge) {
+    {
+        SystemAccessor system = _env->getSystemManager().accessUnique();
+        ASSERT_TRUE(system.createGraph("othergraph"));
+        ASSERT_TRUE(system.newChange("othergraph", CommitHash::head()));
+    }
+
+    const QueryStatus status = query("MERGE_DATAPARTS");
+    ASSERT_TRUE(status.isOk()) << status.getError();
+
+    restartServer();
+    expectPeople();
+}
+
+TEST_F(CompactDataPartsTest, anOpenChangeOnTheMergedGraphBlocksTheMerge) {
+    {
+        SystemAccessor system = _env->getSystemManager().accessUnique();
+        ASSERT_TRUE(system.newChange(_graphName, CommitHash::head()));
+    }
+
+    const size_t commitsBefore = countEntries("commits");
+
+    EXPECT_FALSE(query("MERGE_DATAPARTS").isOk());
+    EXPECT_EQ(commitsBefore, countEntries("commits"));
+}
+
 int main(int argc, char** argv) {
     return turing::test::turingTestMain(argc, argv, [] {
         testing::GTEST_FLAG(repeat) = 1;

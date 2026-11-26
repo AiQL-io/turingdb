@@ -14,6 +14,7 @@
 #include "QueryConfig.h"
 #include "SystemManager.h"
 #include "TuringDB.h"
+#include "dump/CommitLogFile.h"
 #include "dump/GraphLoader.h"
 #include "versioning/Change.h"
 #include "versioning/ChangeID.h"
@@ -125,6 +126,38 @@ protected:
         SystemAccessor system = _env->getSystemManager().accessUnique();
 
         return system.getGraph(_graphName)->getVersionController().getNumCommits();
+    }
+
+    void restartServer() {
+        _env.reset();
+        _env = TuringTestEnv::createSyncedOnDisk(_turingDir);
+
+        SystemAccessor system = _env->getSystemManager().accessUnique();
+        ASSERT_TRUE(system.loadGraph(_graphName));
+    }
+
+    // Leaves the head commit as a dump that ran out of disk left it: a directory without
+    // metadata, and a commit log that does not list it
+    void interruptHeadDump() {
+        const fs::Path logFile = _graphDir / "commitlog";
+
+        std::vector<uint64_t> hashes;
+        ASSERT_TRUE(CommitLogFile::read(logFile, hashes));
+        ASSERT_EQ(_commits.back().get(), hashes.back());
+        hashes.pop_back();
+
+        std::filesystem::remove(logFile.get());
+        ASSERT_TRUE(CommitLogFile::write(logFile, hashes));
+
+        const std::filesystem::path headDirectory = std::filesystem::path {_graphDir.get()} / "commits" / std::to_string(_commits.back().get());
+        ASSERT_TRUE(std::filesystem::remove(headDirectory / "metadata"));
+    }
+
+    size_t countLoggedCommits() const {
+        std::vector<uint64_t> hashes;
+        EXPECT_TRUE(CommitLogFile::read(_graphDir / "commitlog", hashes));
+
+        return hashes.size();
     }
 };
 
@@ -339,6 +372,56 @@ TEST_F(SquashCommitsTest, aSquashThatNeverWasPreparedIsDiscardedOnLoad) {
     EXPECT_EQ(5, reloaded->getVersionController().getNumCommits());
     EXPECT_FALSE(filesystem::exists(commitsDirectory / (tipName + ".squash")));
     EXPECT_FALSE(filesystem::exists(graphDirectory / "commitlog.squash.tmp"));
+}
+
+TEST_F(SquashCommitsTest, aSquashWritesTheCommitsAnInterruptedDumpLeftBehind) {
+    submitPerson("Erin");
+    interruptHeadDump();
+
+    const QueryStatus status = query("SQUASH COMMITS");
+    ASSERT_TRUE(status.isOk()) << status.getError();
+
+    EXPECT_EQ(1, countLoggedCommits());
+    EXPECT_EQ(1, countCommitDirectories());
+
+    restartServer();
+
+    EXPECT_EQ(1, countLoadedCommits());
+    expectPeople({{"Alice"}, {"Bob"}, {"Carol"}, {"Dave"}, {"Erin"}});
+}
+
+TEST_F(SquashCommitsTest, aSubmitAfterAnInterruptedDumpWritesBothCommits) {
+    submitPerson("Erin");
+    interruptHeadDump();
+    submitPerson("Frank");
+
+    EXPECT_EQ(7, countLoggedCommits());
+
+    restartServer();
+
+    EXPECT_EQ(7, countLoadedCommits());
+    expectPeople({{"Alice"}, {"Bob"}, {"Carol"}, {"Dave"}, {"Erin"}, {"Frank"}});
+}
+
+TEST_F(SquashCommitsTest, aSquashIsRefusedWhenTheDiskCannotCatchUpWithMemory) {
+    namespace filesystem = std::filesystem;
+    const filesystem::path partsDirectory = filesystem::path {_graphDir.get()} / "dataparts";
+
+    submitPerson("Erin");
+    interruptHeadDump();
+
+    filesystem::permissions(partsDirectory, filesystem::perms::owner_read | filesystem::perms::owner_exec);
+    const QueryStatus status = query("SQUASH COMMITS");
+    filesystem::permissions(partsDirectory, filesystem::perms::owner_all);
+
+    EXPECT_FALSE(status.isOk());
+    EXPECT_EQ(6, countLoadedCommits());
+    EXPECT_EQ(5, countLoggedCommits());
+
+    restartServer();
+
+    EXPECT_EQ(5, countLoadedCommits());
+    expectPeople({{"Alice"}, {"Bob"}, {"Carol"}, {"Dave"}});
 }
 
 int main(int argc, char** argv) {

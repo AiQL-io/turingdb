@@ -53,7 +53,7 @@ public:
     ChangeResult<void> submitChange(ChangeAccessor& access, JobSystem&, SubmitMode mode = SubmitMode::MERGE);
     ChangeResult<void> deleteChange(ChangeAccessor& access, ChangeID changeID);
 
-    DataPartMergeResult<void> mergeDataParts(Graph* grapph, JobSystem& jobSystem);
+    DataPartMergeResult<void> mergeDataParts(Graph* graph, JobSystem& jobSystem);
 
     SquashHistoryResult<void> squashHistory(Graph* graph,
                                             std::optional<CommitHash> base,
@@ -62,8 +62,6 @@ public:
 
     void listChanges(std::vector<const Change*>& list, const Graph* graph) const;
     bool hasChanges() const;
-
-    bool isEmpty() { return _changes.empty(); };
 
 private:
     mutable RWSpinLock _changesLock;
