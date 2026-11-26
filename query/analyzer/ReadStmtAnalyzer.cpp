@@ -53,29 +53,6 @@ using namespace db;
 
 namespace {
 
-// A tagged scalar carries its type per row rather than in the plan, so no property type
-// rules it out: the comparison the constraint becomes settles it row by row, as the same
-// test written as a WHERE does. That comparison also settles two numbers, which compare by
-// value, and two types that can never hold equal values, where it is false on every row.
-bool constraintTypeCompatible(ValueType propertyType, EvaluatedType exprType) {
-    const bool comparesPerRow = namesATaggedCell(exprType);
-    const bool matchesNothing = exprType == EvaluatedType::Null;
-
-    if (comparesPerRow || matchesNothing) {
-        return true;
-    }
-
-    const std::optional<EvaluatedType> propertyEvaluated = toEvaluatedType(propertyType);
-    const bool comparesNumbers = propertyEvaluated && comparesAsNumbers(*propertyEvaluated, exprType);
-    const bool comparesDisjointTypes = propertyEvaluated && comparesAsDisjointTypes(*propertyEvaluated, exprType);
-
-    if (comparesNumbers || comparesDisjointTypes) {
-        return true;
-    }
-
-    return ExprAnalyzer::propTypeCompatible(propertyType, exprType);
-}
-
 // The type each row an UNWIND emits carries: one level out of a list's shape - however
 // the list was built - and the type of anything that is not a list, spread to its
 // singleton.
@@ -390,6 +367,13 @@ void ReadStmtAnalyzer::analyzeNamedPath(PatternElement* element) {
                    element);
     }
 
+    // A SET analyzes the pattern comprehension it assigns twice, and the reads of the path
+    // hold the declaration the first pass bound
+    if (VarDecl* bound = element->getPathDecl()) {
+        _ctxt->declareAlias(name, bound);
+        return;
+    }
+
     VarDecl* decl = _ctxt->getOrCreateNamedVariable(_ast, EvaluatedType::GraphPath, name);
     element->setPathDecl(decl);
 }
@@ -398,12 +382,13 @@ void ReadStmtAnalyzer::analyze(NodePattern* nodePattern) {
     VarDecl* decl = nullptr;
 
     if (Symbol* symbol = nodePattern->getSymbol()) {
-        decl = _ctxt->getOrCreateNodePatternVariable(_ast, symbol->getName());
-        if (decl->isQuantifiedPath()) {
+        const VarDecl* declared = _ctxt->getDecl(symbol->getName());
+        if (declared && declared->isQuantifiedPath()) {
             throwError(fmt::format("Variable '{}' is already bound to the nodes a quantified pattern grouped", symbol->getName()),
                        nodePattern);
         }
 
+        decl = _ctxt->getOrCreateNodePatternVariable(_ast, symbol->getName());
         nodePattern->setDecl(decl);
     } else {
         decl = _ctxt->createUnnamedVariable(_ast, EvaluatedType::NodePattern);
@@ -430,15 +415,6 @@ void ReadStmtAnalyzer::analyze(NodePattern* nodePattern) {
 
             const std::optional<PropertyType> propType = propTypeMap.get(propName->getName());
 
-            const bool incompatibleValue = propType
-                                           && !constraintTypeCompatible(propType->_valueType, expr->getType());
-            if (incompatibleValue) {
-                throwError(fmt::format("Cannot evaluate node property: types '{}' and '{}' are incompatible",
-                                       ValueTypeName::value(propType->_valueType),
-                                       EvaluatedTypeName::value(expr->getType())),
-                           nodePattern);
-            }
-
             // Create a dummy Expr that represents the predicate evaluation
             Symbol* varSymbol = Symbol::create(_ast, decl->getName());
             QualifiedName* fullName = QualifiedName::create(_ast);
@@ -462,14 +438,15 @@ void ReadStmtAnalyzer::analyze(EdgePattern* edgePattern) {
     VarDecl* decl = nullptr;
 
     if (Symbol* symbol = edgePattern->getSymbol()) {
-        decl = _ctxt->getOrCreateNamedVariable(_ast,
-                                               EvaluatedType::EdgePattern,
-                                               symbol->getName());
-        if (decl->isQuantifiedPath()) {
+        const VarDecl* declared = _ctxt->getDecl(symbol->getName());
+        if (declared && declared->isQuantifiedPath()) {
             throwError(fmt::format("Variable '{}' is already bound to the relationships a quantified pattern grouped", symbol->getName()),
                        edgePattern);
         }
 
+        decl = _ctxt->getOrCreateEntityPatternVariable(_ast,
+                                                       EvaluatedType::EdgePattern,
+                                                       symbol->getName());
         edgePattern->setDecl(decl);
     } else {
         decl = _ctxt->createUnnamedVariable(_ast, EvaluatedType::EdgePattern);
@@ -534,15 +511,6 @@ void ReadStmtAnalyzer::analyzeEdgeProperties(EdgePattern* edgePattern,
         }
 
         const std::optional<PropertyType> propType = propTypeMap.get(propName->getName());
-
-        const bool incompatibleValue = propType
-                                       && !constraintTypeCompatible(propType->_valueType, expr->getType());
-        if (incompatibleValue) {
-            throwError(fmt::format("Cannot evaluate edge property: types '{}' and '{}' are incompatible",
-                                   ValueTypeName::value(propType->_valueType),
-                                   EvaluatedTypeName::value(expr->getType())),
-                       edgePattern);
-        }
 
         // Create a dummy Expr that represents the predicate evaluation
         Symbol* varSymbol = Symbol::create(_ast, decl->getName());
@@ -681,8 +649,9 @@ void ReadStmtAnalyzer::throwIfGroupNameIsBound(const DeclContext* outer, const S
                walk);
 }
 
-VarDecl* ReadStmtAnalyzer::declareGroupVariable(DeclContext* outer, EvaluatedType type, std::string_view name) {
-    VarDecl* group = outer->getOrCreateNamedVariable(_ast, type, name);
+VarDecl* ReadStmtAnalyzer::declareGroupVariable(DeclContext* outer, EvaluatedType entityType, std::string_view name) {
+    VarDecl* group = outer->getOrCreateNamedVariable(_ast, EvaluatedType::List, name);
+    group->setListShape(ListShape(entityType, 1));
     group->setIsQuantifiedPath(true);
 
     return group;
@@ -796,6 +765,10 @@ VarDecl* ReadStmtAnalyzer::resolveShortestPathEndpoint(const Symbol* endpoint, c
     VarDecl* decl = _ctxt->getDecl(name);
     if (!decl) {
         throwError(fmt::format("Variable '{}' not found", name), spSt);
+    }
+
+    if (holdsAnEntityPerRow(decl->getType())) {
+        decl = _ctxt->getOrCreateEntityPatternVariable(_ast, EvaluatedType::NodePattern, name);
     }
 
     const EvaluatedType type = decl->getType();

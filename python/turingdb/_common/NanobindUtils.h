@@ -32,6 +32,12 @@ namespace nb = nanobind;
 
 using PyObj = nb::object;
 
+// Engine strings are bytes that need not be valid UTF-8: a lone surrogate escape or
+// imported data. Invalid sequences become U+FFFD, as errors="replace" does.
+nb::str toPyString(std::string_view text);
+
+void setRuntimeError(std::string_view message);
+
 // Trivial scalar conversions to Python objects. Inline here so the templates
 // below can pick them up via overload resolution.
 inline PyObj toPy(uint64_t v) {
@@ -47,10 +53,10 @@ inline PyObj toPy(db::CustomBool v) {
     return nb::cast(v._boolean);
 }
 inline PyObj toPy(std::string_view v) {
-    return nb::cast(std::string(v));
+    return toPyString(v);
 }
 inline PyObj toPy(const std::string& v) {
-    return nb::cast(v);
+    return toPyString(v);
 }
 
 template <typename T, int I>
@@ -122,34 +128,6 @@ nb::object transformVectorAsNdarray(const std::vector<In>& src, Conv conv) {
     return wrapVectorAsNdarray(std::move(buf));
 }
 
-// Build a Python list by converting each element via toPy(). Used for column
-// types that can't fit a typed numpy array — strings (no fixed-width
-// representation) and nullable columns (no nullable dtype survives through
-// pandas). The toPy(std::optional<T>) overload maps empty optionals to None
-// automatically, so a vector<optional<T>> works without a separate overload.
-template <typename T>
-nb::object vectorAsList(const std::vector<T>& src) {
-    nb::list out;
-    for (const auto& v : src) {
-        out.append(toPy(v));
-    }
-    return out;
-}
-
-// List counterpart to repeatValueAsNdarray: used when the broadcasted value
-// is a string, embedding, or other type that can't sit in a typed numpy
-// array. We share one Python object across every slot since the value is
-// immutable from the caller's point of view.
-template <typename T>
-nb::object repeatValueAsList(const T& v, size_t n) {
-    nb::list out;
-    PyObj py = toPy(v);
-    for (size_t i = 0; i < n; ++i) {
-        out.append(py);
-    }
-    return out;
-}
-
 // Allocates a destination column for every column in incomingDf and registers
 // them with bufferedDf. ColumnConst sources have their value copied here once,
 // since constants don't get appended to row-by-row.
@@ -198,8 +176,8 @@ nb::object embeddingToNdarray(std::span<const float> s);
 // Top-level dispatcher: walks every column of the dataframe and picks the
 // right converter based on the column's runtime kind. The output is a
 // `{"data": {col: ndarray|list}, "dtypes": {col: type_name}}` envelope. The
-// dtype names match the HTTP server's vocabulary ("Int64", "UInt64", "Double",
-// "Bool", "String") so the Python wrapper can reuse the same dtype_map; ID
+// dtype names are the engine's type names ("Int64", "UInt64", "Double", "Bool",
+// "String"), which the Python wrapper maps through DTYPE_MAP; ID
 // types report their underlying integer ("UInt64" for NodeID/EdgeID/etc.)
 // while embeddings and uncommon scalar types report their C++ name and fall
 // back to object dtype on the Python side. Anonymous columns get a synthetic

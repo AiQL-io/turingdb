@@ -22,20 +22,22 @@ git clone --recursive https://github.com/turing-db/turingdb.git
 
 # Build
 mkdir -p build && cd build
-cmake ..
-make -j8
-make install
+cmake -G Ninja ..
+ninja -j8
+ninja install
 
 # Setup environment (adds turingdb to PATH)
 source setup.sh
 ```
 
 **Build variants:**
-- Debug build: `DEBUG_BUILD=1 cmake ..`
-- Release with debug info: `RELDEBUG=1 cmake ..`
-- Callgrind profiling: `CALLGRIND_PROFILE=1 cmake ..`
+- Debug build: `DEBUG_BUILD=1 cmake -G Ninja ..`
+- Release with debug info: `RELDEBUG=1 cmake -G Ninja ..`
+- Callgrind profiling: `CALLGRIND_PROFILE=1 cmake -G Ninja ..`
 
-Always use make, do not use ninja.
+Ninja is the preferred way to build: configure with `cmake -G Ninja ..` and build with `ninja`, not make. CMake compiles through ccache and links with mold when they are installed; `-DTURING_USE_CCACHE=OFF` and `-DTURING_USE_MOLD=OFF` turn them off.
+
+If `ccache` is not on `PATH`, install it in the home directory, which needs no sudo. On Linux, download the latest `linux-<arch>-musl-static` archive from the ccache GitHub releases page (https://github.com/ccache/ccache/releases), where `<arch>` is the output of `uname -m`, and copy the `ccache` binary it contains into `~/.local/bin`. `~/.local/bin` must be on `PATH`. On macOS, `brew install ccache`. A build directory configured without ccache picks it up on the next `cmake ..`.
 
 ## Testing
 
@@ -51,7 +53,7 @@ ctest -R test_storage                    # Run tests matching pattern
 **Regression tests:**
 ```bash
 cd build
-make run_regress    # Run all regression tests
+ninja run_regress    # Run all regression tests
 ```
 
 Regression tests are Python-based and located in `regress/`. Each test has a `run.sh` script.
@@ -59,7 +61,7 @@ Regression tests are Python-based and located in `regress/`. Each test has a `ru
 ## Architecture
 
 ### Query Processing Pipeline
-1. **Parser** (`query/parser/`) - Cypher parser based on ANTLR g4 grammar
+1. **Parser** (`query/parser/`) - Hand-written lexer (`CypherLexer`) and recursive-descent parser (`CypherGrammar`)
 2. **AST** (`query/AST/`) - Abstract syntax tree representation
 3. **Analyzer** (`query/analyzer/`) - Semantic analysis and validation
 4. **Plan** (`query/plan/`) - Query plan generation
@@ -78,15 +80,14 @@ These are structural properties of the graph model, not validation rules layered
 
 - **Every node has at least one label.** An empty label set is not representable; there is no "unlabeled node". An import file with a node whose label list is empty/null is malformed input, not a node to be created label-less.
 - **Every edge has exactly one edge type.** A null/empty edge type is not representable; an edge cannot exist without a type. A null `__type` in an import file is malformed input.
-- **A property value is a scalar, a list or a map.** The scalar types are `ValueType`'s Int64, UInt64, Double, Bool, String, Embedding, DateTime and Duration; `ValueType::List` is the list one, held by `TypedPropertyContainer<types::List>` over a `ListContainer` that owns its elements (see `docs/lists.md`). A stored list may be heterogeneous and may hold nested lists, so a LIST-typed column in an import file is a property to ingest, not unsupported input. `ValueType::Map` is the map one, held by `TypedPropertyContainer<types::Map>` over a `MapContainer` (see `docs/maps.md`): string keys, stored sorted, over values that may be scalars, lists or nested maps. A stored list may hold maps too, owned by its `ListContainer`'s own `MapContainer`.
-- **`ValueType`, `ListBufferTypeTag` and `MapBufferTypeTag` are append-only.** All three are written to disk as their raw ordinals — the property tag in `PropertyTypeMapDumper`, the element tag inside an `EncodedList`, the value tag inside an `EncodedMap` — with no format version beside them. A new member goes immediately before the sentinel; inserting one anywhere else silently reinterprets every datapart already written. The same holds for `net::proto::ColumnInternalKind` on the wire.
+- **A property value is a scalar, a list or a map.** The scalar types are `ValueType`'s Int64, UInt64, Double, Bool, String, Embedding, DateTime, Duration and Point; `ValueType::List` is the list one, held by `TypedPropertyContainer<types::List>` over a `ListContainer` that owns its elements (see `docs/lists.md`). A stored list may be heterogeneous and may hold nested lists, so a LIST-typed column in an import file is a property to ingest, not unsupported input. `ValueType::Map` is the map one, held by `TypedPropertyContainer<types::Map>` over a `MapContainer` (see `docs/maps.md`): string keys, stored sorted, over values that may be scalars, lists or nested maps. A stored list may hold maps too, owned by its `ListContainer`'s own `MapContainer`.
+- **`ValueType` and `CellTag` are append-only.** Both are written to disk as their raw ordinals — the property tag in `PropertyTypeMapDumper`, and the cell tag of an element inside an `EncodedList` and of a value inside an `EncodedMap` — with no format version beside them. A new member goes immediately before the sentinel; inserting one anywhere else silently reinterprets every datapart already written. The same holds for `net::proto::ColumnInternalKind` on the wire, and for `PointCRS`, whose ordinal every stored point carries.
 - **`DateTime` is microseconds since the Unix epoch, UTC** (`storage/metadata/DateTime.h`). `datetime("...")` parses ISO-8601 and spends any offset on the instant, so `...T16:05:00+02:00` and `...T14:05:00Z` are one value and both render as `Z`. One int64 carries no zone; a zoned datetime would be a second type, not a widening of this one.
 - **`Duration` is a signed count of microseconds** (`storage/metadata/Duration.h`). It has no month component, because a month has no fixed length; a calendar duration would be a second type. `duration(<integer>)` reads the count as microseconds, and a duration renders as ISO-8601 hours, minutes and seconds (`PT25H1M1S`).
+- **A `Point` is x, y and z in one of four CRSs** (`storage/metadata/Point.h`): cartesian, cartesian-3d, wgs-84 and wgs-84-3d, Neo4j's. It is 32 bytes, so two equal points are equal in every byte: a 2D point holds a z of 0, no coordinate is -0.0, and the padding is zero. No coordinate is non-finite, a geographic latitude lies in [-90, 90] and its longitude in [-180, 180]. A point renders as the text `point({x: 1.0, y: 2.0, crs: 'cartesian'})`.
 
 ### Server (`server/`, `net/`)
-- Single TCP listener with two response strategies selected at startup by `USE_TURING_PROTO`:
-  - **REST (default):** in-tree HTTP/1.1 stack — `net/http_parser/HTTPParser`, `net/http_common/HTTPWriter`, dispatched by `server/DBServerProcessor`. JSON over HTTP, endpoints routed in `server/DBURIParser.h` / `server/Endpoints.h`. No third-party web framework.
-  - **Native binary protocol (`USE_TURING_PROTO=1`):** TuringDB's binary proto framed as HTTP/1.1 chunked transfer — same `HTTPParser` reads the request, `net/turing_proto_server/TuringProtoWriter` emits one proto packet per HTTP chunk, `server/TuringProtoServerProcessor` handles dispatch. Client side: `net/turing_proto_client/TuringClient` (C++) / `python/turingdb/binary_client.py` (`BinaryClient`).
+- Single TCP listener speaking TuringDB's binary protocol framed as HTTP/1.1 chunked transfer. The in-tree `net/http_parser/HTTPParser` reads the request (endpoints routed in `server/DBURIParser.h` / `server/Endpoints.h`), `server/TuringProtoServerProcessor` handles dispatch, and `net/turing_proto_server/TuringProtoWriter` emits one proto packet per HTTP chunk. There is no JSON protocol and no third-party web framework. Client side: `net/turing_proto_client/TuringClient` (C++), `python/turingdb/binary_client.py` (`BinaryClient`), `wasm/npm` (JS).
 - Default port: 6666
 
 ### Key Modules
@@ -273,6 +274,129 @@ this worklist already. For a pass over filters, use `runFilterWorklist` in
 `query/ir/dialect/db/DBPasses.cpp`. Collecting all matches first and then rewriting them
 is fine only when no rewrite can touch another's match.
 
+## Ops with a body declare how columns enter and leave it
+
+**An op with a region says, through `ColumnCarrierOpInterface`, which columns come into
+the region and which come back out. A pass reads that layout from the interface. It never
+works it out from the op's name.** The layout is a fact about the op, so the op states it,
+once. A pass that switches over op kinds to compute argument positions holds a second copy
+of that fact, and that copy covers only the ops its author thought of.
+
+The interface (`query/ir/dialect/db/DBInterfaces.td`) has two methods for regions, beside
+`getCarrySet` and `getRowSource`, which describe an op's results:
+- `getRegionCarrySet(region, RegionCarrySet&)`: `_count` operands from `_operandOffset`
+  come into the region as the arguments from `_argumentOffset`. `_handsBack` says the op
+  also returns them as its first results. `_yieldsBack` says those results come from the
+  region's yield, which then leads with them, as the region left them.
+- `getYieldedResultOffset(region, offset)`: the columns the region yields come out as the
+  results from `offset` on, one row for each row the region yields. It returns false where
+  the op pads or merges what a region yields.
+
+```text
+op                                      into the region                   back out
+CASE, coalesce, list ops                trailing operands, trailing args  -
+EXISTS, COUNT, COLLECT, [(n)-->(m)|..]  inputs, leading args, row tag      -
+CALL run once per row                   inputs, all args                  inputs, then yields
+CALL carrying its scope                 inputs, leading args              its yield, inputs first
+OPTIONAL MATCH, optional CALL           inputs, leading args              inputs only: own columns pad
+cross product, hash join                -                                 each factor's yield in turn
+```
+
+A body run once per row has no row tag; one carrying its scope may have one after its
+carried arguments, which is why the arguments are counted from `_argumentOffset` rather
+than from the end.
+
+Rules:
+- A new op with a region implements `getRegionCarrySet`, and `getYieldedResultOffset` when
+  its results are a region's yield row for row. An op that implements neither is opaque:
+  no pass carries a column into its body or out of it. That is correct, but every
+  optimisation stops at the op.
+- `getYieldedResultOffset` returning false is a correctness statement. A row an optional
+  op's body missed comes back with its own columns null, so a column carried out through
+  the yield would turn that row's real value into null.
+- In a pass, go through the helpers in `DBPasses.cpp`: `matchRegionCarrySet`,
+  `carriedColumnOf`, `carriedArgument`, `carryIntoRegions`. Never write
+  `isa<CallSubquery, OptionalMatch>` next to argument arithmetic. A pass that handles only
+  some ops, as `trim_unread_columns` handles CASE and the list ops, keeps that choice as a
+  predicate over op kinds and still reads the layout from the interface.
+- This is MLIR's own answer: `RegionBranchOpInterface::getEntrySuccessorOperands` says
+  which operands flow into which region arguments, and `RegionBranchTerminatorOpInterface`
+  which yielded values flow to which results.
+
+Worked example: TUR-390 (#1348). `reuse_property_reads` reached into CASE, coalesce and
+the list ops through `matchRegionCarrySet`, a switch that knew their trailing layout.
+Subquery bodies take their inputs first, ahead of a row tag, so
+`MATCH (n:Person) RETURN n.age, COUNT { MATCH (n)-->(m) WHERE m.age = n.age }` read
+`n.age` a second time inside the body. A sixth case in the switch would have fixed COUNT
+and left EXISTS, COLLECT, CALL, OPTIONAL MATCH, pattern comprehensions and cross products.
+Instead the layout moved onto the ops: 14 ops implement one or both methods, and the pass
+walks into and out of all of them with one generic step each way.
+
+## Maps keyed by IR objects forget what is erased
+
+**A map keyed by `mlir::Value` or `mlir::Operation*` drops an op's entries when the op is
+erased, and every erase goes through the one function that does it.** MLIR puts a new op
+in the memory an erased one freed. A key left behind then answers for whatever value is
+created next at that address. Which value that is depends on the heap, so the program
+changes between runs of one binary, and so does the bug.
+- In lowering, erase through `DBLowering::eraseOp`, never a bare `op->erase()`. It calls
+  `forgetErasedValues` (`query/ir/common/IRConstantColumn.h`), which drops the results and
+  block arguments of the op and of every op nested in it.
+- A new cache keyed by IR objects does the same at each erase, or is cleared after every
+  rewrite, as `ConeCache` in `DBPasses.cpp` is.
+- MLIR's own answer is a `RewriterBase::Listener` (`notifyOperationErased`). It works only
+  in `add_mlir_library` targets: MLIR is built without RTTI and only those targets get
+  `-fno-rtti`, so subclassing `RewriterBase` in lowering or common fails to link with
+  `undefined symbol: _ZTIN4mlir12RewriterBaseE`.
+- Iterating such a map is non-deterministic too. Use `InsertionOrderedMap` when the order
+  reaches the IR (#1316).
+
+Finding a bug of this class:
+- An intermittent crash in a test that runs fixed queries is non-determinism until shown
+  otherwise. Run `EXPLAIN (nl)` of the query in many processes and compare the dumps before
+  reading the crash. Two different dumps put the bug in codegen or lowering, however far
+  downstream it crashes.
+- ASAN did not reproduce it: its allocator lays the heap out differently.
+- Pin it with a test that moves the heap: lower the query many times, each behind padding
+  of a different size, and require one program (`LoweringDeterminismTest`). 64 lowerings
+  passed on the broken code; 256, each behind 24 more bytes, failed 10 runs of 10.
+
+Worked example: #1374. `main` failed `test_query_ir_doom` with a segfault about 1 run in
+30. When a `reduce` accumulator widens (`line = ''` becomes Any), `lowerFold` erases the
+`nl.reduce` it built and lowers it again. The erased values stayed in `_constantColumns`,
+lowering's cache of which values hold one value for every row. When the retry's
+`nl.constant "#"` landed at the address of an erased value cached as not constant,
+`rowAlignedChunk` did not broadcast it, and `NLTranslator` read the 1-row constant as a
+full column. The crash was in the translator, but making `to_any` accept a constant would
+have left lowering non-deterministic. The fix routed all 13 erases in lowering through
+`eraseOp`.
+
+## DenseMap moves its entries on erase and on growth
+
+**No iterator, reference or pointer into an `llvm::DenseMap` or `llvm::DenseSet` survives an
+erase from it or an insert into it.** Both move entries. A stale reference reads whatever the
+heap left there, so the bug changes between runs.
+- An erase leaves no tombstone. This LLVM's `eraseFromFilledBucket` shifts the entries after
+  the hole back into it (Knuth's Algorithm R). Erasing while iterating skips the entry that
+  moves into the hole. Use `remove_if`, which `DenseMap.h` names as the replacement.
+- An insert that grows the table moves every entry to a new bucket array and frees the old
+  one. `M[k] = it->second` and `M[a] = M.at(b)` then read freed memory: C++17 evaluates the
+  right side first, but only to a reference, and the copy reads it after `M[k]` has grown
+  the table. Copy the value into a local before the insert.
+- A reference from `M[k]` or `M.find(k)->second` does not live across a call that can insert
+  into or erase from `M`, including a call handed `*this`.
+- `InsertionOrderedMap` keeps references across an insert, since its entries live in a
+  `std::deque`, but not iterators. An erase invalidates both.
+- valgrind reports these on every run that moves the entry: the read lands in a freed bucket
+  array. A native run mostly reads the old value and passes.
+
+Worked example: `rowSource` in `IRRowAlignment.cpp` wrote `sources[value] = operandIt->second`.
+The 48th entry grows the table from 64 buckets to 128. A `coalesce` of a 46-term sum carried
+across a hop put the `nl.fill_nulls` at that entry. Once glibc reused the freed array, the
+source read back was garbage, and `sameRowSource` segfaulted on it in 9 runs of 10
+(`CarriedColumnRowSourceTest`). The first version of the scrub in `DBLowering::eraseOp` erased
+from `_valueMap` while iterating it and kept one of two entries holding a freed value.
+
 ## C++ Coding Style
 
 Please read `CODING_STYLE.md` for guidelines before any new work.
@@ -373,9 +497,82 @@ Key points:
 ## Build/iteration workflow
 
 - During multi-turn iteration on a change (style feedback, API shape, refactors), **don't build after each edit**. Just write the edits and stop. Builds are slow and noisy; running them every micro-revision burns time. Only build when the user explicitly asks ("build" / "compile" / "run it") or signals the design is settled.
-- **Build only the affected target, never the whole tree for a test.** When the change is one unit test — writing it, fixing it, adding a case to it — build and run that test's target alone: `make -j8 test_query_ir_<name>`, then `./test/query/ir/<feature>/test_query_ir_<name>`. Do not run a bare `make -j8`. The same holds for any single binary you are fixing: name its target. A bare `make -j8` rebuilds the whole engine and every test binary for nothing.
-- Don't preface `make` with `cmake ..`. `make` already re-runs cmake when any tracked `CMakeLists.txt` has changed. Only run `cmake ..` after editing `CMakeLists.txt` / `dependencies.sh`, or when resetting the build directory.
+- **Build only the affected target, never the whole tree for a test.** When the change is one unit test — writing it, fixing it, adding a case to it — build and run that test's target alone: `ninja -j8 test_query_ir_<name>`, then `./test/query/ir/<feature>/test_query_ir_<name>`. Do not run a bare `ninja -j8`. The same holds for any single binary you are fixing: name its target. A bare `ninja -j8` rebuilds the whole engine and every test binary for nothing.
+- Don't preface `ninja` with `cmake ..`. `ninja` already re-runs cmake when any tracked `CMakeLists.txt` has changed. Only run `cmake ..` after editing `CMakeLists.txt` / `dependencies.sh`, or when resetting the build directory.
 - **Make minimal, targeted edits — fix exactly what's asked.** When the request is narrow (a comment, a wording, one line), change only that and leave surrounding working code alone. Don't refactor an adjacent loop or rename things just because you're nearby (e.g. asked to fix a confusing comment over a loop, rewrite the comment — don't also convert the loop to `all_of`). It keeps diffs small and reviewable and respects the existing structure. If a larger refactor seems worthwhile, propose it separately and let the user decide rather than bundling it in. This rule is about *unrelated* changes. A refactor that the root-cause fix needs is part of the fix, not scope creep (see "Fix the root cause, in its most general form").
+
+## Benchmarking
+
+**Compare binaries one server at a time.** Start a server, load the graph, time the queries,
+stop it, then start the next. Never keep two servers resident, loading or answering at the
+same time, even when their queries are interleaved and never execute at once: they share the
+L3, the memory bandwidth and the CPU's turbo budget. Run the servers in ABAB order (baseline,
+new, baseline, new) with the same seed and query order, so drift over the session hits both
+binaries equally.
+
+**A broad slowdown is the machine until an A/B says otherwise.** When turing-bench reports
+regressions spread over many unrelated queries, check the host before the code:
+- Idle states: `cat /sys/devices/system/cpu/cpu*/cpuidle/state*/disable`.
+- The clock one busy core reaches: `perf stat -e cycles,task-clock -- timeout 3 sh -c 'while :; do :; done'`.
+- Other load during the run: `sar -u -f /var/log/sysstat/saDD`.
+- Changes made with sudo: `sudo grep COMMAND /var/log/auth.log`.
+
+Then time the two commits' binaries as above. turing-bench keeps them on hetz-bench in
+`~/.cache/turing-bench/bin/<sha>/turingdb`. hetz-bench is shared: work in a private directory
+on a private port, and kill only your own pids. An interrupted ssh command does not stop a
+job it started with `setsid nohup`; check `ps` and stop it before the next measurement.
+
+Worked example: turing-bench run #4 (2026-10-27) reported 55 regressions of +20-40% for
+`2ed7e5956` against `1ea18067`. Between the two runs C6 had been disabled on hetz-bench, which
+capped one busy core at 2.8 GHz instead of 3.9. The two binaries timed the same, and
+`LOAD JSONL`, whose code had not changed, took 215 s against 167 s. With C6 back on, a rerun
+cleared the 55 regressions.
+
+## Triaging review findings
+
+**Every finding a review turns up gets one outcome: fixed now, filed, by design, or not
+tracked. When no rule below clearly applies, file it.** "By design" and "not tracked" take a
+finding out of view, so they need a rule that covers it. A ticket costs little; a wrong
+dismissal hides a bug.
+
+Classify each finding with the first rule that fits:
+- **Non-determinism: fix now, before anything else.** A query whose IR, plan or answer differs
+  between two runs of one binary. Example: codegen walked pointer-keyed maps, so 6 fixtures
+  carried their columns in heap-address order; #1316 made those maps `InsertionOrderedMap`s.
+- **An answer that depends on chunk boundaries or row order: never by design**, even when it
+  follows from a design that was chosen. Example: TUR-419. A cell write types a new property
+  from its first chunk, so 65,536 integers then 2.5 store as Double, while 65,537 raise.
+- **A major bug, related to the change under review, with a simple fix: fix now.** A bug that
+  predates the change, or whose fix needs a design choice, is filed instead (TUR-416:
+  a failed write query keeps its writes).
+- **Arithmetic overflow: not tracked, except for durations.** Integer overflow is out of scope
+  for now (TUR-214 was cancelled). `sum()` of durations wrapping where `duration + duration`
+  raises is tracked (TUR-410).
+- **Error messages: not tracked.** A wording, a type name inside a message, a missing caret.
+- **TuringDB policy: by design.** `id()` and `elementId()` are always numbers.
+- **Where TuringDB chose better than Neo4j: by design.** A property holding mixed kinds raises,
+  a map can be a property, and values are more typed: a typed `sum()` of no rows is the zero
+  of its type (0.0, PT0S), `percentileCont()` is always a Double, and a duration has no month,
+  so two durations compare. A difference from Neo4j is a bug only if it is wrong in
+  TuringDB's own model.
+- **Dead code: delete it now**, with its build entries. Never file it.
+- **Everything else: file a ticket**, as a bug, a gap or a limitation. A missing feature is
+  filed, not built during triage.
+
+Fixing one:
+- Each fix is its own PR, stacked on the previous one. Write the failing test first.
+
+Filing one:
+- Reproduce it on the current tip first. Put the query and the answer you got in the ticket.
+- Search Linear for a duplicate. A sibling of an open ticket goes on it as a comment: the
+  `count()` cell beside a double that cannot type a new property went on TUR-394.
+- Team TuringDB, project Query Engine, no priority. Write the description for people; code
+  locations and reproduction details go in a collapsible `+++ Agent notes` section.
+- When the fix is a design choice, list the options with their costs and leave the choice open.
+
+After each fix or ticket, update the review document. Each finding states its status
+(`fixed by #N`, `ticketed as TUR-N`, `by design`, `not tracked`, `open`), and every summary
+line points to the same place.
 
 ## Project context
 

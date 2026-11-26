@@ -5,11 +5,12 @@
 #include <ostream>
 
 #include "ID.h"
+#include "PathView.h"
 
 #include "metadata/PropertyType.h"
 #include "metadata/PropertyNull.h"
 
-#include "list/ListElementView.h"
+#include "CellView.h"
 #include "list/ListView.h"
 
 #include "map/MapEntryView.h"
@@ -70,10 +71,14 @@ public:
     static void dumpNull(std::ostream& out);
 
     static void dump(std::ostream& out, ListView list);
-    static void dump(std::ostream& out, ListElementView view, bool isInList = false);
+    static void dump(std::ostream& out, CellView view, bool isInList = false);
 
     static void dump(std::ostream& out, MapView map);
     static void dump(std::ostream& out, MapEntryView view, bool isInMap = false);
+
+    static void dump(std::ostream& out, PathView path);
+
+    static void dump(std::ostream& out, Point value);
 
 private:
     static void dumpImpl(std::ostream& out, uint64_t data);

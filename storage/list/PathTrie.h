@@ -7,7 +7,7 @@
 
 #include "ListBuffer.h"
 #include "ListView.h"
-#include "EntityList.h"
+#include "GraphPath.h"
 #include "ID.h"
 
 namespace db {
@@ -55,11 +55,12 @@ public:
 
     void clear();
 
-    // Appends the hops of the path in walk order, an edge entry then the node it lands on
-    // for each. Reversed it appends them from the far end back, the node an edge lands on
-    // before that edge, over the node entry ahead: that is the node the walk ended at, and
-    // a walk of no hops leaves it to the seed the caller writes next
-    void appendHops(PathRef path, EntityList& entities, bool reversed) const;
+    // Appends the hops of the walk in walk order, each edge and the node it lands on
+    void appendHops(PathRef path, GraphPath& graphPath) const;
+
+    // Appends the hops of the walk from its far end back to its seed. The far end is the
+    // last node of graphPath, or opens it when it is null
+    void appendReversedHops(PathRef path, NodeID seed, GraphPath& graphPath) const;
 
     // Each list in walk order, or backwards from the node the walk ended on
     ListView expandEdges(PathRef path, QueryListBuffer& buffer, bool reversed, PathHopStride hops = {}) const;

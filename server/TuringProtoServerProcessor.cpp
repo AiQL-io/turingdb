@@ -30,48 +30,29 @@ void TuringProtoServerProcessor::process(net::AbstractThreadContext* threadConte
     _threadContext = static_cast<DBThreadContext*>(threadContext);
 
     auto& parser = _connection.getParser<net::HTTPParser<DBURIParser>>();
-    auto& writer = _connection.getWriter<net::proto::TuringProtoWriter>();
+    const net::HTTP::Info& httpInfo = parser.getHttpInfo();
+
+    const bool isPost = httpInfo.getMethod() == net::HTTP::Method::POST;
+    const bool isAuthorized = isRequestAuthorized(_db.getAuthenticator(), httpInfo);
+    const bool isQuery = static_cast<Endpoint>(httpInfo.getEndpoint()) == Endpoint::QUERY;
 
     try {
-        // Emit HTTP/1.1 200 OK + chunked headers up front so the catch block
-        // below can write a PROTOCOL_ERROR chunk for validation failures
-        // without first sending the response headers (Option A from the
-        // design note — every request, valid or not, opens with 200 OK).
-        writer.startResponse();
-
-        const auto& httpInfo = parser.getHttpInfo();
-
-        if (httpInfo.getMethod() != net::HTTP::Method::POST) {
-            throw ProtocolException("Only POST is supported by the binary protocol");
-        }
-
-        if (!isRequestAuthorized(_db.getAuthenticator(), httpInfo)) {
-            throw ProtocolException("Unauthorized: missing or invalid authentication token");
-        }
-
-        switch (static_cast<Endpoint>(httpInfo.getEndpoint())) {
-            case Endpoint::QUERY:
-                handleQuery();
-            break;
-
-            default:
-                throw ProtocolException("Unsupported endpoint for the binary protocol");
-            break;
+        if (!isPost) {
+            rejectRequest(net::HTTP::Status::METHOD_NOT_ALLOWED, "Only POST is supported by the binary protocol");
+        } else if (!isAuthorized) {
+            rejectRequest(net::HTTP::Status::UNAUTHORIZED, "Unauthorized: missing or invalid authentication token");
+        } else if (!isQuery) {
+            rejectRequest(net::HTTP::Status::NOT_FOUND, "Unsupported endpoint for the binary protocol");
+        } else {
+            handleQuery();
         }
 
         _threadContext->getLocalMemory().clear();
-    } catch (const ProtocolException& e) {
-        // Protocol exceptions are errors that occur at the protocol level: e.g invalid
-        // method, unknown endpoint.
-        writer.writeProtocolError(e.what());
-        _connection.setCloseRequired(true);
     } catch (const NetException&) {
-        // Net Exceptions have to do with errors that occur during networking syscalls
         _connection.setCloseRequired(true);
     }
 }
 
-// Process the query in the request
 void TuringProtoServerProcessor::handleQuery() {
     auto& parser = _connection.getParser<net::HTTPParser<DBURIParser>>();
     auto& writer = _connection.getWriter<net::proto::TuringProtoWriter>();
@@ -86,8 +67,15 @@ void TuringProtoServerProcessor::handleQuery() {
 
     TuringProtoQueryRequest request;
     if (status.isOk()) {
-        TuringProtoQueryRequest::read(httpInfo, request, status);
+        try {
+            TuringProtoQueryRequest::read(httpInfo, request, status);
+        } catch (const ProtocolException& e) {
+            rejectRequest(net::HTTP::Status::BAD_REQUEST, e.what());
+            return;
+        }
     }
+
+    writer.startResponse(net::HTTP::Status::OK, net::ConnectionHeader::KEEP_ALIVE);
 
     if (status.isOk()) {
         const QueryState state(transactionInfo.graphName, &mem, &compilerContext, &queryConfig, &_protoNLSink, transactionInfo.commit, transactionInfo.change, &request.getParameters());
@@ -104,4 +92,11 @@ void TuringProtoServerProcessor::handleQuery() {
     }
 
     writer.writeEndPacket(status.getTotalTime().count());
+}
+
+void TuringProtoServerProcessor::rejectRequest(net::HTTP::Status status, std::string_view message) {
+    auto& writer = _connection.getWriter<net::proto::TuringProtoWriter>();
+
+    writer.writeProtocolErrorResponse(status, message);
+    _connection.setCloseRequired(true);
 }

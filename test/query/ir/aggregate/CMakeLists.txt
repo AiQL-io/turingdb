@@ -139,6 +139,9 @@ target_include_directories(test_query_ir_min_max_over_nullable PRIVATE ${IR_TEST
 add_turing_test(test_query_ir_integer_sum_past_null IntegerSumPastNullTest.cpp)
 target_include_directories(test_query_ir_integer_sum_past_null PRIVATE ${IR_TEST_DIR})
 
+add_turing_test(test_query_ir_tagged_cell_sum TaggedCellSumTest.cpp)
+target_include_directories(test_query_ir_tagged_cell_sum PRIVATE ${IR_TEST_DIR})
+
 add_turing_test(test_query_ir_keyless_aggregates_over_element_ops KeylessAggregatesOverElementOpsTest.cpp)
 target_sources(test_query_ir_keyless_aggregates_over_element_ops PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp ${IR_TEST_DIR}/CallV3Test.cpp)
 target_include_directories(test_query_ir_keyless_aggregates_over_element_ops PRIVATE ${IR_TEST_DIR})
@@ -150,6 +153,9 @@ add_turing_test(test_query_ir_count_comparison CountComparisonTest.cpp)
 
 add_turing_test(test_query_ir_component_of_grouping_key ComponentOfGroupingKeyTest.cpp)
 target_include_directories(test_query_ir_component_of_grouping_key PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_grouping_key_in_container GroupingKeyInContainerTest.cpp)
+target_include_directories(test_query_ir_grouping_key_in_container PRIVATE ${IR_TEST_DIR})
 
 # collect() over toString() results.
 add_call_v3_test(test_query_ir_collect_computed_string CollectComputedStringTest.cpp)
@@ -174,3 +180,26 @@ target_link_libraries(test_query_ir_aggregate_over_computed_constant PRIVATE
         turing_db_storage_s
         turing_db_ir_exec_s)
 target_include_directories(test_query_ir_aggregate_over_computed_constant PRIVATE ${IR_TEST_DIR})
+
+add_call_v3_test(test_query_ir_grouped_count_distinct GroupedCountDistinctTest.cpp)
+
+add_call_v3_test(test_query_ir_constant_key_empty_input ConstantKeyEmptyInputTest.cpp)
+
+# Grouping under constant keys, over OPTIONAL MATCH, WITH chains, CALL bodies and every aggregate.
+add_ir_tests(test_query_ir_constant_key_composition ConstantKeyCompositionTest.cpp)
+
+# Grouping under constant keys over the rows a CREATE or a MERGE writes.
+add_ir_tests(test_query_ir_constant_key_write ConstantKeyWriteTest.cpp)
+
+# A collect or a percentile beside other aggregates of one projection, in either order.
+add_ir_tests(test_query_ir_collect_beside_aggregates CollectBesideAggregatesTest.cpp)
+
+add_turing_test(test_query_ir_limit_past_a_collect LimitPastACollectTest.cpp)
+
+add_turing_test(test_query_ir_duration_sum_average DurationSumAverageTest.cpp)
+
+add_turing_test(test_query_ir_duration_sum_overflow DurationSumOverflowTest.cpp)
+
+add_turing_test(test_query_ir_duration_sum_row_order DurationSumRowOrderTest.cpp)
+
+add_turing_test(test_query_ir_percentile_held_in_a_cell PercentileHeldInACellTest.cpp)

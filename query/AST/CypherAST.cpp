@@ -32,6 +32,7 @@
 #include "QueryCommand.h"
 #include "decl/DeclContext.h"
 #include "decl/VarDecl.h"
+#include "decl/ParameterDecl.h"
 #include "decl/PatternData.h"
 
 using namespace db;
@@ -149,6 +150,10 @@ CypherAST::~CypherAST() {
     }
 
     for (VarDecl* decl : _varDecls) {
+        delete decl;
+    }
+
+    for (ParameterDecl* decl : _parameterDecls) {
         delete decl;
     }
 
@@ -276,12 +281,102 @@ void CypherAST::nestQuery(QueryCommand* query) {
     _subQueries.push_back(query);
 }
 
+void CypherAST::saveCheckpoint(Checkpoint& checkpoint) const {
+    checkpoint._parameters = _parameters.size();
+    checkpoint._symbols = _symbols.size();
+    checkpoint._symbolChains = _symbolChains.size();
+    checkpoint._labelExprs = _labelExprs.size();
+    checkpoint._qualifiedNames = _qualifiedNames.size();
+    checkpoint._quantifiedPaths = _quantifiedPaths.size();
+    checkpoint._functionInvocations = _functionInvocations.size();
+    checkpoint._literals = _literals.size();
+    checkpoint._expressions = _expressions.size();
+    checkpoint._exprChains = _exprChains.size();
+    checkpoint._patterns = _patterns.size();
+    checkpoint._patternElems = _patternElems.size();
+    checkpoint._entityPatterns = _entityPatterns.size();
+    checkpoint._projections = _projections.size();
+    checkpoint._whereClauses = _whereClauses.size();
+    checkpoint._yieldClauses = _yieldClauses.size();
+    checkpoint._yieldItems = _yieldItems.size();
+    checkpoint._stmts = _stmts.size();
+    checkpoint._subStmts = _subStmts.size();
+    checkpoint._setItems = _setItems.size();
+    checkpoint._orderByItems = _orderByItems.size();
+    checkpoint._stmtContainers = _stmtContainers.size();
+    checkpoint._queries = _queries.size();
+    checkpoint._subQueries = _subQueries.size();
+    checkpoint._declContexts = _declContexts.size();
+    checkpoint._varDecls = _varDecls.size();
+    checkpoint._parameterDecls = _parameterDecls.size();
+    checkpoint._nodePatternDatas = _nodePatternDatas.size();
+    checkpoint._edgePatternDatas = _edgePatternDatas.size();
+    checkpoint._unnamedVarIdentifiers = _unnamedVarIdentifiers.size();
+}
+
+template <typename Object>
+void CypherAST::truncateObjects(std::vector<Object*>& objects, size_t count) {
+    for (size_t index = count; index < objects.size(); index++) {
+        _sourceManager->eraseLocation(objects[index]);
+        delete objects[index];
+    }
+
+    objects.resize(count);
+}
+
+void CypherAST::rollback(const Checkpoint& checkpoint) {
+    for (size_t index = checkpoint._parameterDecls; index < _parameterDecls.size(); index++) {
+        _parameterDeclMap.erase(_parameterDecls[index]->getName());
+    }
+
+    truncateObjects(_parameters, checkpoint._parameters);
+    truncateObjects(_symbols, checkpoint._symbols);
+    truncateObjects(_symbolChains, checkpoint._symbolChains);
+    truncateObjects(_labelExprs, checkpoint._labelExprs);
+    truncateObjects(_qualifiedNames, checkpoint._qualifiedNames);
+    truncateObjects(_quantifiedPaths, checkpoint._quantifiedPaths);
+    truncateObjects(_functionInvocations, checkpoint._functionInvocations);
+    truncateObjects(_literals, checkpoint._literals);
+    truncateObjects(_expressions, checkpoint._expressions);
+    truncateObjects(_exprChains, checkpoint._exprChains);
+    truncateObjects(_patterns, checkpoint._patterns);
+    truncateObjects(_patternElems, checkpoint._patternElems);
+    truncateObjects(_entityPatterns, checkpoint._entityPatterns);
+    truncateObjects(_projections, checkpoint._projections);
+    truncateObjects(_whereClauses, checkpoint._whereClauses);
+    truncateObjects(_yieldClauses, checkpoint._yieldClauses);
+    truncateObjects(_yieldItems, checkpoint._yieldItems);
+    truncateObjects(_stmts, checkpoint._stmts);
+    truncateObjects(_subStmts, checkpoint._subStmts);
+    truncateObjects(_setItems, checkpoint._setItems);
+    truncateObjects(_orderByItems, checkpoint._orderByItems);
+    truncateObjects(_stmtContainers, checkpoint._stmtContainers);
+    truncateObjects(_queries, checkpoint._queries);
+    truncateObjects(_subQueries, checkpoint._subQueries);
+    truncateObjects(_declContexts, checkpoint._declContexts);
+    truncateObjects(_varDecls, checkpoint._varDecls);
+    truncateObjects(_parameterDecls, checkpoint._parameterDecls);
+    truncateObjects(_nodePatternDatas, checkpoint._nodePatternDatas);
+    truncateObjects(_edgePatternDatas, checkpoint._edgePatternDatas);
+    truncateObjects(_unnamedVarIdentifiers, checkpoint._unnamedVarIdentifiers);
+}
+
 void CypherAST::addDeclContext(DeclContext* ctxt) {
     _declContexts.push_back(ctxt);
 }
 
 void CypherAST::addVarDecl(VarDecl* decl) {
     _varDecls.push_back(decl);
+}
+
+void CypherAST::addParameterDecl(ParameterDecl* decl) {
+    _parameterDecls.push_back(decl);
+    _parameterDeclMap[decl->getName()] = decl;
+}
+
+ParameterDecl* CypherAST::findParameterDecl(std::string_view name) {
+    const auto it = _parameterDeclMap.find(name);
+    return it != _parameterDeclMap.end() ? it->second : nullptr;
 }
 
 void CypherAST::addNodePatternData(NodePatternData* data) {

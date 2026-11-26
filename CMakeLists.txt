@@ -194,6 +194,39 @@ if(APPLE AND NOT NIX_BUILD)
     endif()
 endif()
 
+# Compile through ccache and link with mold when they are available
+option(TURING_USE_CCACHE "Compile through ccache when it is installed" ON)
+if(TURING_USE_CCACHE AND NOT CMAKE_CXX_COMPILER_LAUNCHER)
+    find_program(CCACHE_PROGRAM ccache)
+    if(CCACHE_PROGRAM)
+        set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+        set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE_PROGRAM})
+        message(STATUS "Using ccache: ${CCACHE_PROGRAM}")
+    endif()
+endif()
+
+option(TURING_USE_MOLD "Link with mold when the compiler supports it" ON)
+if(TURING_USE_MOLD AND NOT APPLE)
+    include(CheckLinkerFlag)
+    check_linker_flag(CXX "-fuse-ld=mold" TURING_LINKER_SUPPORTS_MOLD)
+    if(TURING_LINKER_SUPPORTS_MOLD)
+        execute_process(COMMAND ${CMAKE_CXX_COMPILER} -fuse-ld=mold -Wl,--version
+                        OUTPUT_VARIABLE MOLD_VERSION_OUTPUT
+                        ERROR_QUIET)
+        string(REGEX MATCH "mold ([0-9.]+)" MOLD_VERSION_MATCH "${MOLD_VERSION_OUTPUT}")
+        set(MOLD_VERSION "${CMAKE_MATCH_1}")
+
+        # mold before 2.32 aborts building the range extension thunks of a large ARM64 library
+        # (mold issue #1224), and the shared test library is one
+        if(CMAKE_SYSTEM_PROCESSOR STREQUAL "aarch64" AND MOLD_VERSION VERSION_LESS 2.32)
+            message(STATUS "Not using mold ${MOLD_VERSION}: it cannot link a large ARM64 library")
+        else()
+            add_link_options(-fuse-ld=mold)
+            message(STATUS "Using mold linker ${MOLD_VERSION}")
+        endif()
+    endif()
+endif()
+
 # Create compilation database and symlink in the src folder
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 execute_process(
@@ -212,10 +245,6 @@ find_package(Threads REQUIRED)
 
 # Curl
 find_package(CURL REQUIRED)
-
-# Bison and Flex
-find_package(BISON REQUIRED)
-find_package(FLEX REQUIRED)
 
 # Nlohmann json
 find_package(nlohmann_json REQUIRED)
@@ -263,18 +292,6 @@ endif()
 find_package(OpenMP REQUIRED)
 
 
-# Use bison and flex built from source in external/dependencies
-if(NOT NIX_BUILD)
-    set(DEPS_PREFIX "${CMAKE_CURRENT_SOURCE_DIR}/external/dependencies")
-    set(FLEX_INCLUDE_DIRS "${DEPS_PREFIX}/include")
-    set(FLEX_EXECUTABLE "${DEPS_PREFIX}/bin/flex")
-    set(FLEX_LIBRARIES "${DEPS_PREFIX}/lib/libfl.a")
-    set(BISON_EXECUTABLE "${DEPS_PREFIX}/bin/bison")
-    set(BISON_LIBRARIES "${DEPS_PREFIX}/lib/liby.a")
-    message(STATUS "Using flex from: ${FLEX_EXECUTABLE}")
-    message(STATUS "Using bison from: ${BISON_EXECUTABLE}")
-endif()
-
 # zlib
 find_package(ZLIB REQUIRED)
 
@@ -310,7 +327,7 @@ execute_process(COMMAND git rev-parse HEAD
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
 # Get timestamp of current HEAD commit
-execute_process(COMMAND git show --no-patch --format=%at
+execute_process(COMMAND git show --no-patch --format=%ct
                 OUTPUT_VARIABLE HEAD_COMMIT_TIMESTAMP
                 WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 
@@ -338,6 +355,15 @@ add_subdirectory(report)
 add_subdirectory(vector)
 add_subdirectory(extensions)
 add_subdirectory(net)
+
+# The wasm client's portable sources, so a compile error in them fails the native build
+# rather than waiting for ci_wasm. The decoder itself needs emscripten and is skipped
+# here by the EMSCRIPTEN guard in wasm/CMakeLists.txt; build_npm.sh builds that.
+option(TURINGDB_BUILD_WASM "Build the wasm client's portable sources and their test" ON)
+if (TURINGDB_BUILD_WASM)
+    add_subdirectory(wasm)
+endif()
+
 add_subdirectory(db)
 add_subdirectory(server)
 add_subdirectory(tools)

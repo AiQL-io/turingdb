@@ -58,6 +58,8 @@ target_include_directories(test_query_ir_list_element_operand PRIVATE ${IR_TEST_
 add_turing_test(test_query_ir_list_scalar_concat ListScalarConcatTest.cpp)
 target_include_directories(test_query_ir_list_scalar_concat PRIVATE ${IR_TEST_DIR})
 
+add_call_v3_test(test_query_ir_list_plus_null ListPlusNullTest.cpp)
+
 add_turing_test(test_query_ir_list_slice ListSliceTest.cpp)
 target_include_directories(test_query_ir_list_slice PRIVATE ${IR_TEST_DIR})
 
@@ -100,6 +102,9 @@ target_include_directories(test_query_ir_list_comprehension PRIVATE ${IR_TEST_DI
 
 add_turing_test(test_query_ir_reduce ReduceTest.cpp)
 target_include_directories(test_query_ir_reduce PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_all_reduce AllReduceTest.cpp)
+target_include_directories(test_query_ir_all_reduce PRIVATE ${IR_TEST_DIR})
 
 add_turing_test(test_query_ir_list_comprehension_edge_variable ListComprehensionEdgeVariableTest.cpp)
 target_include_directories(test_query_ir_list_comprehension_edge_variable PRIVATE ${IR_TEST_DIR})
@@ -144,3 +149,39 @@ target_include_directories(test_query_ir_list_predicate_early_exit PRIVATE ${IR_
 add_call_v3_test(test_query_ir_constant_list_element_truth ConstantListElementTruthTest.cpp)
 
 add_call_v3_test(test_query_ir_logical_operator_over_unreached_cell LogicalOperatorOverUnreachedCellTest.cpp)
+
+# reduce and allReduce over a list of collected paths.
+add_call_v3_test(test_query_ir_reduce_over_paths ReduceOverPathsTest.cpp)
+
+add_call_v3_test(test_query_ir_empty_list_unification EmptyListUnificationTest.cpp)
+
+# reduce and allReduce over the list a variable-length or quantified pattern binds.
+add_turing_test(test_query_ir_fold_over_pattern_list FoldOverPatternListTest.cpp)
+target_sources(test_query_ir_fold_over_pattern_list PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+target_include_directories(test_query_ir_fold_over_pattern_list PRIVATE ${IR_TEST_DIR})
+
+# allReduce over paths, with list, string and null accumulators, in every clause position.
+add_ir_tests(test_query_ir_all_reduce_composition AllReduceCompositionTest.cpp)
+
+add_turing_test(test_query_ir_slice_by_type_erased_bound SliceByTypeErasedBoundTest.cpp)
+
+add_call_v3_test(test_query_ir_list_of_paths ListOfPathsTest.cpp)
+
+add_call_v3_test(test_query_ir_coll_index_of CollIndexOfTest.cpp)
+
+add_turing_test(test_query_ir_index_or_slice_a_non_list_cell IndexOrSliceANonListCellTest.cpp)
+
+add_turing_test(test_query_ir_function_list_element_type FunctionListElementTypeTest.cpp)
+
+add_turing_test(test_query_ir_range_over_type_erased_bound RangeOverTypeErasedBoundTest.cpp)
+
+add_turing_test(test_query_ir_nested_comprehension_over_a_projected_list NestedComprehensionOverAProjectedListTest.cpp)
+
+add_turing_test(test_query_ir_element_body_reading_a_computed_value ElementBodyReadingAComputedValueTest.cpp)
+
+add_turing_test(test_query_ir_iterate_a_cell_as_a_list_of_one IterateACellAsAListOfOneTest.cpp)
+
+add_ir_tests(test_query_ir_membership_lowering MembershipLoweringTest.cpp)
+target_sources(test_query_ir_membership_lowering PRIVATE ${IR_TEST_DIR}/StringRowSink.cpp)
+
+add_turing_test(test_query_ir_list_out_of_bounds ListOutOfBoundsTest.cpp)

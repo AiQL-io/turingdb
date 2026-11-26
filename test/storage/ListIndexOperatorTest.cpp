@@ -8,10 +8,12 @@
 
 #include "columns/BinaryOperators.h"
 #include "list/ListBuffer.h"
-#include "list/ListElementView.h"
+#include "CellView.h"
 #include "list/ListView.h"
 
 #include "metadata/PropertyNull.h"
+
+#include "TuringException.h"
 
 using namespace db;
 
@@ -23,12 +25,12 @@ protected:
         return _buffer.insert(elements);
     }
 
-    ListElementView cell(QueryListBuffer::ListItemVariant element) {
+    CellView cell(QueryListBuffer::ListItemVariant element) {
         return list({element}).elements()[0];
     }
 
-    std::optional<types::Int64::Primitive> integerAt(const std::optional<ListElementView>& element) {
-        if (!element.has_value() || element->getTag() != ListBufferTypeTag::Int) {
+    std::optional<types::Int64::Primitive> integerAt(const std::optional<CellView>& element) {
+        if (!element.has_value() || element->getTag() != CellTag::Int) {
             return std::nullopt;
         }
 
@@ -88,14 +90,22 @@ TEST_F(ListIndexOperatorTest, readsNothingAtANullPosition) {
 
 TEST_F(ListIndexOperatorTest, readsThroughACellHoldingAList) {
     const ListView inner = list({int64_t {10}, int64_t {20}});
-    const ListElementView nested = cell(inner);
+    const CellView nested = cell(inner);
 
     EXPECT_EQ(integerAt(ListIndex {}(nested, int64_t {1})), 20);
     EXPECT_FALSE(ListIndex {}(nested, int64_t {2}).has_value());
 }
 
-TEST_F(ListIndexOperatorTest, readsNothingThroughACellHoldingAScalar) {
-    const ListElementView scalar = cell(int64_t {10});
+TEST_F(ListIndexOperatorTest, readsNothingThroughACellHoldingNull) {
+    const CellView nullCell = cell(PropertyNull {});
 
-    EXPECT_FALSE(ListIndex {}(scalar, int64_t {0}).has_value());
+    EXPECT_FALSE(ListIndex {}(nullCell, int64_t {0}).has_value());
+    EXPECT_FALSE(ListIndex {}(nullCell, uint64_t {0}).has_value());
+}
+
+TEST_F(ListIndexOperatorTest, raisesThroughACellHoldingAScalar) {
+    const CellView scalar = cell(int64_t {10});
+
+    EXPECT_THROW(ListIndex {}(scalar, int64_t {0}), TuringException);
+    EXPECT_THROW(ListIndex {}(scalar, uint64_t {0}), TuringException);
 }

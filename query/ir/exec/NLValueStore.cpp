@@ -48,16 +48,16 @@ MapView NLValueStore::own(MapView map) {
     return getLists().getMaps().copy(map);
 }
 
-ListElementView NLValueStore::own(ListElementView element) {
+PathView NLValueStore::own(PathView path) {
+    _valueCount++;
+
+    return getPaths().insert(path.getIDs());
+}
+
+CellView NLValueStore::own(CellView element) {
     _valueCount++;
 
     return getLists().copy(element);
-}
-
-MapEntryView NLValueStore::own(MapEntryView entry) {
-    _valueCount++;
-
-    return getLists().getMaps().copy(entry);
 }
 
 ListView NLValueStore::decode(const EncodedList& list) {
@@ -76,7 +76,7 @@ ListBuffer<>::ListItemVariant NLValueStore::ownItem(const ListBuffer<>::ListItem
     return std::visit([this](const auto& value) -> ListBuffer<>::ListItemVariant { return ownElement(value); }, item);
 }
 
-ListElementView NLValueStore::ownCell(ListBuffer<>::ListItemVariant& item) {
+CellView NLValueStore::ownCell(ListBuffer<>::ListItemVariant& item) {
     _valueCount++;
 
     const auto ownNested = [this](auto& value) {
@@ -124,6 +124,10 @@ void NLValueStore::clear() {
         _embeddings->clear();
     }
 
+    if (_paths) {
+        _paths->clear();
+    }
+
     if (_lists) {
         _lists->clear();
     }
@@ -143,6 +147,14 @@ ListContainer::EmbeddingBuffer& NLValueStore::getEmbeddings() {
     }
 
     return *_embeddings;
+}
+
+ListContainer::PathBuffer& NLValueStore::getPaths() {
+    if (!_paths) {
+        _paths = std::make_unique<ListContainer::PathBuffer>();
+    }
+
+    return *_paths;
 }
 
 ListContainer& NLValueStore::getLists() {

@@ -2,8 +2,7 @@
 
 #include <stdint.h>
 
-#include "decl/EvaluatedType.h"
-#include "decl/ListShape.h"
+#include "decl/ExprType.h"
 
 #include "EnumToString.h"
 
@@ -34,10 +33,13 @@ public:
         PATTERN_COMPREHENSION,
         LIST_PREDICATE,
         REDUCE,
+        ALL_REDUCE,
+        MAP_PROJECTION,
         CASE,
         EXISTS,
         COUNT_SUBQUERY,
         COLLECT_SUBQUERY,
+        PARAMETER,
 
         _SIZE
     };
@@ -51,11 +53,17 @@ public:
 
     Kind getKind() const { return _exprKind; }
 
-    virtual EvaluatedType getType() const { return _type; }
+    virtual EvaluatedType getType() const { return _exprType._type; }
 
     // How deeply a List-typed expression nests and what its innermost elements are.
     // What an UNWIND of this expression binds its variable to.
-    const ListShape& getListShape() const { return _listShape; }
+    const ListShape& getListShape() const { return _exprType._shape; }
+
+    const ExprType& getExprType() const { return _exprType; }
+
+    // The type every value converts to without loss, which a property written from them
+    // takes: the type itself, or for Any the one a selection's branches share, Any if none
+    EvaluatedType getCommonType() const { return getType() == EvaluatedType::Any ? _exprType._commonType : getType(); }
 
     const VarDecl* getExprVarDecl() const { return _exprVarDecl; }
 
@@ -63,9 +71,13 @@ public:
         return _name;
     }
 
-    void setType(EvaluatedType type) { _type = type; }
+    void setType(EvaluatedType type) { _exprType._type = type; }
 
-    void setListShape(const ListShape& shape) { _listShape = shape; }
+    void setListShape(const ListShape& shape) { _exprType._shape = shape; }
+
+    void setExprType(const ExprType& type) { _exprType = type; }
+
+    void setCommonType(EvaluatedType type) { _exprType._commonType = type; }
 
     void setExprVarDecl(const VarDecl* decl) { _exprVarDecl = decl; }
 
@@ -113,8 +125,7 @@ protected:
 private:
     const VarDecl* _exprVarDecl {nullptr};
     Kind _exprKind {Kind::BINARY};
-    EvaluatedType _type {EvaluatedType::Invalid};
-    ListShape _listShape;
+    ExprType _exprType;
     Flags _flags {Flags::NONE};
     std::string_view _name;
 };
@@ -137,10 +148,13 @@ using ExprKindDescription = EnumToString<Expr::Kind>::Create<
     EnumStringPair<Expr::Kind::PATTERN_COMPREHENSION, "PATTERN_COMPREHENSION">,
     EnumStringPair<Expr::Kind::LIST_PREDICATE, "LIST_PREDICATE">,
     EnumStringPair<Expr::Kind::REDUCE, "REDUCE">,
+    EnumStringPair<Expr::Kind::ALL_REDUCE, "ALL_REDUCE">,
+    EnumStringPair<Expr::Kind::MAP_PROJECTION, "MAP_PROJECTION">,
     EnumStringPair<Expr::Kind::CASE, "CASE">,
     EnumStringPair<Expr::Kind::EXISTS, "EXISTS">,
     EnumStringPair<Expr::Kind::COUNT_SUBQUERY, "COUNT_SUBQUERY">,
-    EnumStringPair<Expr::Kind::COLLECT_SUBQUERY, "COLLECT_SUBQUERY">
+    EnumStringPair<Expr::Kind::COLLECT_SUBQUERY, "COLLECT_SUBQUERY">,
+    EnumStringPair<Expr::Kind::PARAMETER, "PARAMETER">
 >;
 
 }

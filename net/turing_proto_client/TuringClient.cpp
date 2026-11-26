@@ -3,13 +3,17 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/uio.h>
 #include <unistd.h>
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -20,6 +24,7 @@
 #include "HTTPUtils.h"
 #include "TuringProtoDecoder.h"
 #include "TuringProtoHeaders.h"
+#include "TuringResponseHead.h"
 #include "TuringException.h"
 #include "TuringSink.h"
 #include "TuringSinkColumnContainer.h"
@@ -34,28 +39,6 @@ namespace {
 
 // Length of the "\r\n\r\n" sentinel that terminates an HTTP/1.1 header block.
 constexpr size_t HEADERS_END_SIZE = 4;
-
-// Parses the integer status code from an HTTP/1.1 status line —
-// "HTTP/1.1 200 OK" -> 200. Throws TuringException on malformed input.
-int parseStatusCode(std::string_view statusLine) {
-    const size_t space1 = statusLine.find(' ');
-    if (space1 == std::string_view::npos) {
-        throw TuringException("Malformed HTTP response status line");
-    }
-    const std::string_view afterVersion = statusLine.substr(space1 + 1);
-    const size_t space2 = afterVersion.find(' ');
-    const std::string_view codeStr = (space2 == std::string_view::npos)
-                                       ? afterVersion
-                                       : afterVersion.substr(0, space2);
-    int statusCode = 0;
-    for (const char c : codeStr) {
-        if (c < '0' || c > '9') {
-            throw TuringException("Malformed HTTP status code");
-        }
-        statusCode = statusCode * 10 + (c - '0');
-    }
-    return statusCode;
-}
 
 // Inverse of net::http::writeHexU32. Lowercases each digit first so the a-f
 // and A-F cases collapse into one branch.
@@ -152,7 +135,7 @@ void TuringClient::connect() {
             continue;
         }
 
-        if (::connect(sock, addr->ai_addr, addr->ai_addrlen) != 0) {
+        if (!connectSocket(sock, addr->ai_addr, addr->ai_addrlen)) {
             lastErrno = errno;
             ::close(sock);
             continue;
@@ -160,6 +143,7 @@ void TuringClient::connect() {
 
         _socket = sock;
         ::freeaddrinfo(result);
+        applySocketTimeout();
         return;
     }
 
@@ -167,6 +151,72 @@ void TuringClient::connect() {
     throw TuringException(std::string("Failed to connect to ")
                           + _remoteAddress + ":" + _remotePort + ": "
                           + strerror(lastErrno));
+}
+
+void TuringClient::setTimeout(std::chrono::milliseconds timeout) {
+    _timeout = timeout;
+
+    if (_socket >= 0) {
+        applySocketTimeout();
+    }
+}
+
+bool TuringClient::connectSocket(int socket, const sockaddr* address, socklen_t addressSize) {
+    if (_timeout.count() == 0) {
+        return ::connect(socket, address, addressSize) == 0;
+    }
+
+    const int flags = ::fcntl(socket, F_GETFL, 0);
+    ::fcntl(socket, F_SETFL, flags | O_NONBLOCK);
+
+    const bool connectedAtOnce = ::connect(socket, address, addressSize) == 0;
+    if (!connectedAtOnce) {
+        if (errno != EINPROGRESS) {
+            return false;
+        }
+
+        pollfd target {.fd = socket, .events = POLLOUT, .revents = 0};
+        const int ready = ::poll(&target, 1, static_cast<int>(_timeout.count()));
+        if (ready < 0) {
+            return false;
+        } else if (ready == 0) {
+            errno = ETIMEDOUT;
+            return false;
+        }
+
+        int connectError = 0;
+        socklen_t connectErrorSize = sizeof(connectError);
+        ::getsockopt(socket, SOL_SOCKET, SO_ERROR, &connectError, &connectErrorSize);
+        if (connectError != 0) {
+            errno = connectError;
+            return false;
+        }
+    }
+
+    ::fcntl(socket, F_SETFL, flags);
+    return true;
+}
+
+void TuringClient::applySocketTimeout() {
+    const std::chrono::seconds seconds = std::chrono::duration_cast<std::chrono::seconds>(_timeout);
+    const std::chrono::microseconds microseconds = std::chrono::duration_cast<std::chrono::microseconds>(_timeout - seconds);
+
+    const timeval limit {.tv_sec = static_cast<time_t>(seconds.count()),
+                         .tv_usec = static_cast<suseconds_t>(microseconds.count())};
+    ::setsockopt(_socket, SOL_SOCKET, SO_RCVTIMEO, &limit, sizeof(limit));
+    ::setsockopt(_socket, SOL_SOCKET, SO_SNDTIMEO, &limit, sizeof(limit));
+}
+
+void TuringClient::throwSocketError(std::string_view action) {
+    const int error = errno;
+    disconnect();
+
+    const bool timedOut = error == EAGAIN || error == EWOULDBLOCK;
+    if (timedOut) {
+        throw TuringException(fmt::format("{}: timed out after {} ms", action, _timeout.count()));
+    }
+
+    throw TuringException(fmt::format("{}: {}", action, strerror(error)));
 }
 
 void TuringClient::disconnect() {
@@ -179,8 +229,7 @@ void TuringClient::disconnect() {
     }
 }
 
-void TuringClient::sendRequest(const std::string& query, const db::ParameterMap* parameters) {
-    _requestBody.build(query, parameters);
+void TuringClient::sendRequest(const std::string& query) {
     const std::span<char> prefix = _requestBody.getPrefix();
     const std::span<char> suffix = _requestBody.getSuffix();
 
@@ -201,7 +250,8 @@ void TuringClient::sendRequest(const std::string& query, const db::ParameterMap*
     headers += _remotePort;
     headers += "\r\n";
 
-    headers += "Content-type: application/turing-proto\r\n";
+    headers += CONTENT_TYPE_HEADER;
+    headers += "\r\n";
     headers += "Content-Length: ";
     headers += std::to_string(prefix.size() + query.size() + suffix.size());
     headers += "\r\n";
@@ -234,10 +284,10 @@ void TuringClient::sendRequest(const std::string& query, const db::ParameterMap*
         const ssize_t bytesSent = ::sendmsg(_socket, &msg, MSG_NOSIGNAL);
 
         if (bytesSent < 0) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK) {
+            if (errno == EINTR) {
                 continue;
             }
-            throw TuringException(std::string("Failed to send HTTP request: ") + strerror(errno));
+            throwSocketError("Failed to send HTTP request");
         }
 
         if (bytesSent == 0) {
@@ -271,7 +321,7 @@ void TuringClient::fillScratch() {
             if (errno == EINTR) {
                 continue;
             }
-            throw TuringException(std::string("Failed to read HTTP response: ") + strerror(errno));
+            throwSocketError("Failed to read HTTP response");
         }
         if (bytesRead == 0) {
             throw TuringException("Connection closed during HTTP read");
@@ -301,7 +351,7 @@ void TuringClient::recvExactly(void* dst, size_t len) {
             if (errno == EINTR) {
                 continue;
             }
-            throw TuringException(std::string("Failed to read response body: ") + strerror(errno));
+            throwSocketError("Failed to read response body");
         }
         if (bytesRead == 0) {
             throw TuringException("Connection closed mid-response");
@@ -333,14 +383,9 @@ void TuringClient::recvHttpResponseHeaders() {
             }
 
             const std::string_view headerBlock(_httpScratch.data(), i);
-            const size_t crlf = headerBlock.find("\r\n");
-            const std::string_view statusLine = (crlf == std::string_view::npos)
-                                                  ? headerBlock
-                                                  : headerBlock.substr(0, crlf);
-            const int statusCode = parseStatusCode(statusLine);
-            if (statusCode != 200) {
-                throw TuringException("Server returned HTTP " + std::to_string(statusCode));
-            }
+            TuringResponseHead head;
+            TuringResponseHead::parse(headerBlock, head);
+            head.throwIfNoPackets();
 
             _scratchHead = i + HEADERS_END_SIZE;
             return;
@@ -370,10 +415,7 @@ void TuringClient::recvChunkBody(size_t chunkSize, ProtoHeader* outHeader) {
     bioassert(chunkSize >= ProtoHeader::wireSize(), "Chunk smaller than ProtoHeader");
     const size_t payloadSize = chunkSize - ProtoHeader::wireSize();
 
-    _inBuf.reset();
-    if (payloadSize > _inBuf.capacity()) {
-        throw TuringException("Server proto payload exceeds client inbuf capacity");
-    }
+    _inBuf.reset(payloadSize);
 
     std::array<iovec, 2> iovecs = {{
         {_protoHeaderBuf.data(), ProtoHeader::wireSize()},
@@ -444,27 +486,45 @@ db::QueryStatus TuringClient::sendQuery(const std::string& query,
         throw TuringException(fmt::format("The graph name is {} bytes, more than the {} bytes the binary protocol allows",
                                           _graphName.length(),
                                           MAX_WIRE_SIZE));
+    } else if (!isConnected()) {
+        throw TuringException("The client is not connected: call connect() before sending a query");
     }
 
-    sendRequest(query, parameters);
+    _requestBody.build(query, parameters);
+
+    db::QueryStatus status;
+    try {
+        sendRequest(query);
+        receiveResponse(callback, status);
+    } catch (...) {
+        disconnect();
+        throw;
+    }
+
+    return status;
+}
+
+void TuringClient::receiveResponse(const db::QueryCallbacks::OnOutputData& callback, db::QueryStatus& queryStatus) {
     recvHttpResponseHeaders();
 
     _embeddingBuffer.clear();
+    _pathBuffer.clear();
     _stringBuffer.clear();
     _listBuffer.clear();
     _mapBuffer.clear();
     _localMem->clear();
 
     db::DataframeManager dfMan;
-    db::QueryStatus res;
     std::vector<DecodedColumnSchema> columnSchemas;
     db::Dataframe df;
-    TuringSink sink(_localMem, &_embeddingBuffer, &_listBuffer, &_mapBuffer);
+    TuringSink sink(_localMem, &_embeddingBuffer, &_pathBuffer, &_listBuffer, &_mapBuffer);
     TuringSinkColumnContainer dataframeContainer(&df, &dfMan);
     TuringProtoDecoder<TuringSink> decoder(&_inBuf, &sink, columnSchemas);
 
     bool callbackFired = false;
     bool sawTerminalPacket = false;
+    std::optional<std::string> errorMessage;
+    std::optional<std::string> protocolError;
 
     while (true) {
         const size_t chunkSize = recvChunkSizeLine();
@@ -479,7 +539,8 @@ db::QueryStatus TuringClient::sendQuery(const std::string& query,
         recvChunkBody(chunkSize, &responseHeader);
         recvCrlf();
 
-        if (sawTerminalPacket) {
+        const bool continuesProtocolError = protocolError && responseHeader._type == MessageTypes::PROTOCOL_ERROR;
+        if (sawTerminalPacket && !continuesProtocolError) {
             throw TuringException("Unexpected proto packet after END/ERROR");
         }
 
@@ -519,21 +580,22 @@ db::QueryStatus TuringClient::sendQuery(const std::string& query,
 
                 db::QueryCallbacks::ExecTimeMilliseconds totalTimeMs = 0;
                 memcpy(&totalTimeMs, _inBuf.data(), sizeof(totalTimeMs));
-                res.setTotalTime(Milliseconds(totalTimeMs));
+                queryStatus.setTotalTime(Milliseconds(totalTimeMs));
                 sawTerminalPacket = true;
             }
             break;
 
             case MessageTypes::ERROR: {
-                if (_inBuf.size() < sizeof(db::QueryStatus::Status)) {
+                if (errorMessage) {
+                    errorMessage->append(_inBuf.data(), _inBuf.size());
+                } else if (_inBuf.size() < sizeof(db::QueryStatus::Status)) {
                     throw TuringException("Invalid ERROR packet payload size");
+                } else {
+                    db::QueryStatus::Status status;
+                    memcpy(&status, _inBuf.data(), sizeof(status));
+                    queryStatus.setStatus(status);
+                    errorMessage.emplace(_inBuf.data() + sizeof(status), _inBuf.size() - sizeof(status));
                 }
-
-                db::QueryStatus::Status status;
-                memcpy(&status, _inBuf.data(), sizeof(status));
-                res.setStatus(status);
-                res.setMessage(std::string_view(_inBuf.data() + sizeof(status),
-                                                _inBuf.size() - sizeof(status)));
                 // ERROR is not the response terminator — the server still
                 // emits an END packet afterwards (with the elapsed time)
                 // even when the query failed. Mirrors the binary protocol
@@ -542,8 +604,11 @@ db::QueryStatus TuringClient::sendQuery(const std::string& query,
             break;
 
             case MessageTypes::PROTOCOL_ERROR:
-                throw TuringException("Protocol error from server: "
-                                      + std::string(_inBuf.data(), _inBuf.size()));
+                if (!protocolError) {
+                    protocolError.emplace();
+                }
+                protocolError->append(_inBuf.data(), _inBuf.size());
+                sawTerminalPacket = true;
             break;
 
             default:
@@ -552,5 +617,13 @@ db::QueryStatus TuringClient::sendQuery(const std::string& query,
         }
     }
 
-    return res;
+    if (protocolError) {
+        throw TuringException("Protocol error from server: " + *protocolError);
+    } else if (!sawTerminalPacket) {
+        throw TuringException("The response ended before the END packet");
+    }
+
+    if (errorMessage) {
+        queryStatus.setMessage(*errorMessage);
+    }
 }

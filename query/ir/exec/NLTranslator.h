@@ -358,6 +358,8 @@ private:
                                   const SchemaNameNouns& nouns,
                                   llvm::SmallVectorImpl<llvm::StringRef>& names) const;
     const ParameterValue& lookupParameter(llvm::StringRef name) const;
+    void bindParameterArguments(mlir::func::FuncOp function);
+    Column* boundParameterColumn(llvm::StringRef name, mlir::Type elementType, const ParameterValue& value);
     llvm::StringRef boundSchemaName(llvm::StringRef parameterName,
                                     const SchemaNameNouns& nouns,
                                     const std::string& name) const;
@@ -369,7 +371,7 @@ private:
 
     // Translate the nl.for over an nl.unwind_const iterator: allocate the single
     // value loop variable (a nullable value column for a homogeneous list, a
-    // ColumnVector<ListElementView> for a heterogeneous one) and record the
+    // ColumnVector<CellView> for a heterogeneous one) and record the
     // unwind-const loop statement in body. The literal sibling of
     // translateConstScanLoop - a source loop that streams a fixed ListView one chunk
     // at a time rather than a set of node IDs.
@@ -953,7 +955,6 @@ private:
     static NLCompareFunction selectCompareForChunkType(mlir::Type chunkType);
     static NLKeyAppendFunction selectKeyAppendForChunkType(mlir::Type chunkType);
     static NLJoinKeyFunctions selectJoinKeyFunctionsForChunkType(mlir::Type chunkType);
-    static NLKeyIsMatchableFunction selectKeyMatchableForChunkType(mlir::Type chunkType);
 
     // The non-null row count handler for a chunk type - the all-rows count for an
     // ID chunk, the present-value count for a !storage.nullable<...> chunk. Used by
@@ -976,6 +977,10 @@ private:
     static NLCellWrite selectCellWriteForChunkType(mlir::Type resultChunkType,
                                                    const Column* value,
                                                    mlir::Type valueChunkType);
+
+    // The fill of the null rows of a chunk, which turns on where it holds its null as the
+    // reset of a selection does. Used by nl.fill_nulls.
+    static NLFillNullRowsFn selectFillNullRowsForChunkType(mlir::Type chunkType);
 
     // Translate an nl.get_node_properties / nl.get_edge_properties: resolve the
     // property name (carried by the nl.get_property_type that produced the
@@ -1013,6 +1018,10 @@ private:
                                 mlir::OperandRange propValues,
                                 NLMergeData::Node& node);
 
+    void translateCreatedProperty(llvm::StringRef propName,
+                                  mlir::Value propValue,
+                                  NLCreatedProperty& property);
+
     // Resolves one property constraint of a merge pattern on both sides: the row's
     // asked-for value column with the appender that keys it, and - when the graph's
     // schema has the property - the scratch column a candidate's value is read back
@@ -1029,17 +1038,19 @@ private:
     void collectWrittenMergeProperties(const std::vector<NLMergeProperty>& properties,
                                        NLMergeScanProperties& writtenProperties);
 
-    // The property a set writes to. A write of a null or of list elements carries no single
-    // type on its value chunk, so the property's own type is what it stages, and a name no
-    // property in the graph carries has nothing to remove - answered by an invalid property
-    // rather than by interning the name.
-    PropertyType setPropertyType(llvm::StringRef propName,
-                                 mlir::Type valueChunkType,
-                                 bool writesNull) const;
+    // The property a set writes to. A write of a null or of tagged cells carries no single
+    // type on its value chunk, so it reaches a property the program types as it runs -
+    // answered by an invalid property rather than by interning the name.
+    PropertyType setPropertyType(llvm::StringRef propName, mlir::Type valueChunkType) const;
 
     void translateSetNodeProperty(mlir::nl::SetNodeProperty setNodeProperty, NLStmtContainer* body);
 
     void translateSetEdgeProperty(mlir::nl::SetEdgeProperty setEdgeProperty, NLStmtContainer* body);
+
+    void createMapKeyProperties(mlir::DictionaryAttr createdTypes) const;
+
+    template <typename SetPropertiesData, typename SetPropertiesOp>
+    void translateSetProperties(SetPropertiesOp setProperties, mlir::Value input, NLStmtContainer* body);
 
     void translateDeleteNode(mlir::nl::DeleteNode deleteNode, NLStmtContainer* body);
 
@@ -1062,12 +1073,21 @@ private:
     template <ColumnOperator Op, typename OpType>
     void translateBinaryOp(OpType op, NLStmtContainer* body);
 
+    // A list is searched for a boolean held in a value column, never in a mask
+    const Column* searchedValueColumn(const Column* column, NLStmtContainer* body);
+
     // Binds the index kernel an nl.list_index runs, chosen by what its result holds: a
     // value of the type its list names, or the tagged cell a mixed list holds
     void translateListIndex(mlir::nl::ListIndex index, NLStmtContainer* body);
 
     void translateNot(mlir::nl::Not notOp, NLStmtContainer* body);
     void translateToNullable(mlir::nl::ToNullable toNullable, NLStmtContainer* body);
+    void translateCheckedCast(mlir::nl::CheckedCast checkedCast, NLStmtContainer* body);
+
+    // Binds @param result to one null per row of @param nullLiteral, the untyped null
+    // literal's chunk, in the type @param result names
+    void translateNullLiteral(mlir::Value result, const Column* nullLiteral, NLStmtContainer* body);
+    void translateToAny(mlir::nl::ToAny toAny, NLStmtContainer* body);
 
     // The selection of an nl.case or an nl.case_merge, run by @param run: the two are read
     // alike and differ only in the rows their kernels read each branch at
@@ -1076,19 +1096,26 @@ private:
 
     void translateIsNotTrue(mlir::nl::IsNotTrue isNotTrue, NLStmtContainer* body);
 
+    void translateFillNulls(mlir::nl::FillNulls fillNulls, NLStmtContainer* body);
+
+    template <typename NullTestOp>
+    void translateNullTest(NullTestOp nullTest, NLStmtContainer* body);
+
     // Allocates the list column an nl.make_list writes, and binds the read each element
     // column's cells go into the list buffer through
     void translateMakeList(mlir::nl::MakeList makeList, NLStmtContainer* body);
     void translateSubstring(mlir::nl::Substring substring, NLStmtContainer* body);
     void translateSplit(mlir::nl::Split split, NLStmtContainer* body);
     void translateReplace(mlir::nl::Replace replace, NLStmtContainer* body);
+    void translatePointFunction(mlir::Operation* operation, NLHandlerFunction run, NLStmtContainer* body);
 
     template <typename Function, typename StringEndOp>
     void translateStringEnd(StringEndOp stringEnd, NLStmtContainer* body);
     void translateMakeMap(mlir::nl::MakeMap makeMap, NLStmtContainer* body);
+    void translateMergeMaps(mlir::nl::MergeMaps merge, NLStmtContainer* body);
     void translateStaticMapKey(mlir::nl::StaticMapKey mapKey, NLStmtContainer* body);
-    void translateMapEntryValue(mlir::nl::MapEntryValue entryValue, NLStmtContainer* body);
     void translateDynamicMapKey(mlir::nl::DynamicMapKey mapKey, NLStmtContainer* body);
+    void translateContainerIndex(mlir::nl::ContainerIndex index, NLStmtContainer* body);
 
     // Translate an nl.list_comprehension: allocate the element chunk, one chunk per
     // carried column and the list column the step fills, pick the handlers that read the
@@ -1098,6 +1125,18 @@ private:
     // Translate an nl.list_predicate the same way, into the nullable mask the step fills
     void translateListPredicate(mlir::nl::ListPredicate predicate, NLStmtContainer* body);
     void translateReduce(mlir::nl::Reduce reduce, NLStmtContainer* body);
+    void translateAllReduce(mlir::nl::AllReduce allReduce, NLStmtContainer* body);
+
+    // What nl.reduce and nl.all_reduce allocate alike: the drain the source's shape takes,
+    // the element chunk, and the fold over @param accumulator. @param extra is what
+    // @param Data adds.
+    template <typename Data, typename Op, typename... Extra>
+    Data* allocFoldData(Op op, Column* accumulator, Extra... extra);
+
+    // What they translate alike: the element, the accumulator and the carry set gathered
+    // into the body's chunks, the body, and the writes of the accumulator it yields
+    template <typename Op>
+    void translateFoldBody(Op op, NLFoldData* data);
 
     // What the two share: the element chunk and the row tag bound over the source's
     // cells, allocated into @param data's own, then the carry set and the body translated
@@ -1213,7 +1252,7 @@ private:
 
     static bool isEntityIDElement(mlir::Type elementType);
 
-    static bool isIDElement(mlir::Type elementType);
+    static bool isNullableIDValue(mlir::Type valueType);
     Column* allocOptIDColumn(NLChunkKind kind);
 
     static bool isPlainValueElementType(mlir::Type elementType);
@@ -1225,12 +1264,10 @@ private:
     // A column of list cells, each a view over the query's list buffer
     Column* allocListColumn();
     Column* allocOptListColumn();
-    Column* allocEntityListColumn();
 
-    Column* allocListElementColumn();
-    Column* allocOptListElementColumn();
-    Column* allocMapEntryColumn();
-    Column* allocConstMapEntryColumn();
+    Column* allocCellColumn();
+    Column* allocOptCellColumn();
+    Column* allocConstCellColumn();
 
     Column* getColumn(mlir::Value chunkValue) const;
 

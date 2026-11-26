@@ -9,6 +9,7 @@
 
 #include <spdlog/fmt/fmt.h>
 
+#include "QueryTypeName.h"
 #include "TuringException.h"
 #include "map/MapView.h"
 
@@ -299,13 +300,8 @@ bool Duration::partNamed(std::string_view name, DurationPart& part) {
     return true;
 }
 
-bool Duration::fromMap(const MapView& map, Duration& out) {
-    Duration sum {0};
-    bool holdsANullCount = false;
-
-    for (const MapEntryView entry : map) {
-        const std::string_view unit = entry.getKey();
-
+void Duration::fromMap(const MapView& map, Duration& out) {
+    const auto microsecondsOf = [](std::string_view unit) {
         DurationPart part {DurationPart::Years};
         const bool namesAPart = partNamed(unit, part);
         const int64_t microseconds = namesAPart ? microsecondsPerUnit(part) : 0;
@@ -314,35 +310,38 @@ bool Duration::fromMap(const MapView& map, Duration& out) {
             throw TuringException(fmt::format("Unknown duration component: {}", unit));
         }
 
-        const Duration perUnit(microseconds);
-        const MapBufferTypeTag tag = entry.getValueTag();
+        return microseconds;
+    };
 
-        if (tag == MapBufferTypeTag::Int) {
-            sum = sum + perUnit * entry.getValueAs<int64_t>();
-        } else if (tag == MapBufferTypeTag::UInt) {
-            const uint64_t count = entry.getValueAs<uint64_t>();
+    for (const MapEntryView entry : map) {
+        microsecondsOf(entry.getKey());
+    }
+
+    Duration sum {0};
+
+    for (const MapEntryView entry : map) {
+        const std::string_view unit = entry.getKey();
+        const Duration perUnit(microsecondsOf(unit));
+        const CellTag tag = entry.getValue().getTag();
+
+        if (tag == CellTag::Int) {
+            sum = sum + perUnit * entry.getValue().getAs<int64_t>();
+        } else if (tag == CellTag::UInt) {
+            const uint64_t count = entry.getValue().getAs<uint64_t>();
 
             if (count > static_cast<uint64_t>(INT64_MAX)) {
                 throw TuringException("Duration overflow");
             }
 
             sum = sum + perUnit * static_cast<int64_t>(count);
-        } else if (tag == MapBufferTypeTag::Double) {
-            sum = sum + perUnit * entry.getValueAs<double>();
-        } else if (tag == MapBufferTypeTag::Null) {
-            holdsANullCount = true;
+        } else if (tag == CellTag::Double) {
+            sum = sum + perUnit * entry.getValue().getAs<double>();
         } else {
-            throw TuringException(fmt::format("duration() reads a number for each unit, and the map key '{}' holds a value that is not one", unit));
+            throw TuringException(fmt::format("duration() reads a number for the unit '{}', not '{}'", unit, queryTypeName(tag)));
         }
     }
 
-    if (holdsANullCount) {
-        return false;
-    }
-
     out = sum;
-
-    return true;
 }
 
 void Duration::format(std::string& out, Duration value) {

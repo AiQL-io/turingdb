@@ -50,8 +50,7 @@ public:
         MakeMemoryPool<ColumnVector<NodeID>>::type,
         MakeMemoryPool<ColumnVector<EdgeID>>::type,
         MakeMemoryPool<ColumnVector<PathRef>>::type,
-        MakeMemoryPool<ColumnVector<Path>>::type,
-        MakeMemoryPool<ColumnVector<EntityList>>::type,
+        MakeMemoryPool<ColumnVector<GraphPath>>::type,
         MakeMemoryPool<ColumnVector<LabelID>>::type,
         MakeMemoryPool<ColumnVector<LabelSetID>>::type,
         MakeMemoryPool<ColumnVector<EdgeTypeID>>::type,
@@ -65,6 +64,8 @@ public:
         MakeMemoryPool<ColumnMask>::type,
         MakeMemoryPool<ColumnConst<NodeID>>::type,
         MakeMemoryPool<ColumnConst<EdgeID>>::type,
+        MakeMemoryPool<ColumnConst<GraphPath>>::type,
+        MakeMemoryPool<ColumnConst<PathRef>>::type,
         MakeMemoryPool<ColumnConst<LabelSetID>>::type,
         MakeMemoryPool<ColumnConst<EdgeTypeID>>::type,
         MakeMemoryPool<ColumnConst<size_t>>::type,
@@ -79,6 +80,7 @@ public:
         MakeMemoryPool<ColumnConst<types::Embedding::Primitive>>::type,
         MakeMemoryPool<ColumnConst<types::DateTime::Primitive>>::type,
         MakeMemoryPool<ColumnConst<types::Duration::Primitive>>::type,
+        MakeMemoryPool<ColumnConst<types::Point::Primitive>>::type,
 
         MakeMemoryPool<ColumnConst<std::optional<types::Int64::Primitive>>>::type,
         MakeMemoryPool<ColumnConst<std::optional<types::Int64::Primitive>>>::type,
@@ -90,6 +92,7 @@ public:
         MakeMemoryPool<ColumnConst<std::optional<types::Embedding::Primitive>>>::type,
         MakeMemoryPool<ColumnConst<std::optional<types::DateTime::Primitive>>>::type,
         MakeMemoryPool<ColumnConst<std::optional<types::Duration::Primitive>>>::type,
+        MakeMemoryPool<ColumnConst<std::optional<types::Point::Primitive>>>::type,
 
         MakeMemoryPool<ColumnConst<PropertyNull>>::type,
 
@@ -101,6 +104,7 @@ public:
         MakeMemoryPool<ColumnVector<types::Embedding::Primitive>>::type,
         MakeMemoryPool<ColumnVector<types::DateTime::Primitive>>::type,
         MakeMemoryPool<ColumnVector<types::Duration::Primitive>>::type,
+        MakeMemoryPool<ColumnVector<types::Point::Primitive>>::type,
 
         MakeMemoryPool<ColumnVector<const CommitBuilder*>>::type,
         MakeMemoryPool<ColumnVector<const Change*>>::type,
@@ -113,6 +117,7 @@ public:
         MakeMemoryPool<ColumnOptVector<types::Embedding::Primitive>>::type,
         MakeMemoryPool<ColumnOptVector<types::DateTime::Primitive>>::type,
         MakeMemoryPool<ColumnOptVector<types::Duration::Primitive>>::type,
+        MakeMemoryPool<ColumnOptVector<types::Point::Primitive>>::type,
         MakeMemoryPool<ColumnOptVector<NodeID>>::type,
         MakeMemoryPool<ColumnOptVector<EdgeID>>::type,
         MakeMemoryPool<ColumnOptVector<EdgeTypeID>>::type,
@@ -126,20 +131,18 @@ public:
         MakeMemoryPool<ColumnVector<ListView>>::type,
         MakeMemoryPool<ColumnOptVector<ListView>>::type,
         MakeMemoryPool<ColumnConst<ListView>>::type,
-        MakeMemoryPool<ColumnVector<ListElementView>>::type,
-        MakeMemoryPool<ColumnOptVector<ListElementView>>::type,
-        MakeMemoryPool<ColumnConst<ListElementView>>::type,
-        MakeMemoryPool<ColumnConst<std::optional<ListElementView>>>::type,
+        MakeMemoryPool<ColumnVector<CellView>>::type,
+        MakeMemoryPool<ColumnOptVector<CellView>>::type,
+        MakeMemoryPool<ColumnConst<CellView>>::type,
+        MakeMemoryPool<ColumnConst<std::optional<CellView>>>::type,
         MakeMemoryPool<ColumnOptVector<ListView>>::type,
         MakeMemoryPool<ColumnConst<std::optional<ListView>>>::type,
 
         MakeMemoryPool<ColumnVector<MapView>>::type,
         MakeMemoryPool<ColumnOptVector<MapView>>::type,
         MakeMemoryPool<ColumnConst<MapView>>::type,
-        MakeMemoryPool<ColumnConst<std::optional<MapView>>>::type,
+        MakeMemoryPool<ColumnConst<std::optional<MapView>>>::type
 
-        MakeMemoryPool<ColumnVector<MapEntryView>>::type,
-        MakeMemoryPool<ColumnConst<MapEntryView>>::type
     >;
 
     template <typename KeyT, typename ValueT>

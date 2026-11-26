@@ -71,6 +71,8 @@ add_turing_test(test_query_ir_string_function StringFunctionTest.cpp)
 
 add_turing_test(test_query_ir_string_argument_function StringArgumentFunctionTest.cpp)
 
+add_turing_test(test_query_ir_split_on_delimiter_list SplitOnDelimiterListTest.cpp)
+
 add_turing_test(test_query_ir_untyped_element_function UntypedElementFunctionTest.cpp)
 
 add_turing_test(test_query_ir_function_argument_source FunctionArgumentSourceTest.cpp)
@@ -153,5 +155,19 @@ target_include_directories(test_query_ir_entity_comparison_lowering PRIVATE ${IR
 
 add_call_v3_test(test_query_ir_unary_minus UnaryMinusTest.cpp)
 
+add_call_v3_test(test_query_ir_minus_before_a_list MinusBeforeAListTest.cpp)
+
 add_turing_test(test_query_ir_list_element_concatenation ListElementConcatenationTest.cpp)
 target_include_directories(test_query_ir_list_element_concatenation PRIVATE ${IR_TEST_DIR})
+
+add_call_v3_test(test_query_ir_equality_across_types EqualityAcrossTypesTest.cpp)
+
+# An expression over constants alone sits below every constant and handle hoisted above it.
+add_call_v3_test(test_query_ir_computation_below_hoisted_values ComputationBelowHoistedValuesTest.cpp)
+
+add_call_v3_test(test_query_ir_is_empty_function IsEmptyFunctionTest.cpp)
+
+# elementId(): an identifier for each node and edge, unique and stable within a query.
+add_ir_tests(test_query_ir_element_id_function ElementIdFunctionTest.cpp)
+
+add_turing_test(test_query_ir_conversion_over_no_rows ConversionOverNoRowsTest.cpp)

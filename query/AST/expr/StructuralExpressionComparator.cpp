@@ -21,7 +21,9 @@
 #include "IndexExpr.h"
 #include "ListExpr.h"
 #include "LiteralExpr.h"
+#include "ParameterExpr.h"
 #include "LogicalExpr.h"
+#include "MapProjectionExpr.h"
 #include "PropertyExpr.h"
 #include "PropertyLookupExpr.h"
 #include "StringExpr.h"
@@ -30,7 +32,24 @@
 
 using namespace db;
 
+namespace {
+
+const Expr* comparedForm(const Expr* expr) {
+    if (!expr || expr->getKind() != Expr::Kind::INDEX) {
+        return expr;
+    }
+
+    const Expr* dottedForm = static_cast<const IndexExpr*>(expr)->getDottedForm();
+
+    return dottedForm ? dottedForm : expr;
+}
+
+}
+
 bool StructuralExpressionComparator::equal(const Expr* lhs, const Expr* rhs) {
+    lhs = comparedForm(lhs);
+    rhs = comparedForm(rhs);
+
     // The same node, or two null operands of the same shape, need no further comparison
     if (lhs == rhs) {
         return true;
@@ -98,26 +117,8 @@ bool StructuralExpressionComparator::equal(const Expr* lhs, const Expr* rhs) {
             const bool sameProperty = lhsProperty->getPropName() == rhsProperty->getPropName();
 
             // Two components of one value are two values, so the component is part of
-            // what the access reads: n.at.year and n.at.day name the same property
-            const bool lhsReadsADateTime = lhsProperty->readsADateTimeComponent();
-            const bool rhsReadsADateTime = rhsProperty->readsADateTimeComponent();
-            const bool lhsReadsADuration = lhsProperty->readsADurationComponent();
-            const bool rhsReadsADuration = rhsProperty->readsADurationComponent();
-
-            const bool neitherReadsAComponent = !lhsReadsADateTime
-                                             && !rhsReadsADateTime
-                                             && !lhsReadsADuration
-                                             && !rhsReadsADuration;
-
-            const bool sameDateTimeComponent = lhsReadsADateTime
-                                            && rhsReadsADateTime
-                                            && lhsProperty->getDateTimePart() == rhsProperty->getDateTimePart();
-
-            const bool sameDurationComponent = lhsReadsADuration
-                                            && rhsReadsADuration
-                                            && lhsProperty->getDurationPart() == rhsProperty->getDurationPart();
-
-            const bool sameComponent = neitherReadsAComponent || sameDateTimeComponent || sameDurationComponent;
+            // what the access reads: d.year and d.day read the same variable
+            const bool sameComponent = lhsProperty->getComponent() == rhsProperty->getComponent();
 
             // And two keys of one map are two values for the same reason. The key is empty
             // on every read that is not one, so the comparison stands for all of them.
@@ -150,6 +151,14 @@ bool StructuralExpressionComparator::equal(const Expr* lhs, const Expr* rhs) {
             const LiteralExpr* rhsLiteral = static_cast<const LiteralExpr*>(rhs);
 
             return equalLiterals(lhsLiteral->getLiteral(), rhsLiteral->getLiteral());
+        }
+        break;
+
+        case Expr::Kind::PARAMETER: {
+            const ParameterExpr* lhsParameter = static_cast<const ParameterExpr*>(lhs);
+            const ParameterExpr* rhsParameter = static_cast<const ParameterExpr*>(rhs);
+
+            return lhsParameter->getParameter()->getName() == rhsParameter->getParameter()->getName();
         }
         break;
 
@@ -206,6 +215,22 @@ bool StructuralExpressionComparator::equal(const Expr* lhs, const Expr* rhs) {
 
             return equal(lhsCase->getSubject(), rhsCase->getSubject())
                    && equal(lhsCase->getElseExpr(), rhsCase->getElseExpr());
+        }
+        break;
+
+        case Expr::Kind::MAP_PROJECTION: {
+            const MapProjectionExpr* lhsProjection = static_cast<const MapProjectionExpr*>(lhs);
+            const MapProjectionExpr* rhsProjection = static_cast<const MapProjectionExpr*>(rhs);
+
+            const auto sameItem = [](const MapProjectionExpr::Item& left, const MapProjectionExpr::Item& right) {
+                const bool sameKey = !left._key || !right._key ? left._key == right._key
+                                                               : left._key->getName() == right._key->getName();
+
+                return left._kind == right._kind && sameKey && equal(left._value, right._value);
+            };
+
+            return equal(lhsProjection->getBase(), rhsProjection->getBase())
+                   && std::ranges::equal(lhsProjection->getItems(), rhsProjection->getItems(), sameItem);
         }
         break;
 
@@ -281,24 +306,6 @@ bool StructuralExpressionComparator::equalLabelExprs(const LabelExpr* lhs, const
     }
 
     return true;
-}
-
-bool StructuralExpressionComparator::readsThePropertyOfComponent(const Expr* candidate, const PropertyExpr* component) {
-    if (candidate->getKind() != Expr::Kind::PROPERTY) {
-        return false;
-    } 
-
-    if (!component->readsAComponent()) {
-        return false;
-    }
-
-    const PropertyExpr* property = static_cast<const PropertyExpr*>(candidate);
-
-    const bool candidateReadsAComponent = property->readsAComponent();
-    const bool sameEntity = property->getEntityVarDecl() == component->getEntityVarDecl();
-    const bool sameProperty = property->getPropName() == component->getPropName();
-
-    return !candidateReadsAComponent && sameEntity && sameProperty;
 }
 
 bool StructuralExpressionComparator::equalLiterals(const Literal* lhs, const Literal* rhs) {

@@ -30,7 +30,8 @@ CLANG_BUILD=1 ./dependencies.sh
 | Flag | Harness | What it tests |
 |------|---------|---------------|
 | `--cypher` | `fuzz_query_engine` | Query engine: parse, analyze, generate the db program, lower and execute against SimpleGraph data |
-| `--http` | `fuzz_http_parser` | HTTP server: the request path of `TCPConnectionManager` after `recv()`, `DBServerProcessor` running the query against SimpleGraph data, and the chunked JSON response |
+| `--parser` | `fuzz_cypher_parser` | Cypher parser alone: lex, parse and render the syntax error |
+| `--http` | `fuzz_http_parser` | HTTP server: the request path of `TCPConnectionManager` after `recv()`, `TuringProtoServerProcessor` running the query against SimpleGraph data, and the chunked binary response |
 | `--proto` | `fuzz_proto_parser` | Binary protocol end to end: a real `TuringServer` in-process, `net::proto::TuringClient` sends the fuzzed query and decodes the response. The input is the query string |
 | `--csv` | `fuzz_csv_parser` | CSV parser: `parseCSVLine()` and `peekFileStructure()` |
 
@@ -74,7 +75,7 @@ Run under valgrind for detailed analysis:
 
 ```bash
 # Build debug harnesses first (one-time)
-cd build_debug && cmake .. && make -j8 fuzz_query_engine fuzz_http_parser
+cd build_debug && cmake -G Ninja .. && ninja -j8 fuzz_query_engine fuzz_http_parser
 
 # Analyze a crash
 valgrind --leak-check=full --track-origins=yes \
@@ -90,9 +91,9 @@ The harnesses only catch expected user-input errors. For the query engine that i
 - Any other unexpected exception
 
 `fuzz_http_parser` runs the server's own request path, where `QueryInterpreterV3` turns these
-into a JSON error response. The harness reads the response back and aborts when `error_details`
-starts with `Unexpected exception` or is `Unknown exception occurred`, when the body is not valid
-JSON, or when the chunked framing is broken.
+into an ERROR packet. The harness reads the response back and aborts when the message of an ERROR
+packet starts with `Unexpected exception` or is `Unknown exception occurred`, when a packet does
+not fill its chunk, or when the chunked framing is broken.
 
 `fuzz_proto_parser` drives the binary protocol through the real `net::proto::TuringClient`: the
 client sends the query and decodes the response, so the harness writes no framing or decoding of
@@ -107,7 +108,7 @@ Token dictionaries improve AFL's mutation quality for structured inputs:
 - `fuzz/http.dict` — HTTP methods, headers, TuringDB endpoints, URI parameters
 
 These are automatically loaded by `run_afl.sh` for the corresponding harness. The
-keyword, function and procedure sections come from `query/parser/CypherLexer.l`,
+keyword, function and procedure sections come from `query/parser/CypherLexer.cpp`,
 `query/AST/FunctionDecls.cpp` and `procedures/`; refresh them when the language grows.
 `MERGE_DATAPARTS` is left out on purpose: the command is not meant to be used yet, so
 `fuzz_query_engine` skips any query that names it and `make_corpus.py` seeds none.
@@ -116,8 +117,8 @@ keyword, function and procedure sections come from `query/parser/CypherLexer.l`,
 
 - `fuzz/corpus/cypher/` — Cypher queries from the query test suite, the regression tests and the C++ unit tests
 - `fuzz/corpus/http/` — 272 HTTP inputs (AFL++-generated corpus covering all parser edges),
-  and `cypher_*.raw`: each hand-written Cypher seed in the `POST /query` request the Python
-  HTTP client sends, on main, inside a change, on a commit and with a token
+  and `cypher_*.raw`: each hand-written Cypher seed in the `POST /query` request
+  `net::proto::TuringClient` sends, on main, inside a change, on a commit and with a token
 - `fuzz/corpus/proto/` — the hand-written Cypher seeds as plain queries; the proto harness feeds
   the query to `net::proto::TuringClient`, which frames the request
 - `fuzz/corpus/csv/` — 3 CSV files (basic, quoted, no headers)

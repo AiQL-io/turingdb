@@ -46,6 +46,7 @@ public:
         std::optional<types::List::OwningPrimitive>,
         std::optional<types::DateTime::Primitive>,
         std::optional<types::Duration::Primitive>,
+        std::optional<types::Point::Primitive>,
         std::optional<types::Map::OwningPrimitive>
      >;
      using UntypedProperties = std::vector<UntypedProperty>;
@@ -297,5 +298,11 @@ private:
     EntityIDRebaser* _idRebaser {nullptr};
     CommitWriteBuffer* _buffer {nullptr};
 };
+
+// Where this change's provisional IDs start. A node or edge it writes is named by the ID
+// it will commit as - one past the last the graph holds, plus the entity's offset in the
+// write buffer - so these are what turn one into the other.
+size_t committedNodeCount(const GraphView* view);
+size_t committedEdgeCount(const GraphView* view);
 
 }

@@ -2,12 +2,14 @@
 
 #include <stdint.h>
 #include <string.h>
+#include <type_traits>
 
 #include <spdlog/fmt/fmt.h>
 
 #include "ParameterMap.h"
-#include "list/ListBufferTypeTag.h"
-#include "map/MapBufferTypeTag.h"
+#include "CellTag.h"
+#include "metadata/DateTime.h"
+#include "metadata/Duration.h"
 #include "metadata/PropertyType.h"
 
 #include "TuringException.h"
@@ -22,45 +24,55 @@ namespace {
 
 template <typename T>
 T readValue(const char* bytes) {
+    static_assert(std::is_trivially_copyable_v<T>);
+
     T value {};
     memcpy(&value, bytes, sizeof(T));
     return value;
 }
 
-// List and map tags name their members alike but number them differently, so one reader
-// serves both. The bytes are [tag][value].
-template <typename Tag>
+// The bytes are [tag][value]
 void readScalar(const char* bytes, db::ParameterValue& slot) {
-    const Tag tag = readValue<Tag>(bytes);
-    const char* value = bytes + sizeof(Tag);
+    const db::CellTag tag = readValue<db::CellTag>(bytes);
+    const char* value = bytes + sizeof(db::CellTag);
 
     switch (tag) {
-        case Tag::Int:
+        case db::CellTag::Int:
             slot.setInt64(readValue<db::types::Int64::Primitive>(value));
         break;
-        case Tag::Double:
+        case db::CellTag::Double:
             slot.setDouble(readValue<db::types::Double::Primitive>(value));
         break;
-        case Tag::Bool:
+        case db::CellTag::Bool:
             slot.setBool(readValue<db::types::Bool::Primitive>(value));
         break;
-        case Tag::Null:
+        case db::CellTag::Null:
             slot.setNull();
         break;
-        case Tag::UInt:
+        case db::CellTag::UInt:
             throwUnsupportedType("UInt64");
         break;
-        case Tag::NodeID:
+        case db::CellTag::NodeID:
             throwUnsupportedType("NodeID");
         break;
-        case Tag::EdgeID:
+        case db::CellTag::EdgeID:
             throwUnsupportedType("EdgeID");
         break;
-        case Tag::DateTime:
-            throwUnsupportedType("DateTime");
+        case db::CellTag::DateTime: {
+            const db::DateTime instant = readValue<db::types::DateTime::Primitive>(value);
+            if (!db::DateTime::isRenderable(instant)) {
+                throw TuringException(fmt::format("A DateTime parameter of {} microseconds names no instant the engine can spell",
+                                                  instant.getMicroseconds()));
+            }
+
+            slot.setDateTime(instant);
+        }
         break;
-        case Tag::Duration:
-            throwUnsupportedType("Duration");
+        case db::CellTag::Duration:
+            slot.setDuration(readValue<db::types::Duration::Primitive>(value));
+        break;
+        case db::CellTag::Point:
+            throwUnsupportedType("Point");
         break;
         default:
             throw TuringException(fmt::format("Invalid value tag {} in a parameter", static_cast<uint32_t>(tag)));
@@ -82,6 +94,10 @@ float* ParameterMapSink::allocEmbedding(size_t numFloats) {
     throwUnsupportedType("Embedding");
 }
 
+uint64_t* ParameterMapSink::allocPathIDs(size_t idCount) {
+    throwUnsupportedType("Path");
+}
+
 char* ParameterMapSink::allocString(size_t size) {
     ParameterFrame& frame = _frames.back();
 
@@ -101,7 +117,7 @@ db::ListView ParameterMapSink::beginList(size_t elementCount, size_t byteSize) {
     throw TuringException("The parameters must be a map, not a list");
 }
 
-db::ListElementView ParameterMapSink::beginNestedList(size_t elementCount, size_t byteSize) {
+db::CellView ParameterMapSink::beginNestedList(size_t elementCount, size_t byteSize) {
     db::ParameterValue::List& list = nextSlot().setList();
     list.resize(elementCount);
     completeValue();
@@ -110,18 +126,23 @@ db::ListElementView ParameterMapSink::beginNestedList(size_t elementCount, size_
     return {};
 }
 
-db::ListElementView ParameterMapSink::writeListValue(std::string_view value) {
+db::CellView ParameterMapSink::writeListValue(std::string_view value) {
     completeValue();
     return {};
 }
 
-db::ListElementView ParameterMapSink::writeListValue(std::span<const float> value) {
+db::CellView ParameterMapSink::writeListValue(std::span<const float> value) {
     completeValue();
     return {};
 }
 
-db::ListElementView ParameterMapSink::writeListElementBytes(const char* bytes, size_t byteSize) {
-    readScalar<db::ListBufferTypeTag>(bytes, nextSlot());
+db::CellView ParameterMapSink::writeListValue(db::PathView value) {
+    completeValue();
+    return {};
+}
+
+db::CellView ParameterMapSink::writeCellBytes(const char* bytes, size_t byteSize) {
+    readScalar(bytes, nextSlot());
     completeValue();
     return {};
 }
@@ -131,7 +152,7 @@ db::MapView ParameterMapSink::beginMap(size_t entryCount, size_t byteSize) {
     return {};
 }
 
-db::ListElementView ParameterMapSink::beginNestedMap(size_t entryCount, size_t byteSize) {
+db::CellView ParameterMapSink::beginNestedMap(size_t entryCount, size_t byteSize) {
     db::ParameterValue::Map& map = nextSlot().setMap();
     completeValue();
 
@@ -143,7 +164,7 @@ void ParameterMapSink::writeMapKey(std::string_view key) {
 }
 
 void ParameterMapSink::writeMapValueBytes(const char* bytes, size_t byteSize) {
-    readScalar<db::MapBufferTypeTag>(bytes, nextSlot());
+    readScalar(bytes, nextSlot());
     completeValue();
 }
 

@@ -7,10 +7,12 @@
 #include "mlir/IR/MLIRContext.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/Value.h"
+#include "mlir/IR/ValueRange.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include "DBTypes.h"
+#include "NullLiteralType.h"
 #include "StorageTypes.h"
 
 using namespace db;
@@ -70,6 +72,10 @@ mlir::Type durationElement(mlir::MLIRContext* context, mlir::Type inputElement) 
     return storage::DurationType::get(context);
 }
 
+mlir::Type pointElement(mlir::MLIRContext* context, mlir::Type inputElement) {
+    return storage::PointType::get(context);
+}
+
 // A list function reads a list cell, or the type-erased cell an unwind of a list of lists
 // hands its nested lists on as
 bool readsAList(mlir::Type inputElement) {
@@ -82,6 +88,17 @@ mlir::Type sizeElement(mlir::MLIRContext* context, mlir::Type inputElement) {
     }
 
     return mlir::IntegerType::get(context, 64);
+}
+
+mlir::Type isEmptyElement(mlir::MLIRContext* context, mlir::Type inputElement) {
+    const bool readsAValue = readsAList(inputElement)
+                          || mlir::isa<storage::StringType, storage::MapType>(inputElement);
+
+    if (!readsAValue) {
+        return mlir::Type {};
+    }
+
+    return booleanElement(context, inputElement);
 }
 
 // A stored list may mix the types of its elements, so one read out of a cell is the
@@ -129,6 +146,7 @@ const std::unordered_map<std::string_view, ElementRule> elementRules = {
     {"db.to_boolean",  &booleanElement},
     {"db.to_datetime", &dateTimeElement},
     {"db.to_duration", &durationElement},
+    {"db.to_point",    &pointElement},
 
     {"db.datetime_year",        &integerElement},
     {"db.datetime_month",       &integerElement},
@@ -158,6 +176,15 @@ const std::unordered_map<std::string_view, ElementRule> elementRules = {
     {"db.duration_milliseconds_of_second", &integerElement},
     {"db.duration_microseconds_of_second", &integerElement},
 
+    {"db.point_x",         &floatElement},
+    {"db.point_y",         &floatElement},
+    {"db.point_z",         &floatElement},
+    {"db.point_longitude", &floatElement},
+    {"db.point_latitude",  &floatElement},
+    {"db.point_height",    &floatElement},
+    {"db.point_crs",       &stringElement},
+    {"db.point_srid",      &integerElement},
+
     {"db.to_string",          &stringElement},
     {"db.to_integer_or_null", &integerElement},
     {"db.to_float_or_null",   &floatElement},
@@ -165,6 +192,7 @@ const std::unordered_map<std::string_view, ElementRule> elementRules = {
     {"db.to_string_or_null",  &stringElement},
     {"db.element_id",         &integerElement},
     {"db.size",               &sizeElement},
+    {"db.is_empty",           &isEmptyElement},
     {"db.char_length",        &integerElement},
     {"db.head",               &listItemElement},
     {"db.last",               &listItemElement},
@@ -218,6 +246,39 @@ mlir::Type db::declaredColumnElement(mlir::Value column) {
     const auto nullable = mlir::dyn_cast<storage::NullableType>(element);
 
     return nullable ? nullable.getValueType() : element;
+}
+
+mlir::Type db::selectedColumnElement(mlir::MLIRContext* context, mlir::ValueRange values) {
+    mlir::Type shared;
+
+    for (const mlir::Value value : values) {
+        const mlir::Type declared = mlir::cast<mlir::db::ColumnType>(value.getType()).getType();
+        if (mlir::isNullLiteralType(declared)) {
+            continue;
+        }
+
+        // A mask and a boolean value hold the same truth value, which lowering reads as an i1
+        mlir::Type element = declaredColumnElement(value);
+        if (mlir::isa<storage::BoolType>(element)) {
+            element = mlir::IntegerType::get(context, 1);
+        }
+
+        const bool unresolved = mlir::isa<mlir::NoneType>(element);
+        const bool disagrees = shared && shared != element;
+        if (unresolved || disagrees) {
+            return mlir::NoneType::get(context);
+        }
+
+        shared = element;
+    }
+
+    if (!shared) {
+        return mlir::NoneType::get(context);
+    } else if (mlir::holdsItsOwnNull(shared)) {
+        return shared;
+    }
+
+    return storage::NullableType::get(context, shared);
 }
 
 mlir::Type db::unaryFunctionElement(mlir::Operation* function, mlir::Type inputElement) {

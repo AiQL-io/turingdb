@@ -1,6 +1,6 @@
 #include "PathTrie.h"
 
-#include "ListBufferTypeTag.h"
+#include "CellTag.h"
 #include "ListWriteCursor.h"
 
 #include "BioAssert.h"
@@ -83,25 +83,40 @@ PathRef PathTrie::handleOf(size_t arena, size_t index) {
     return PathRef((static_cast<uint64_t>(arena) << indexBits) | index);
 }
 
-void PathTrie::appendHops(PathRef path, EntityList& entities, bool reversed) const {
+void PathTrie::appendHops(PathRef path, GraphPath& graphPath) const {
+    bioassert(!graphPath.isNull(), "A walk taken with the pattern continues a path that opened on a node");
+
     const uint64_t depth = getDepth(path);
-    const bool writesOverTheNodeAhead = reversed && !entities.empty();
-    const size_t firstEntry = writesOverTheNodeAhead ? entities.size() - 1 : entities.size();
-    entities.resize(firstEntry + depth * 2);
+    const size_t firstHop = graphPath.getLength();
+    graphPath.setNodeCount(firstHop + depth + 1);
 
     PathRef current = path;
     for (uint64_t hop = depth; hop > 0; hop--) {
         const PathTrieEntry& entry = get(current);
-        const size_t entryIndex = firstEntry + (reversed ? (depth - hop) : (hop - 1)) * 2;
 
-        const EntityList::Entry edge {EntityType::Edge, EntityID(entry._edge.getValue())};
-        const EntityList::Entry node {EntityType::Node, EntityID(entry._node.getValue())};
-
-        entities[entryIndex] = reversed ? node : edge;
-        entities[entryIndex + 1] = reversed ? edge : node;
+        graphPath.setNode(firstHop + hop, entry._node);
+        graphPath.setEdge(firstHop + hop - 1, entry._edge);
 
         current = entry._parent;
     }
+}
+
+void PathTrie::appendReversedHops(PathRef path, NodeID seed, GraphPath& graphPath) const {
+    const uint64_t depth = getDepth(path);
+    const size_t firstHop = graphPath.getLength();
+    graphPath.setNodeCount(firstHop + depth + 1);
+
+    PathRef current = path;
+    for (uint64_t step = 0; step < depth; step++) {
+        const PathTrieEntry& entry = get(current);
+
+        graphPath.setNode(firstHop + step, entry._node);
+        graphPath.setEdge(firstHop + step, entry._edge);
+
+        current = entry._parent;
+    }
+
+    graphPath.setNode(firstHop + depth, seed);
 }
 
 ListView PathTrie::expandEdges(PathRef path, QueryListBuffer& buffer, bool reversed, PathHopStride hops) const {
@@ -117,7 +132,7 @@ ListView PathTrie::expandEdges(PathRef path, QueryListBuffer& buffer, bool rever
 
         if (taken % hops._stride == hops._offset) {
             const uint64_t index = taken / hops._stride;
-            cursor.writeValueAt(reversed ? count - 1 - index : index, ListBufferTypeTag::EdgeID, entry._edge);
+            cursor.writeValueAt(reversed ? count - 1 - index : index, CellTag::EdgeID, entry._edge);
         }
 
         current = entry._parent;
@@ -139,7 +154,7 @@ ListView PathTrie::expandEnds(PathRef path, QueryListBuffer& buffer, bool revers
 
         if (taken % hops._stride == hops._offset) {
             const uint64_t index = taken / hops._stride;
-            cursor.writeValueAt(reversed ? count - 1 - index : index, ListBufferTypeTag::NodeID, entry._node);
+            cursor.writeValueAt(reversed ? count - 1 - index : index, CellTag::NodeID, entry._node);
         }
 
         current = entry._parent;
@@ -156,11 +171,11 @@ ListView PathTrie::expandNodes(PathRef path, NodeID seed, QueryListBuffer& buffe
     PathRef current = path;
     for (uint64_t index = depth; index > 0; index--) {
         const PathTrieEntry& entry = get(current);
-        cursor.writeValueAt(reversed ? depth - index : index, ListBufferTypeTag::NodeID, entry._node);
+        cursor.writeValueAt(reversed ? depth - index : index, CellTag::NodeID, entry._node);
         current = entry._parent;
     }
 
-    cursor.writeValueAt(reversed ? depth : 0, ListBufferTypeTag::NodeID, seed);
+    cursor.writeValueAt(reversed ? depth : 0, CellTag::NodeID, seed);
 
     return cursor.getView();
 }
@@ -181,14 +196,14 @@ ListView PathTrie::expandSources(PathRef path, NodeID seed, QueryListBuffer& buf
 
         if (hop % hops._stride == hops._offset) {
             const uint64_t index = hop / hops._stride;
-            cursor.writeValueAt(reversed ? count - 1 - index : index, ListBufferTypeTag::NodeID, entry._node);
+            cursor.writeValueAt(reversed ? count - 1 - index : index, CellTag::NodeID, entry._node);
         }
 
         current = entry._parent;
     }
 
     if (hops._offset == 0) {
-        cursor.writeValueAt(reversed ? count - 1 : 0, ListBufferTypeTag::NodeID, seed);
+        cursor.writeValueAt(reversed ? count - 1 : 0, CellTag::NodeID, seed);
     }
 
     return cursor.getView();

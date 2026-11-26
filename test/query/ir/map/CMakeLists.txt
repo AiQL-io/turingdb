@@ -65,3 +65,34 @@ target_include_directories(test_query_ir_map_order_by PRIVATE ${IR_TEST_DIR})
 
 add_turing_test(test_query_ir_map_null_test MapNullTestTest.cpp)
 target_include_directories(test_query_ir_map_null_test PRIVATE ${IR_TEST_DIR})
+
+add_turing_test(test_query_ir_null_inside_value_equality NullInsideValueEqualityTest.cpp)
+target_include_directories(test_query_ir_null_inside_value_equality PRIVATE ${IR_TEST_DIR})
+
+add_call_v3_test(test_query_ir_map_holding_a_node MapHoldingANodeTest.cpp)
+
+add_call_v3_test(test_query_ir_map_holding_a_path MapHoldingAPathTest.cpp)
+
+# A map projection: the properties of a node or an edge, picked by name, as a map.
+add_ir_tests(test_query_ir_map_projection MapProjectionTest.cpp)
+
+# A property lookup on a map literal.
+add_ir_tests(test_query_ir_map_literal_lookup MapLiteralLookupTest.cpp)
+
+add_turing_test(test_query_ir_map_projection_over_null MapProjectionOverNullTest.cpp)
+
+add_turing_test(test_query_ir_map_projection_precedence MapProjectionPrecedenceTest.cpp)
+
+add_turing_test(test_query_ir_map_repeated_key MapRepeatedKeyTest.cpp)
+
+add_turing_test(test_query_ir_nested_map_key NestedMapKeyTest.cpp)
+
+add_turing_test(test_query_ir_literal_map_key LiteralMapKeyTest.cpp)
+
+add_turing_test(test_query_ir_dotted_property_chain DottedPropertyChainQueryTest.cpp)
+
+add_turing_test(test_query_ir_temporal_map_projection TemporalMapProjectionTest.cpp)
+
+add_turing_test(test_query_ir_pattern_repeated_key PatternRepeatedKeyTest.cpp)
+
+add_turing_test(test_query_ir_map_literal_runtime_key MapLiteralRuntimeKeyTest.cpp)

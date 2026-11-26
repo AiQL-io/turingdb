@@ -5,22 +5,24 @@
 #include <nlohmann/json.hpp>
 #include <optional>
 #include <unordered_map>
+#include <variant>
 
 #include "ID.h"
 #include "JsonlImportResult.h"
 #include "list/ListContainer.h"
 #include "list/ListView.h"
+#include "map/MapContainer.h"
 #include "metadata/PropertyNull.h"
 #include "metadata/PropertyType.h"
 #include "versioning/ChangeAccessor.h"
 #include "versioning/CommitBuilder.h"
 #include "writers/DataPartBuilder.h"
 
-#include "DateTimeSpec.h"
-#include "DurationSpec.h"
 #include "EmbeddingsSpec.h"
+#include "TypedPropertySpec.h"
 
 #include "Profiler.h"
+#include "TuringException.h"
 #include "writers/MetadataBuilder.h"
 
 using json = nlohmann::json;
@@ -147,22 +149,13 @@ ListView fillList(const json& array, ListContainer& lists) {
     return lists.insert(elements);
 }
 
-// The instant a property the query named as a datetime holds. A name it did not is left
-// alone, so a string that happens to read as a date stays the text it was written as.
-JsonlImportResult<std::optional<DateTime>> tryGetDateTime(std::string_view name,
-                                                          const json& value,
-                                                          const DateTimeSpec& dateTimeSpecs,
-                                                          size_t lineNo) {
-    if (!dateTimeSpecs.contains(name)) {
-        return std::optional<DateTime> {};
-    }
-
+JsonlImportResult<DateTime> tryGetDateTime(std::string_view name, const json& value, size_t lineNumber) {
     // The query said this property holds an instant, so a value that names none is the
     // malformed input it reports rather than a property silently written as something
     // else. A null is not such a value - the caller drops it before reaching here.
     if (!value.is_string()) {
         return JsonlImportError::result(JsonlImportErrorType::NON_DATETIME_VALUE,
-                                        lineNo,
+                                        lineNumber,
                                         fmt::format("property '{}' is not a string", name));
     }
 
@@ -170,21 +163,14 @@ JsonlImportResult<std::optional<DateTime>> tryGetDateTime(std::string_view name,
     const std::optional<DateTime> instant = DateTime::parse(text);
     if (!instant) {
         return JsonlImportError::result(JsonlImportErrorType::NON_DATETIME_VALUE,
-                                        lineNo,
+                                        lineNumber,
                                         fmt::format("property '{}' reads '{}'", name, text));
     }
 
-    return instant;
+    return *instant;
 }
 
-JsonlImportResult<std::optional<Duration>> tryGetDuration(std::string_view name,
-                                                          const json& value,
-                                                          const DurationSpec& durationSpecs,
-                                                          size_t lineNumber) {
-    if (!durationSpecs.contains(name)) {
-        return std::optional<Duration> {};
-    }
-
+JsonlImportResult<Duration> tryGetDuration(std::string_view name, const json& value, size_t lineNumber) {
     const bool isUnsignedPastInt64 = value.is_number_unsigned()
                                   && value.get<uint64_t>() > static_cast<uint64_t>(INT64_MAX);
     if (!value.is_number_integer() || isUnsignedPastInt64) {
@@ -193,7 +179,112 @@ JsonlImportResult<std::optional<Duration>> tryGetDuration(std::string_view name,
                                         fmt::format("property '{}' reads '{}'", name, value.dump()));
     }
 
-    return std::optional<Duration> {Duration(value.get<int64_t>())};
+    return Duration(value.get<int64_t>());
+}
+
+// The map point() reads a JSON object as. point() reads no deeper than the kind of a value,
+// so a nested object or array goes in empty.
+MapView fillPointMap(const json& object, MapContainer& maps, ListContainer& lists) {
+    std::vector<MapContainer::MapKeyValuePair> entries;
+    entries.reserve(object.size());
+
+    for (const auto& [key, field] : object.items()) {
+        if (field.is_object()) {
+            entries.push_back({key, maps.insert({})});
+        } else if (field.is_array()) {
+            entries.push_back({key, lists.insert({})});
+        } else if (field.is_null()) {
+            entries.push_back({key, PropertyNull {}});
+        } else if (field.is_boolean()) {
+            entries.push_back({key, types::Bool::Primitive(field.get<bool>())});
+        } else if (field.is_number_unsigned()) {
+            entries.push_back({key, field.get<uint64_t>()});
+        } else if (field.is_number_integer()) {
+            entries.push_back({key, field.get<int64_t>()});
+        } else if (field.is_number_float()) {
+            entries.push_back({key, field.get<double>()});
+        } else {
+            entries.push_back({key, field.get<std::string_view>()});
+        }
+    }
+
+    return maps.insert(entries);
+}
+
+JsonlImportResult<Point> tryGetPoint(std::string_view name,
+                                     const json& value,
+                                     MapContainer& maps,
+                                     ListContainer& lists,
+                                     size_t lineNumber) {
+    if (!value.is_object()) {
+        return JsonlImportError::result(JsonlImportErrorType::NON_POINT_VALUE,
+                                        lineNumber,
+                                        fmt::format("property '{}' is not an object", name));
+    }
+
+    Point point;
+    try {
+        if (!Point::fromMap(fillPointMap(value, maps, lists), point)) {
+            return JsonlImportError::result(JsonlImportErrorType::NON_POINT_VALUE,
+                                            lineNumber,
+                                            fmt::format("property '{}' holds a null", name));
+        }
+    } catch (const TuringException& e) {
+        return JsonlImportError::result(JsonlImportErrorType::NON_POINT_VALUE,
+                                        lineNumber,
+                                        fmt::format("property '{}': {}", name, e.what()));
+    }
+
+    return point;
+}
+
+// A name the query did not type is left alone, so a string that happens to read as a date
+// stays the text it was written as.
+using TypedValue = std::variant<DateTime, Duration, Point>;
+
+JsonlImportResult<std::optional<TypedValue>> tryGetTypedValue(std::string_view name,
+                                                              const json& value,
+                                                              ValueType type,
+                                                              MapContainer& maps,
+                                                              ListContainer& lists,
+                                                              size_t lineNumber) {
+    if (type == ValueType::DateTime) {
+        const JsonlImportResult<DateTime> instant = tryGetDateTime(name, value, lineNumber);
+        if (!instant) {
+            return instant.get_unexpected();
+        }
+
+        return std::optional<TypedValue> {instant.value()};
+    } else if (type == ValueType::Duration) {
+        const JsonlImportResult<Duration> duration = tryGetDuration(name, value, lineNumber);
+        if (!duration) {
+            return duration.get_unexpected();
+        }
+
+        return std::optional<TypedValue> {duration.value()};
+    } else if (type == ValueType::Point) {
+        const JsonlImportResult<Point> point = tryGetPoint(name, value, maps, lists, lineNumber);
+        if (!point) {
+            return point.get_unexpected();
+        }
+
+        return std::optional<TypedValue> {point.value()};
+    }
+
+    return std::optional<TypedValue> {};
+}
+
+template <typename Add>
+void visitTypedValue(const TypedValue& typed, Add&& add) {
+    std::visit([&add]<typename Value>(const Value& held) {
+        if constexpr (std::is_same_v<Value, DateTime>) {
+            add.template operator()<types::DateTime>(held);
+        } else if constexpr (std::is_same_v<Value, Duration>) {
+            add.template operator()<types::Duration>(held);
+        } else {
+            add.template operator()<types::Point>(held);
+        }
+    }, typed);
 }
 
 std::optional<size_t> tryGetEmbDim(std::string_view name,
@@ -215,8 +306,7 @@ std::optional<size_t> tryGetEmbDim(std::string_view name,
 JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                                            std::istream& stream,
                                            const EmbeddingsSpec& embeddingSpecs,
-                                           const DateTimeSpec& dateTimeSpecs,
-                                           const DurationSpec& durationSpecs) {
+                                           const TypedPropertySpec& typedProperties) {
     Profile profile("JsonlParser::parse");
 
     std::string line;
@@ -231,15 +321,15 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
 
     std::vector<float> embBacking;
     ListContainer listBacking;
+    MapContainer mapBacking;
 
     while (std::getline(stream, line)) {
         ++lineNumber;
 
         // Each list the last line built has been copied into the datapart, so the scratch
         // is released here rather than growing into a second copy of the whole file.
-        if (listBacking.size() > 0) {
-            listBacking.clear();
-        }
+        listBacking.clear();
+        mapBacking.clear();
 
         // If empty line, skip
         if (line.empty()) {
@@ -302,25 +392,17 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                             continue;
                         }
 
-                        const JsonlImportResult<std::optional<DateTime>> instant =
-                            tryGetDateTime(ptName, value, dateTimeSpecs, lineNumber);
-                        if (!instant) {
-                            return instant.get_unexpected();
+                        const ValueType typedType = typedProperties.getType(ptName);
+                        const JsonlImportResult<std::optional<TypedValue>> typed =
+                            tryGetTypedValue(ptName, value, typedType, mapBacking, listBacking, lineNumber);
+                        if (!typed) {
+                            return typed.get_unexpected();
                         }
 
-                        const JsonlImportResult<std::optional<Duration>> duration =
-                            tryGetDuration(ptName, value, durationSpecs, lineNumber);
-                        if (!duration) {
-                            return duration.get_unexpected();
-                        }
+                        const std::optional<TypedValue>& typedValue = typed.value();
 
-                        const bool valueIsDateTime = instant.value().has_value();
-                        const bool valueIsDuration = duration.value().has_value();
-
-                        if (valueIsDateTime) {
-                            vt = ValueType::DateTime;
-                        } else if (valueIsDuration) {
-                            vt = ValueType::Duration;
+                        if (typedValue) {
+                            vt = typedType;
                         } else if (value.is_number_float()) {
                             vt = ValueType::Double;
                         } else if (value.is_boolean()) {
@@ -341,10 +423,10 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                             pt = metadataBuilder.getOrCreatePropertyType(ptName, vt);
                         }
 
-                        if (valueIsDateTime) {
-                            builder.addNodeProperty<types::DateTime>(nodeID, pt._id, *instant.value());
-                        } else if (valueIsDuration) {
-                            builder.addNodeProperty<types::Duration>(nodeID, pt._id, *duration.value());
+                        if (typedValue) {
+                            visitTypedValue(*typedValue, [&]<typename Type>(const typename Type::Primitive& held) {
+                                builder.addNodeProperty<Type>(nodeID, pt._id, held);
+                            });
                         } else if (value.is_number_float()) {
                             builder.addNodeProperty<types::Double>(nodeID, pt._id, value.get<double>());
                         } else if (value.is_boolean()) {
@@ -417,25 +499,17 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                             continue;
                         }
 
-                        const JsonlImportResult<std::optional<DateTime>> instant =
-                            tryGetDateTime(ptName, value, dateTimeSpecs, lineNumber);
-                        if (!instant) {
-                            return instant.get_unexpected();
+                        const ValueType typedType = typedProperties.getType(ptName);
+                        const JsonlImportResult<std::optional<TypedValue>> typed =
+                            tryGetTypedValue(ptName, value, typedType, mapBacking, listBacking, lineNumber);
+                        if (!typed) {
+                            return typed.get_unexpected();
                         }
 
-                        const JsonlImportResult<std::optional<Duration>> duration =
-                            tryGetDuration(ptName, value, durationSpecs, lineNumber);
-                        if (!duration) {
-                            return duration.get_unexpected();
-                        }
+                        const std::optional<TypedValue>& typedValue = typed.value();
 
-                        const bool valueIsDateTime = instant.value().has_value();
-                        const bool valueIsDuration = duration.value().has_value();
-
-                        if (valueIsDateTime) {
-                            vt = ValueType::DateTime;
-                        } else if (valueIsDuration) {
-                            vt = ValueType::Duration;
+                        if (typedValue) {
+                            vt = typedType;
                         } else if (value.is_number_float()) {
                             vt = ValueType::Double;
                         } else if (value.is_boolean()) {
@@ -456,10 +530,10 @@ JsonlImportResult<void> JsonlParser::parse(ChangeAccessor& change,
                             pt = metadataBuilder.getOrCreatePropertyType(ptName, vt);
                         }
 
-                        if (valueIsDateTime) {
-                            builder.addEdgeProperty<types::DateTime>(edge, pt._id, *instant.value());
-                        } else if (valueIsDuration) {
-                            builder.addEdgeProperty<types::Duration>(edge, pt._id, *duration.value());
+                        if (typedValue) {
+                            visitTypedValue(*typedValue, [&]<typename Type>(const typename Type::Primitive& held) {
+                                builder.addEdgeProperty<Type>(edge, pt._id, held);
+                            });
                         } else if (value.is_number_float()) {
                             builder.addEdgeProperty<types::Double>(edge, pt._id, value.get<double>());
                         } else if (value.is_boolean()) {

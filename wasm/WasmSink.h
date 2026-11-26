@@ -1,3 +1,6 @@
+// Copyright Turing Biosystems Ltd
+// SPDX-License-Identifier: Apache-2.0
+
 #pragma once
 
 #include <stddef.h>
@@ -9,17 +12,15 @@
 
 #include "ChunkedBuffer.h"
 #include "TuringProtoDecoderConcepts.h"
-#include "list/ListBufferTypeTag.h"
-#include "list/ListUtils.h"
-#include "map/MapBufferTypeTag.h"
+#include "CellTag.h"
+#include "CellUtils.h"
 
 #include "Column.h"
 #include "ColumnConst.h"
 #include "ColumnContainer.h"
 #include "ColumnVector.h"
-#include "ListElementView.h"
+#include "WasmCellView.h"
 #include "ListView.h"
-#include "MapEntryView.h"
 
 namespace wasm {
 
@@ -55,18 +56,16 @@ consteval ColumnType wireCodeOfElement() {
         return ColumnType::DATE_TIME;
     } else if constexpr (std::is_same_v<Element, db::types::Duration::Primitive>) {
         return ColumnType::DURATION;
-    } else if constexpr (std::is_same_v<Element, db::Path>) {
-        return ColumnType::PATH;
-    } else if constexpr (std::is_same_v<Element, db::EntityList>) {
-        return ColumnType::ENTITY_LIST;
+    } else if constexpr (std::is_same_v<Element, db::types::Point::Primitive>) {
+        return ColumnType::POINT;
+    } else if constexpr (std::is_same_v<Element, db::GraphPath>) {
+        return ColumnType::GRAPH_PATH;
     } else if constexpr (std::is_same_v<Element, ListView>) {
         return ColumnType::LIST_VIEW;
-    } else if constexpr (std::is_same_v<Element, ListElementView>) {
-        return ColumnType::LIST_ELEMENT_VIEW;
+    } else if constexpr (std::is_same_v<Element, WasmCellView>) {
+        return ColumnType::CELL_VIEW;
     } else if constexpr (std::is_same_v<Element, MapView>) {
         return ColumnType::MAP_VIEW;
-    } else if constexpr (std::is_same_v<Element, MapEntryView>) {
-        return ColumnType::MAP_ENTRY_VIEW;
     } else if constexpr (std::is_same_v<Element, db::ValueType>) {
         return ColumnType::VALUE_TYPE;
     } else if constexpr (std::is_same_v<Element, db::PropertyNull>) {
@@ -114,9 +113,8 @@ public:
     using ColumnOptConst = wasm::ColumnConst<std::optional<T>>;
 
     using ListView = wasm::ListView;
-    using ListElementView = wasm::ListElementView;
+    using CellView = wasm::WasmCellView;
     using MapView = wasm::MapView;
-    using MapEntryView = wasm::MapEntryView;
 
     WasmSink();
     ~WasmSink();
@@ -124,27 +122,35 @@ public:
     template <typename ColumnT>
     Column* alloc() { return new ColumnT(wireCodeOfElement<typename ColumnT::ValueType>()); }
 
+    template <typename ColumnT>
+    static consteval bool holds() { return true; }
+
     float* allocEmbedding(size_t numFloats);
     std::span<const float> getEmbeddingView(float* data, size_t numFloats);
+
+    uint64_t* allocPathIDs(size_t idCount);
+    db::PathView getPathView(uint64_t* ids, size_t idCount);
 
     char* allocString(size_t size);
     std::string_view getStringView(char* data, size_t size);
 
     ListView beginList(size_t elementCount, size_t byteSize);
-    ListElementView beginNestedList(size_t elementCount, size_t byteSize);
-    ListElementView writeListValue(std::string_view value);
-    ListElementView writeListValue(std::span<const float> value);
-    ListElementView writeListElementBytes(const char* bytes, size_t byteSize);
+    CellView beginNestedList(size_t elementCount, size_t byteSize);
+    CellView writeListValue(std::string_view value);
+    CellView writeListValue(std::span<const float> value);
+    CellView writeListValue(db::PathView value);
+    CellView writeCellBytes(const char* bytes, size_t byteSize);
 
     MapView beginMap(size_t entryCount, size_t byteSize);
-    ListElementView beginNestedMap(size_t entryCount, size_t byteSize);
+    CellView beginNestedMap(size_t entryCount, size_t byteSize);
     void writeMapKey(std::string_view key);
     void writeMapValue(std::string_view value);
     void writeMapValue(std::span<const float> value);
+    void writeMapValue(db::PathView value);
 
     template <typename T>
     void writeMapValue(const T& value) {
-        const db::ListBufferTypeTag tag = db::TypeToListBufferTag<T>::Tag;
+        const db::CellTag tag = db::TypeToCellTag<T>::Tag;
         appendBytes(&tag, sizeof(tag));
         appendBytes(&value, sizeof(value));
 
@@ -155,7 +161,6 @@ public:
 
     // The entry the open map last opened a key for, which is where the entry starts. A map
     // entry column stores one per row.
-    MapEntryView lastMapEntry() const { return _lastMapEntry; }
 
     bool topMapExpectsValue() const;
 
@@ -179,7 +184,7 @@ private:
         bool _keyPending {false};
     };
 
-    // The decoder hands over an embedding view before filling its floats (the payload
+    // The decoder hands over an embedding or a path view before filling its payload (which
     // may still be in flight across packets), so the copy into the reserved list slot
     // waits until the list bytes are read.
     struct DeferredPayload {
@@ -189,17 +194,17 @@ private:
     };
 
     net::proto::ChunkedBuffer<float> _embeddingBuffer;
+    net::proto::ChunkedBuffer<uint64_t> _pathBuffer;
     net::proto::ChunkedBuffer<char> _stringBuffer;
     std::vector<char> _nestedBytes;
     std::vector<std::string_view> _nestedStrings;
     std::vector<OpenContainer> _containerStack;
-    MapEntryView _lastMapEntry;
     std::vector<DeferredPayload> _deferredPayloads;
 
     uint32_t appendBytes(const void* bytes, size_t byteSize);
     uint32_t appendCountHeader(size_t count);
-    ListElementView appendNestedHeader(db::ListBufferTypeTag tag, size_t count);
-    ListElementView appendDeferredPayload(db::ListBufferTypeTag tag, const char* source, size_t byteSize);
+    CellView appendNestedHeader(db::CellTag tag, size_t count);
+    CellView appendDeferredPayload(db::CellTag tag, const char* source, size_t byteSize);
     void countElementWritten();
 };
 

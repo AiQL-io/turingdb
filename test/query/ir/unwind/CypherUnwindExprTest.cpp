@@ -722,8 +722,7 @@ TEST_F(CypherUnwindExprTest, unwindsTaggedCellsBesideTheCellTheyCameFrom) {
 }
 
 TEST_F(CypherUnwindExprTest, sumsAHeterogeneousElement) {
-    // Mixed numeric tags are what leaves the list type-erased, and Cypher adds those to a
-    // float, so the cells reduce by tag into one.
+    // The cells are added by tag, and the float among them makes the sum a float
     expectRows("UNWIND [1, 2.5] AS v RETURN sum(v)", {{"3.500000"}});
 }
 
@@ -763,7 +762,7 @@ TEST_F(CypherUnwindExprTest, sumsAHeterogeneousElementPerGroup) {
 }
 
 TEST_F(CypherUnwindExprTest, sumsNoHeterogeneousCellToZero) {
-    expectRows("UNWIND [] AS v RETURN sum(v)", {{"0.000000"}});
+    expectRows("UNWIND [1, 'a'] AS v WITH v WHERE v IS NULL RETURN sum(v)", {{"0"}});
 }
 
 TEST_F(CypherUnwindExprTest, collectsEachTagOfAHeterogeneousElement) {
@@ -788,7 +787,7 @@ TEST_F(CypherUnwindExprTest, unwindsANestedEdgeListToItsEdges) {
 TEST_F(CypherUnwindExprTest, rejectsSummingANonNumericCell) {
     // The cells carry a type each, so the check the column types make for a typed
     // reduction is made per row instead - and a string is no number in either.
-    expectRejected("UNWIND [10, 'a'] AS v RETURN sum(v)", "requires a numeric column");
+    expectRejected("UNWIND [10, 'a'] AS v RETURN sum(v)", "sum() and avg() read numbers or durations, not 'String'");
 }
 
 TEST_F(CypherUnwindExprTest, rejectsAnUnwoundVariableThatIsAlreadyDeclared) {

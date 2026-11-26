@@ -1,9 +1,11 @@
 #include "DBPasses.h"
 
+#include <math.h>
 #include <stdint.h>
 #include <algorithm>
-#include <limits>
+#include <map>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <tuple>
 
@@ -25,6 +27,7 @@
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/MathExtras.h"
 
 #include "CardinalityEstimation.h"
 #include "metadata/GraphMetadata.h"
@@ -32,9 +35,12 @@
 #include "views/GraphView.h"
 
 #include "IRConstantColumn.h"
+#include "IRRaiseEffect.h"
+#include "DBColumnElement.h"
 #include "StorageAttributes.h"
 #include "PropertyScanLiteral.h"
 #include "PathHopArguments.h"
+#include "NullLiteralType.h"
 #include "DBOps.h"
 
 #include "BioAssert.h"
@@ -66,11 +72,14 @@ namespace mlir::db {
 #define GEN_PASS_DEF_FUSEHASHJOIN
 #define GEN_PASS_DEF_FUSEFETCHNODES
 #define GEN_PASS_DEF_REROOTPATTERNATSEED
+#define GEN_PASS_DEF_REROOTPATTERNATCHEAPESTNODE
 #define GEN_PASS_DEF_FUSEEXPLOREENDCONSTRAINT
 #define GEN_PASS_DEF_HOISTHOPCONJUNCTS
 #define GEN_PASS_DEF_FUSEEXPLOREHOPLABELS
 #define GEN_PASS_DEF_SINKMAKEPATH
+#define GEN_PASS_DEF_SINKINTOOPTIONALMATCH
 #define GEN_PASS_DEF_FUSEPATHELEMENTS
+#define GEN_PASS_DEF_FUSEPATHLENGTH
 #define GEN_PASS_DEF_FUSEEXPLOREENDNODES
 #define GEN_PASS_DEF_FUSEEXPLOREENDFACTOR
 #define GEN_PASS_DEF_FUSEEXPLOREENDSET
@@ -79,6 +88,8 @@ namespace mlir::db {
 #define GEN_PASS_DEF_COUNTPATHROWS
 #define GEN_PASS_DEF_TRIMUNREADCOLUMNS
 #define GEN_PASS_DEF_COUNTFROMMETADATA
+#define GEN_PASS_DEF_CANONICALIZECOALESCE
+#define GEN_PASS_DEF_HOISTUNCONDITIONALREGIONS
 #include "DBPasses.h.inc"
 
 namespace {
@@ -259,7 +270,15 @@ struct FuseScanByLabel : public impl::FuseScanByLabelBase<FuseScanByLabel> {
 };
 
 bool isGraphWrite(Operation* op) {
-    return isa<CreateNode, CreateEdge, Merge, SetNodeProperty, SetEdgeProperty, DeleteNode, DeleteEdge>(op);
+    return isa<CreateNode,
+               CreateEdge,
+               Merge,
+               SetNodeProperty,
+               SetEdgeProperty,
+               SetNodeProperties,
+               SetEdgeProperties,
+               DeleteNode,
+               DeleteEdge>(op);
 }
 
 bool isNodeSource(Operation* op) {
@@ -278,6 +297,17 @@ bool isEdgeHop(Operation* op) {
                GetInEdgesByTypeAndLabel>(op);
 }
 
+bool isEdgeScan(Operation* op) {
+    return isa<ScanEdges,
+               ScanEdgesByType,
+               ScanOutEdgesByLabelSrc,
+               ScanInEdgesByLabelTgt,
+               ScanOutEdgesByLabelTgt,
+               ScanInEdgesByLabelSrc,
+               ScanOutEdgesByLabelSrcTgt,
+               ScanInEdgesByLabelSrcTgt>(op);
+}
+
 bool isReverseHop(Operation* op) {
     return isa<GetInEdges, GetInEdgesByType, GetInEdgesByLabel, GetInEdgesByTypeAndLabel>(op);
 }
@@ -292,6 +322,10 @@ size_t hopReachedResult(Operation* hop) {
 }
 
 constexpr size_t hopFixedResultCount = 4;
+
+constexpr size_t EDGE_IDS_RESULT = 1;
+constexpr size_t EDGE_TYPES_RESULT = 2;
+constexpr size_t EDGE_TARGETS_RESULT = 3;
 
 // srcids, tgtids and paths; the carry set follows
 constexpr size_t pathFixedResultCount = 3;
@@ -340,77 +374,50 @@ void collectColumnEqualities(FilterOp filter, llvm::SmallVectorImpl<ColumnEquali
 }
 
 // One step of the climb from a column to the column its variable was bound at. It crosses a
-// producer where the op builds the rows - a hop or a cross product - rather than dropping them
+// row op where the op is not a filter: it builds, orders or groups the rows rather than only
+// dropping some
 struct LineageStep {
     Value _next;
     bool _isAnchor {false};
-    bool _crossesProducer {false};
+    bool _crossesRowOp {false};
 };
 
-// Sets _isAnchor where @param column is where its variable was bound, _next to the column
-// the climb goes on from, and neither where the climb cannot pass the op defining it
+// A filter over the rows an op hands on can run on the rows it takes instead, unless the op
+// has an effect a row it drops would miss, or keeps the rows at some positions
+bool letsAFilterAcross(Operation* op) {
+    return mlir::isMemoryEffectFree(op) && !op->hasTrait<OpTrait::KeepsRowsByPosition>();
+}
+
+// Sets _isAnchor where @param column is where its variable was bound: a node source, or an op
+// carrying the rows in flight that makes the column. Sets _next to the column the climb goes
+// on from, and neither where the climb cannot pass the op defining it
 void stepTowardLineageAnchor(Value column, LineageStep& step) {
     Operation* const def = column.getDefiningOp();
     if (!def) {
         return;
+    } else if (isNodeSource(def)) {
+        step._isAnchor = true;
+        return;
     }
 
-    const size_t resultIndex = cast<OpResult>(column).getResultNumber();
+    ColumnCarrierOpInterface carrier = dyn_cast<ColumnCarrierOpInterface>(def);
+    if (!carrier) {
+        return;
+    }
 
-    if (isNodeSource(def)) {
+    CarrySet carrySet;
+    const Value rowSource = carrier.getRowSource(cast<OpResult>(column));
+
+    if (rowSource && letsAFilterAcross(def)) {
+        step._next = rowSource;
+        step._crossesRowOp = !isa<FilterOp>(def);
+    } else if (!rowSource && carrier.getCarrySet(carrySet)) {
         step._isAnchor = true;
-    } else if (FilterOp filter = dyn_cast<FilterOp>(def)) {
-        step._next = filter.getColumnsToFilter()[resultIndex];
-    } else if (CrossProduct product = dyn_cast<CrossProduct>(def)) {
-        step._next = productFactorColumn(product, resultIndex);
-        step._crossesProducer = true;
-    } else if (isEdgeHop(def)) {
-        // The input node re-surfaces as srcids (forward) or tgtids (reverse) and each
-        // carried column passes through: those continue a variable that existed before
-        // the hop, so keep climbing. The opposite node end and the eids/etypes are
-        // bound here, so the variable is born at this hop - its earliest filter point.
-        if (resultIndex == hopInputResult(def)) {
-            step._next = def->getOperand(0);
-            step._crossesProducer = true;
-        } else if (resultIndex >= hopFixedResultCount) {
-            // Carried columns follow input_nodes (operand 0) in operand order.
-            step._next = def->getOperand(1 + (resultIndex - hopFixedResultCount));
-            step._crossesProducer = true;
-        } else {
-            step._isAnchor = true;
-        }
-    } else if (ExplorePaths exploration = dyn_cast<ExplorePaths>(def)) {
-        constexpr size_t tgtResultIndex = 1;
-
-        // The seed re-surfaces as srcids and each carried column passes through; the end
-        // node and the path are born here, whichever direction the exploration walks -
-        // except where the walk is one that comes back to its seed, which leaves the end
-        // holding that seed row for row, so a predicate on it is one on the seed.
-        const bool endHoldsTheSeed = resultIndex == tgtResultIndex && exploration.getEndsOnSeed();
-
-        if (resultIndex == 0 || endHoldsTheSeed) {
-            step._next = def->getOperand(0);
-            step._crossesProducer = true;
-        } else if (resultIndex >= pathFixedResultCount) {
-            step._next = def->getOperand(1 + (resultIndex - pathFixedResultCount));
-            step._crossesProducer = true;
-        } else {
-            step._isAnchor = true;
-        }
-    } else if (Unwind unwind = dyn_cast<Unwind>(def)) {
-        // The element is born at the unwind, and each carried column repeats the rows it
-        // carries once per element
-        if (resultIndex == 0) {
-            step._isAnchor = true;
-        } else {
-            step._next = unwind.getColumnsToFilter()[resultIndex - 1];
-            step._crossesProducer = true;
-        }
     }
 }
 
 // The climbs of one pass run, each built from the climb one step up. A push_down_filters push
-// moves a single-variable predicate, which changes no anchor and crosses no producer, so a
+// moves a single-variable predicate, which changes no anchor and crosses no row op, so a
 // climb stays true across pushes; its equalities are kept as their sides' anchors, which a
 // push never erases. A rewrite that replaces an anchor has to clear() them.
 class LineageClimbs {
@@ -420,11 +427,11 @@ public:
         return _climbs.at(column)._anchor;
     }
 
-    Value climb(Value column, bool& crossedProducer, llvm::SmallVectorImpl<ColumnEquality>& anchorEqualities) {
+    Value climb(Value column, bool& crossedRowOp, llvm::SmallVectorImpl<ColumnEquality>& anchorEqualities) {
         computeClimb(column);
 
         const Climb& climb = _climbs.at(column);
-        crossedProducer = crossedProducer || climb._crossedProducer;
+        crossedRowOp = crossedRowOp || climb._crossedRowOp;
 
         if (climb._equalities != NO_LIST) {
             llvm::append_range(anchorEqualities, _equalityLists[climb._equalities]);
@@ -449,7 +456,7 @@ private:
 
     struct Climb {
         Value _anchor;
-        bool _crossedProducer {false};
+        bool _crossedRowOp {false};
         size_t _equalities {NO_LIST};
     };
 
@@ -501,7 +508,7 @@ private:
             } else if (step._next) {
                 const Climb next = _climbs.at(step._next);
                 climb._anchor = next._anchor;
-                climb._crossedProducer = next._crossedProducer || step._crossesProducer;
+                climb._crossedRowOp = next._crossedRowOp || step._crossesRowOp;
                 climb._equalities = next._equalities;
 
                 for (const ColumnEquality& equality : llvm::reverse(filterEqualities)) {
@@ -535,7 +542,7 @@ private:
 bool isMaskComputeOp(Operation* op) {
     return isa<EqOp, NeqOp, GtOp, LtOp, GteOp, LteOp,
                StartsWithOp, EndsWithOp, ContainsOp, InOp,
-               AndOp, OrOp, XorOp, NotOp,
+               AndOp, OrOp, XorOp, NotOp, IsNullOp, IsNotNullOp,
                AddOp, SubOp, MulOp, DivOp, ModOp, PowOp, ConcatOp, Negate, UnaryPlus,
                ConstantOp,
                GetNodeProperties, GetEdgeProperties, ElementID>(op);
@@ -554,10 +561,10 @@ struct ConeFrame {
 };
 
 // A cone is what a pass moves onto rows the query may not have run it on, so an op that may
-// raise on some row's value - any op not declared speculatable - stays out of it, as one of
-// the cone's inputs
+// raise on some row's value - any op not declared speculatable, or holding one - stays out
+// of it, as one of the cone's inputs
 bool raisesOnSomeRows(Operation* op) {
-    return !mlir::isSpeculatable(op);
+    return !::db::runsWithoutRaising(op);
 }
 
 // Gathers the mask's compute cone and the external columns feeding it. Valid
@@ -717,10 +724,10 @@ bool matchPushablePredicate(FilterOp filter,
         return false;
     }
 
-    bool crossedProducer = false;
+    bool crossedRowOp = false;
     llvm::SmallVector<ColumnEquality, 4> anchorEqualities;
     for (const Value input : pushable._cone._inputs) {
-        const Value inputAnchor = climbs.climb(input, crossedProducer, anchorEqualities);
+        const Value inputAnchor = climbs.climb(input, crossedRowOp, anchorEqualities);
         if (!inputAnchor) {
             return false;
         }
@@ -736,13 +743,13 @@ bool matchPushablePredicate(FilterOp filter,
     const Value equatedAnchor = scannedAnchorEqualTo(pushable._anchor, anchorEqualities);
     if (equatedAnchor) {
         pushable._anchor = equatedAnchor;
-        crossedProducer = true;
+        crossedRowOp = true;
     }
 
     // Crossing only filters leaves the predicate over the rows the anchor produced already:
     // moving it would swap two filters over the same rows, or step between a constraint
     // filter and the op that is about to absorb it.
-    if (!crossedProducer) {
+    if (!crossedRowOp) {
         return false;
     }
 
@@ -910,6 +917,17 @@ Value comparedNodeColumn(Value side) {
     return isNodeColumn(side) ? side : Value();
 }
 
+bool nodeIDOfLiteral(Attribute literal, int64_t& nodeID) {
+    const IntegerAttr integer = dyn_cast<IntegerAttr>(literal);
+    if (!integer || !integer.getType().isSignlessInteger(64)) {
+        return false;
+    }
+
+    nodeID = integer.getInt();
+
+    return nodeID >= 0;
+}
+
 bool matchNodeIDEquality(Value mask, Value scanColumn, int64_t& nodeID) {
     EqOp equality = mask.getDefiningOp<EqOp>();
     if (!equality) {
@@ -933,14 +951,40 @@ bool matchNodeIDEquality(Value mask, Value scanColumn, int64_t& nodeID) {
         return false;
     }
 
-    const IntegerAttr literal = dyn_cast<IntegerAttr>(constant.getValue());
-    if (!literal || !literal.getType().isSignlessInteger(64)) {
+    return nodeIDOfLiteral(constant.getValue(), nodeID);
+}
+
+bool matchNodeIDMembership(Value mask, Value scanColumn, llvm::SmallVectorImpl<int64_t>& nodeIDs) {
+    InOp membership = mask.getDefiningOp<InOp>();
+    if (!membership || comparedNodeColumn(membership.getLhs()) != scanColumn) {
         return false;
     }
 
-    nodeID = literal.getInt();
+    const Value list = membership.getRhs();
+    ConstantOp constant = list.getDefiningOp<ConstantOp>();
+    if (!constant) {
+        return false;
+    }
 
-    return nodeID >= 0;
+    const ArrayAttr elements = dyn_cast<ArrayAttr>(constant.getValue());
+    if (!elements) {
+        return false;
+    }
+
+    for (const Attribute element : elements) {
+        if (isa<UnitAttr>(element)) {
+            continue;
+        }
+
+        int64_t nodeID = 0;
+        if (!nodeIDOfLiteral(element, nodeID)) {
+            return false;
+        }
+
+        nodeIDs.push_back(nodeID);
+    }
+
+    return true;
 }
 
 // An UNWIND of N elements folds into a chain of N - 1 ORs, so the walk keeps its own stack:
@@ -957,11 +1001,11 @@ bool collectNodeIDDisjunction(Value mask, Value scanColumn, llvm::SmallVectorImp
         }
 
         int64_t nodeID = 0;
-        if (!matchNodeIDEquality(disjunct, scanColumn, nodeID)) {
+        if (matchNodeIDEquality(disjunct, scanColumn, nodeID)) {
+            nodeIDs.push_back(nodeID);
+        } else if (!matchNodeIDMembership(disjunct, scanColumn, nodeIDs)) {
             return false;
         }
-
-        nodeIDs.push_back(nodeID);
     }
 
     llvm::sort(nodeIDs);
@@ -1015,6 +1059,7 @@ struct UnwindEqualityCross {
     bool _unwindOnTheLeft {false};
     bool _readsTheIDs {false};
     bool _readsTheIntegers {false};
+    bool _readsTheElement {false};
     Value _unwoundColumn;
     Value _comparedColumn;
     EqOp _equality {nullptr};
@@ -1038,37 +1083,51 @@ UnwindConst matchUnwindFactor(Region& factor) {
     return yield.getColumns().front().getDefiningOp<UnwindConst>();
 }
 
+// Whether = holds two elements equal. A double equals every double it compares equal to, so
+// 0.0 and -0.0 are one value and a NaN equals none.
+bool holdsEqualElements(ArrayAttr elements) {
+    llvm::SmallDenseSet<Attribute, 8> seen;
+
+    for (const Attribute element : elements) {
+        const FloatAttr floating = dyn_cast<FloatAttr>(element);
+        if (floating && floating.getValue().isNaN()) {
+            continue;
+        }
+
+        const bool isZero = floating && floating.getValue().isZero();
+        const Attribute value = isZero ? FloatAttr::get(floating.getType(), 0.0) : element;
+
+        if (!seen.insert(value).second) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // Whether one comparison per element stands in for what the unwound column is compared to.
 // A heterogeneous list rides the type-erased column whose cells are compared by the tag
-// each carries, which no set of typed comparisons reproduces, and a repeated element emits
-// the rows it matches once per copy, which a membership test does not express.
+// each carries, which no set of typed comparisons reproduces, and two equal elements - 0.0
+// and -0.0 among them - emit the rows they match once each, which a membership test does not.
 bool elementsCompareDistinctly(UnwindConst unwind) {
     const ColumnType column = cast<ColumnType>(unwind.getResult().getType());
     if (isa<storage::AnyType>(column.getType())) {
         return false;
     }
 
-    llvm::SmallDenseSet<Attribute, 8> seen;
-    for (const Attribute element : unwind.getElements()) {
-        if (!isa<IntegerAttr, FloatAttr, StringAttr>(element)) {
-            return false;
-        }
+    const ArrayAttr elements = unwind.getElements();
+    const bool literalElements = llvm::all_of(elements, [](Attribute element) {
+        return isa<IntegerAttr, FloatAttr, StringAttr>(element);
+    });
 
-        if (!seen.insert(element).second) {
-            return false;
-        }
-    }
-
-    return true;
+    return literalElements && !holdsEqualElements(elements);
 }
 
 // On every row the filter keeps, the elements hold the value of the column they were
 // compared to. A node or an edge equals an integer by the ID it carries, so a projection
 // reads the elements back through id() of an entity column, never through the entity.
 bool comparesAnEntity(Value comparedColumn) {
-    const ColumnType column = cast<ColumnType>(comparedColumn.getType());
-
-    return isa<storage::NodeIDType, storage::EdgeIDType>(column.getType());
+    return isa<storage::NodeIDType, storage::EdgeIDType>(::db::inferredColumnElement(comparedColumn));
 }
 
 bool unwindsIntegers(UnwindConst unwind) {
@@ -1083,14 +1142,22 @@ bool unwindsFloats(UnwindConst unwind) {
     return isa<mlir::Float64Type>(column.getType());
 }
 
-// Whether a column is declared to hold integers. A column typed none is resolved only in
-// lowering, and can turn out to hold floats or tagged cells.
+// Whether a column holds integers. A column typed none that no function produces is resolved
+// only in lowering, and can turn out to hold floats or tagged cells.
 bool holdsIntegers(Value column) {
-    const Type element = cast<ColumnType>(column.getType()).getType();
-    const storage::NullableType nullable = dyn_cast<storage::NullableType>(element);
-    const Type value = nullable ? nullable.getValueType() : element;
+    return ::db::inferredColumnElement(column).isInteger(64);
+}
 
-    return value.isInteger(64);
+// Whether every value of the column equal to an element is that element. A number can equal
+// another without being it - 32 = 32.0, 0 = -0.0 - which a string or a boolean cannot.
+bool equalsOnlyTheElements(UnwindConst unwind, Value comparedColumn) {
+    if (unwindsFloats(unwind)) {
+        return false;
+    } else if (unwindsIntegers(unwind)) {
+        return holdsIntegers(comparedColumn);
+    }
+
+    return true;
 }
 
 // A count(*) reads how many rows a column has, never what it holds, so any column of the
@@ -1102,15 +1169,13 @@ bool onlyCountsRows(Value column) {
     });
 }
 
-// A clause reading the rows through a region of its own spells the type of every column it
-// takes in the block argument standing for it, and in the results it hands back, so a
-// column of another type cannot be put in its place.
-bool readThroughABlockArgument(Value column) {
-    const auto takesItThroughARegion = [](Operation* user) {
-        return isa<OptionalMatch, CallSubquery, ExistsSubquery, CountSubquery, CollectSubquery, PatternComprehension>(user);
-    };
-
-    return llvm::any_of(column.getUsers(), takesItThroughARegion);
+// An output writes out whatever column it is handed. Any other reader may spell the type of
+// the column it reads, in its results, a block argument or a list it builds, so a column of
+// another type cannot be put in its place.
+bool onlyOutputsRead(Value column) {
+    return llvm::all_of(column.getUsers(), [](Operation* user) {
+        return isa<Output>(user);
+    });
 }
 
 // The one equality among the users of @param unwoundColumn, provided nothing else reads it
@@ -1196,6 +1261,15 @@ bool matchUnwindEqualityCross(CrossProduct product, UnwindEqualityCross& match) 
         return false;
     }
 
+    // The disjunction is tested on every row of the relation, which only pays where it is a
+    // lookup: node IDs, which fuse_scan_by_node_ids scans directly, or one element, a single
+    // equality. A longer list of keys is a cut fuse_hash_join indexes.
+    const bool comparesNodeIDs = static_cast<bool>(comparedNodeColumn(match._comparedColumn));
+    const bool unwindsOneElement = match._unwind.getElements().size() == 1;
+    if (!comparesNodeIDs && !unwindsOneElement) {
+        return false;
+    }
+
     // Codegen carries every column in flight, so the filter holding the elements does not
     // mean anything reads them: an unused result is dropped rather than stood in for, and
     // only a column something does read has to be one the compared column can replace.
@@ -1203,13 +1277,13 @@ bool matchUnwindEqualityCross(CrossProduct product, UnwindEqualityCross& match) 
     const ResultRange filtered = match._filter.getFilteredColumns();
 
     const bool entityCompared = comparesAnEntity(match._comparedColumn);
-    const bool integersCompared = holdsIntegers(match._comparedColumn);
     const bool integerElements = unwindsIntegers(match._unwind);
-    const bool floatElements = unwindsFloats(match._unwind);
+    const bool standsForTheElements = equalsOnlyTheElements(match._unwind, match._comparedColumn);
 
-    // A number can equal another without being it - 32 = 32.0, 0.0 = -0.0 - so integer
-    // elements are read back through toInteger of a column not declared to hold integers,
-    // and float elements are not stood in for.
+    // One element is what every row the filter keeps was compared equal to, whatever the
+    // compared column holds, so it is read back as itself where no column stands for it.
+    // Several are compared to a node's ID, and are read back as that ID, typed as the
+    // elements, where something other than an output reads them.
     size_t survivingColumns = 0;
     for (size_t index = 0; index < carried.size(); index++) {
         const bool holdsTheElements = carried[index] == match._unwoundColumn;
@@ -1217,25 +1291,25 @@ bool matchUnwindEqualityCross(CrossProduct product, UnwindEqualityCross& match) 
         if (holdsTheElements) {
             const Value elements = filtered[index];
             const bool readsTheValues = !onlyCountsRows(elements);
+            const bool sameType = elements.getType() == match._comparedColumn.getType();
+            const bool acceptsTheComparedType = sameType || onlyOutputsRead(elements);
             const bool readsTheIDs = entityCompared && readsTheValues;
-            const bool readsTheIntegers = integerElements && !integersCompared && !entityCompared && readsTheValues;
-            const bool readsTheFloats = floatElements && readsTheValues;
-            const bool convertsTheStandIn = readsTheIDs || readsTheIntegers;
-            const Type standInType = convertsTheStandIn ? elements.getType() : match._comparedColumn.getType();
-            const bool changesTheType = elements.getType() != standInType;
+            const bool readsTheComparedColumn = !entityCompared && standsForTheElements && acceptsTheComparedType;
+            const bool convertsTheStandIn = readsTheValues && !readsTheIDs && !readsTheComparedColumn;
+            const bool readsTheElement = convertsTheStandIn && unwindsOneElement;
+            const bool readsTheIntegers = convertsTheStandIn && comparesNodeIDs && !unwindsOneElement && standsForTheElements && integerElements;
 
             if (elements.use_empty()) {
                 continue;
             } else if (readsTheIDs && !integerElements) {
                 return false;
-            } else if (readsTheFloats) {
-                return false;
-            } else if (changesTheType && readThroughABlockArgument(elements)) {
+            } else if (convertsTheStandIn && !readsTheElement && !readsTheIntegers) {
                 return false;
             }
 
             match._readsTheIDs = match._readsTheIDs || readsTheIDs;
             match._readsTheIntegers = match._readsTheIntegers || readsTheIntegers;
+            match._readsTheElement = match._readsTheElement || readsTheElement;
         }
 
         survivingColumns++;
@@ -1311,7 +1385,7 @@ void fuseUnwindEquality(UnwindEqualityCross& match, mlir::OpBuilder& builder) {
     const Operation::operand_range carried = match._filter.getColumnsToFilter();
     const ResultRange filtered = match._filter.getFilteredColumns();
 
-    const bool convertsTheStandIn = match._readsTheIDs || match._readsTheIntegers;
+    const bool convertsTheStandIn = match._readsTheIDs || match._readsTheIntegers || match._readsTheElement;
 
     llvm::SmallVector<Value> columns;
     llvm::SmallVector<Type> resultTypes;
@@ -1333,10 +1407,11 @@ void fuseUnwindEquality(UnwindEqualityCross& match, mlir::OpBuilder& builder) {
         keptColumns.push_back(index);
     }
 
-    const size_t comparedIndex = llvm::find(columns, match._comparedColumn) - columns.begin();
-    if (convertsTheStandIn && comparedIndex == columns.size()) {
-        columns.push_back(match._comparedColumn);
-        resultTypes.push_back(match._comparedColumn.getType());
+    const Value standInSource = match._readsTheIntegers ? comparedNodeColumn(match._comparedColumn) : match._comparedColumn;
+    const size_t standInIndex = llvm::find(columns, standInSource) - columns.begin();
+    if (convertsTheStandIn && standInIndex == columns.size()) {
+        columns.push_back(standInSource);
+        resultTypes.push_back(standInSource.getType());
     }
 
     builder.setInsertionPoint(match._filter);
@@ -1351,9 +1426,15 @@ void fuseUnwindEquality(UnwindEqualityCross& match, mlir::OpBuilder& builder) {
 
         const Location loc = match._filter.getLoc();
         const Type elementsType = match._unwoundColumn.getType();
-        const Value standIn = fused.getResult(comparedIndex);
-        const Value elements = match._readsTheIDs ? builder.create<ElementID>(loc, elementsType, standIn).getResult()
-                                                  : builder.create<ToInteger>(loc, elementsType, standIn).getResult();
+        const Value standIn = fused.getResult(standInIndex);
+
+        Value elements;
+        if (match._readsTheIDs || match._readsTheIntegers) {
+            elements = builder.create<ElementID>(loc, elementsType, standIn).getResult();
+        } else {
+            ConstantOp element = builder.create<ConstantOp>(loc, match._unwind.getElements()[0]);
+            elements = builder.create<BroadcastConstant>(loc, element.getResult(), standIn).getResult();
+        }
 
         for (const size_t index : elementsReadConverted) {
             filtered[index].replaceAllUsesWith(elements);
@@ -1662,7 +1743,8 @@ bool computesAValuePerRow(Operation* op) {
 
     return op->hasTrait<OpTrait::ConstantThroughOperands>()
         || computesPerRow(op)
-        || isa<Range, MakeList, MakeMap, ListSlice, CollectSubquery, CountSubquery, ExistsSubquery, PatternComprehension>(op);
+        || isa<Range, MakeList, MakeMap, ListSlice, DynamicMapKey, MakePath, ExpandPath, PathLength,
+               CollectSubquery, CountSubquery, ExistsSubquery, PatternComprehension>(op);
 }
 
 // The ops computing an unwind's source that nothing else reads, in block order, and the
@@ -2046,16 +2128,17 @@ CrossProduct stackedProduct(FilterOp filter) {
     return product;
 }
 
-// The rows of a cross product and of the filters stacked over it, climbed one filter at a
-// time. It answers matchFilterChain's question for each filter of the stack, while following
-// the readers of each level once rather than once per filter above it.
+// The rows of a cross product, or of another op making rows, and of the filters stacked
+// over it, climbed one filter at a time. It answers matchFilterChain's question for each
+// filter of the stack, while following the readers of each level once rather than once per
+// filter above it.
 class FilterStack {
 public:
-    explicit FilterStack(CrossProduct product)
-        : _block(product->getBlock()),
-        _top(product)
+    explicit FilterStack(Operation* rows)
+        : _block(rows->getBlock()),
+        _top(rows)
     {
-        followReaders(product);
+        followReaders(rows);
     }
 
     FilterOp getReader() const {
@@ -2151,7 +2234,7 @@ bool collectCarriedRowOps(Unwind unwind, ConeCache& cache, llvm::SmallVectorImpl
         }
 
         Operation* const def = value.getDefiningOp();
-        const bool madeInTheBlock = def && def->getBlock() == block && mlir::isMemoryEffectFree(def);
+        const bool madeInTheBlock = def && def->getBlock() == block && ::db::hasNoEffectButRaising(def);
 
         if (!madeInTheBlock) {
             return false;
@@ -2799,13 +2882,14 @@ Value disjunctionColumn(Value mask) {
         mask = disjunction.getLhs();
     }
 
-    EqOp equality = mask.getDefiningOp<EqOp>();
-    if (!equality) {
-        return {};
+    if (InOp membership = mask.getDefiningOp<InOp>()) {
+        return comparedNodeColumn(membership.getLhs());
+    } else if (EqOp equality = mask.getDefiningOp<EqOp>()) {
+        const Value lhs = equality.getLhs();
+        return comparedNodeColumn(lhs.getDefiningOp<ConstantOp>() ? equality.getRhs() : lhs);
     }
 
-    const Value lhs = equality.getLhs();
-    return comparedNodeColumn(lhs.getDefiningOp<ConstantOp>() ? equality.getRhs() : lhs);
+    return {};
 }
 
 bool keepsTheSourceRows(Operation& op) {
@@ -4029,18 +4113,6 @@ bool collectScanLabels(ArrayAttr labelNames, const ::db::GraphMetadata& metadata
     return resolvesEveryLabel;
 }
 
-// The nodes carrying every one of these labels, none when the schema lacks one of them.
-size_t estimateLabelledNodes(ArrayAttr labelNames,
-                             const ::db::GraphMetadata& metadata,
-                             const ::db::CardinalityEstimation& estimation) {
-    ::db::LabelSet labels;
-    if (!collectScanLabels(labelNames, metadata, labels)) {
-        return 0;
-    }
-
-    return estimation.estimateNodeCount(labels);
-}
-
 // The edges the index keyed by one end's labels holds under these labels, which is what a
 // scan of it walks, and none when the schema lacks one of them.
 size_t estimateIndexedEdges(ArrayAttr labelNames,
@@ -4873,30 +4945,20 @@ struct FuseExploreHopLabels : public impl::FuseExploreHopLabelsBase<FuseExploreH
     }
 };
 
-// A filter carrying a named path its mask does not read cuts the rows before the path is
-// built: the build moves behind it, over the columns the filter keeps. Null where it stays.
-MakePath sinkPastFilter(MakePath build, mlir::OpBuilder& builder) {
+// A filter carrying a named path cuts the rows before the path is built: the path is built
+// again behind it, over the columns the filter keeps. A mask reading the path still reads
+// the build ahead of the filter. Null where the filter does not keep every entity.
+MakePath sinkPastFilter(MakePath build, FilterOp filter, mlir::OpBuilder& builder) {
     const Value path = build.getResult();
-    if (!path.hasOneUse()) {
-        return nullptr;
-    }
-
-    FilterOp filter = dyn_cast<FilterOp>(*path.getUsers().begin());
-    if (!filter || filter->getBlock() != build->getBlock()) {
-        return nullptr;
-    }
-
     const OperandRange carried = filter.getColumnsToFilter();
 
     llvm::SmallVector<Value> keptColumns;
     llvm::SmallVector<Type> keptTypes;
     llvm::SmallVector<size_t> keptIndices(carried.size(), 0);
-    size_t pathIndex = 0;
 
     for (size_t index = 0; index < carried.size(); index++) {
         const Value column = carried[index];
         if (column == path) {
-            pathIndex = index;
             continue;
         }
 
@@ -4928,14 +4990,28 @@ MakePath sinkPastFilter(MakePath build, mlir::OpBuilder& builder) {
 
     const ResultRange filtered = filter.getFilteredColumns();
     for (size_t index = 0; index < filtered.size(); index++) {
-        const Value replacement = index == pathIndex ? sunk.getResult() : narrowed.getResult(keptIndices[index]);
+        const Value replacement = carried[index] == path ? sunk.getResult() : narrowed.getResult(keptIndices[index]);
         filtered[index].replaceAllUsesWith(replacement);
     }
 
     filter.erase();
-    build.erase();
 
     return sunk;
+}
+
+MakePath sinkPastFirstSinkableFilter(MakePath build, mlir::OpBuilder& builder) {
+    for (Operation* user : build.getResult().getUsers()) {
+        FilterOp filter = dyn_cast<FilterOp>(user);
+        if (!filter || filter->getBlock() != build->getBlock()) {
+            continue;
+        }
+
+        if (const MakePath sunk = sinkPastFilter(build, filter, builder)) {
+            return sunk;
+        }
+    }
+
+    return nullptr;
 }
 
 struct SinkMakePath : public impl::SinkMakePathBase<SinkMakePath> {
@@ -4948,10 +5024,114 @@ struct SinkMakePath : public impl::SinkMakePathBase<SinkMakePath> {
         });
 
         while (!builds.empty()) {
-            const MakePath sunk = sinkPastFilter(builds.pop_back_val(), builder);
-            if (sunk) {
-                builds.push_back(sunk);
+            MakePath build = builds.pop_back_val();
+            const MakePath sunk = sinkPastFirstSinkableFilter(build, builder);
+            if (!sunk) {
+                continue;
             }
+
+            builds.push_back(sunk);
+
+            if (build->use_empty()) {
+                build.erase();
+            } else {
+                builds.push_back(build);
+            }
+        }
+    }
+};
+
+OptionalYield patternYield(OptionalMatch optional) {
+    return cast<OptionalYield>(optional.getPattern().front().getTerminator());
+}
+
+// Rebuilds an optional match over the columns its yield names, which a pass has just added
+// to or dropped some of. The old results keptResults lists stand, in order, for the first
+// new ones.
+OptionalMatch rebuildOptionalMatch(OptionalMatch optional, llvm::ArrayRef<size_t> keptResults, mlir::OpBuilder& builder) {
+    OptionalYield yield = patternYield(optional);
+
+    llvm::SmallVector<Type> resultTypes;
+    for (const Value column : yield.getColumns()) {
+        resultTypes.push_back(column.getType());
+    }
+
+    builder.setInsertionPoint(optional);
+    OptionalMatch rebuilt = builder.create<OptionalMatch>(optional.getLoc(), resultTypes, optional.getInputColumns());
+    rebuilt->setAttrs(optional->getAttrDictionary());
+    rebuilt.getPattern().takeBody(optional.getPattern());
+
+    const ResultRange results = optional->getResults();
+    for (size_t index = 0; index < keptResults.size(); index++) {
+        results[keptResults[index]].replaceAllUsesWith(rebuilt->getResult(index));
+    }
+
+    optional.erase();
+
+    return rebuilt;
+}
+
+// A missed row pads a pattern variable with null, and size(), nodes(), relationships() and
+// length() of a null are null too. So the pattern computes them before the padding, which
+// then carries their result instead of the list or path.
+bool matchOptionalVariableRead(Operation* read, OptionalMatch& optional, size_t& resultIndex) {
+    if (!isa<Size, PathElements>(read)) {
+        return false;
+    }
+
+    const OpResult padded = dyn_cast<OpResult>(read->getOperand(0));
+    if (!padded) {
+        return false;
+    }
+
+    optional = dyn_cast<OptionalMatch>(padded.getOwner());
+    resultIndex = padded.getResultNumber();
+
+    return optional && resultIndex >= optional.getInputColumns().size();
+}
+
+void sinkIntoOptionalMatch(Operation* read, OptionalMatch optional, size_t resultIndex, mlir::OpBuilder& builder) {
+    OptionalYield yield = patternYield(optional);
+
+    builder.setInsertionPoint(yield);
+    Operation* const sunk = builder.clone(*read);
+    sunk->setOperand(0, yield.getColumns()[resultIndex]);
+
+    yield.getColumnsMutable().append(sunk->getResult(0));
+
+    llvm::SmallVector<size_t> keptResults(optional->getNumResults());
+    std::iota(keptResults.begin(), keptResults.end(), size_t {0});
+
+    OptionalMatch rebuilt = rebuildOptionalMatch(optional, keptResults, builder);
+
+    read->getResult(0).replaceAllUsesWith(rebuilt->getResults().back());
+    read->erase();
+}
+
+struct SinkIntoOptionalMatch : public impl::SinkIntoOptionalMatchBase<SinkIntoOptionalMatch> {
+    void runOnOperation() override {
+        mlir::OpBuilder builder(&getContext());
+
+        llvm::SetVector<Operation*> reads;
+        getOperation()->walk([&reads](Operation* op) {
+            if (isa<Size, PathElements>(op)) {
+                reads.insert(op);
+            }
+        });
+
+        while (!reads.empty()) {
+            Operation* const read = reads.pop_back_val();
+
+            OptionalMatch optional;
+            size_t resultIndex = 0;
+            if (!matchOptionalVariableRead(read, optional, resultIndex)) {
+                continue;
+            }
+
+            const Operation::user_range users = read->getUsers();
+            const llvm::SmallVector<Operation*> readers(users.begin(), users.end());
+            sinkIntoOptionalMatch(read, optional, resultIndex, builder);
+            reads.insert(readers.begin(), readers.end());
         }
     }
 };
@@ -5058,6 +5238,51 @@ struct FusePathElements : public impl::FusePathElementsBase<FusePathElements> {
             result.replaceAllUsesWith(widened.getResult());
             elements.erase();
             eraseIfUnused(walk._build);
+        }
+    }
+};
+
+// A to_nullable column holds a value in every row, so the size of one is the size of the
+// column it widens
+void readSizeOfTheWidenedColumn(Size size) {
+    while (ToNullable widened = size.getInput().getDefiningOp<ToNullable>()) {
+        size->setOperand(0, widened.getOperand());
+        eraseIfUnused(widened);
+    }
+}
+
+// The list a walk's handles expand to holds one entry per hop, or per repetition of a body
+// of several steps, which the depth of the handle answers, and its list of nodes one more
+struct FusePathLength : public impl::FusePathLengthBase<FusePathLength> {
+    void runOnOperation() override {
+        mlir::OpBuilder builder(&getContext());
+
+        llvm::SmallVector<Size> sizes;
+        getOperation()->walk([&sizes](Size size) {
+            sizes.push_back(size);
+        });
+
+        for (Size size : sizes) {
+            readSizeOfTheWidenedColumn(size);
+
+            ExpandPath expansion = size.getInput().getDefiningOp<ExpandPath>();
+            if (!expansion) {
+                continue;
+            }
+
+            Value result = size.getResult();
+            const bool countsNodes = expansion.getKind() == storage::PathExpansionKind::Nodes;
+
+            builder.setInsertionPoint(size);
+            PathLength length = builder.create<PathLength>(size.getLoc(),
+                                                           result.getType(),
+                                                           expansion.getPaths(),
+                                                           expansion.getStepsAttr(),
+                                                           countsNodes ? builder.getUnitAttr() : UnitAttr());
+
+            result.replaceAllUsesWith(length.getResult());
+            size.erase();
+            eraseIfUnused(expansion);
         }
     }
 };
@@ -5768,11 +5993,14 @@ bool matchHopTest(ListPredicate predicate, ExplorePaths exploration, llvm::Small
     ComprehensionYield yield = cast<ComprehensionYield>(body.getTerminator());
 
     const auto readsOnlyTheHop = [&body, tag](Value operand) {
-        if (const BlockArgument argument = dyn_cast<BlockArgument>(operand)) {
-            return argument.getOwner() == &body && argument != tag;
+        const BlockArgument argument = dyn_cast<BlockArgument>(operand);
+        if (argument && argument.getOwner() == &body) {
+            return argument != tag;
+        } else if (!argument && operand.getDefiningOp()->getBlock() == &body) {
+            return true;
         }
 
-        return operand.getDefiningOp()->getBlock() == &body || ::db::yieldsConstantColumn(operand);
+        return ::db::yieldsConstantColumn(operand);
     };
 
     for (Operation& op : body.without_terminator()) {
@@ -6330,79 +6558,122 @@ bool matchBuiltPath(Count count, Value& rows) {
     return true;
 }
 
+// The list a walk's handles expand to is never null either, so a count of a path or of
+// that list tallies the rows of a column its build read: the node the path opens on, or
+// the handles themselves
+void countBuiltRows(OpOperand& counted) {
+    Operation* const build = counted.get().getDefiningOp();
+
+    if (MakePath path = dyn_cast_or_null<MakePath>(build)) {
+        counted.set(path.getEntities().front());
+    } else if (ExpandPath expansion = dyn_cast_or_null<ExpandPath>(build)) {
+        counted.set(expansion.getPaths());
+    } else {
+        return;
+    }
+
+    eraseIfUnused(build);
+}
+
+// The aggregate inputs of a grouping op are its trailing operands, one per kind
+void countGroupedBuiltRows(Operation* grouping, ArrayRef<int64_t> kinds) {
+    const size_t firstInput = grouping->getNumOperands() - kinds.size();
+    const int64_t countKind = static_cast<int64_t>(storage::GroupAggregateKind::Count);
+
+    for (size_t index = 0; index < kinds.size(); index++) {
+        if (kinds[index] == countKind) {
+            countBuiltRows(grouping->getOpOperand(firstInput + index));
+        }
+    }
+}
+
 struct CountPathRows : public impl::CountPathRowsBase<CountPathRows> {
     void runOnOperation() override {
         mlir::OpBuilder builder(&getContext());
 
         llvm::SmallVector<Count> counts;
-        getOperation()->walk([&counts](Count count) {
-            counts.push_back(count);
+        llvm::SmallVector<GroupAggregate> groupAggregates;
+        llvm::SmallVector<Collect> collects;
+        getOperation()->walk([&counts, &groupAggregates, &collects](Operation* op) {
+            if (Count count = dyn_cast<Count>(op)) {
+                counts.push_back(count);
+            } else if (GroupAggregate groupAggregate = dyn_cast<GroupAggregate>(op)) {
+                groupAggregates.push_back(groupAggregate);
+            } else if (Collect collect = dyn_cast<Collect>(op)) {
+                collects.push_back(collect);
+            }
         });
 
         for (Count count : counts) {
             Value rows;
-            if (!matchBuiltPath(count, rows)) {
-                continue;
+            if (matchBuiltPath(count, rows)) {
+                Operation* build = count.getInput().getDefiningOp();
+
+                count->setOperand(0, rows);
+                count.setRowsAttr(builder.getUnitAttr());
+
+                if (build->use_empty()) {
+                    build->erase();
+                }
+            } else if (!count.getDistinct()) {
+                countBuiltRows(count->getOpOperand(0));
             }
+        }
 
-            Operation* build = count.getInput().getDefiningOp();
+        for (GroupAggregate groupAggregate : groupAggregates) {
+            countGroupedBuiltRows(groupAggregate, groupAggregate.getKinds());
+        }
 
-            count->setOperand(0, rows);
-            count.setRowsAttr(builder.getUnitAttr());
-
-            if (build->use_empty()) {
-                build->erase();
+        for (Collect collect : collects) {
+            const std::optional<ArrayRef<int64_t>> kinds = collect.getKinds();
+            if (kinds) {
+                countGroupedBuiltRows(collect, *kinds);
             }
         }
     }
 };
 
-// Where an op's carry set sits: the carried operands start at _operandOffset and each comes
-// back as the result at the same position from _resultOffset. _trailingOperandCount is what
-// the op takes after its carry set, which a trim keeps as it found it.
-struct CarrySetLayout {
-    size_t _operandOffset {0};
-    size_t _resultOffset {0};
-    size_t _trailingOperandCount {0};
-};
+bool matchCarrySet(Operation* op, CarrySet& carrySet) {
+    ColumnCarrierOpInterface carrier = dyn_cast<ColumnCarrierOpInterface>(op);
 
-bool matchCarrySetLayout(Operation* op, CarrySetLayout& layout) {
-    if (isEdgeHop(op)) {
-        layout = CarrySetLayout {._operandOffset = 1, ._resultOffset = hopFixedResultCount};
-        return true;
-    } else if (ExplorePaths exploration = dyn_cast<ExplorePaths>(op)) {
-        const size_t endNodeCount = exploration.getEndNodes() ? 1u : 0u;
-        layout = CarrySetLayout {._operandOffset = 1,
-                                 ._resultOffset = pathFixedResultCount,
-                                 ._trailingOperandCount = endNodeCount + exploration.getHopImports().size()};
-        return true;
-    } else if (isa<FilterOp>(op)) {
-        layout = CarrySetLayout {._operandOffset = 1, ._resultOffset = 0};
-        return true;
-    } else if (isa<Unwind, FetchNodes>(op)) {
-        layout = CarrySetLayout {._operandOffset = 1, ._resultOffset = 1};
-        return true;
-    } else if (isa<Limit, Skip, Sort, GroupAggregate, Collect>(op)) {
-        layout = CarrySetLayout {._operandOffset = 0, ._resultOffset = 0};
-        return true;
-    } else if (CallProcedure call = dyn_cast<CallProcedure>(op)) {
-        const size_t inputCount = call.getInputs().size();
-        const size_t yieldCount = call.getYields().size();
-        layout = CarrySetLayout {._operandOffset = inputCount, ._resultOffset = yieldCount};
-        return true;
+    return carrier && carrier.getCarrySet(carrySet);
+}
+
+bool carriesIntoItsRegions(Operation* op) {
+    ColumnCarrierOpInterface carrier = dyn_cast<ColumnCarrierOpInterface>(op);
+    if (!carrier) {
+        return false;
     }
 
-    return false;
+    llvm::SmallVector<Value, 1> carried;
+    for (Region& region : op->getRegions()) {
+        for (const BlockArgument argument : region.getArguments()) {
+            carrier.collectCarriedColumns(argument, carried);
+        }
+    }
+
+    return !carried.empty();
+}
+
+// The columns a trim drops in pairs, each operand with the result it comes back as: the carry
+// set, and a grouping op's aggregate inputs with the aggregates they reduce to. A dedup keeps
+// every column it carries, its key being all of them, and an op whose regions read its carry
+// set keeps it for them
+bool matchTrimmedColumns(Operation* op, CarrySet& carrySet) {
+    const bool keepsItsCarrySet = isa<RemoveDuplicates>(op) || carriesIntoItsRegions(op);
+    if (keepsItsCarrySet || !matchCarrySet(op, carrySet)) {
+        return false;
+    } else if (isa<GroupAggregate, Collect>(op)) {
+        carrySet._count = op->getNumOperands();
+    }
+
+    return true;
 }
 
 bool trimsColumns(Operation* op) {
-    CarrySetLayout layout;
+    CarrySet carrySet;
 
-    return matchCarrySetLayout(op, layout) || isa<CrossProduct, HashJoin>(op);
-}
-
-size_t carriedCount(Operation* op, const CarrySetLayout& layout) {
-    return op->getNumOperands() - layout._operandOffset - layout._trailingOperandCount;
+    return matchTrimmedColumns(op, carrySet) || isa<CrossProduct, HashJoin, OptionalMatch>(op);
 }
 
 void keepOneOf(llvm::SmallBitVector& keep, size_t begin, size_t end) {
@@ -6466,21 +6737,21 @@ void keepRowCarryingColumn(ValueRange columns, size_t firstIndex, llvm::SmallBit
     }
 }
 
-void selectKeptCarriedColumns(Operation* op, const CarrySetLayout& layout, llvm::SmallVectorImpl<size_t>& kept) {
-    const size_t count = carriedCount(op, layout);
+void selectKeptCarriedColumns(Operation* op, const CarrySet& carrySet, llvm::SmallVectorImpl<size_t>& kept) {
+    const size_t count = carrySet._count;
 
     llvm::SmallBitVector keep(count);
     for (size_t carriedIndex = 0; carriedIndex < count; carriedIndex++) {
-        if (!op->getResult(layout._resultOffset + carriedIndex).use_empty()) {
+        if (!op->getResult(carrySet._resultOffset + carriedIndex).use_empty()) {
             keep.set(carriedIndex);
         }
     }
 
     keepRequiredColumns(op, keep);
 
-    const bool standsForItsRows = layout._resultOffset == 0;
+    const bool standsForItsRows = carrySet._resultOffset == 0;
     if (standsForItsRows) {
-        keepRowCarryingColumn(op->getOperands().drop_front(layout._operandOffset), 0, keep);
+        keepRowCarryingColumn(op->getOperands().slice(carrySet._operandOffset, count), 0, keep);
     }
 
     for (size_t carriedIndex = 0; carriedIndex < count; carriedIndex++) {
@@ -6588,25 +6859,30 @@ void trimAttributes(Operation* op, llvm::ArrayRef<size_t> kept, OperationState& 
         const int32_t inputCount = static_cast<int32_t>(call.getInputs().size());
         const int32_t keptCount = static_cast<int32_t>(kept.size());
         state.attributes.set(call.getOperandSegmentSizesAttrName(), builder.getDenseI32ArrayAttr({inputCount, keptCount}));
+    } else if (UnwindRange unwind = dyn_cast<UnwindRange>(op)) {
+        const int32_t fromCount = unwind.getFrom() ? 1 : 0;
+        const int32_t toCount = unwind.getTo() ? 1 : 0;
+        const int32_t keptCount = static_cast<int32_t>(kept.size());
+        state.attributes.set(unwind.getOperandSegmentSizesAttrName(), builder.getDenseI32ArrayAttr({1, 1, 1, fromCount, toCount, keptCount}));
     }
 }
 
-void trimCarrySet(Operation* op, const CarrySetLayout& layout, llvm::ArrayRef<size_t> kept, mlir::OpBuilder& builder) {
+void trimCarrySet(Operation* op, const CarrySet& carrySet, llvm::ArrayRef<size_t> kept, mlir::OpBuilder& builder) {
     const Operation::operand_range operands = op->getOperands();
     const Operation::result_range results = op->getResults();
 
     llvm::SmallVector<Value> trimmedOperands;
-    llvm::append_range(trimmedOperands, operands.take_front(layout._operandOffset));
+    llvm::append_range(trimmedOperands, operands.take_front(carrySet._operandOffset));
 
     llvm::SmallVector<Type> trimmedTypes;
-    llvm::append_range(trimmedTypes, results.take_front(layout._resultOffset).getTypes());
+    llvm::append_range(trimmedTypes, results.take_front(carrySet._resultOffset).getTypes());
 
     for (const size_t carriedIndex : kept) {
-        trimmedOperands.push_back(operands[layout._operandOffset + carriedIndex]);
-        trimmedTypes.push_back(results[layout._resultOffset + carriedIndex].getType());
+        trimmedOperands.push_back(operands[carrySet._operandOffset + carriedIndex]);
+        trimmedTypes.push_back(results[carrySet._resultOffset + carriedIndex].getType());
     }
 
-    llvm::append_range(trimmedOperands, operands.take_back(layout._trailingOperandCount));
+    llvm::append_range(trimmedOperands, operands.drop_front(carrySet._operandOffset + carrySet._count));
 
     OperationState state(op->getLoc(), op->getName());
     state.addOperands(trimmedOperands);
@@ -6626,13 +6902,13 @@ void trimCarrySet(Operation* op, const CarrySetLayout& layout, llvm::ArrayRef<si
         trimmed->getRegion(regionIndex).takeBody(op->getRegion(regionIndex));
     }
 
-    for (size_t resultIndex = 0; resultIndex < layout._resultOffset; resultIndex++) {
+    for (size_t resultIndex = 0; resultIndex < carrySet._resultOffset; resultIndex++) {
         results[resultIndex].replaceAllUsesWith(trimmed->getResult(resultIndex));
     }
 
     for (size_t keptIndex = 0; keptIndex < kept.size(); keptIndex++) {
-        Value carried = results[layout._resultOffset + kept[keptIndex]];
-        carried.replaceAllUsesWith(trimmed->getResult(layout._resultOffset + keptIndex));
+        Value carried = results[carrySet._resultOffset + kept[keptIndex]];
+        carried.replaceAllUsesWith(trimmed->getResult(carrySet._resultOffset + keptIndex));
     }
 }
 
@@ -6777,13 +7053,14 @@ void trimHashJoin(HashJoin join, mlir::OpBuilder& builder) {
     joinOp->erase();
 }
 
-// A lazy case hands its carried columns to every region as block arguments, so a column no
-// region reads leaves the operands and the arguments of every region together. A column
-// carried twice - the subject of `CASE t WHEN ...` beside the variable t - is read through
-// its first argument. One row-carrying column stays for the lowering to size the CASE by.
-void trimLazyCase(LazyCase caseOp) {
-    const OperandRange carried = caseOp.getColumnsToFilter();
-    const MutableArrayRef<Region> regions = caseOp.getBranches();
+// A lazy case or a coalesce hands its carried columns to every region as block arguments,
+// so a column no region reads leaves the operands and the arguments of every region
+// together. A column carried twice - the subject of `CASE t WHEN ...` beside the variable
+// t - is read through its first argument. One row-carrying column stays for the lowering to
+// size the selection by.
+void trimSelectionCarrySet(Operation* selection) {
+    const OperandRange carried = selection->getOperands();
+    const MutableArrayRef<Region> regions = selection->getRegions();
 
     for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
         const auto firstIt = llvm::find(carried, carried[carriedIndex]);
@@ -6827,20 +7104,22 @@ void trimLazyCase(LazyCase caseOp) {
         region.front().eraseArguments(erased);
     }
 
-    caseOp->eraseOperands(erased);
+    selection->eraseOperands(erased);
 }
 
 // The ops over the elements of a list repeat every carried column once per element, so a
-// column the body does not read leaves the operands and the body's arguments together. A
-// constant list is laid out over the rows of a carried column, so one row-carrying column
-// stays for it.
-void trimElementCarrySet(Operation* op, Value source, OperandRange carried, Block& body) {
-    const size_t argumentOffset = body.getNumArguments() - carried.size();
-
+// column none of their regions reads leaves the operands and every region's arguments
+// together. A constant list is laid out over the rows of a carried column, so one
+// row-carrying column stays for it.
+void trimElementCarrySet(Operation* op, Value source, OperandRange carried) {
     llvm::SmallBitVector keep(carried.size());
-    for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
-        if (!body.getArgument(argumentOffset + carriedIndex).use_empty()) {
-            keep.set(carriedIndex);
+    for (Region& region : op->getRegions()) {
+        const Block::BlockArgListType carriedArguments = region.front().getArguments().take_back(carried.size());
+
+        for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
+            if (!carriedArguments[carriedIndex].use_empty()) {
+                keep.set(carriedIndex);
+            }
         }
     }
 
@@ -6855,20 +7134,107 @@ void trimElementCarrySet(Operation* op, Value source, OperandRange carried, Bloc
     const size_t operandOffset = carried.getBeginOperandIndex();
 
     llvm::BitVector erasedOperands(op->getNumOperands());
-    llvm::BitVector erasedArguments(body.getNumArguments());
     for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
         if (!keep[carriedIndex]) {
             erasedOperands.set(operandOffset + carriedIndex);
-            erasedArguments.set(argumentOffset + carriedIndex);
         }
     }
 
-    body.eraseArguments(erasedArguments);
+    for (Region& region : op->getRegions()) {
+        Block& block = region.front();
+        const size_t argumentOffset = block.getNumArguments() - carried.size();
+
+        llvm::BitVector erasedArguments(block.getNumArguments());
+        for (size_t carriedIndex = 0; carriedIndex < carried.size(); carriedIndex++) {
+            if (!keep[carriedIndex]) {
+                erasedArguments.set(argumentOffset + carriedIndex);
+            }
+        }
+
+        block.eraseArguments(erasedArguments);
+    }
+
     op->eraseOperands(erasedOperands);
 }
 
-bool readsCarriedColumnsInItsRegions(Operation* op) {
-    return isa<LazyCase, ListComprehension, ListPredicate, Reduce>(op);
+bool matchRegionCarrySet(Region& region, RegionCarrySet& carrySet) {
+    ColumnCarrierOpInterface carrier = dyn_cast_or_null<ColumnCarrierOpInterface>(region.getParentOp());
+
+    return carrier && carrier.getRegionCarrySet(region, carrySet);
+}
+
+// Null for an argument the op binds itself: a list element, an accumulator or a row tag
+Value carriedColumnOf(BlockArgument argument) {
+    Region& region = *argument.getParentRegion();
+
+    RegionCarrySet carrySet;
+    if (!matchRegionCarrySet(region, carrySet)) {
+        return {};
+    }
+
+    const size_t argumentIndex = argument.getArgNumber();
+    const bool isCarried = argumentIndex >= carrySet._argumentOffset
+                        && argumentIndex < carrySet._argumentOffset + carrySet._count;
+    if (!isCarried) {
+        return {};
+    }
+
+    return region.getParentOp()->getOperand(carrySet._operandOffset + argumentIndex - carrySet._argumentOffset);
+}
+
+BlockArgument carriedArgument(Region& region, size_t carriedIndex) {
+    RegionCarrySet carrySet;
+    const bool carries = matchRegionCarrySet(region, carrySet);
+    bioassert(carries, "A region a column is carried into belongs to an op with a carry set");
+
+    return region.front().getArgument(static_cast<unsigned>(carrySet._argumentOffset + carriedIndex));
+}
+
+// The position of @param column in the carry set of @param op into its regions, appended to
+// the run where the op does not carry it yet: as an operand, and as an argument of every region
+size_t carryIntoRegions(Operation* op, Value column, mlir::RewriterBase& rewriter, bool& appended) {
+    RegionCarrySet carrySet;
+    const bool carries = matchRegionCarrySet(op->getRegion(0), carrySet);
+    bioassert(carries, "An op a column is carried into carries columns into its regions");
+
+    const OperandRange carried = op->getOperands().slice(carrySet._operandOffset, carrySet._count);
+    const auto carriedIt = llvm::find(carried, column);
+
+    appended = carriedIt == carried.end();
+    if (!appended) {
+        return static_cast<size_t>(carriedIt - carried.begin());
+    }
+
+    llvm::SmallVector<unsigned, 2> argumentPositions;
+    for (Region& region : op->getRegions()) {
+        RegionCarrySet regionCarrySet;
+        const bool carriesIntoRegion = matchRegionCarrySet(region, regionCarrySet);
+        bioassert(carriesIntoRegion, "An op carrying columns into a region carries them into all of them");
+
+        argumentPositions.push_back(static_cast<unsigned>(regionCarrySet._argumentOffset + regionCarrySet._count));
+    }
+
+    rewriter.modifyOpInPlace(op, [op, column, &carrySet, &argumentPositions] {
+        op->insertOperands(static_cast<unsigned>(carrySet._operandOffset + carrySet._count), column);
+
+        for (size_t regionIndex = 0; regionIndex < argumentPositions.size(); regionIndex++) {
+            Block& body = op->getRegion(static_cast<unsigned>(regionIndex)).front();
+            body.insertArgument(argumentPositions[regionIndex], column.getType(), column.getLoc());
+        }
+    });
+
+    return carrySet._count;
+}
+
+BlockArgument carryIntoRegion(Region& region, Value column, mlir::RewriterBase& rewriter) {
+    bool appended = false;
+    const size_t carriedIndex = carryIntoRegions(region.getParentOp(), column, rewriter, appended);
+
+    return carriedArgument(region, carriedIndex);
+}
+
+bool trimsItsRegionCarrySet(Operation* op) {
+    return isa<LazyCase, Coalesce, ListComprehension, ListPredicate, Reduce, AllReduce>(op);
 }
 
 struct TrimVisit {
@@ -6902,7 +7268,7 @@ void collectTrimOrder(Operation* root, llvm::SmallVectorImpl<Operation*>& order)
             continue;
         }
 
-        if (readsCarriedColumnsInItsRegions(op)) {
+        if (trimsItsRegionCarrySet(op)) {
             worklist.push_back(TrimVisit {._op = op, ._regionsVisited = true});
         } else if (trimsColumns(op)) {
             order.push_back(op);
@@ -6913,47 +7279,250 @@ void collectTrimOrder(Operation* root, llvm::SmallVectorImpl<Operation*>& order)
 }
 
 void trimCarriedColumns(Operation* op, mlir::OpBuilder& builder) {
-    CarrySetLayout layout;
-    const bool carries = matchCarrySetLayout(op, layout);
+    CarrySet carrySet;
+    const bool carries = matchTrimmedColumns(op, carrySet);
     bioassert(carries, "A trimming op that is neither a cross product nor a join has a carry set");
 
     llvm::SmallVector<size_t> kept;
-    selectKeptCarriedColumns(op, layout, kept);
+    selectKeptCarriedColumns(op, carrySet, kept);
 
-    if (kept.size() == carriedCount(op, layout)) {
+    if (kept.size() == carrySet._count) {
         return;
     }
 
-    trimCarrySet(op, layout, kept, builder);
+    trimCarrySet(op, carrySet, kept, builder);
     op->erase();
 }
 
-void trimUnreadColumnsOf(Operation* op, mlir::OpBuilder& builder) {
-    if (LazyCase caseOp = dyn_cast<LazyCase>(op)) {
-        trimLazyCase(caseOp);
+// An op that may raise stays, and so does the error a row raises on it. Its own set, not
+// @param erased, tells a freed op from a live one: the caller's set can hold an address a
+// later op was allocated at, and nothing is allocated while this runs.
+template <typename Erasable>
+bool eraseUnreadOps(llvm::SmallVectorImpl<Operation*>& pending, Erasable erasable, llvm::SmallPtrSetImpl<Operation*>& erased) {
+    llvm::SmallPtrSet<Operation*, 16> freed;
+
+    while (!pending.empty()) {
+        Operation* const op = pending.pop_back_val();
+
+        const bool unread = op && !freed.contains(op) && erasable(op) && mlir::isOpTriviallyDead(op);
+        if (!unread || raisesOnSomeRows(op)) {
+            continue;
+        }
+
+        for (const Value operand : op->getOperands()) {
+            pending.push_back(operand.getDefiningOp());
+        }
+
+        op->walk([&freed](Operation* nested) {
+            freed.insert(nested);
+        });
+
+        op->erase();
+    }
+
+    erased.insert(freed.begin(), freed.end());
+
+    return !freed.empty();
+}
+
+// Lowering runs every op it is handed, so the ops a dropped column leaves unread in the
+// pattern go too, but for one that may raise. Every op there that shapes the rows hands the
+// yield the row tag or a column it keeps, so the ones left unread only computed dropped values.
+void eraseUnreadInPattern(llvm::ArrayRef<Value> dropped, Region& pattern, llvm::SmallPtrSetImpl<Operation*>& erased) {
+    llvm::SmallVector<Operation*> producers;
+    for (const Value column : dropped) {
+        producers.push_back(column.getDefiningOp());
+    }
+
+    const auto inPattern = [&pattern](Operation* op) {
+        return pattern.isAncestor(op->getParentRegion());
+    };
+
+    eraseUnreadOps(producers, inPattern, erased);
+}
+
+// An optional match pads and carries the variables its pattern binds for what reads them
+// past it, so one nothing reads leaves its yield. The columns it joins onto stay: the
+// pattern walks them, and a row it missed is rebuilt from them.
+void trimOptionalMatch(OptionalMatch optional, mlir::OpBuilder& builder, llvm::SmallPtrSetImpl<Operation*>& erased) {
+    OptionalYield yield = patternYield(optional);
+    const OperandRange columns = yield.getColumns();
+    const size_t inputCount = optional.getInputColumns().size();
+
+    llvm::SmallBitVector keep(columns.size());
+    keep.set(0, inputCount);
+    for (size_t columnIndex = inputCount; columnIndex < columns.size(); columnIndex++) {
+        if (!optional->getResult(columnIndex).use_empty()) {
+            keep.set(columnIndex);
+        }
+    }
+
+    keepRowCarryingColumn(columns, 0, keep);
+
+    if (keep.all()) {
+        return;
+    }
+
+    llvm::SmallVector<Value> keptColumns;
+    llvm::SmallVector<Value> droppedColumns;
+    llvm::SmallVector<size_t> keptResults;
+    for (size_t columnIndex = 0; columnIndex < columns.size(); columnIndex++) {
+        if (keep[columnIndex]) {
+            keptColumns.push_back(columns[columnIndex]);
+            keptResults.push_back(columnIndex);
+        } else {
+            droppedColumns.push_back(columns[columnIndex]);
+        }
+    }
+
+    yield.getColumnsMutable().assign(keptColumns);
+
+    OptionalMatch trimmed = rebuildOptionalMatch(optional, keptResults, builder);
+    eraseUnreadInPattern(droppedColumns, trimmed.getPattern(), erased);
+}
+
+void trimUnreadColumnsOf(Operation* op, mlir::OpBuilder& builder, llvm::SmallPtrSetImpl<Operation*>& erased) {
+    if (isa<LazyCase, Coalesce>(op)) {
+        trimSelectionCarrySet(op);
     } else if (ListComprehension comprehension = dyn_cast<ListComprehension>(op)) {
-        trimElementCarrySet(op, comprehension.getSource(), comprehension.getColumnsToFilter(), comprehension.getBody().front());
+        trimElementCarrySet(op, comprehension.getSource(), comprehension.getColumnsToFilter());
     } else if (ListPredicate predicate = dyn_cast<ListPredicate>(op)) {
-        trimElementCarrySet(op, predicate.getSource(), predicate.getColumnsToFilter(), predicate.getBody().front());
+        trimElementCarrySet(op, predicate.getSource(), predicate.getColumnsToFilter());
     } else if (Reduce reduce = dyn_cast<Reduce>(op)) {
-        trimElementCarrySet(op, reduce.getSource(), reduce.getColumnsToFilter(), reduce.getBody().front());
+        trimElementCarrySet(op, reduce.getSource(), reduce.getColumnsToFilter());
+    } else if (AllReduce allReduce = dyn_cast<AllReduce>(op)) {
+        trimElementCarrySet(op, allReduce.getSource(), allReduce.getColumnsToFilter());
     } else if (CrossProduct product = dyn_cast<CrossProduct>(op)) {
         trimCrossProduct(product, builder);
     } else if (HashJoin join = dyn_cast<HashJoin>(op)) {
         trimHashJoin(join, builder);
+    } else if (OptionalMatch optional = dyn_cast<OptionalMatch>(op)) {
+        trimOptionalMatch(optional, builder, erased);
     } else {
         trimCarriedColumns(op, builder);
     }
 }
 
+// Lowering runs every op it is handed, so a value computed per row that nothing reads goes,
+// and so do the ones only it read. Unlike a filter or a hop nothing reads, it shapes no row
+// a constant could be laid out over.
+bool eraseUnreadRowValues(Operation* root) {
+    llvm::SmallVector<Operation*> ops;
+    root->walk([&ops](Operation* op) {
+        ops.push_back(op);
+    });
+
+    llvm::SmallPtrSet<Operation*, 16> erased;
+    return eraseUnreadOps(ops, computesAValuePerRow, erased);
+}
+
 struct TrimUnreadColumns : public impl::TrimUnreadColumnsBase<TrimUnreadColumns> {
     void runOnOperation() override {
-        llvm::SmallVector<Operation*> order;
-        collectTrimOrder(getOperation(), order);
-
         mlir::OpBuilder builder(&getContext());
-        for (Operation* const op : order) {
-            trimUnreadColumnsOf(op, builder);
+
+        // A value erased as unread can be all that read a column a hop or a filter still
+        // carries, so the trim runs again until a round erases no value
+        bool erasedRowValues = true;
+        while (erasedRowValues) {
+            llvm::SmallVector<Operation*> order;
+            collectTrimOrder(getOperation(), order);
+
+            llvm::SmallPtrSet<Operation*, 16> erased;
+            for (Operation* const op : order) {
+                if (!erased.contains(op)) {
+                    trimUnreadColumnsOf(op, builder, erased);
+                }
+            }
+
+            erasedRowValues = eraseUnreadRowValues(getOperation());
+        }
+    }
+};
+
+struct CanonicalizeCoalesce : public impl::CanonicalizeCoalesceBase<CanonicalizeCoalesce> {
+    void runOnOperation() override {
+        MLIRContext* const context = &getContext();
+
+        llvm::SmallVector<Operation*> coalesces;
+        getOperation()->walk([&coalesces](Coalesce coalesce) {
+            coalesces.push_back(coalesce.getOperation());
+        });
+
+        mlir::RewritePatternSet patterns(context);
+        Coalesce::getCanonicalizationPatterns(patterns, context);
+        const mlir::FrozenRewritePatternSet frozenPatterns(std::move(patterns));
+
+        // Kept to the coalesces: the driver's folding and region simplification would
+        // otherwise rewrite the rest of the program as well, and its dead-op removal would
+        // erase an op an inlined argument held, a Pure CASE holding a division included
+        mlir::GreedyRewriteConfig config;
+        config.setStrictness(mlir::GreedyRewriteStrictness::ExistingOps);
+        config.enableFolding(false);
+        config.enableConstantCSE(false);
+        config.setRegionSimplificationLevel(mlir::GreedySimplifyRegionLevel::Disabled);
+
+        if (failed(mlir::applyOpPatternsGreedily(coalesces, frozenPatterns, config))) {
+            signalPassFailure();
+        }
+    }
+};
+
+// A CASE's first condition and a coalesce's first argument see every row the op receives;
+// each later region sees only the rows the regions before it passed on.
+Region& unconditionalRegion(Operation* selection) {
+    return selection->getRegion(0);
+}
+
+bool computesOverCarriedColumns(Region& region) {
+    Block& body = region.front();
+    Operation* const yielding = body.getTerminator()->getOperand(0).getDefiningOp();
+
+    const bool computedInTheRegion = yielding && yielding->getBlock() == &body;
+    const bool readsACarriedColumn = llvm::any_of(body.getArguments(), [](BlockArgument argument) {
+        return !argument.use_empty();
+    });
+
+    return computedInTheRegion && readsACarriedColumn;
+}
+
+void hoistUnconditionalRegion(Operation* selection, mlir::RewriterBase& rewriter) {
+    Region& region = unconditionalRegion(selection);
+    Block& body = region.front();
+    Operation* const yield = body.getTerminator();
+
+    for (Operation& op : llvm::make_early_inc_range(body.without_terminator())) {
+        rewriter.moveOpBefore(&op, selection);
+    }
+
+    for (const BlockArgument argument : body.getArguments()) {
+        rewriter.replaceAllUsesWith(argument, carriedColumnOf(argument));
+    }
+
+    const Value yielded = yield->getOperand(0);
+    if (::db::yieldsConstantColumn(yielded)) {
+        return;
+    }
+
+    const BlockArgument value = carryIntoRegion(region, yielded, rewriter);
+    rewriter.modifyOpInPlace(yield, [yield, value] {
+        yield->setOperand(0, value);
+    });
+}
+
+struct HoistUnconditionalRegions : public impl::HoistUnconditionalRegionsBase<HoistUnconditionalRegions> {
+    void runOnOperation() override {
+        llvm::SmallVector<Operation*> selections;
+        getOperation()->walk([&selections](Operation* op) {
+            if (isa<LazyCase, Coalesce>(op)) {
+                selections.push_back(op);
+            }
+        });
+
+        mlir::IRRewriter rewriter(&getContext());
+        for (Operation* const selection : selections) {
+            if (computesOverCarriedColumns(unconditionalRegion(selection))) {
+                hoistUnconditionalRegion(selection, rewriter);
+            }
         }
     }
 };
@@ -7058,12 +7627,8 @@ bool matchPropertyValueScanChain(FilterOp filter, PropertyValueScanChain& chain)
 
 bool isUntypedNullMask(Value mask) {
     const auto columnType = dyn_cast<ColumnType>(mask.getType());
-    if (!columnType) {
-        return false;
-    }
 
-    const auto nullableType = dyn_cast<storage::NullableType>(columnType.getType());
-    return nullableType && isa<mlir::NoneType>(nullableType.getValueType());
+    return columnType && isNullLiteralType(columnType.getType());
 }
 
 // Rebuilds the conjuncts the fused scan does not carry over its rows, as the mask of the
@@ -7151,23 +7716,6 @@ bool mapsRowsThrough(Operation* op) {
     return isEdgeHop(op) || isa<FilterOp, Unwind, Limit, Skip, Sort>(op);
 }
 
-// The operand whose rows a result's rows are drawn from, if any: each carried column comes
-// back at its own position, and a hop's input re-surfaces as srcids, or tgtids when it
-// walks backwards.
-bool matchRowSourceOperand(Operation* op, const CarrySetLayout& layout, size_t resultIndex, size_t& operandIndex) {
-    if (resultIndex >= layout._resultOffset) {
-        operandIndex = layout._operandOffset + (resultIndex - layout._resultOffset);
-        return true;
-    } else if (isEdgeHop(op)) {
-        if (resultIndex == hopInputResult(op)) {
-            operandIndex = 0;
-            return true;
-        }
-    }
-
-    return false;
-}
-
 bool matchPropertyRead(Operation* op, StringAttr& property, bool& nodeProperty) {
     if (GetNodeProperties read = dyn_cast<GetNodeProperties>(op)) {
         property = read.getPropertyAttr();
@@ -7189,6 +7737,18 @@ bool matchPropertyWrite(Operation* op, StringAttr& property, bool& nodeProperty)
         return true;
     } else if (SetEdgeProperty write = dyn_cast<SetEdgeProperty>(op)) {
         property = write.getPropertyAttr();
+        nodeProperty = false;
+        return true;
+    }
+
+    return false;
+}
+
+bool matchPropertiesWrite(Operation* op, bool& nodeProperty) {
+    if (isa<SetNodeProperties>(op)) {
+        nodeProperty = true;
+        return true;
+    } else if (isa<SetEdgeProperties>(op)) {
         nodeProperty = false;
         return true;
     }
@@ -7222,18 +7782,61 @@ Value appendCarriedColumn(Operation* op, Value column, mlir::RewriterBase& rewri
 }
 
 Value carryThrough(Operation* op, Value column, mlir::RewriterBase& rewriter) {
-    CarrySetLayout layout;
-    const bool carries = matchCarrySetLayout(op, layout);
+    CarrySet carrySet;
+    const bool carries = matchCarrySet(op, carrySet);
     bioassert(carries, "A row-mapping op has a carry set");
 
-    const size_t carriedColumnCount = carriedCount(op, layout);
-    for (size_t carriedIndex = 0; carriedIndex < carriedColumnCount; carriedIndex++) {
-        if (op->getOperand(layout._operandOffset + carriedIndex) == column) {
-            return op->getResult(layout._resultOffset + carriedIndex);
+    for (size_t carriedIndex = 0; carriedIndex < carrySet._count; carriedIndex++) {
+        if (op->getOperand(carrySet._operandOffset + carriedIndex) == column) {
+            return op->getResult(carrySet._resultOffset + carriedIndex);
         }
     }
 
     return appendCarriedColumn(op, column, rewriter);
+}
+
+Value canonicalArgument(Value rows) {
+    BlockArgument argument = dyn_cast<BlockArgument>(rows);
+    const Value carried = argument ? carriedColumnOf(argument) : Value();
+    if (!carried) {
+        return rows;
+    }
+
+    Region& region = *argument.getParentRegion();
+
+    RegionCarrySet carrySet;
+    matchRegionCarrySet(region, carrySet);
+
+    const OperandRange carriedColumns = region.getParentOp()->getOperands().slice(carrySet._operandOffset, carrySet._count);
+    const size_t firstIndex = static_cast<size_t>(llvm::find(carriedColumns, carried) - carriedColumns.begin());
+
+    return carriedArgument(region, firstIndex);
+}
+
+// Two columns hold the same values row for row where they come from the same column: two
+// arguments of a body carrying one column in, and two results of an op mapping rows through,
+// as a hop hands back the node it walks from and carries it where the rows in flight hold it.
+// Both are known as the first of them.
+Value canonicalRows(Value rows) {
+    const OpResult result = dyn_cast<OpResult>(rows);
+    Operation* const owner = result ? result.getOwner() : nullptr;
+    if (!owner || !mapsRowsThrough(owner)) {
+        return canonicalArgument(rows);
+    }
+
+    ColumnCarrierOpInterface carrier = cast<ColumnCarrierOpInterface>(owner);
+    const Value rowSource = carrier.getRowSource(result);
+    if (!rowSource) {
+        return rows;
+    }
+
+    const Value sourceRows = canonicalArgument(rowSource);
+    const auto sibling = llvm::find_if(owner->getResults(), [&carrier, sourceRows](OpResult other) {
+        const Value otherSource = carrier.getRowSource(other);
+        return otherSource && canonicalArgument(otherSource) == sourceRows;
+    });
+
+    return *sibling;
 }
 
 // The property columns reuse_property_reads can hand a later read of the same rows: the
@@ -7243,7 +7846,7 @@ Value carryThrough(Operation* op, Value column, mlir::RewriterBase& rewriter) {
 class KnownPropertyColumns {
 public:
     Value find(Value rows, StringAttr property, bool nodeProperty, Operation* useSite) const {
-        const auto rowsIt = _columns.find(rows);
+        const auto rowsIt = _columns.find(canonicalRows(rows));
         if (rowsIt == _columns.end()) {
             return {};
         }
@@ -7270,23 +7873,23 @@ public:
     }
 
     void addRead(Operation* read, StringAttr property, bool nodeProperty) {
-        _columns[read->getOperand(0)].push_back(KnownProperty {property, nodeProperty, read->getResult(0), read});
+        _columns[canonicalRows(read->getOperand(0))].push_back(KnownProperty {property, nodeProperty, read->getResult(0), read});
     }
 
     void addCarried(Value rows, StringAttr property, bool nodeProperty, Value column) {
-        _columns[rows].push_back(KnownProperty {property, nodeProperty, column, nullptr});
+        _columns[canonicalRows(rows)].push_back(KnownProperty {property, nodeProperty, column, nullptr});
     }
 
-    // Moves what is known of @param replacedResults, the results of an op since widened
-    // into @param widened, onto the results of @param widened at the same positions
-    void rebind(llvm::ArrayRef<Value> replacedResults, Operation* widened) {
-        llvm::DenseMap<Value, size_t> replacedIndices;
-        for (size_t index = 0; index < replacedResults.size(); index++) {
-            replacedIndices[replacedResults[index]] = index;
+    // Moves what is known of @param replaced, the results of an op since rebuilt, onto
+    // @param replacements, the results standing for them in the op rebuilt
+    void rebind(llvm::ArrayRef<Value> replaced, llvm::ArrayRef<Value> replacements) {
+        llvm::DenseMap<Value, Value> replacementOf;
+        for (size_t index = 0; index < replaced.size(); index++) {
+            replacementOf[replaced[index]] = replacements[index];
         }
 
-        for (size_t index = 0; index < replacedResults.size(); index++) {
-            const auto rowsIt = _columns.find(replacedResults[index]);
+        for (size_t index = 0; index < replaced.size(); index++) {
+            const auto rowsIt = _columns.find(replaced[index]);
             if (rowsIt == _columns.end()) {
                 continue;
             }
@@ -7295,13 +7898,13 @@ public:
             _columns.erase(rowsIt);
 
             for (KnownProperty& property : known) {
-                const auto columnIt = replacedIndices.find(property._column);
-                if (columnIt != replacedIndices.end()) {
-                    property._column = widened->getResult(columnIt->second);
+                const auto columnIt = replacementOf.find(property._column);
+                if (columnIt != replacementOf.end()) {
+                    property._column = columnIt->second;
                 }
             }
 
-            _columns[widened->getResult(index)] = known;
+            _columns[replacements[index]] = known;
         }
     }
 
@@ -7316,60 +7919,830 @@ private:
     llvm::DenseMap<Value, llvm::SmallVector<KnownProperty, 1>> _columns;
 };
 
-// The column holding `property` for the rows of `column`, taken from a read already
-// standing before `useSite` and carried down through the ops in between when that read was
-// taken further up the chain. Null when there is none: this adds no read of its own.
-Value propertyColumnOf(Value column,
-                       StringAttr property,
-                       bool nodeProperty,
-                       Operation* useSite,
-                       KnownPropertyColumns& knownColumns,
-                       mlir::RewriterBase& rewriter) {
-    llvm::SmallVector<Operation*> carriers;
-    llvm::SmallVector<size_t> carriedRowsResults;
-    Value rows = column;
+enum class RowsStepKind {
+    MapsRows,
+    IntoRegion,
+    ReadsRowConstant,
+    LaysOutConstant,
+    OutOfRegion,
+    RunConstantOutOfRegion,
+    HandsBack,
+};
 
-    Value propertyColumn = knownColumns.find(rows, property, nodeProperty, useSite);
+// The rows _rows come from _outerRows across one op: _op maps them through or reads them as a
+// run constant, or they come into _body, out of its yield, or out of the op holding it. Into
+// the body and handed back, _position is the column's place in the op's region carry set.
+struct RowsStep {
+    RowsStepKind _kind {RowsStepKind::MapsRows};
+    Operation* _op {nullptr};
+    Block* _body {nullptr};
+    size_t _position {0};
+    Value _rows;
+    Value _outerRows;
+};
 
-    while (!propertyColumn) {
-        Operation* const def = rows.getDefiningOp();
-        if (!def || !mapsRowsThrough(def)) {
-            return {};
-        }
+MutableOperandRange yieldedColumnsOf(Block& body) {
+    Operation* const terminator = body.getTerminator();
 
-        CarrySetLayout layout;
-        const bool carries = matchCarrySetLayout(def, layout);
-        bioassert(carries, "A row-mapping op has a carry set");
-
-        size_t sourceOperandIndex = 0;
-        const size_t resultIndex = cast<OpResult>(rows).getResultNumber();
-        if (!matchRowSourceOperand(def, layout, resultIndex, sourceOperandIndex)) {
-            return {};
-        }
-
-        carriers.push_back(def);
-        carriedRowsResults.push_back(resultIndex);
-        rows = def->getOperand(sourceOperandIndex);
-
-        propertyColumn = knownColumns.find(rows, property, nodeProperty, def);
+    if (Yield yield = dyn_cast<Yield>(terminator)) {
+        return yield.getColumnsMutable();
+    } else if (SubqueryYield yield = dyn_cast<SubqueryYield>(terminator)) {
+        return yield.getColumnsMutable();
     }
 
-    for (size_t carrierIndex = carriers.size(); carrierIndex > 0; carrierIndex--) {
-        Operation* const carrier = carriers[carrierIndex - 1];
+    OptionalYield yield = cast<OptionalYield>(terminator);
+
+    return yield.getColumnsMutable();
+}
+
+bool matchMapsRowsStep(OpResult result, RowsStep& step) {
+    Operation* const carrier = result.getOwner();
+    if (!mapsRowsThrough(carrier)) {
+        return false;
+    }
+
+    const Value rowSource = cast<ColumnCarrierOpInterface>(carrier).getRowSource(result);
+    if (!rowSource) {
+        return false;
+    }
+
+    step = RowsStep {._op = carrier, ._position = result.getResultNumber(), ._rows = result, ._outerRows = rowSource};
+
+    return true;
+}
+
+bool matchHandedBackResult(OpResult result, RowsStep& step) {
+    Operation* const op = result.getOwner();
+    if (op->getNumRegions() == 0) {
+        return false;
+    }
+
+    Region& region = op->getRegion(0);
+
+    RegionCarrySet carrySet;
+    const size_t carriedIndex = result.getResultNumber();
+    const bool handsBack = matchRegionCarrySet(region, carrySet) && carrySet._handsBack && carriedIndex < carrySet._count;
+    if (!handsBack) {
+        return false;
+    }
+
+    step = RowsStep {._kind = RowsStepKind::HandsBack,
+                     ._body = &region.front(),
+                     ._position = carriedIndex,
+                     ._rows = result,
+                     ._outerRows = op->getOperand(carrySet._operandOffset + carriedIndex)};
+
+    return true;
+}
+
+// The steps from the column @param body yields back for its carried column at @param carriedIndex
+// down to the argument it comes in as, nearest the yield first: ops mapping rows through, and
+// ops handing back a column they carry in
+bool matchHandedBackChain(Block& body, size_t carriedIndex, llvm::SmallVectorImpl<RowsStep>& chain) {
+    const Value argument = canonicalArgument(carriedArgument(*body.getParent(), carriedIndex));
+    const OperandRange yielded = yieldedColumnsOf(body);
+
+    Value rows = yielded[carriedIndex];
+    while (canonicalArgument(rows) != argument) {
+        const OpResult result = dyn_cast<OpResult>(rows);
+
+        RowsStep step;
+        const bool stepsInTheBody = result && result.getOwner()->getBlock() == &body
+                                 && (matchMapsRowsStep(result, step) || matchHandedBackResult(result, step));
+        if (!stepsInTheBody) {
+            return false;
+        }
+
+        chain.push_back(step);
+        rows = step._outerRows;
+    }
+
+    return true;
+}
+
+// Whether a column carried in alongside the one at @param carriedIndex can be handed back: along
+// the steps the body hands that one back through, and through the body of each op among them
+// that yields its carried columns back too
+bool handsBackAlong(Block& body, const RegionCarrySet& carrySet, size_t carriedIndex) {
+    if (!carrySet._yieldsBack) {
+        return true;
+    }
+
+    llvm::SmallVector<std::pair<Block*, size_t>> pending {{&body, carriedIndex}};
+    while (!pending.empty()) {
+        const auto [handingBody, handedIndex] = pending.pop_back_val();
+
+        llvm::SmallVector<RowsStep> chain;
+        if (!matchHandedBackChain(*handingBody, handedIndex, chain)) {
+            return false;
+        }
+
+        for (const RowsStep& step : chain) {
+            RegionCarrySet stepCarrySet;
+            const bool yieldsBack = step._kind == RowsStepKind::HandsBack
+                                 && matchRegionCarrySet(*step._body->getParent(), stepCarrySet)
+                                 && stepCarrySet._yieldsBack;
+            if (yieldsBack) {
+                pending.push_back({step._body, step._position});
+            }
+        }
+    }
+
+    return true;
+}
+
+bool matchRowConstantStep(OpResult result, RowsStep& step) {
+    RowConstant constant = dyn_cast<RowConstant>(result.getOwner());
+    if (!constant) {
+        return false;
+    }
+
+    step = RowsStep {._kind = RowsStepKind::ReadsRowConstant,
+                     ._op = constant.getOperation(),
+                     ._rows = result,
+                     ._outerRows = constant.getRow()};
+
+    return true;
+}
+
+bool matchIntoRegionStep(BlockArgument argument, RowsStep& step) {
+    const Value carried = carriedColumnOf(argument);
+    if (!carried) {
+        return false;
+    }
+
+    Block* const body = argument.getOwner();
+
+    RegionCarrySet carrySet;
+    matchRegionCarrySet(*body->getParent(), carrySet);
+
+    const size_t carriedIndex = argument.getArgNumber() - carrySet._argumentOffset;
+    if (!handsBackAlong(*body, carrySet, carriedIndex)) {
+        return false;
+    }
+
+    step = RowsStep {._kind = RowsStepKind::IntoRegion,
+                     ._body = body,
+                     ._position = carriedIndex,
+                     ._rows = argument,
+                     ._outerRows = carried};
+
+    return true;
+}
+
+bool matchOutOfRegionStep(OpResult result, RowsStep& step) {
+    Operation* const op = result.getOwner();
+    ColumnCarrierOpInterface carrier = dyn_cast<ColumnCarrierOpInterface>(op);
+    if (!carrier) {
+        return false;
+    }
+
+    const size_t resultIndex = result.getResultNumber();
+    for (Region& region : op->getRegions()) {
+        size_t resultOffset = 0;
+        if (!carrier.getYieldedResultOffset(region, resultOffset)) {
+            continue;
+        }
+
+        Block& body = region.front();
+        const OperandRange yielded = yieldedColumnsOf(body);
+
+        const bool comesOutOfTheRegion = resultIndex >= resultOffset && resultIndex < resultOffset + yielded.size();
+        if (comesOutOfTheRegion) {
+            const size_t yieldIndex = resultIndex - resultOffset;
+            step = RowsStep {._kind = RowsStepKind::OutOfRegion,
+                             ._body = &body,
+                             ._position = yieldIndex,
+                             ._rows = result,
+                             ._outerRows = yielded[yieldIndex]};
+
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool matchHandsBackStep(OpResult result, RowsStep& step) {
+    if (!matchHandedBackResult(result, step)) {
+        return false;
+    }
+
+    Block& body = *step._body;
+
+    RegionCarrySet carrySet;
+    matchRegionCarrySet(*body.getParent(), carrySet);
+
+    return handsBackAlong(body, carrySet, step._position);
+}
+
+Value runConstantArgument(Value column) {
+    RowConstant constant = column ? column.getDefiningOp<RowConstant>() : RowConstant();
+
+    return constant ? canonicalArgument(constant.getRow()) : Value();
+}
+
+// The column of the rows @param value holds one value for: itself, or for a value computed per
+// row, the first column it is computed over that is not a constant
+Value rowsOf(Value value, Block& body) {
+    Value rows = value;
+    while (true) {
+        Operation* const op = rows.getDefiningOp();
+        if (!op || op->getBlock() != &body || !computesAValuePerRow(op)) {
+            return rows;
+        }
+
+        const OperandRange operands = op->getOperands();
+        const auto rowOperand = llvm::find_if(operands, [](Value operand) {
+            return !::db::yieldsConstantColumn(operand);
+        });
+        if (rowOperand == operands.end()) {
+            return rows;
+        }
+
+        rows = *rowOperand;
+    }
+}
+
+// The argument whose run constant @param column holds on every row, mapped down from it by the
+// ops of @param body; null where it holds none
+Value heldRunConstantArgument(Value column, Block& body) {
+    Value rows = column;
+    while (rows) {
+        if (const Value argument = runConstantArgument(rows)) {
+            return argument;
+        }
+
+        const OpResult result = dyn_cast<OpResult>(rows);
+        Operation* const op = result ? result.getOwner() : nullptr;
+
+        const bool mapsRowsInTheBody = op && op->getBlock() == &body && mapsRowsThrough(op);
+        if (!mapsRowsInTheBody) {
+            return {};
+        }
+
+        rows = cast<ColumnCarrierOpInterface>(op).getRowSource(result);
+    }
+
+    return {};
+}
+
+Value runConstantOf(Block& body, Value argument) {
+    for (const BlockArgument candidate : body.getArguments()) {
+        if (canonicalArgument(candidate) != argument) {
+            continue;
+        }
+
+        for (Operation* const user : candidate.getUsers()) {
+            if (RowConstant constant = dyn_cast<RowConstant>(user)) {
+                return constant.getResult();
+            }
+        }
+    }
+
+    return {};
+}
+
+// The rows @param body yields, as the first yielded column holding one value per row is over
+Value yieldedRowsOf(Block& body) {
+    const OperandRange yielded = yieldedColumnsOf(body);
+    for (const Value column : yielded) {
+        const Value rows = rowsOf(column, body);
+        if (!::db::yieldsConstantColumn(rows)) {
+            return rows;
+        }
+    }
+
+    return {};
+}
+
+// The ops mapping rows through from the rows of @param yielded, a column @param body yields,
+// down to the first with a result holding the run constant read off @param argument, which
+// @param holder is set to; nearest the yield first
+bool matchRunConstantChain(Block& body, Value yielded, Value argument, llvm::SmallVectorImpl<Operation*>& chain, Value& holder) {
+    Value rows = rowsOf(yielded, body);
+    while (rows) {
+        const OpResult result = dyn_cast<OpResult>(rows);
+        Operation* const op = result ? result.getOwner() : nullptr;
+
+        const bool mapsRowsInTheBody = op && op->getBlock() == &body && mapsRowsThrough(op);
+        if (!mapsRowsInTheBody) {
+            return false;
+        }
+
+        const auto holding = llvm::find_if(op->getResults(), [&body, argument](OpResult other) {
+            return heldRunConstantArgument(other, body) == argument;
+        });
+
+        if (holding != op->getResults().end()) {
+            holder = *holding;
+            return true;
+        }
+
+        rows = cast<ColumnCarrierOpInterface>(op).getRowSource(result);
+        chain.push_back(op);
+    }
+
+    return false;
+}
+
+// The steps from the rows a body run per row yields down to a column holding the run constant
+// its carried column at @param carriedIndex is read as, along the first yielded column they
+// lead from. Where no column holds it, @param holder is the run constant itself, which is laid
+// out over the yielded rows.
+bool matchRunConstantChainOf(Block& body, size_t carriedIndex, llvm::SmallVectorImpl<Operation*>& chain, Value& holder) {
+    const Value argument = canonicalArgument(carriedArgument(*body.getParent(), carriedIndex));
+
+    const OperandRange yielded = yieldedColumnsOf(body);
+    for (const Value column : yielded) {
+        chain.clear();
+        if (matchRunConstantChain(body, column, argument, chain, holder)) {
+            return true;
+        }
+    }
+
+    chain.clear();
+    holder = runConstantOf(body, argument);
+
+    return holder && yieldedRowsOf(body);
+}
+
+// A body run per row yields rows of one run, so the carried column a result hands back holds
+// on each of them the run constant the body reads it as. The rows come out of the body from
+// a column holding that constant, which the yielded rows map from.
+bool matchRunConstantOutOfRegionStep(OpResult result, RowsStep& step) {
+    RowsStep handsBack;
+    if (!matchHandedBackResult(result, handsBack)) {
+        return false;
+    }
+
+    Block& body = *handsBack._body;
+    Region& region = *body.getParent();
+
+    RegionCarrySet carrySet;
+    matchRegionCarrySet(region, carrySet);
+
+    size_t resultOffset = 0;
+    ColumnCarrierOpInterface carrier = cast<ColumnCarrierOpInterface>(result.getOwner());
+    const bool yieldsRowForRow = !carrySet._yieldsBack && carrier.getYieldedResultOffset(region, resultOffset);
+    if (!yieldsRowForRow) {
+        return false;
+    }
+
+    llvm::SmallVector<Operation*> chain;
+    Value holder;
+    if (!matchRunConstantChainOf(body, handsBack._position, chain, holder)) {
+        return false;
+    }
+
+    step = RowsStep {._kind = RowsStepKind::RunConstantOutOfRegion,
+                     ._op = chain.empty() ? body.getTerminator() : chain.back(),
+                     ._body = &body,
+                     ._position = handsBack._position,
+                     ._rows = result,
+                     ._outerRows = holder};
+
+    return true;
+}
+
+// A non-optional CALL hands its carried columns back out of its body, so a result doing both
+// steps out of the body: a read there reaches it, and a read before the op through the body
+bool matchRowsStep(Value rows, RowsStep& step) {
+    if (const BlockArgument argument = dyn_cast<BlockArgument>(rows)) {
+        return matchIntoRegionStep(argument, step);
+    }
+
+    const OpResult result = cast<OpResult>(rows);
+
+    return matchMapsRowsStep(result, step)
+        || matchRowConstantStep(result, step)
+        || matchOutOfRegionStep(result, step)
+        || matchRunConstantOutOfRegionStep(result, step)
+        || matchHandsBackStep(result, step);
+}
+
+// A walk into a body through the run constant a result hands back, and out of it through the
+// argument that constant is read off, only passes the op: one step handing the column back
+void collapseRunConstantRoundTrips(llvm::SmallVectorImpl<RowsStep>& steps) {
+    for (size_t stepIndex = 0; stepIndex < steps.size(); stepIndex++) {
+        if (steps[stepIndex]._kind != RowsStepKind::RunConstantOutOfRegion) {
+            continue;
+        }
+
+        Block* const body = steps[stepIndex]._body;
+        const auto exitIt = std::find_if(steps.begin() + stepIndex + 1, steps.end(), [body](const RowsStep& step) {
+            return step._kind == RowsStepKind::IntoRegion && step._body == body;
+        });
+        if (exitIt == steps.end()) {
+            continue;
+        }
+
+        RowsStep handsBack;
+        const bool handsBackTheColumn = matchHandedBackResult(cast<OpResult>(steps[stepIndex]._rows), handsBack);
+        bioassert(handsBackTheColumn, "A run constant comes out of a body as a column its op hands back");
+
+        steps.erase(steps.begin() + stepIndex + 1, exitIt + 1);
+        steps[stepIndex] = handsBack;
+    }
+}
+
+// The op a column of the rows a step reaches has to stand before
+Operation* outerUseSite(const RowsStep& step) {
+    switch (step._kind) {
+        case RowsStepKind::MapsRows:
+        case RowsStepKind::ReadsRowConstant:
+        case RowsStepKind::RunConstantOutOfRegion:
+            return step._op;
+        break;
+        case RowsStepKind::IntoRegion:
+        case RowsStepKind::HandsBack:
+            return step._body->getParentOp();
+        break;
+        case RowsStepKind::OutOfRegion:
+            return step._body->getTerminator();
+        break;
+        case RowsStepKind::LaysOutConstant:
+            return nullptr;
+        break;
+    }
+
+    return nullptr;
+}
+
+// A run constant holds its one value for every row of its body, so a column read off it
+// reaches the rows mapped from it without being carried, laid out over the rows the walk
+// mapped down from
+void layOutRunConstant(llvm::SmallVectorImpl<RowsStep>& steps) {
+    size_t firstMapping = steps.size();
+    while (firstMapping > 0 && steps[firstMapping - 1]._kind == RowsStepKind::MapsRows) {
+        firstMapping--;
+    }
+
+    if (firstMapping == steps.size()) {
+        return;
+    }
+
+    const Value entryRows = steps[firstMapping]._rows;
+    steps.truncate(firstMapping);
+    steps.push_back(RowsStep {._kind = RowsStepKind::LaysOutConstant, ._rows = entryRows});
+}
+
+// An op handing back the column it carries in at _carriedIndex for the rows of the one at
+// _rowsIndex, and that column carried up _chain toward the body's yield, _nextStep steps of
+// it still to go
+struct HandBack {
+    Operation* _op {nullptr};
+    size_t _carriedIndex {0};
+    size_t _rowsIndex {0};
+    llvm::SmallVector<RowsStep> _chain;
+    size_t _nextStep {0};
+    Value _column;
+};
+
+// Hands a read the column holding its property for its rows: one read before it, or one read
+// of rows its own come from, carried down to it through the ops between
+class PropertyColumnWalk {
+public:
+    PropertyColumnWalk(KnownPropertyColumns& known, mlir::RewriterBase& rewriter)
+        : _known(known),
+          _rewriter(rewriter)
+    {
+    }
+
+    // Null where there is none: this adds no read. A walk starts again once handing a column
+    // back through a region has rebuilt ops a step of it stood on.
+    Value propertyColumnOf(Operation* read, StringAttr property, bool nodeProperty) {
+        _property = property;
+        _nodeProperty = nodeProperty;
+
+        Value propertyColumn;
+        bool rebuilt = true;
+        while (rebuilt) {
+            llvm::SmallVector<RowsStep> steps;
+            propertyColumn = findKnownColumn(read, steps);
+            if (!propertyColumn) {
+                return {};
+            }
+
+            rebuilt = false;
+            for (size_t stepIndex = steps.size(); stepIndex > 0 && !rebuilt; stepIndex--) {
+                propertyColumn = carryBack(steps[stepIndex - 1], propertyColumn, rebuilt);
+            }
+        }
+
+        return propertyColumn;
+    }
+
+private:
+    KnownPropertyColumns& _known;
+    mlir::RewriterBase& _rewriter;
+    StringAttr _property;
+    bool _nodeProperty {false};
+
+    Value findKnownColumn(Operation* read, llvm::SmallVectorImpl<RowsStep>& steps) {
+        Value rows = read->getOperand(0);
+        Operation* useSite = read;
+
+        while (true) {
+            if (isa_and_present<RowConstant>(rows.getDefiningOp())) {
+                layOutRunConstant(steps);
+            }
+
+            const Value known = _known.find(rows, _property, _nodeProperty, useSite);
+            if (known) {
+                collapseRunConstantRoundTrips(steps);
+                return known;
+            }
+
+            RowsStep step;
+            if (!matchRowsStep(rows, step)) {
+                return {};
+            }
+
+            steps.push_back(step);
+            rows = step._outerRows;
+            useSite = outerUseSite(step);
+        }
+    }
+
+    Value carryBack(const RowsStep& step, Value column, bool& rebuilt) {
+        switch (step._kind) {
+            case RowsStepKind::MapsRows:
+                return carryThroughRows(step, column);
+            break;
+            case RowsStepKind::IntoRegion:
+                return carryIntoBody(step, column, rebuilt);
+            break;
+            case RowsStepKind::ReadsRowConstant:
+                return readAsRowConstant(step, column);
+            break;
+            case RowsStepKind::LaysOutConstant:
+                return layOutConstant(step, column);
+            break;
+            case RowsStepKind::OutOfRegion:
+                return carryOutOf(*step._body, column);
+            break;
+            case RowsStepKind::RunConstantOutOfRegion:
+                return carryRunConstantOutOfBody(step, column);
+            break;
+            case RowsStepKind::HandsBack:
+                return carryThroughBody(step, column);
+            break;
+        }
+
+        return column;
+    }
+
+    Value carryThroughRows(const RowsStep& step, Value column) {
+        const Value carried = carryThroughOp(step._op, column);
+        Operation* const carrying = carried.getDefiningOp();
+
+        _known.addCarried(carrying->getResult(static_cast<unsigned>(step._position)), _property, _nodeProperty, carried);
+
+        return carried;
+    }
+
+    Value carryThroughOp(Operation* carrier, Value column) {
         const llvm::SmallVector<Value> carrierResults(carrier->getResults());
 
-        propertyColumn = carryThrough(carrier, propertyColumn, rewriter);
+        const Value carried = carryThrough(carrier, column, _rewriter);
 
-        Operation* const carrying = propertyColumn.getDefiningOp();
+        Operation* const carrying = carried.getDefiningOp();
         if (carrying != carrier) {
-            knownColumns.rebind(carrierResults, carrying);
+            const ResultRange replacements = carrying->getResults();
+            _known.rebind(carrierResults, llvm::SmallVector<Value>(replacements.take_front(carrierResults.size())));
         }
 
-        knownColumns.addCarried(carrying->getResult(carriedRowsResults[carrierIndex - 1]), property, nodeProperty, propertyColumn);
+        return carried;
     }
 
-    return propertyColumn;
-}
+    Value carryIntoBody(const RowsStep& step, Value column, bool& rebuilt) {
+        Block& body = *step._body;
+        Operation* const op = body.getParentOp();
+
+        bool appended = false;
+        const size_t carriedIndex = carryIntoRegions(op, column, _rewriter, appended);
+
+        RegionCarrySet carrySet;
+        matchRegionCarrySet(*body.getParent(), carrySet);
+
+        if (appended && carrySet._handsBack) {
+            handBack(op, carriedIndex, step._position);
+            rebuilt = carrySet._yieldsBack;
+        }
+
+        const BlockArgument argument = carriedArgument(*body.getParent(), carriedIndex);
+        _known.addCarried(step._rows, _property, _nodeProperty, argument);
+
+        return argument;
+    }
+
+    Value carryThroughBody(const RowsStep& step, Value column) {
+        Operation* op = step._body->getParentOp();
+
+        bool appended = false;
+        const size_t carriedIndex = carryIntoRegions(op, column, _rewriter, appended);
+        if (appended) {
+            op = handBack(op, carriedIndex, step._position);
+        }
+
+        return op->getResult(static_cast<unsigned>(carriedIndex));
+    }
+
+    // @param op hands back the column it has just carried in at @param carriedIndex as a new
+    // result. A body yielding its carried columns back yields it along the one at
+    // @param rowsIndex, carried through each step between, and an op among them handing back
+    // what it carries in hands this column back the same way before the steps above it go on.
+    Operation* handBack(Operation* op, size_t carriedIndex, size_t rowsIndex) {
+        llvm::SmallVector<HandBack> handBacks;
+        pushHandBack(op, carriedIndex, rowsIndex, handBacks);
+
+        while (true) {
+            HandBack& current = handBacks.back();
+
+            if (current._nextStep == 0) {
+                const size_t handedIndex = current._carriedIndex;
+                Operation* const rebuilt = finishHandBack(current);
+
+                handBacks.pop_back();
+                if (handBacks.empty()) {
+                    return rebuilt;
+                }
+
+                handBacks.back()._column = rebuilt->getResult(static_cast<unsigned>(handedIndex));
+                continue;
+            }
+
+            current._nextStep--;
+            const RowsStep step = current._chain[current._nextStep];
+
+            if (step._kind == RowsStepKind::MapsRows) {
+                current._column = carryThroughOp(step._op, current._column);
+                continue;
+            }
+
+            Operation* const handing = step._body->getParentOp();
+
+            bool appended = false;
+            const size_t handedIndex = carryIntoRegions(handing, current._column, _rewriter, appended);
+            if (appended) {
+                pushHandBack(handing, handedIndex, step._position, handBacks);
+            } else {
+                current._column = handing->getResult(static_cast<unsigned>(handedIndex));
+            }
+        }
+    }
+
+    void pushHandBack(Operation* op, size_t carriedIndex, size_t rowsIndex, llvm::SmallVectorImpl<HandBack>& handBacks) {
+        Region& region = op->getRegion(0);
+
+        RegionCarrySet carrySet;
+        matchRegionCarrySet(region, carrySet);
+
+        HandBack handBack {._op = op, ._carriedIndex = carriedIndex, ._rowsIndex = rowsIndex};
+        if (carrySet._yieldsBack) {
+            const bool chained = matchHandedBackChain(region.front(), rowsIndex, handBack._chain);
+            bioassert(chained, "A column is carried into a body only along one it yields back");
+
+            handBack._nextStep = handBack._chain.size();
+            handBack._column = carriedArgument(region, carriedIndex);
+        }
+
+        handBacks.push_back(handBack);
+    }
+
+    Operation* finishHandBack(const HandBack& handBack) {
+        Operation* const op = handBack._op;
+        Region& region = op->getRegion(0);
+
+        RegionCarrySet carrySet;
+        matchRegionCarrySet(region, carrySet);
+
+        if (carrySet._yieldsBack) {
+            insertYieldedColumn(region.front(), handBack._carriedIndex, handBack._column);
+        }
+
+        const Value column = op->getOperand(static_cast<unsigned>(carrySet._operandOffset + handBack._carriedIndex));
+        Operation* const rebuilt = insertResult(op, handBack._carriedIndex, column.getType());
+
+        _known.addCarried(rebuilt->getResult(static_cast<unsigned>(handBack._rowsIndex)),
+                          _property,
+                          _nodeProperty,
+                          rebuilt->getResult(static_cast<unsigned>(handBack._carriedIndex)));
+
+        return rebuilt;
+    }
+
+    Value readAsRowConstant(const RowsStep& step, Value column) {
+        _rewriter.setInsertionPointAfter(step._op);
+        const Value constant = _rewriter.create<RowConstant>(step._op->getLoc(), column).getResult();
+
+        _known.addCarried(step._rows, _property, _nodeProperty, constant);
+
+        return constant;
+    }
+
+    Value layOutConstant(const RowsStep& step, Value constant) {
+        _rewriter.setInsertionPointAfterValue(step._rows);
+        const Value laidOut = _rewriter.create<BroadcastConstant>(step._rows.getLoc(), constant, step._rows).getResult();
+
+        _known.addCarried(step._rows, _property, _nodeProperty, laidOut);
+
+        return laidOut;
+    }
+
+    Value carryRunConstantOutOfBody(const RowsStep& step, Value column) {
+        Block& body = *step._body;
+
+        llvm::SmallVector<Operation*> chain;
+        Value holder;
+        const bool chained = matchRunConstantChainOf(body, step._position, chain, holder);
+        bioassert(chained, "A run constant comes out of a body along the rows it yields");
+
+        if (runConstantArgument(holder)) {
+            Operation* const terminator = body.getTerminator();
+            _rewriter.setInsertionPoint(terminator);
+
+            const Value rows = yieldedRowsOf(body);
+            const Value laidOut = _rewriter.create<BroadcastConstant>(terminator->getLoc(), column, rows).getResult();
+
+            return carryOutOf(body, laidOut);
+        }
+
+        Value carried = column;
+        for (size_t chainIndex = chain.size(); chainIndex > 0; chainIndex--) {
+            carried = carryThroughOp(chain[chainIndex - 1], carried);
+        }
+
+        return carryOutOf(body, carried);
+    }
+
+    Value carryOutOf(Block& body, Value column) {
+        Operation* op = body.getParentOp();
+
+        size_t resultOffset = 0;
+        const bool yields = cast<ColumnCarrierOpInterface>(op).getYieldedResultOffset(*body.getParent(), resultOffset);
+        bioassert(yields, "A column comes out of a region whose yield the op's results stand for");
+
+        const OperandRange yielded = yieldedColumnsOf(body);
+        const auto yieldedIt = llvm::find(yielded, column);
+        const size_t yieldIndex = static_cast<size_t>(yieldedIt - yielded.begin());
+
+        if (yieldedIt == yielded.end()) {
+            insertYieldedColumn(body, yieldIndex, column);
+            op = insertResult(op, resultOffset + yieldIndex, column.getType());
+        }
+
+        return op->getResult(static_cast<unsigned>(resultOffset + yieldIndex));
+    }
+
+    void insertYieldedColumn(Block& body, size_t yieldIndex, Value column) {
+        MutableOperandRange yielded = yieldedColumnsOf(body);
+        const OperandRange current = yielded;
+
+        llvm::SmallVector<Value> columns(current.begin(), current.end());
+        columns.insert(columns.begin() + yieldIndex, column);
+
+        _rewriter.modifyOpInPlace(body.getTerminator(), [&yielded, &columns] {
+            yielded.assign(columns);
+        });
+    }
+
+    // Rebuilds @param op with a result of @param type at @param resultIndex, the ones from there
+    // on moving up one, and its regions moved over
+    Operation* insertResult(Operation* op, size_t resultIndex, Type type) {
+        llvm::SmallVector<Type> types(op->getResultTypes());
+        types.insert(types.begin() + resultIndex, type);
+
+        const unsigned regionCount = op->getNumRegions();
+
+        OperationState state(op->getLoc(), op->getName());
+        state.addOperands(op->getOperands());
+        state.addTypes(types);
+        state.addAttributes(op->getAttrs());
+        for (unsigned regionIndex = 0; regionIndex < regionCount; regionIndex++) {
+            state.addRegion();
+        }
+
+        _rewriter.setInsertionPoint(op);
+        Operation* const rebuilt = _rewriter.create(state);
+        for (unsigned regionIndex = 0; regionIndex < regionCount; regionIndex++) {
+            rebuilt->getRegion(regionIndex).takeBody(op->getRegion(regionIndex));
+        }
+
+        const llvm::SmallVector<Value> replaced(op->getResults());
+        llvm::SmallVector<Value> replacements;
+        for (size_t index = 0; index < replaced.size(); index++) {
+            const size_t rebuiltIndex = index < resultIndex ? index : index + 1;
+            replacements.push_back(rebuilt->getResult(static_cast<unsigned>(rebuiltIndex)));
+        }
+
+        _known.rebind(replaced, replacements);
+        _rewriter.replaceOp(op, replacements);
+
+        return rebuilt;
+    }
+};
 
 struct ReusePropertyReads : public impl::ReusePropertyReadsBase<ReusePropertyReads> {
     void runOnOperation() override {
@@ -7378,6 +8751,8 @@ struct ReusePropertyReads : public impl::ReusePropertyReadsBase<ReusePropertyRea
         llvm::SmallVector<Operation*> reads;
         llvm::DenseSet<Attribute> writtenNodeProperties;
         llvm::DenseSet<Attribute> writtenEdgeProperties;
+        bool writesEveryNodeProperty = false;
+        bool writesEveryEdgeProperty = false;
         root->walk([&](Operation* op) {
             StringAttr writtenProperty;
             bool writesNodes = false;
@@ -7390,11 +8765,18 @@ struct ReusePropertyReads : public impl::ReusePropertyReadsBase<ReusePropertyRea
                 } else {
                     writtenEdgeProperties.insert(writtenProperty);
                 }
+            } else if (matchPropertiesWrite(op, writesNodes)) {
+                if (writesNodes) {
+                    writesEveryNodeProperty = true;
+                } else {
+                    writesEveryEdgeProperty = true;
+                }
             }
         });
 
         mlir::IRRewriter rewriter(&getContext());
         KnownPropertyColumns knownColumns;
+        PropertyColumnWalk walk(knownColumns, rewriter);
         for (Operation* const read : reads) {
             StringAttr property;
             bool nodeProperty = false;
@@ -7404,18 +8786,18 @@ struct ReusePropertyReads : public impl::ReusePropertyReadsBase<ReusePropertyRea
             // A read standing before this one saw what the property held before the write,
             // and a projection behind a SET reads what the statement wrote
             const llvm::DenseSet<Attribute>& written = nodeProperty ? writtenNodeProperties : writtenEdgeProperties;
-            if (written.contains(property)) {
+            const bool writesEveryProperty = nodeProperty ? writesEveryNodeProperty : writesEveryEdgeProperty;
+            if (writesEveryProperty || written.contains(property)) {
                 continue;
             }
 
-            const Value reused = propertyColumnOf(read->getOperand(0), property, nodeProperty, read, knownColumns, rewriter);
+            const Value reused = walk.propertyColumnOf(read, property, nodeProperty);
             if (!reused) {
                 knownColumns.addRead(read, property, nodeProperty);
                 continue;
             }
 
-            read->getResult(0).replaceAllUsesWith(reused);
-            read->erase();
+            rewriter.replaceOp(read, reused);
         }
     }
 };
@@ -7466,34 +8848,13 @@ struct EqualityCross {
     bool _buildsTheLeftFactor {false};
 };
 
-// The type a key's rows carry at run time, when its db column fixes it: a column the
-// product yields, or a property read, whose chunk lowering builds from the type it
-// declares. Null for a column typed none, and for a key computed by any other op, whose
-// type lowering derives from its operands rather than from the one the op declares.
-Type fixedKeyType(const JoinKeySide& side) {
-    const llvm::SmallVector<Operation*>& coneOps = side._cone._ops;
-    const Type keyType = side._key.getType();
+// Whether a key's rows can be hashed. The two keys need not share a type: the join hashes
+// each side by its own and compares them as the equality does. A path has no value to hash,
+// as two paths are equal when they run through the same nodes and edges.
+bool isHashableKey(const JoinKeySide& side) {
+    const Type keyType = cast<ColumnType>(side._key.getType()).getType();
 
-    const bool isAColumn = coneOps.empty();
-    const bool isAPropertyRead = coneOps.size() == 1
-                              && isa<GetNodeProperties, GetEdgeProperties>(coneOps.front());
-    const bool typeIsResolved = !isa<mlir::NoneType>(cast<ColumnType>(keyType).getType());
-
-    if ((isAColumn || isAPropertyRead) && typeIsResolved) {
-        return keyType;
-    }
-
-    return nullptr;
-}
-
-// Whether the two sides' keys are provably columns of one type. The join matches a build
-// key against a probe key by the bytes each serializes to, so two columns that could
-// serialize differently - an integer property against a string one, a node against a
-// number - would answer a comparison the equality did not.
-bool keysShareAColumnType(const JoinKeySide& left, const JoinKeySide& right) {
-    const Type leftType = fixedKeyType(left);
-
-    return leftType && leftType == fixedKeyType(right);
+    return !isa<storage::PathType, storage::PathRefType>(keyType);
 }
 
 // Reads into side the one product column a key is computed over, along with the ops
@@ -7502,7 +8863,7 @@ bool keysShareAColumnType(const JoinKeySide& left, const JoinKeySide& right) {
 // first side, and is set to the one this side found.
 bool matchKeySide(Value key, JoinKeySide& side, CrossProduct& product) {
     side._key = key;
-    side._cone = collectMaskCone(key);
+    collectRowCone({key}, key.getParentBlock(), side._cone);
 
     if (side._cone._inputs.size() != 1) {
         return false;
@@ -7603,7 +8964,7 @@ bool carriesJoinColumnsOnly(FilterOp filter, const EqualityCross& match) {
 // multiply where a scan or a traversal contributes them linearly.
 bool factorHoldsAProduct(Region& factor) {
     const WalkResult walked = factor.walk([](Operation* op) {
-        if (isa<CrossProduct, HashJoin>(op)) {
+        if (isa<CrossProduct>(op)) {
             return WalkResult::interrupt();
         }
 
@@ -7631,37 +8992,51 @@ void keySideLabels(const JoinKeySide& side,
     collectScanLabels(scan.getLabels(), metadata, labels);
 }
 
-// The row budget a limit downstream of the cut puts on the rows the join would emit, and
-// zero when none governs them. A product stops as soon as the budget is met, where the
-// join reads its whole build side before it can emit a row, which is what tips a small
-// budget back towards the product.
-uint64_t limitOverTheCut(FilterOp filter) {
-    llvm::SmallVector<Operation*, 8> pending;
+// An op reading the rows of a cut, and how many of those rows the skips between them drop
+struct CutRowsReader {
+    Operation* _op {nullptr};
+    uint64_t _skipped {0};
+};
+
+// The rows the cut must produce for a limit downstream of it to be met, and none when no
+// limit bounds them. The budget reaches the cut only through ops handing each row on as at
+// least one row as they read it. A skip adds the rows it drops to the limit after it, and a
+// LIMIT 0 needs no row: the loops stop before their first step.
+std::optional<uint64_t> limitOverTheCut(FilterOp filter) {
+    Block* const cutBlock = filter->getBlock();
+
+    llvm::SmallVector<CutRowsReader, 8> pending;
     llvm::SmallPtrSet<Operation*, 8> visited;
-    for (const Value column : filter.getFilteredColumns()) {
-        for (Operation* const user : column.getUsers()) {
-            if (visited.insert(user).second) {
-                pending.push_back(user);
+    const auto pushReaders = [&](Operation* op, uint64_t skipped) {
+        for (Operation* const user : op->getUsers()) {
+            Operation* const reader = cutBlock->findAncestorOpInBlock(*user);
+            if (visited.insert(reader).second) {
+                pending.push_back(CutRowsReader {reader, skipped});
             }
         }
-    }
+    };
 
+    pushReaders(filter, 0);
+
+    std::optional<uint64_t> budget;
     while (!pending.empty()) {
-        Operation* const op = pending.pop_back_val();
-        if (Limit limit = dyn_cast<Limit>(op)) {
-            return limit.getCount();
-        }
+        const CutRowsReader reader = pending.pop_back_val();
+        Operation* const op = reader._op;
 
-        for (const Value result : op->getResults()) {
-            for (Operation* const user : result.getUsers()) {
-                if (visited.insert(user).second) {
-                    pending.push_back(user);
-                }
-            }
+        if (Limit limit = dyn_cast<Limit>(op)) {
+            const uint64_t count = limit.getCount();
+            const uint64_t rows = count == 0 ? 0 : llvm::SaturatingAdd(reader._skipped, count);
+            budget = std::max(budget.value_or(0), rows);
+        } else if (Skip skip = dyn_cast<Skip>(op)) {
+            pushReaders(op, llvm::SaturatingAdd(reader._skipped, skip.getCount()));
+        } else if (computesAValuePerRow(op) || isa<OptionalMatch>(op)) {
+            pushReaders(op, reader._skipped);
+        } else {
+            return std::nullopt;
         }
     }
 
-    return 0;
+    return budget;
 }
 
 // Whether the cut is better left as the product it stands as. The join reads its build
@@ -7699,136 +9074,756 @@ bool prefersTheProduct(const EqualityCross& match, const DBPassContext& context)
 // yielded item at.
 constexpr size_t uncountableRows = 10;
 
-size_t multiplySaturating(size_t rows, size_t factor) {
-    constexpr size_t rowCeiling = std::numeric_limits<size_t>::max();
-    if (factor != 0 && rows > rowCeiling / factor) {
-        return rowCeiling;
+// System R's share of rows a predicate keeps (Selinger et al., 1979): the graph counts
+// nodes per label set and edges per end, but no value per property.
+constexpr double EQUALITY_SELECTIVITY = 0.1;
+constexpr double RANGE_SELECTIVITY = 1.0 / 3.0;
+constexpr double MEMBERSHIP_SELECTIVITY_CEILING = 0.5;
+
+// PostgreSQL's count of distinct values in a column it holds no statistics of
+// (DEFAULT_NUM_DISTINCT): as many as the rows, up to this many
+constexpr double DEFAULT_DISTINCT_VALUES = 200;
+
+std::optional<int64_t> literalInteger(Value value) {
+    ConstantOp constant = value.getDefiningOp<ConstantOp>();
+    const IntegerAttr integer = constant ? dyn_cast<IntegerAttr>(constant.getValue()) : IntegerAttr();
+    if (!integer) {
+        return std::nullopt;
     }
 
-    return rows * factor;
+    return integer.getInt();
 }
+
+double estimateUnwoundRows(Unwind unwind) {
+    Range range = unwind.getSource().getDefiningOp<Range>();
+    if (!range) {
+        return static_cast<double>(uncountableRows);
+    }
+
+    const Value stepColumn = range.getStep();
+    const std::optional<int64_t> start = literalInteger(range.getStart());
+    const std::optional<int64_t> end = literalInteger(range.getEnd());
+    const std::optional<int64_t> step = stepColumn ? literalInteger(stepColumn) : std::optional<int64_t>(1);
+
+    const bool countsLiterals = start && end && step && *step != 0;
+    if (!countsLiterals) {
+        return static_cast<double>(uncountableRows);
+    }
+
+    const double steps = (static_cast<double>(*end) - static_cast<double>(*start)) / static_cast<double>(*step);
+
+    return steps < 0 ? 0 : floor(steps) + 1;
+}
+
+using KnownLabels = llvm::DenseMap<Value, ::db::LabelSet>;
+
+// The edges a hop walks as far as the estimate tells them apart: the labels known on the
+// node it leaves and on the node it reaches, and the types it keeps, every type until one
+// is named
+struct HopEdges {
+    ::db::LabelSet _near;
+    ::db::LabelSet _far;
+    llvm::SmallVector<::db::EdgeTypeID, 2> _types;
+    bool _isTyped {false};
+    bool _leavesSource {true};
+    bool _walksBoth {false};
+};
+
+// The hop a walk last took at a node, and whether the node is the source of its edges
+struct NodeSide {
+    Operation* _hop {nullptr};
+    bool _isOut {true};
+};
+
+// What an estimate walking a pattern's ops knows of its rows: the labels each node carries,
+// the edges each hop walked, found from the hop and from the node it reached, and the hop
+// the walk last took at each node
+struct WalkKnowledge {
+    KnownLabels _labels;
+    llvm::DenseMap<Operation*, HopEdges> _hops;
+    llvm::DenseMap<Value, Operation*> _reachingHops;
+    llvm::DenseMap<Value, NodeSide> _lastSides;
+};
+
+// What a hop makes and reads per row it reads
+struct HopEstimate {
+    double _rows {0};
+    double _edgesRead {0};
+};
+
+// The edge types a list of names stands for, a name the schema lacks standing for no edge
+void collectEdgeTypes(ArrayAttr names, const ::db::GraphMetadata& metadata, llvm::SmallVectorImpl<::db::EdgeTypeID>& edgeTypes) {
+    const ::db::EdgeTypeMap& edgeTypeMap = metadata.edgeTypes();
+    for (const Attribute nameAttr : names) {
+        const StringAttr name = dyn_cast<StringAttr>(nameAttr);
+        if (!name) {
+            continue;
+        }
+
+        const llvm::StringRef nameRef = name.getValue();
+        const std::optional<::db::EdgeTypeID> edgeType = edgeTypeMap.get(std::string_view(nameRef.data(), nameRef.size()));
+        if (edgeType && !llvm::is_contained(edgeTypes, *edgeType)) {
+            edgeTypes.push_back(*edgeType);
+        }
+    }
+}
+
+// The hop or edge scan a column of edge types was read from: its own type column, or the
+// types of its edge column
+Operation* findTypedHop(Value edgeTypes, llvm::function_ref<Value(Value)> nodeOf) {
+    Value column = nodeOf(edgeTypes);
+    size_t resultIndex = EDGE_TYPES_RESULT;
+    if (GetEdgeTypes read = column.getDefiningOp<GetEdgeTypes>()) {
+        column = nodeOf(read.getInputEdges());
+        resultIndex = EDGE_IDS_RESULT;
+    }
+
+    const OpResult result = dyn_cast<OpResult>(column);
+    if (!result || result.getResultNumber() != resultIndex) {
+        return nullptr;
+    }
+
+    Operation* const owner = result.getOwner();
+    if (!isEdgeHop(owner) && !isEdgeScan(owner)) {
+        return nullptr;
+    }
+
+    return owner;
+}
+
+class RowEstimator {
+public:
+    explicit RowEstimator(const ::db::GraphView& view)
+        : _metadata(view.metadata()),
+        _estimation(view),
+        _nodeCount(static_cast<double>(_estimation.estimateNodeCount(::db::LabelSet {}))),
+        _edgeCount(static_cast<double>(_estimation.estimateEdgeCount()))
+    {
+    }
+
+    double getNodeCount() const { return _nodeCount; }
+    double getEdgeCount() const { return _edgeCount; }
+
+    double getLabelledNodes(const ::db::LabelSet& labels) const {
+        if (labels.empty()) {
+            return _nodeCount;
+        }
+
+        return static_cast<double>(_estimation.estimateNodeCount(labels));
+    }
+
+    // The nodes a scan reads: those carrying every label @param labelNames names, every node
+    // when it names none, whose labels go into @param knowledge for the column @param nodes
+    double scanNodes(Value nodes, ArrayAttr labelNames, WalkKnowledge& knowledge) const {
+        if (!labelNames) {
+            return _nodeCount;
+        }
+
+        ::db::LabelSet labels;
+        if (!collectScanLabels(labelNames, _metadata, labels)) {
+            return 0;
+        }
+
+        knowledge._labels[nodes] = labels;
+
+        return getLabelledNodes(labels);
+    }
+
+    // The rows an edge scan makes: the edges of the types @param typeNames names, every type
+    // when it names none, from the nodes carrying every label @param sourceNames names to
+    // those carrying every label @param targetNames names, an end with no names being any
+    // node. What it walked goes into @param knowledge, as a hop out of its sources would.
+    double scanEdges(Operation* scan,
+                     ArrayAttr sourceNames,
+                     ArrayAttr targetNames,
+                     ArrayAttr typeNames,
+                     WalkKnowledge& knowledge) const {
+        HopEdges edges;
+        const bool resolvesSource = !sourceNames || collectScanLabels(sourceNames, _metadata, edges._near);
+        const bool resolvesTarget = !targetNames || collectScanLabels(targetNames, _metadata, edges._far);
+        if (typeNames) {
+            narrowTypes(typeNames, edges);
+        }
+
+        const Value sources = scan->getResult(0);
+        const Value targets = scan->getResult(EDGE_TARGETS_RESULT);
+
+        knowledge._labels[sources] = edges._near;
+        knowledge._labels[targets] = edges._far;
+        knowledge._hops[scan] = edges;
+        knowledge._reachingHops[targets] = scan;
+        knowledge._lastSides[sources] = NodeSide {._hop = scan, ._isOut = true};
+        knowledge._lastSides[targets] = NodeSide {._hop = scan, ._isOut = false};
+
+        if (!resolvesSource || !resolvesTarget) {
+            return 0;
+        }
+
+        return countHopEdges(edges);
+    }
+
+    // The rows a hop makes and the edges it reads per row it reads: the edges it walks per
+    // node carrying the labels known on @param from, of its own types or else of @param
+    // keptTypes, which a filter of its type column keeps, and every edge on that side of the
+    // node, since a node's edges of one type are scattered through all of them. A node the
+    // walk took a hop at before has the edges of the nodes that hop leads to, not the
+    // average. What it walked goes into @param knowledge.
+    HopEstimate walkHop(Operation* hop,
+                        bool walksBackward,
+                        Value from,
+                        Value to,
+                        ArrayAttr keptTypes,
+                        WalkKnowledge& knowledge) const {
+        HopEdges edges;
+        edges._near = knowledge._labels.lookup(from);
+        edges._far = knowledge._labels.lookup(to);
+        edges._leavesSource = isReverseHop(hop) == walksBackward;
+        edges._walksBoth = isa<GetEdges>(hop);
+
+        bool reachesLabelledNodes = true;
+        if (isEdgeHop(hop)) {
+            const ArrayAttr hopTypes = hop->getAttrOfType<ArrayAttr>("edge_types");
+            const ArrayAttr types = hopTypes ? hopTypes : keptTypes;
+            if (types) {
+                narrowTypes(types, edges);
+            }
+
+            const ArrayAttr reachedLabels = hop->getAttrOfType<ArrayAttr>("labels");
+            if (reachedLabels && !walksBackward) {
+                reachesLabelledNodes = collectScanLabels(reachedLabels, _metadata, edges._far);
+            }
+        }
+
+        HopEdges read;
+        read._near = edges._near;
+        read._leavesSource = edges._leavesSource;
+        read._walksBoth = edges._walksBoth;
+
+        const bool relatesToEarlierHops = isEdgeHop(hop) && !edges._walksBoth;
+
+        double rowsLift = 1;
+        double readLift = 1;
+        const auto previous = knowledge._lastSides.find(from);
+        if (relatesToEarlierHops && previous != knowledge._lastSides.end()) {
+            const NodeSide previousSide = previous->second;
+            const HopEdges& previousEdges = knowledge._hops.find(previousSide._hop)->second;
+            const ::db::DegreeSelection previousDegree = selectionOf(previousEdges, previousSide._isOut);
+
+            rowsLift = getDegreeLift(edges._near, previousDegree, selectionOf(edges, edges._leavesSource));
+            readLift = getDegreeLift(edges._near, previousDegree, selectionOf(read, read._leavesSource));
+        }
+
+        knowledge._labels[to] = edges._far;
+        knowledge._hops[hop] = edges;
+        knowledge._reachingHops[to] = hop;
+
+        if (relatesToEarlierHops) {
+            knowledge._lastSides[from] = NodeSide {._hop = hop, ._isOut = edges._leavesSource};
+            knowledge._lastSides[to] = NodeSide {._hop = hop, ._isOut = !edges._leavesSource};
+        } else {
+            knowledge._lastSides.erase(from);
+            knowledge._lastSides.erase(to);
+        }
+
+        const double nodes = getLabelledNodes(edges._near);
+        if (nodes == 0) {
+            return HopEstimate {};
+        }
+
+        HopEstimate estimate;
+        estimate._edgesRead = readLift * countHopEdges(read) / nodes;
+        if (reachesLabelledNodes) {
+            estimate._rows = rowsLift * countHopEdges(edges) / nodes;
+        }
+
+        return estimate;
+    }
+
+    // The share of rows a label check on @param node keeps, which then adds the labels every
+    // alternative asks for to what @param knowledge knows of the node
+    double keepLabelled(ArrayAttr alternatives, Value node, WalkKnowledge& knowledge) const {
+        const double kept = shareLabelled(alternatives, node, knowledge);
+
+        ::db::LabelSet shared;
+        addSharedLabels(alternatives, shared);
+        knowledge._labels[node].merge(shared);
+
+        const auto reaching = knowledge._reachingHops.find(node);
+        if (reaching != knowledge._reachingHops.end()) {
+            knowledge._hops[reaching->second]._far.merge(shared);
+        }
+
+        return kept;
+    }
+
+    // @param nodeOf names the node a column holds, whose labels @param knowledge keeps
+    double getSelectivity(Value mask, llvm::function_ref<Value(Value)> nodeOf, WalkKnowledge& knowledge) const {
+        llvm::SmallVector<Value, 4> conjuncts;
+        collectConjuncts(mask, conjuncts);
+
+        double kept = 1;
+        for (const Value conjunct : conjuncts) {
+            const LabelCheck check = readLabelCheck(conjunct);
+            CheckEdgeTypeConstraint typeCheck = conjunct.getDefiningOp<CheckEdgeTypeConstraint>();
+
+            if (check._alternatives) {
+                kept *= keepLabelled(check._alternatives, nodeOf(check._nodes), knowledge);
+            } else if (typeCheck) {
+                kept *= keepTyped(typeCheck, nodeOf, knowledge);
+            } else {
+                kept *= getPredicateSelectivity(conjunct, nodeOf, knowledge);
+            }
+        }
+
+        return kept;
+    }
+
+private:
+    // The edge counts and degree products asked for, read off the graph once each: the walks
+    // the estimate compares ask for the same ones over and over
+    using StatisticKey = llvm::SmallVector<uint64_t, 16>;
+
+    static constexpr uint64_t EDGE_COUNT_KEY = 0;
+    static constexpr uint64_t DEGREE_PRODUCTS_KEY = 1;
+
+    const ::db::GraphMetadata& _metadata;
+    ::db::CardinalityEstimation _estimation;
+    double _nodeCount {0};
+    double _edgeCount {0};
+    mutable std::map<StatisticKey, double> _statistics;
+
+    struct LabelCheck {
+        ArrayAttr _alternatives;
+        Value _nodes;
+    };
+
+    static LabelCheck readLabelCheck(Value predicate) {
+        CheckLabelConstraint check = predicate.getDefiningOp<CheckLabelConstraint>();
+        if (!check) {
+            return {};
+        }
+
+        GetNodeLabelSet labelSet = check.getLabelsetIds().getDefiningOp<GetNodeLabelSet>();
+        if (!labelSet) {
+            return {};
+        }
+
+        return LabelCheck {._alternatives = check.getAlternatives(), ._nodes = labelSet.getInputNodes()};
+    }
+
+    static void appendLabels(const ::db::LabelSet& labels, StatisticKey& key) {
+        for (const uint64_t word : labels.integers()) {
+            key.push_back(word);
+        }
+    }
+
+    static void appendDegree(const ::db::DegreeSelection& degree, StatisticKey& key) {
+        key.push_back(degree._isOut ? 1 : 0);
+        key.push_back(degree._isEveryType ? 1 : 0);
+        key.push_back(degree._edgeTypes.size());
+        for (const ::db::EdgeTypeID edgeType : degree._edgeTypes) {
+            key.push_back(edgeType.getValue());
+        }
+    }
+
+    double countEdges(const ::db::LabelSet& source, const HopEdges& edges, const ::db::LabelSet& target) const {
+        StatisticKey key {EDGE_COUNT_KEY};
+        appendLabels(source, key);
+        appendLabels(target, key);
+        appendDegree(selectionOf(edges, true), key);
+
+        const auto [known, isNew] = _statistics.try_emplace(key, 0);
+        if (!isNew) {
+            return known->second;
+        }
+
+        double count = 0;
+        if (!edges._isTyped) {
+            count = static_cast<double>(_estimation.estimateEdgeCount(source, target));
+        } else {
+            for (const ::db::EdgeTypeID edgeType : edges._types) {
+                count += static_cast<double>(_estimation.estimateEdgeCount(source, edgeType, target));
+            }
+        }
+
+        known->second = count;
+
+        return count;
+    }
+
+    double sumDegreeProducts(const ::db::LabelSet& labels,
+                             const ::db::DegreeSelection& first,
+                             const ::db::DegreeSelection& second) const {
+        StatisticKey key {DEGREE_PRODUCTS_KEY};
+        appendLabels(labels, key);
+        appendDegree(first, key);
+        appendDegree(second, key);
+
+        const auto [known, isNew] = _statistics.try_emplace(key, 0);
+        if (isNew) {
+            known->second = static_cast<double>(_estimation.estimateDegreeProducts(labels, first, second));
+        }
+
+        return known->second;
+    }
+
+    double countHopEdges(const HopEdges& edges) const {
+        const ::db::LabelSet& source = edges._leavesSource ? edges._near : edges._far;
+        const ::db::LabelSet& target = edges._leavesSource ? edges._far : edges._near;
+
+        double count = countEdges(source, edges, target);
+        if (edges._walksBoth) {
+            count += countEdges(target, edges, source);
+        }
+
+        return count;
+    }
+
+    static ::db::DegreeSelection selectionOf(const HopEdges& edges, bool isOut) {
+        return ::db::DegreeSelection {._edgeTypes = edges._types, ._isEveryType = !edges._isTyped, ._isOut = isOut};
+    }
+
+    // The edges @param degree selects on the nodes carrying @param labels
+    double countSelectedEdges(const ::db::LabelSet& labels, const ::db::DegreeSelection& degree) const {
+        HopEdges edges;
+        edges._near = labels;
+        edges._types.assign(degree._edgeTypes.begin(), degree._edgeTypes.end());
+        edges._isTyped = !degree._isEveryType;
+        edges._leavesSource = degree._isOut;
+
+        return countHopEdges(edges);
+    }
+
+    // How many times the label set's average of the edges @param next selects a node carrying
+    // @param labels has when the walk took the edges @param previous selects there before:
+    // a walk comes to a node with many edges more often than to one with few
+    double getDegreeLift(const ::db::LabelSet& labels,
+                         const ::db::DegreeSelection& previous,
+                         const ::db::DegreeSelection& next) const {
+        const double nodes = getLabelledNodes(labels);
+        const double previousEdges = countSelectedEdges(labels, previous);
+        const double nextEdges = countSelectedEdges(labels, next);
+        if (nodes == 0 || previousEdges == 0 || nextEdges == 0) {
+            return 1;
+        }
+
+        const double products = sumDegreeProducts(labels, previous, next);
+
+        return (products / previousEdges) / (nextEdges / nodes);
+    }
+
+    // Keeps the types of @param edges the names ask for, every one of them when the edges
+    // were of any type
+    void narrowTypes(ArrayAttr typeNames, HopEdges& edges) const {
+        llvm::SmallVector<::db::EdgeTypeID, 2> named;
+        collectEdgeTypes(typeNames, _metadata, named);
+
+        if (edges._isTyped) {
+            llvm::erase_if(edges._types, [&named](::db::EdgeTypeID edgeType) {
+                return !llvm::is_contained(named, edgeType);
+            });
+        } else {
+            edges._types.assign(named.begin(), named.end());
+            edges._isTyped = true;
+        }
+    }
+
+    void addSharedLabels(ArrayAttr alternatives, ::db::LabelSet& labels) const {
+        llvm::DenseSet<Attribute> sharedNames;
+        addSharedLabelNames(alternatives, sharedNames);
+
+        const ::db::LabelMap& labelMap = _metadata.labels();
+        for (const Attribute name : sharedNames) {
+            const StringAttr nameAttr = dyn_cast<StringAttr>(name);
+            if (!nameAttr) {
+                continue;
+            }
+
+            const llvm::StringRef nameRef = nameAttr.getValue();
+            const std::optional<::db::LabelID> label = labelMap.get(std::string_view(nameRef.data(), nameRef.size()));
+            if (label) {
+                labels.set(*label);
+            }
+        }
+    }
+
+    // The share of nodes carrying @param known that carry the labels of one alternative
+    double shareLabelled(ArrayAttr alternatives, const ::db::LabelSet& known) const {
+        const double knownNodes = getLabelledNodes(known);
+        if (knownNodes == 0) {
+            return 0;
+        }
+
+        double kept = 0;
+        for (const Attribute alternative : alternatives) {
+            ::db::LabelSet labels;
+            if (collectScanLabels(cast<ArrayAttr>(alternative), _metadata, labels)) {
+                labels.merge(known);
+                kept += getLabelledNodes(labels);
+            }
+        }
+
+        return std::min(1.0, kept / knownNodes);
+    }
+
+    // A node a hop reached is checked among the edges that hop walked, so a type that only
+    // ever reaches nodes of a label keeps all of them; any other among the nodes it is
+    // known to carry the labels of
+    double shareLabelled(ArrayAttr alternatives, Value node, const WalkKnowledge& knowledge) const {
+        const auto reaching = knowledge._reachingHops.find(node);
+        if (reaching == knowledge._reachingHops.end()) {
+            return shareLabelled(alternatives, knowledge._labels.lookup(node));
+        }
+
+        const HopEdges& edges = knowledge._hops.find(reaching->second)->second;
+        const double walked = countHopEdges(edges);
+        if (walked == 0) {
+            return 0;
+        }
+
+        double kept = 0;
+        for (const Attribute alternative : alternatives) {
+            HopEdges labelled = edges;
+            if (collectScanLabels(cast<ArrayAttr>(alternative), _metadata, labelled._far)) {
+                kept += countHopEdges(labelled);
+            }
+        }
+
+        return std::min(1.0, kept / walked);
+    }
+
+    // The share of rows a type check keeps: of the edges its hop walked, or of the graph's
+    // when no hop the estimate walked made them
+    double shareTyped(CheckEdgeTypeConstraint check,
+                      llvm::function_ref<Value(Value)> nodeOf,
+                      const WalkKnowledge& knowledge) const {
+        Operation* const hop = findTypedHop(check.getEdgeTypeIds(), nodeOf);
+        const auto walkedEdges = hop ? knowledge._hops.find(hop) : knowledge._hops.end();
+
+        HopEdges edges = walkedEdges != knowledge._hops.end() ? walkedEdges->second : HopEdges {};
+        const double walked = countHopEdges(edges);
+        if (walked == 0) {
+            return 0;
+        }
+
+        narrowTypes(check.getEdgeTypes(), edges);
+
+        return countHopEdges(edges) / walked;
+    }
+
+    double keepTyped(CheckEdgeTypeConstraint check,
+                     llvm::function_ref<Value(Value)> nodeOf,
+                     WalkKnowledge& knowledge) const {
+        const double kept = shareTyped(check, nodeOf, knowledge);
+
+        Operation* const hop = findTypedHop(check.getEdgeTypeIds(), nodeOf);
+        const auto walkedEdges = hop ? knowledge._hops.find(hop) : knowledge._hops.end();
+        if (walkedEdges != knowledge._hops.end()) {
+            narrowTypes(check.getEdgeTypes(), walkedEdges->second);
+        }
+
+        return kept;
+    }
+
+    // An equality naming a node keeps one node of those it compares, as one on a key does
+    double getEqualitySelectivity(EqOp equality, llvm::function_ref<Value(Value)> nodeOf, const WalkKnowledge& knowledge) const {
+        double nodes = 0;
+        for (const Value side : {equality.getLhs(), equality.getRhs()}) {
+            const Value nodeColumn = comparedNodeColumn(side);
+            if (nodeColumn) {
+                nodes = std::max(nodes, getLabelledNodes(knowledge._labels.lookup(nodeOf(nodeColumn))));
+            }
+        }
+
+        return nodes >= 1 ? 1 / nodes : EQUALITY_SELECTIVITY;
+    }
+
+    double getMembershipSelectivity(InOp membership) const {
+        ConstantOp constant = membership.getRhs().getDefiningOp<ConstantOp>();
+        const ArrayAttr elements = constant ? dyn_cast<ArrayAttr>(constant.getValue()) : ArrayAttr();
+        if (!elements) {
+            return MEMBERSHIP_SELECTIVITY_CEILING;
+        }
+
+        return std::min(MEMBERSHIP_SELECTIVITY_CEILING, EQUALITY_SELECTIVITY * static_cast<double>(elements.size()));
+    }
+
+    double getLeafSelectivity(Value predicate, llvm::function_ref<Value(Value)> nodeOf, const WalkKnowledge& knowledge) const {
+        Operation* const def = predicate.getDefiningOp();
+
+        if (EqOp equality = dyn_cast_or_null<EqOp>(def)) {
+            return getEqualitySelectivity(equality, nodeOf, knowledge);
+        } else if (isa_and_nonnull<NeqOp>(def)) {
+            return 1 - EQUALITY_SELECTIVITY;
+        } else if (isa_and_nonnull<GtOp, LtOp, GteOp, LteOp>(def)) {
+            return RANGE_SELECTIVITY;
+        } else if (InOp membership = dyn_cast_or_null<InOp>(def)) {
+            return getMembershipSelectivity(membership);
+        } else if (CheckEdgeTypeConstraint typeCheck = dyn_cast_or_null<CheckEdgeTypeConstraint>(def)) {
+            return shareTyped(typeCheck, nodeOf, knowledge);
+        } else if (const LabelCheck check = readLabelCheck(predicate); check._alternatives) {
+            return shareLabelled(check._alternatives, nodeOf(check._nodes), knowledge);
+        }
+
+        return 1;
+    }
+
+    // A flat OR or AND chain is as long as the query, so the walk keeps its own stack
+    double getPredicateSelectivity(Value predicate, llvm::function_ref<Value(Value)> nodeOf, const WalkKnowledge& knowledge) const {
+        llvm::DenseMap<Value, double> kept;
+        llvm::SmallVector<Value> pending {predicate};
+
+        while (!pending.empty()) {
+            const Value current = pending.back();
+            if (kept.count(current)) {
+                pending.pop_back();
+                continue;
+            }
+
+            Operation* const def = current.getDefiningOp();
+            if (!isa_and_nonnull<AndOp, OrOp, XorOp, NotOp>(def)) {
+                kept[current] = getLeafSelectivity(current, nodeOf, knowledge);
+                pending.pop_back();
+                continue;
+            }
+
+            bool operandsPending = false;
+            for (const Value operand : def->getOperands()) {
+                if (!kept.count(operand)) {
+                    pending.push_back(operand);
+                    operandsPending = true;
+                }
+            }
+
+            if (operandsPending) {
+                continue;
+            }
+
+            const double first = kept.lookup(def->getOperand(0));
+            const double second = def->getNumOperands() > 1 ? kept.lookup(def->getOperand(1)) : 0;
+
+            if (isa<AndOp>(def)) {
+                kept[current] = first * second;
+            } else if (isa<OrOp>(def)) {
+                kept[current] = first + second - first * second;
+            } else if (isa<XorOp>(def)) {
+                kept[current] = first + second - 2 * first * second;
+            } else {
+                kept[current] = 1 - first;
+            }
+
+            pending.pop_back();
+        }
+
+        return kept.lookup(predicate);
+    }
+};
 
 // The rows an op seeds a factor with, and nothing at all when it seeds none - a fetch, a
 // filter or a hop reads a column rather than making one. A listed set of IDs is its own
 // count, a literal list one row per element, a by-label scan what the graph holds under
-// those labels, and a property scan the whole node count: selectivity is not something
-// the db level knows.
-std::optional<size_t> estimateSourceRows(Operation* op,
-                                         const ::db::GraphMetadata& metadata,
-                                         const ::db::CardinalityEstimation& estimation) {
+// those labels, and a property scan the share of those an equality keeps.
+std::optional<double> estimateSourceRows(Operation* op, const RowEstimator& estimator, WalkKnowledge& knowledge) {
     if (ConstScanNodes constScan = dyn_cast<ConstScanNodes>(op)) {
-        return constScan.getNodeIDs().size();
+        return static_cast<double>(constScan.getNodeIDs().size());
     } else if (UnwindConst unwind = dyn_cast<UnwindConst>(op)) {
-        return unwind.getElements().size();
+        return static_cast<double>(unwind.getElements().size());
     } else if (ScanNodesByLabel byLabel = dyn_cast<ScanNodesByLabel>(op)) {
-        return estimateLabelledNodes(byLabel.getLabels(), metadata, estimation);
-    } else if (isa<ScanNodes, ScanNodesByPropertyValue>(op)) {
-        return estimation.estimateNodeCount(::db::LabelSet {});
+        return estimator.scanNodes(byLabel.getResult(), byLabel.getLabels(), knowledge);
+    } else if (ScanNodes scan = dyn_cast<ScanNodes>(op)) {
+        return estimator.scanNodes(scan.getResult(), ArrayAttr(), knowledge);
+    } else if (ScanNodesByPropertyValue byValue = dyn_cast<ScanNodesByPropertyValue>(op)) {
+        const std::optional<ArrayAttr> labels = byValue.getLabels();
+        const double scanned = estimator.scanNodes(byValue->getResult(0), labels ? *labels : ArrayAttr(), knowledge);
+
+        return scanned * EQUALITY_SELECTIVITY;
     } else if (EdgeScanLabels scanLabels; readEdgeScanLabels(op, scanLabels)) {
-        const size_t nodeCount = estimation.estimateNodeCount(::db::LabelSet {});
-        if (nodeCount == 0) {
-            return 0;
-        }
-
-        const bool indexedByTarget = scanLabels._indexedByTarget;
-        const ArrayAttr indexedLabels = indexedByTarget ? scanLabels._target : scanLabels._source;
-        const ArrayAttr otherLabels = indexedByTarget ? scanLabels._source : scanLabels._target;
-
-        // The other end's labels keep the share of the walked edges they select of the nodes,
-        // the two ends' labels taken as independent.
-        size_t rows = estimation.estimateEdgeCount();
-        if (indexedLabels) {
-            rows = estimateIndexedEdges(indexedLabels, indexedByTarget, metadata, estimation);
-        }
-
-        if (otherLabels) {
-            rows = multiplySaturating(estimateLabelledNodes(otherLabels, metadata, estimation), rows) / nodeCount;
-        }
-
-        return rows;
+        return estimator.scanEdges(op, scanLabels._source, scanLabels._target, ArrayAttr(), knowledge);
     } else if (ScanEdgesByType byType = dyn_cast<ScanEdgesByType>(op)) {
-        if (byType.getEdgeTypes().empty()) {
-            return 0;
-        }
-
-        return estimation.estimateEdgeCount();
+        return estimator.scanEdges(op, ArrayAttr(), ArrayAttr(), byType.getEdgeTypes(), knowledge);
     }
 
     return std::nullopt;
 }
 
 // The ratio an op multiplies the rows it reads by, and nothing when it hands them on as
-// they come. A hop makes the graph's average degree of rows per row it reads - all the db
-// level can say of a hop out of a node it cannot name - and an undirected one walks both
-// directions, so twice that. It is a ratio rather than a count because a graph with fewer
-// edges than nodes has a hop shrink its input rather than grow it. An unwind makes a row
-// per element of each row's list, whose length is a property of the rows themselves: no
-// statistic of the graph measures it, so it reads at the figure an uncountable source
-// does - where a literal list, whose elements are in the IR, is counted exactly instead.
-struct RowMultiplier {
-    size_t _numerator {1};
-    size_t _denominator {1};
+// they come. A hop makes a row per edge it walks of the nodes it reads, of the types and to
+// the labels it keeps, and an undirected one walks both directions. It is a ratio rather
+// than a count because a graph with fewer edges than nodes has a hop shrink its input
+// rather than grow it. An unwind makes a row per element of each row's list, whose length
+// is a property of the rows themselves: no statistic of the graph measures it, so it reads
+// at the figure an uncountable source does - where a literal list or a range between
+// literal bounds, whose elements are in the IR, is counted exactly instead.
+std::optional<double> estimateRowMultiplier(Operation* op, const RowEstimator& estimator, WalkKnowledge& knowledge) {
+    if (Unwind unwind = dyn_cast<Unwind>(op)) {
+        return estimateUnwoundRows(unwind);
+    } else if (!isEdgeHop(op)) {
+        return std::nullopt;
+    }
+
+    return estimator.walkHop(op, false, op->getOperand(0), op->getResult(hopReachedResult(op)), ArrayAttr(), knowledge)._rows;
+}
+
+struct RegionRows {
+    double _rows {1};
+    bool _countedASource {false};
 };
 
-std::optional<RowMultiplier> estimateRowMultiplier(Operation* op, const ::db::CardinalityEstimation& estimation) {
-    if (isa<Unwind>(op)) {
-        return RowMultiplier {uncountableRows, 1};
-    }
-
-    const bool walksOneDirection = isa<GetOutEdges,
-                                       GetInEdges,
-                                       GetOutEdgesByType,
-                                       GetInEdgesByType,
-                                       GetOutEdgesByLabel,
-                                       GetInEdgesByLabel,
-                                       GetOutEdgesByTypeAndLabel,
-                                       GetInEdgesByTypeAndLabel>(op);
-    const bool walksBoth = isa<GetEdges>(op);
-    if (!walksOneDirection && !walksBoth) {
-        return std::nullopt;
-    }
-
-    const bool isByTypeHop = isa<GetOutEdgesByType, GetInEdgesByType, GetOutEdgesByTypeAndLabel, GetInEdgesByTypeAndLabel>(op);
-    const bool walksNoEdge = isByTypeHop && op->getAttrOfType<ArrayAttr>("edge_types").empty();
-    if (walksNoEdge) {
-        return RowMultiplier {0, 1};
-    }
-
-    const size_t nodeCount = estimation.estimateNodeCount(::db::LabelSet {});
-    if (nodeCount == 0) {
-        return std::nullopt;
-    }
-
-    const size_t edgeCount = estimation.estimateEdgeCount();
-
-    return RowMultiplier {walksBoth ? 2 * edgeCount : edgeCount, nodeCount};
+double estimateRegionRows(const RegionRows& region) {
+    return region._countedASource ? region._rows : static_cast<double>(uncountableRows);
 }
 
 // The rows a factor makes: the product of what its sources seed it with, a factor crossing
 // two of them holding a row per pair, grown or shrunk by every hop and unwind reading from
-// one. A factor seeded from somewhere the db level cannot count - a procedure, a load -
-// counts as an uncountable source's rows.
-size_t estimateFactorRows(Region& factor,
-                          const ::db::GraphMetadata& metadata,
-                          const ::db::CardinalityEstimation& estimation) {
-    bool countedASource = false;
-    size_t rows = 1;
+// one and cut by every filter. A join makes as many as its smaller side, each key taken as
+// distinct on its side: the db level counts no distinct values. A factor seeded from
+// somewhere the db level cannot count - a procedure, a load - counts as an uncountable
+// source's rows.
+double estimateFactorRows(Region& factor, const RowEstimator& estimator) {
+    llvm::DenseMap<Region*, RegionRows> regionRows;
+    WalkKnowledge knowledge;
+
+    const auto columnItself = [](Value column) {
+        return column;
+    };
 
     factor.walk([&](Operation* op) {
-        const std::optional<size_t> seeded = estimateSourceRows(op, metadata, estimation);
-        if (seeded) {
-            countedASource = true;
-            rows = multiplySaturating(rows, *seeded);
+        RegionRows nested;
+        if (HashJoin join = dyn_cast<HashJoin>(op)) {
+            const double leftRows = estimateRegionRows(regionRows.lookup(&join.getLeftFactor()));
+            const double rightRows = estimateRegionRows(regionRows.lookup(&join.getRightFactor()));
+            nested = RegionRows {std::min(leftRows, rightRows), true};
+        } else {
+            for (Region& region : op->getRegions()) {
+                const RegionRows counted = regionRows.lookup(&region);
+                nested._rows *= counted._rows;
+                nested._countedASource = nested._countedASource || counted._countedASource;
+            }
+        }
+
+        RegionRows& rows = regionRows[op->getParentRegion()];
+        rows._rows *= nested._rows;
+        rows._countedASource = rows._countedASource || nested._countedASource;
+
+        if (FilterOp filter = dyn_cast<FilterOp>(op)) {
+            rows._rows *= estimator.getSelectivity(filter.getMask(), columnItself, knowledge);
             return;
         }
 
-        const std::optional<RowMultiplier> multiplier = estimateRowMultiplier(op, estimation);
+        const std::optional<double> seeded = estimateSourceRows(op, estimator, knowledge);
+        if (seeded) {
+            rows._countedASource = true;
+            rows._rows *= *seeded;
+            return;
+        }
+
+        const std::optional<double> multiplier = estimateRowMultiplier(op, estimator, knowledge);
         if (multiplier) {
-            rows = multiplySaturating(rows, multiplier->_numerator) / multiplier->_denominator;
+            rows._rows *= *multiplier;
         }
     });
 
-    return countedASource ? rows : uncountableRows;
+    return estimateRegionRows(regionRows.lookup(&factor));
 }
 
 // Which way round the two sides go into the join, whose right factor is the built one. The
@@ -7850,12 +9845,9 @@ bool buildsTheLeftFactor(const EqualityCross& match, const DBPassContext& contex
         return rightHoldsAProduct && !leftHoldsAProduct;
     }
 
-    const ::db::GraphView& view = *context._view;
-    const ::db::GraphMetadata& metadata = view.metadata();
-    const ::db::CardinalityEstimation estimation(view);
+    const RowEstimator estimator(*context._view);
 
-    return estimateFactorRows(leftFactor, metadata, estimation)
-         < estimateFactorRows(rightFactor, metadata, estimation);
+    return estimateFactorRows(leftFactor, estimator) < estimateFactorRows(rightFactor, estimator);
 }
 
 bool matchEqualityCross(FilterOp filter, EqualityCross& match) {
@@ -7900,7 +9892,7 @@ bool matchEqualityCross(FilterOp filter, EqualityCross& match) {
     match._left._factor = &product.getLeftFactor();
     match._right._factor = &product.getRightFactor();
 
-    if (!keysShareAColumnType(match._left, match._right)) {
+    if (!isHashableKey(match._left) || !isHashableKey(match._right)) {
         return false;
     }
 
@@ -8043,12 +10035,12 @@ struct FuseHashJoin : public impl::FuseHashJoinBase<FuseHashJoin> {
                 return;
             }
 
-            match._buildsTheLeftFactor = buildsTheLeftFactor(match, context);
             matches.push_back(match);
         });
 
         mlir::OpBuilder builder(&getContext());
         for (EqualityCross& match : matches) {
+            match._buildsTheLeftFactor = buildsTheLeftFactor(match, context);
             fuseHashJoin(match, builder);
         }
     }
@@ -8100,9 +10092,9 @@ Operation* soleValueReader(Value column) {
 Value siblingColumnOf(Value column, Operation* reader) {
     OperandRange candidates = reader->getOperands();
 
-    CarrySetLayout layout;
-    if (matchCarrySetLayout(reader, layout)) {
-        candidates = candidates.slice(layout._operandOffset, carriedCount(reader, layout));
+    CarrySet carrySet;
+    if (matchCarrySet(reader, carrySet)) {
+        candidates = candidates.slice(carrySet._operandOffset, carrySet._count);
     } else if (!isa<Yield>(reader)) {
         return {};
     }
@@ -8303,20 +10295,20 @@ CrossProduct dropProductColumn(CrossProduct product, size_t resultIndex, mlir::R
 }
 
 void dropCarriedColumn(Operation* op, size_t resultIndex, mlir::RewriterBase& rewriter) {
-    CarrySetLayout layout;
-    const bool carries = matchCarrySetLayout(op, layout);
+    CarrySet carrySet;
+    const bool carries = matchCarrySet(op, carrySet);
     bioassert(carries, "A fetch chain link without a carry set");
 
-    const size_t droppedIndex = resultIndex - layout._resultOffset;
+    const size_t droppedIndex = resultIndex - carrySet._resultOffset;
 
     llvm::SmallVector<size_t> kept;
-    for (size_t carriedIndex = 0; carriedIndex < carriedCount(op, layout); carriedIndex++) {
+    for (size_t carriedIndex = 0; carriedIndex < carrySet._count; carriedIndex++) {
         if (carriedIndex != droppedIndex) {
             kept.push_back(carriedIndex);
         }
     }
 
-    trimCarrySet(op, layout, kept, rewriter);
+    trimCarrySet(op, carrySet, kept, rewriter);
     rewriter.eraseOp(op);
 }
 
@@ -8422,7 +10414,7 @@ struct FuseFetchNodes : public impl::FuseFetchNodesBase<FuseFetchNodes> {
 
 // A row-wise op a re-rooted pattern recomputes over its new rows rather than carrying
 bool computesPerRow(Operation* op) {
-    return isRowWiseOp(op) || isa<ListIndex, ToNullable, GetEdgeTypes>(op);
+    return isRowWiseOp(op) || isa<ListIndex, ContainerIndex, ToNullable, GetEdgeTypes>(op);
 }
 
 bool isHop(Operation* op) {
@@ -8445,17 +10437,88 @@ struct SeedPattern {
     llvm::SmallVector<FilterOp> _filters;
 };
 
-// Where a pattern's rows meet the rows of the column its node is equated to: a cross
-// product with the pattern in one factor, or an unwind carrying the pattern's columns
-struct SeedJunction {
+// Where a pattern's rows meet rows that are not its own: a cross product with the pattern
+// in one factor, or an unwind carrying the pattern's columns
+struct PatternJunction {
     Operation* _op {nullptr};
-    Region* _seedFactor {nullptr};
+    Region* _otherFactor {nullptr};
     llvm::SmallVector<Value> _patternOutputs;
     llvm::SmallVector<Value> _patternResults;
-    llvm::SmallVector<Value> _seedResults;
+    llvm::SmallVector<Value> _otherResults;
 };
 
-bool standsFromTheJunction(Operation* op, const SeedJunction& junction) {
+void readProductJunction(CrossProduct product, bool patternOnTheLeft, PatternJunction& junction) {
+    Operation* const op = product.getOperation();
+    const size_t leftCount = factorYield(op, 0).getNumOperands();
+
+    Region& patternFactor = patternOnTheLeft ? product.getLeftFactor() : product.getRightFactor();
+
+    junction._op = op;
+    junction._otherFactor = patternOnTheLeft ? &product.getRightFactor() : &product.getLeftFactor();
+
+    const Operation::operand_range patternYield = factorYieldColumns(patternFactor);
+    junction._patternOutputs.assign(patternYield.begin(), patternYield.end());
+
+    for (size_t index = 0; index < op->getNumResults(); index++) {
+        const bool fromThePattern = (index < leftCount) == patternOnTheLeft;
+        (fromThePattern ? junction._patternResults : junction._otherResults).push_back(op->getResult(index));
+    }
+}
+
+void readUnwindJunction(Unwind unwind, PatternJunction& junction) {
+    const Operation::operand_range patternOutputs = unwind.getColumnsToFilter();
+    const ResultRange patternResults = unwind.getCarried();
+
+    junction._op = unwind.getOperation();
+    junction._otherResults.push_back(unwind.getElement());
+    junction._patternOutputs.assign(patternOutputs.begin(), patternOutputs.end());
+    junction._patternResults.assign(patternResults.begin(), patternResults.end());
+}
+
+// The value a result of the junction hands on: the pattern column it took, or for the other
+// side the result itself. Null for a value the junction did not make.
+Value junctionSource(const PatternJunction& junction, Value result) {
+    const auto patternResult = llvm::find(junction._patternResults, result);
+    if (patternResult != junction._patternResults.end()) {
+        return junction._patternOutputs[patternResult - junction._patternResults.begin()];
+    } else if (llvm::is_contained(junction._otherResults, result)) {
+        return result;
+    }
+
+    return {};
+}
+
+// The unwound list is none of the pattern's, the unwind carries the pattern's columns alone, and
+// nothing but the pattern and the unwind reads what the pattern binds
+bool unwindsOverThePatternAlone(const PatternJunction& junction,
+                                const SeedPattern& pattern,
+                                llvm::ArrayRef<Operation*> orderedOps) {
+    Unwind unwind = cast<Unwind>(junction._op);
+
+    Operation* const sourceDef = unwind.getSource().getDefiningOp();
+    if (sourceDef && pattern._ops.contains(sourceDef)) {
+        return false;
+    }
+
+    for (const Value output : junction._patternOutputs) {
+        Operation* const def = output.getDefiningOp();
+        if (!def || !pattern._ops.contains(def)) {
+            return false;
+        }
+    }
+
+    for (Operation* const patternOp : orderedOps) {
+        for (Operation* const user : patternOp->getUsers()) {
+            if (user != junction._op && !pattern._ops.contains(user)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+bool standsFromTheJunction(Operation* op, const PatternJunction& junction) {
     if (!op || op->getBlock() != junction._op->getBlock()) {
         return false;
     }
@@ -8463,13 +10526,43 @@ bool standsFromTheJunction(Operation* op, const SeedJunction& junction) {
     return !op->isBeforeInBlock(junction._op);
 }
 
+// A conjunct of a filter over a junction that reads both its sides, which the pattern's
+// walk can apply as soon as it has bound the pattern nodes and edges the conjunct reads.
+// _equatesKeys says it is an equality of a key of each side, and _hashes that
+// fuse_hash_join can then run a product crossed in right before it as a hash join.
+struct JoinConjunct {
+    Value _conjunct;
+    FilterOp _filter {nullptr};
+    MaskCone _cone;
+    llvm::SmallPtrSet<void*, 4> _patternInputs;
+    bool _equatesKeys {false};
+    bool _hashes {false};
+};
+
+struct WalkEvent {
+    enum class Kind {
+        RootLabels,
+        Filter,
+        Forward,
+        Backward,
+        Cross,
+        Join,
+    };
+
+    Kind _kind {Kind::Filter};
+    FilterOp _filter {nullptr};
+    const PatternStep* _step {nullptr};
+    const JoinConjunct* _join {nullptr};
+};
+
 struct PatternSeed {
-    SeedJunction _junction;
+    PatternJunction _junction;
     SeedPattern _pattern;
     FilterOp _filter {nullptr};
     EqOp _equality {nullptr};
     Value _seeded;
     Value _ids;
+    llvm::SmallVector<WalkEvent> _events;
 };
 
 // The value a pattern column was bound as, following the ops that only hand it on
@@ -8517,7 +10610,11 @@ void collectPatternInputs(Value value, const SeedPattern& pattern, llvm::SmallPt
 
         const Value origin = patternOrigin(current, pattern);
         Operation* const originDef = origin.getDefiningOp();
-        if (originDef && pattern._ops.contains(originDef)) {
+        if (!originDef || !pattern._ops.contains(originDef)) {
+            continue;
+        } else if (computesPerRow(originDef)) {
+            worklist.push_back(origin);
+        } else {
             inputs.insert(origin.getAsOpaquePointer());
         }
     }
@@ -8562,6 +10659,14 @@ void collectPatternOps(Operation* root, Operation* end, SeedPattern& pattern) {
     }
 }
 
+bool walksFreely(ExplorePaths exploration) {
+    return !exploration.getEndNodes()
+        && !exploration.getEndColumn()
+        && !exploration.getEndsOnSeed()
+        && !exploration.getDistinct()
+        && exploration.getHopImports().empty();
+}
+
 // Checks every op of the pattern is one a re-rooted pattern can be rebuilt from, and
 // records its steps and filters
 bool analyzePattern(SeedPattern& pattern, llvm::ArrayRef<Operation*> orderedOps) {
@@ -8578,12 +10683,7 @@ bool analyzePattern(SeedPattern& pattern, llvm::ArrayRef<Operation*> orderedOps)
             const Value from = patternOrigin(op->getOperand(0), pattern);
             pattern._steps.push_back(PatternStep {._op = op, ._from = from, ._to = op->getResult(hopReachedResult(op))});
         } else if (ExplorePaths exploration = dyn_cast<ExplorePaths>(op)) {
-            const bool walksFreely = !exploration.getEndNodes()
-                                  && !exploration.getEndColumn()
-                                  && !exploration.getEndsOnSeed()
-                                  && !exploration.getDistinct()
-                                  && exploration.getHopImports().empty();
-            if (!walksFreely) {
+            if (!walksFreely(exploration)) {
                 return false;
             }
 
@@ -8636,6 +10736,162 @@ bool isPatternNode(const SeedPattern& pattern, Value origin) {
     return llvm::any_of(pattern._steps, [origin](const PatternStep& step) { return step._to == origin; });
 }
 
+size_t eventRank(const WalkEvent& event) {
+    if (event._kind == WalkEvent::Kind::RootLabels) {
+        return 1;
+    }
+
+    FilterOp filter = event._filter;
+    const Value mask = filter.getMask();
+
+    if (mask.getDefiningOp<CheckEdgeTypeConstraint>()) {
+        return 0;
+    } else if (mask.getDefiningOp<CheckLabelConstraint>()) {
+        return 1;
+    }
+
+    return 2;
+}
+
+bool raisesOnSomeRow(Value mask, const SeedPattern& pattern) {
+    llvm::SmallVector<Value> pending {mask};
+    llvm::DenseSet<Value> visited;
+
+    while (!pending.empty()) {
+        const Value current = pending.pop_back_val();
+        if (!visited.insert(current).second) {
+            continue;
+        }
+
+        Operation* const def = current.getDefiningOp();
+        if (!def || !pattern._ops.contains(def) || !computesPerRow(def)) {
+            continue;
+        } else if (raisesOnSomeRows(def)) {
+            return true;
+        }
+
+        llvm::append_range(pending, def->getOperands());
+    }
+
+    return false;
+}
+
+void bindStep(const PatternStep& step, llvm::DenseSet<Value>& bound) {
+    Operation* const stepOp = step._op;
+
+    bound.insert(step._from);
+    bound.insert(step._to);
+
+    if (ExplorePaths exploration = dyn_cast<ExplorePaths>(stepOp)) {
+        bound.insert(exploration.getPaths());
+    } else {
+        bound.insert(stepOp->getResult(1));
+        bound.insert(stepOp->getResult(2));
+    }
+}
+
+// The order a pattern is rebuilt in from its seeded node: each filter as soon as what it
+// reads is bound, then the first step written that leaves a bound node. The rows already
+// pass the filters of @param applied, and the root's labels when @param rootChecked. False
+// when the walk leaves a step or a filter out.
+bool planWalk(const SeedPattern& pattern,
+              Value seeded,
+              const llvm::SmallPtrSetImpl<Operation*>& applied,
+              bool rootChecked,
+              llvm::SmallVectorImpl<WalkEvent>& events) {
+    const Value root = pattern._root->getResult(0);
+    llvm::DenseSet<Value> bound {seeded};
+    llvm::SmallPtrSet<Operation*, 16> appliedFilters(applied.begin(), applied.end());
+    llvm::SmallPtrSet<Operation*, 16> walked;
+
+    const auto readsBound = [&pattern, &bound](Value value) {
+        llvm::SmallPtrSet<void*, 8> inputs;
+        collectPatternInputs(value, pattern, inputs);
+
+        return llvm::all_of(inputs, [&bound](void* input) { return bound.contains(Value::getFromOpaquePointer(input)); });
+    };
+
+    // A filter whose mask may raise on a row's value runs on no row the written pattern did
+    // not run it on: only once every filter and step written ahead of it holds
+    const auto holdsWhatPrecedes = [&pattern, &appliedFilters, &walked, &rootChecked](FilterOp filter) {
+        Operation* const filterOp = filter.getOperation();
+        const auto precedes = [filterOp](Operation* op) {
+            return op->isBeforeInBlock(filterOp);
+        };
+
+        for (FilterOp written : pattern._filters) {
+            if (precedes(written) && !appliedFilters.contains(written.getOperation())) {
+                return false;
+            }
+        }
+
+        for (const PatternStep& step : pattern._steps) {
+            if (precedes(step._op) && !walked.contains(step._op)) {
+                return false;
+            }
+        }
+
+        return rootChecked;
+    };
+
+    bool progressed = true;
+    while (progressed) {
+        progressed = false;
+
+        llvm::SmallVector<WalkEvent> checks;
+        if (!rootChecked && bound.contains(root)) {
+            checks.push_back(WalkEvent {._kind = WalkEvent::Kind::RootLabels});
+            rootChecked = true;
+        }
+
+        for (FilterOp filter : pattern._filters) {
+            const Value mask = filter.getMask();
+            const bool unapplied = !appliedFilters.contains(filter.getOperation());
+            const bool applicable = unapplied
+                                 && readsBound(mask)
+                                 && (!raisesOnSomeRow(mask, pattern) || holdsWhatPrecedes(filter));
+            if (applicable) {
+                checks.push_back(WalkEvent {._kind = WalkEvent::Kind::Filter, ._filter = filter});
+                appliedFilters.insert(filter.getOperation());
+            }
+        }
+
+        // The order codegen writes them in under a hop, which the passes fusing them into
+        // the hop match on: its edge types, then its end's labels, then the rest
+        llvm::stable_sort(checks, [](const WalkEvent& lhs, const WalkEvent& rhs) {
+            return eventRank(lhs) < eventRank(rhs);
+        });
+
+        llvm::append_range(events, checks);
+
+        for (const PatternStep& step : pattern._steps) {
+            Operation* const stepOp = step._op;
+            if (walked.contains(stepOp)) {
+                continue;
+            }
+
+            const bool forward = bound.contains(step._from);
+            const bool backward = !forward && bound.contains(step._to) && isHop(stepOp);
+            if (!forward && !backward) {
+                continue;
+            }
+
+            events.push_back(WalkEvent {._kind = forward ? WalkEvent::Kind::Forward : WalkEvent::Kind::Backward, ._step = &step});
+
+            bindStep(step, bound);
+            walked.insert(stepOp);
+            progressed = true;
+            break;
+        }
+    }
+
+    const bool appliesEveryFilter = llvm::all_of(pattern._filters, [&appliedFilters](FilterOp filter) {
+        return appliedFilters.contains(filter.getOperation());
+    });
+
+    return walked.size() == pattern._steps.size() && appliesEveryFilter;
+}
+
 // The junction column each column of a block is carried from through the filters after it,
 // kept so the filters of one chain trace it once rather than once per filter. A reroot
 // rewrites the block, so clear() follows every one.
@@ -8686,24 +10942,15 @@ private:
     llvm::DenseMap<Value, Value> _junctions;
 };
 
-bool matchSeedJunction(OpResult seededResult, SeedJunction& junction, SeedPattern& pattern) {
+bool matchSeedJunction(OpResult seededResult, PatternJunction& junction, SeedPattern& pattern) {
     Operation* const op = seededResult.getOwner();
-    junction._op = op;
 
     if (CrossProduct product = dyn_cast<CrossProduct>(op)) {
         const size_t leftCount = factorYield(op, 0).getNumOperands();
         const bool patternOnTheLeft = seededResult.getResultNumber() < leftCount;
+        readProductJunction(product, patternOnTheLeft, junction);
 
         Region& patternFactor = patternOnTheLeft ? product.getLeftFactor() : product.getRightFactor();
-        junction._seedFactor = patternOnTheLeft ? &product.getRightFactor() : &product.getLeftFactor();
-
-        const Operation::operand_range patternYield = factorYieldColumns(patternFactor);
-        junction._patternOutputs.assign(patternYield.begin(), patternYield.end());
-
-        for (size_t index = 0; index < op->getNumResults(); index++) {
-            const bool fromThePattern = (index < leftCount) == patternOnTheLeft;
-            (fromThePattern ? junction._patternResults : junction._seedResults).push_back(op->getResult(index));
-        }
 
         const size_t outputIndex = llvm::find(junction._patternResults, Value(seededResult)) - junction._patternResults.begin();
         Operation* const root = findPatternRoot(junction._patternOutputs[outputIndex]);
@@ -8727,14 +10974,9 @@ bool matchSeedJunction(OpResult seededResult, SeedJunction& junction, SeedPatter
         return false;
     }
 
-    const Operation::operand_range patternOutputs = unwind.getColumnsToFilter();
-    const ResultRange patternResults = unwind.getCarried();
+    readUnwindJunction(unwind, junction);
 
-    junction._seedResults.push_back(unwind.getElement());
-    junction._patternOutputs.assign(patternOutputs.begin(), patternOutputs.end());
-    junction._patternResults.assign(patternResults.begin(), patternResults.end());
-
-    Operation* const root = findPatternRoot(patternOutputs[seededResult.getResultNumber() - 1]);
+    Operation* const root = findPatternRoot(junction._patternOutputs[seededResult.getResultNumber() - 1]);
     if (!root || root->getBlock() != op->getBlock()) {
         return false;
     }
@@ -8748,26 +10990,8 @@ bool matchSeedJunction(OpResult seededResult, SeedJunction& junction, SeedPatter
         }
     }
 
-    // The unwound list is the seed's own, and the unwind carries the pattern alone
-    Operation* const sourceDef = unwind.getSource().getDefiningOp();
-    if (sourceDef && pattern._ops.contains(sourceDef)) {
+    if (!unwindsOverThePatternAlone(junction, pattern, orderedOps)) {
         return false;
-    }
-
-    for (const Value output : junction._patternOutputs) {
-        Operation* const def = output.getDefiningOp();
-        if (!def || !pattern._ops.contains(def)) {
-            return false;
-        }
-    }
-
-    // Nothing but the pattern and the unwind may read what the pattern binds
-    for (Operation* const patternOp : orderedOps) {
-        for (Operation* const user : patternOp->getUsers()) {
-            if (user != op && !pattern._ops.contains(user)) {
-                return false;
-            }
-        }
     }
 
     return analyzePattern(pattern, orderedOps);
@@ -8775,7 +10999,7 @@ bool matchSeedJunction(OpResult seededResult, SeedJunction& junction, SeedPatter
 
 // @param visited holds the values an earlier call reached without finding the seed, so a
 // caller asking of every filter along a chain walks the chain once
-bool readsTheSeed(Value value, const SeedJunction& junction, llvm::DenseSet<Value>& visited) {
+bool readsTheSeed(Value value, const PatternJunction& junction, llvm::DenseSet<Value>& visited) {
     llvm::SmallVector<Value> worklist {value};
 
     while (!worklist.empty()) {
@@ -8784,7 +11008,7 @@ bool readsTheSeed(Value value, const SeedJunction& junction, llvm::DenseSet<Valu
             continue;
         }
 
-        if (llvm::is_contained(junction._seedResults, current)) {
+        if (llvm::is_contained(junction._otherResults, current)) {
             return true;
         }
 
@@ -8804,14 +11028,14 @@ bool readsTheSeed(Value value, const SeedJunction& junction, llvm::DenseSet<Valu
     return false;
 }
 
-bool isComputedFromTheSeed(Value ids, const SeedJunction& junction, Operation* filter) {
+bool isComputedFromTheSeed(Value ids, const PatternJunction& junction, Operation* filter) {
     llvm::SmallVector<Value> worklist {ids};
     llvm::DenseSet<Value> visited;
     llvm::DenseSet<Value> masksVisited;
 
     while (!worklist.empty()) {
         const Value current = worklist.pop_back_val();
-        if (!visited.insert(current).second || llvm::is_contained(junction._seedResults, current)) {
+        if (!visited.insert(current).second || llvm::is_contained(junction._otherResults, current)) {
             continue;
         }
 
@@ -8843,7 +11067,7 @@ bool isComputedFromTheSeed(Value ids, const SeedJunction& junction, Operation* f
 
 // The junction's rows reach the equality's filter through filters and row-wise ops alone,
 // which keep their meaning over the rows the equality would have kept
-bool readsTheJunctionRowWise(const SeedJunction& junction, FilterOp filter) {
+bool readsTheJunctionRowWise(const PatternJunction& junction, FilterOp filter) {
     llvm::SmallPtrSet<Operation*, 16> readers;
     Operation* const junctionOp = junction._op;
 
@@ -8887,12 +11111,16 @@ bool matchPatternSeedSide(FilterOp filter, EqOp equality, Value seeded, Value id
         return false;
     }
 
-    seed = PatternSeed {};
+    // GCC 13 reads moving an empty event list into the seed as a memmove past its end
+    // (-Warray-bounds), so the seed is rebuilt in place rather than assigned a fresh one
+    std::destroy_at(&seed);
+    std::construct_at(&seed);
+
     if (!matchSeedJunction(seededResult, seed._junction, seed._pattern)) {
         return false;
     }
 
-    const SeedJunction& junction = seed._junction;
+    const PatternJunction& junction = seed._junction;
     const size_t outputIndex = llvm::find(junction._patternResults, Value(seededResult)) - junction._patternResults.begin();
     seed._seeded = patternOrigin(junction._patternOutputs[outputIndex], seed._pattern);
 
@@ -8913,6 +11141,11 @@ bool matchPatternSeedSide(FilterOp filter, EqOp equality, Value seeded, Value id
     const bool seedsTheRoot = seed._seeded == seed._pattern._root->getResult(0);
     const bool foldsIntoAConstScan = product && seedsTheRoot && matchUnwindEqualityCross(product, unwindEquality);
     if (foldsIntoAConstScan) {
+        return false;
+    }
+
+    const llvm::SmallPtrSet<Operation*, 1> noneApplied;
+    if (!planWalk(seed._pattern, seed._seeded, noneApplied, false, seed._events)) {
         return false;
     }
 
@@ -8964,6 +11197,13 @@ public:
 
     Value currentOf(Value origin) const { return _current.lookup(origin); }
 
+    void setJunction(const PatternJunction* junction) { _junction = junction; }
+
+    // The value a result of the junction holds over the rebuilt rows
+    Value materializeJunctionResult(Value result) {
+        return materialize(junctionSource(*_junction, result));
+    }
+
     // The value a pattern column holds over the rebuilt rows
     Value materialize(Value value) {
         mlir::IRMapping materialized;
@@ -8979,15 +11219,24 @@ public:
             const Value origin = patternOrigin(pending, _pattern);
             Operation* const def = pending.getDefiningOp();
 
+            Operation* computing = nullptr;
             if (_current.count(origin)) {
                 materialized.map(pending, _current.lookup(origin));
-            } else if (!def || !_pattern._ops.contains(def)) {
+            } else if (def && _pattern._ops.contains(def)) {
+                computing = origin.getDefiningOp();
+
+                const bool computedPerRow = computing && _pattern._ops.contains(computing) && computesPerRow(computing);
+                bioassert(computedPerRow, "A pattern column read before the step binding it");
+            } else if (!def || isVisibleHere(pending)) {
                 materialized.map(pending, pending);
             } else {
-                bioassert(computesPerRow(def), "A pattern column read before the step binding it");
+                computing = def;
+                bioassert(computesFromTheRow(def), "A walk rebuilt out of its factor reads a row the factor made");
+            }
 
+            if (computing) {
                 bool operandsPending = false;
-                for (const Value operand : llvm::reverse(def->getOperands())) {
+                for (const Value operand : llvm::reverse(computing->getOperands())) {
                     if (!materialized.contains(operand)) {
                         worklist.push_back(operand);
                         operandsPending = true;
@@ -8998,8 +11247,8 @@ public:
                     continue;
                 }
 
-                Operation* const cloned = _builder.clone(*def, materialized);
-                materialized.map(pending, cloned->getResult(cast<OpResult>(pending).getResultNumber()));
+                Operation* const cloned = _builder.clone(*computing, materialized);
+                materialized.map(pending, cloned->getResult(cast<OpResult>(origin).getResultNumber()));
             }
 
             worklist.pop_back();
@@ -9008,43 +11257,28 @@ public:
         return materialized.lookup(value);
     }
 
-    void walkFrom(Value seeded) {
-        llvm::SmallPtrSet<Operation*, 16> walked;
-        llvm::SmallPtrSet<Operation*, 16> applied;
-        bool rootChecked = false;
-
-        bool progressed = true;
-        while (progressed) {
-            progressed = false;
-
-            if (!rootChecked && isAvailable(_pattern._root->getResult(0))) {
-                applyRootLabels();
-                rootChecked = true;
-            }
-
-            for (FilterOp filter : _pattern._filters) {
-                const bool applicable = !applied.contains(filter.getOperation()) && dependsOnAvailable(filter.getMask());
-                if (applicable) {
+    void walk(llvm::ArrayRef<WalkEvent> events) {
+        for (const WalkEvent& event : events) {
+            switch (event._kind) {
+                case WalkEvent::Kind::RootLabels:
+                    applyRootLabels();
+                break;
+                case WalkEvent::Kind::Filter: {
+                    FilterOp filter = event._filter;
                     keepRows(materialize(filter.getMask()));
-                    applied.insert(filter.getOperation());
                 }
-            }
-
-            for (const PatternStep& step : _pattern._steps) {
-                if (walked.contains(step._op)) {
-                    continue;
-                }
-
-                if (isAvailable(step._from)) {
-                    walkForward(step);
-                } else if (isAvailable(step._to)) {
-                    walkBackward(step);
-                } else {
-                    continue;
-                }
-
-                walked.insert(step._op);
-                progressed = true;
+                break;
+                case WalkEvent::Kind::Forward:
+                    walkForward(*event._step);
+                break;
+                case WalkEvent::Kind::Backward:
+                    walkBackward(*event._step);
+                break;
+                case WalkEvent::Kind::Cross:
+                    crossJunction();
+                break;
+                case WalkEvent::Kind::Join:
+                    keepRows(materializeJoin(*event._join));
                 break;
             }
         }
@@ -9056,43 +11290,134 @@ private:
     Location _loc;
     llvm::DenseMap<Value, Value> _current;
     llvm::SmallVector<Value> _inFlight;
+    const PatternJunction* _junction {nullptr};
 
-    bool isAvailable(Value origin) const { return _current.count(origin) > 0; }
-
-    bool dependsOnAvailable(Value value) const {
-        llvm::SmallPtrSet<void*, 8> inputs;
-        collectPatternInputs(value, _pattern, inputs);
-
-        return llvm::all_of(inputs, [this](void* input) { return isAvailable(Value::getFromOpaquePointer(input)); });
+    // A walk crossing a product in leaves the factor it was written in, whose values the rows
+    // rebuilt after the cross no longer see
+    bool isVisibleHere(Value value) const {
+        Region* const here = _builder.getInsertionBlock()->getParent();
+        return value.getParentRegion()->isAncestor(here);
     }
 
-    void carried(llvm::SmallVectorImpl<Value>& columns) const {
-        for (const Value origin : _inFlight) {
-            columns.push_back(_current.lookup(origin));
+    // The rows rebuilt so far take the junction's place: crossed with the other factor of its
+    // product, or repeated once per element of its unwind
+    void crossJunction() {
+        const PatternJunction& junction = *_junction;
+        Operation* const junctionOp = junction._op;
+
+        llvm::SmallVector<Value> rebuilt;
+        carried(rebuilt, Value());
+
+        _builder.setInsertionPoint(junctionOp);
+
+        Operation* crossed = nullptr;
+        llvm::SmallVector<Value> otherColumns;
+        llvm::SmallVector<Value> rebuiltColumns;
+
+        if (CrossProduct product = dyn_cast<CrossProduct>(junctionOp)) {
+            Region& leftFactor = product.getLeftFactor();
+            Region& rightFactor = product.getRightFactor();
+            const bool patternOnTheLeft = junction._otherFactor == &rightFactor;
+
+            Region& patternFactor = patternOnTheLeft ? leftFactor : rightFactor;
+            Yield yield = cast<Yield>(patternFactor.front().getTerminator());
+            yield->setOperands(rebuilt);
+
+            llvm::SmallVector<Type> types;
+            collectFactorTypes(leftFactor, rightFactor, types);
+
+            CrossProduct crossedProduct = _builder.create<CrossProduct>(_loc, types);
+            crossedProduct.getLeftFactor().takeBody(leftFactor);
+            crossedProduct.getRightFactor().takeBody(rightFactor);
+
+            const size_t leftWidth = leftFactorWidth(crossedProduct);
+            for (const OpResult result : crossedProduct->getResults()) {
+                const bool fromThePattern = (result.getResultNumber() < leftWidth) == patternOnTheLeft;
+                (fromThePattern ? rebuiltColumns : otherColumns).push_back(result);
+            }
+
+            crossed = crossedProduct.getOperation();
+        } else {
+            Unwind unwind = cast<Unwind>(junctionOp);
+
+            llvm::SmallVector<Type> types {unwind.getElement().getType()};
+            for (const Value column : rebuilt) {
+                types.push_back(column.getType());
+            }
+
+            Unwind crossedUnwind = _builder.create<Unwind>(_loc, types, unwind.getSource(), rebuilt);
+            const ResultRange crossedRows = crossedUnwind.getCarried();
+
+            otherColumns.push_back(crossedUnwind.getElement());
+            rebuiltColumns.assign(crossedRows.begin(), crossedRows.end());
+
+            crossed = crossedUnwind.getOperation();
+        }
+
+        _builder.setInsertionPointAfter(crossed);
+
+        const llvm::SmallVector<Value> rebuiltOrigins(_inFlight.begin(), _inFlight.end());
+        _inFlight.clear();
+        _current.clear();
+
+        for (size_t index = 0; index < otherColumns.size(); index++) {
+            bind(junction._otherResults[index], otherColumns[index]);
+        }
+
+        for (size_t index = 0; index < rebuiltColumns.size(); index++) {
+            bind(rebuiltOrigins[index], rebuiltColumns[index]);
         }
     }
 
-    void carried(llvm::SmallVectorImpl<Value>& columns, llvm::SmallVectorImpl<Type>& types) const {
+    Value materializeJoin(const JoinConjunct& join) {
+        mlir::IRMapping mapping;
+        for (const Value input : join._cone._inputs) {
+            const Value source = junctionSource(*_junction, climbFilters(input));
+            if (source) {
+                mapping.map(input, materialize(source));
+            }
+        }
+
+        for (Operation* const coneOp : join._cone._ops) {
+            _builder.clone(*coneOp, mapping);
+        }
+
+        return mapping.lookup(join._conjunct);
+    }
+
+    // A hop hands back the node it walks from as its own result, so it does not carry it
+    void carried(llvm::SmallVectorImpl<Value>& columns, Value walkedFrom) const {
+        for (const Value origin : _inFlight) {
+            if (origin != walkedFrom) {
+                columns.push_back(_current.lookup(origin));
+            }
+        }
+    }
+
+    void carried(llvm::SmallVectorImpl<Value>& columns, llvm::SmallVectorImpl<Type>& types, Value walkedFrom) const {
         const size_t first = columns.size();
-        carried(columns);
+        carried(columns, walkedFrom);
         for (size_t index = first; index < columns.size(); index++) {
             types.push_back(columns[index].getType());
         }
     }
 
-    void rebindCarried(Operation* op, size_t firstCarried) {
-        for (size_t index = 0; index < _inFlight.size(); index++) {
-            _current[_inFlight[index]] = op->getResult(firstCarried + index);
+    void rebindCarried(Operation* op, size_t firstCarried, Value walkedFrom) {
+        size_t resultIndex = firstCarried;
+        for (const Value origin : _inFlight) {
+            if (origin != walkedFrom) {
+                _current[origin] = op->getResult(resultIndex++);
+            }
         }
     }
 
     void keepRows(Value mask) {
         llvm::SmallVector<Value> columns;
         llvm::SmallVector<Type> types;
-        carried(columns, types);
+        carried(columns, types, Value());
 
         FilterOp filter = _builder.create<FilterOp>(_loc, types, mask, columns);
-        rebindCarried(filter.getOperation(), 0);
+        rebindCarried(filter.getOperation(), 0, Value());
     }
 
     void applyRootLabels() {
@@ -9105,8 +11430,8 @@ private:
         keepRows(checkLabels(root, scanByLabel.getLabels(), _loc, _builder));
     }
 
-    void bindHop(const PatternStep& step, Operation* walked, size_t fromResult, size_t toResult) {
-        rebindCarried(walked, hopFixedResultCount);
+    void bindHop(const PatternStep& step, Operation* walked, Value walkedFrom, size_t fromResult, size_t toResult) {
+        rebindCarried(walked, hopFixedResultCount, walkedFrom);
 
         bind(step._from, walked->getResult(fromResult));
         bind(step._to, walked->getResult(toResult));
@@ -9123,7 +11448,7 @@ private:
         llvm::SmallVector<Value> columns;
         llvm::SmallVector<Type> types;
         hopTypes(step._op, types);
-        carried(columns, types);
+        carried(columns, types, step._from);
 
         OperationState state(_loc, step._op->getName());
         state.addOperands(_current.lookup(step._from));
@@ -9131,24 +11456,24 @@ private:
         state.addTypes(types);
         Operation* const walked = _builder.create(state);
 
-        bindHop(step, walked, hopInputResult(step._op), hopReachedResult(step._op));
+        bindHop(step, walked, step._from, hopInputResult(step._op), hopReachedResult(step._op));
     }
 
     // An out-hop reversed is an in-hop from the node it reached, over the same edges
     void walkBackward(const PatternStep& step) {
         llvm::SmallVector<Value> columns;
-        carried(columns);
+        carried(columns, step._to);
 
         const Value from = _current.lookup(step._to);
         Operation* const walked = createReversedHop(step._op, from, ArrayAttr(), columns, _builder);
 
-        bindHop(step, walked, hopReachedResult(walked), hopInputResult(walked));
+        bindHop(step, walked, step._to, hopReachedResult(walked), hopInputResult(walked));
     }
 
     void walkExploration(ExplorePaths exploration, const PatternStep& step) {
         llvm::SmallVector<Value> columns;
         llvm::SmallVector<Type> types {exploration.getSrcids().getType(), exploration.getTgtids().getType(), exploration.getPaths().getType()};
-        carried(columns, types);
+        carried(columns, types, step._from);
 
         ExplorePaths walked = _builder.create<ExplorePaths>(_loc,
                                                             types,
@@ -9168,14 +11493,14 @@ private:
                                                             exploration.getStepCount());
         takeHopRegions(exploration, walked);
 
-        rebindCarried(walked.getOperation(), pathFixedResultCount);
+        rebindCarried(walked.getOperation(), pathFixedResultCount, step._from);
         bind(step._from, walked.getSrcids());
         bind(step._to, walked.getTgtids());
         bind(exploration.getPaths(), walked.getPaths());
     }
 };
 
-Value cloneSeedIDs(Value ids, const SeedJunction& junction, mlir::IRMapping& seedColumns, mlir::OpBuilder& builder) {
+Value cloneSeedIDs(Value ids, const PatternJunction& junction, mlir::IRMapping& seedColumns, mlir::OpBuilder& builder) {
     llvm::SmallVector<Value> worklist {ids};
 
     while (!worklist.empty()) {
@@ -9226,8 +11551,42 @@ Value cloneSeedIDs(Value ids, const SeedJunction& junction, mlir::IRMapping& see
     return seedColumns.lookup(ids);
 }
 
+// Whether every row of a column names a node the graph holds, so that a fetch would keep
+// it as it is: a scan's nodes, a fetch's, or either end of a hop or a walk
+bool namesGraphNodes(Value column) {
+    for (;;) {
+        const OpResult result = dyn_cast<OpResult>(column);
+        if (!result) {
+            return false;
+        }
+
+        Operation* const op = result.getOwner();
+        const size_t resultIndex = result.getResultNumber();
+
+        if (isa<ScanNodes, ScanNodesByLabel, ScanNodesByPropertyValue>(op)) {
+            return true;
+        } else if (FilterOp filter = dyn_cast<FilterOp>(op)) {
+            column = filter.getColumnsToFilter()[resultIndex];
+        } else if (isa<FetchNodes>(op) && resultIndex > 0) {
+            column = op->getOperand(resultIndex);
+        } else if (isa<FetchNodes>(op)) {
+            return true;
+        } else if (isEdgeHop(op) && resultIndex >= hopFixedResultCount) {
+            column = op->getOperand(1 + resultIndex - hopFixedResultCount);
+        } else if (isEdgeHop(op)) {
+            return resultIndex == hopInputResult(op) || resultIndex == hopReachedResult(op);
+        } else if (ExplorePaths exploration = dyn_cast<ExplorePaths>(op); exploration && resultIndex >= pathFixedResultCount) {
+            column = exploration.getColumnsToFilter()[resultIndex - pathFixedResultCount];
+        } else if (ExplorePaths exploration = dyn_cast<ExplorePaths>(op)) {
+            return column == exploration.getSrcids() || column == exploration.getTgtids();
+        } else {
+            return false;
+        }
+    }
+}
+
 void reroot(PatternSeed& seed, mlir::RewriterBase& rewriter) {
-    SeedJunction& junction = seed._junction;
+    PatternJunction& junction = seed._junction;
     Operation* const junctionOp = junction._op;
     const Location loc = junctionOp->getLoc();
 
@@ -9236,11 +11595,11 @@ void reroot(PatternSeed& seed, mlir::RewriterBase& rewriter) {
     // The seed's rows on their own: the other factor's body, or the list unwound again
     // without the pattern's columns
     llvm::SmallVector<Value> seedColumns;
-    if (junction._seedFactor) {
-        const Operation::operand_range yielded = factorYieldColumns(*junction._seedFactor);
+    if (junction._otherFactor) {
+        const Operation::operand_range yielded = factorYieldColumns(*junction._otherFactor);
         seedColumns.assign(yielded.begin(), yielded.end());
 
-        Block& seedBlock = junction._seedFactor->front();
+        Block& seedBlock = junction._otherFactor->front();
         junctionOp->getBlock()->getOperations().splice(Block::iterator(junctionOp),
                                                        seedBlock.getOperations(),
                                                        seedBlock.begin(),
@@ -9254,15 +11613,13 @@ void reroot(PatternSeed& seed, mlir::RewriterBase& rewriter) {
 
     mlir::IRMapping seedMapping;
     for (size_t index = 0; index < seedColumns.size(); index++) {
-        seedMapping.map(junction._seedResults[index], seedColumns[index]);
+        seedMapping.map(junction._otherResults[index], seedColumns[index]);
     }
 
     const Value ids = cloneSeedIDs(seed._ids, junction, seedMapping, rewriter);
 
-    // A scan only produces nodes a fetch would keep, so its column is the seeded node as is
     llvm::SmallVector<Value> seededColumns {ids};
-    const bool namesScannedNodes = isa_and_nonnull<ScanNodes, ScanNodesByLabel, ScanNodesByPropertyValue>(ids.getDefiningOp());
-    if (namesScannedNodes) {
+    if (namesGraphNodes(ids)) {
         llvm::append_range(seededColumns, seedColumns);
     } else {
         llvm::SmallVector<Type> fetchTypes {seed._seeded.getType()};
@@ -9276,23 +11633,23 @@ void reroot(PatternSeed& seed, mlir::RewriterBase& rewriter) {
 
     PatternReplay replay(seed._pattern, rewriter, loc);
     for (size_t index = 0; index < seedColumns.size(); index++) {
-        replay.bind(junction._seedResults[index], seededColumns[index + 1]);
+        replay.bind(junction._otherResults[index], seededColumns[index + 1]);
     }
 
     replay.bind(seed._seeded, seededColumns.front());
-    replay.walkFrom(seed._seeded);
+    replay.walk(seed._events);
 
     for (size_t index = 0; index < junction._patternResults.size(); index++) {
         junction._patternResults[index].replaceAllUsesWith(replay.materialize(junction._patternOutputs[index]));
     }
 
-    for (Value seedResult : junction._seedResults) {
+    for (Value seedResult : junction._otherResults) {
         seedResult.replaceAllUsesWith(replay.currentOf(seedResult));
     }
 
     dropConjunct(seed._filter, seed._equality.getResult(), rewriter);
 
-    if (junction._seedFactor) {
+    if (junction._otherFactor) {
         rewriter.eraseOp(junctionOp);
         return;
     }
@@ -9326,6 +11683,641 @@ struct RerootPatternAtSeed : public impl::RerootPatternAtSeedBase<RerootPatternA
 
         runFilterWorklist<PatternSeed>(getOperation(), matchSeed, rerootAtSeed);
     }
+};
+
+// The estimate counts rows and edges read rather than time, and a walk off the written root
+// reads the nodes after its first hop out of their order, so a pattern moves off the root
+// the query wrote only when another start costs this much less
+constexpr double REROOT_GAIN_FACTOR = 1.3;
+
+// The junction a pattern ends at, the conjuncts of the filters over it that relate the
+// pattern to the junction's other side, and the rows that side multiplies the walk's by
+struct JunctionJoins {
+    PatternJunction _junction;
+    llvm::SmallVector<JoinConjunct, 2> _joins;
+    double _crossedRows {0};
+};
+
+// A pattern rooted at a scan up to the first op reading it that is not rebuilt with it, and
+// the walk out of the node making the fewest rows, scanned by the labels its filters ask for.
+// A walk crossing the other side of its junction in partway rebuilds the junction there.
+struct CheapestRoot {
+    SeedPattern _pattern;
+    llvm::SmallVector<Operation*> _orderedOps;
+    Operation* _end {nullptr};
+    Value _start;
+    ArrayAttr _labels;
+    llvm::SmallVector<WalkEvent> _events;
+    JunctionJoins _joins;
+    bool _crossesJunction {false};
+};
+
+// False when a graph write stands before the end, which the rebuilt pattern would read past
+bool collectRootedPattern(Operation* scan, CheapestRoot& match) {
+    SeedPattern& pattern = match._pattern;
+    pattern._root = scan;
+    pattern._ops.insert(scan);
+    match._orderedOps.push_back(scan);
+
+    const auto definedByThePattern = [&pattern](Value value) {
+        Operation* const def = value.getDefiningOp();
+        return def && pattern._ops.contains(def);
+    };
+
+    for (Operation& op : llvm::make_range(std::next(Block::iterator(scan)), scan->getBlock()->end())) {
+        bool writesTheGraph = false;
+        bool readsThePattern = false;
+        op.walk([&](Operation* nested) {
+            writesTheGraph = writesTheGraph || isGraphWrite(nested);
+            readsThePattern = readsThePattern || llvm::any_of(nested->getOperands(), definedByThePattern);
+        });
+
+        if (writesTheGraph) {
+            return false;
+        } else if (!readsThePattern) {
+            continue;
+        }
+
+        ExplorePaths exploration = dyn_cast<ExplorePaths>(op);
+        const bool explores = exploration && walksFreely(exploration);
+
+        const bool buildsThePattern = isa<FilterOp>(op) || isHop(&op) || explores || computesPerRow(&op);
+        if (!buildsThePattern) {
+            match._end = &op;
+            return true;
+        }
+
+        FilterOp filter = dyn_cast<FilterOp>(op);
+        const bool carriesRows = filter || isHop(&op) || explores;
+        const OperandRange carried = filter ? filter.getColumnsToFilter() : op.getOperands();
+        if (carriesRows && !llvm::all_of(carried, definedByThePattern)) {
+            return false;
+        }
+
+        pattern._ops.insert(&op);
+        match._orderedOps.push_back(&op);
+    }
+
+    return false;
+}
+
+void collectWrittenWalk(const CheapestRoot& match, llvm::SmallVectorImpl<WalkEvent>& events) {
+    const llvm::SmallVector<PatternStep>& steps = match._pattern._steps;
+
+    size_t stepIndex = 0;
+    for (Operation* const op : match._orderedOps) {
+        if (FilterOp filter = dyn_cast<FilterOp>(op)) {
+            events.push_back(WalkEvent {._kind = WalkEvent::Kind::Filter, ._filter = filter});
+        } else if (isHop(op) || isa<ExplorePaths>(op)) {
+            events.push_back(WalkEvent {._kind = WalkEvent::Kind::Forward, ._step = &steps[stepIndex++]});
+        }
+    }
+}
+
+bool isComputedAhead(Value value, Operation* op) {
+    Operation* const ancestor = value.getParentBlock()->findAncestorOpInBlock(*op);
+    if (!ancestor) {
+        return false;
+    }
+
+    Operation* const def = value.getDefiningOp();
+
+    return !def || def->isBeforeInBlock(ancestor);
+}
+
+// The keys fuse_hash_join joins on: each side of the equality computed from one column of a
+// side of the junction of its own
+void readJoinKeys(Value conjunct, const PatternJunction& junction, bool usesHashJoin, JoinConjunct& join) {
+    EqOp equality = conjunct.getDefiningOp<EqOp>();
+    if (!equality) {
+        return;
+    }
+
+    bool keysThePattern = false;
+    bool keysTheOtherSide = false;
+    bool hashesKeys = true;
+    for (const Value key : {equality.getLhs(), equality.getRhs()}) {
+        JoinKeySide side;
+        side._key = key;
+        collectRowCone({key}, equality->getBlock(), side._cone);
+
+        if (side._cone._inputs.size() != 1) {
+            return;
+        }
+
+        const Value column = climbFilters(side._cone._inputs.front());
+        keysThePattern = keysThePattern || llvm::is_contained(junction._patternResults, column);
+        keysTheOtherSide = keysTheOtherSide || llvm::is_contained(junction._otherResults, column);
+        hashesKeys = hashesKeys && isHashableKey(side);
+    }
+
+    join._equatesKeys = keysThePattern && keysTheOtherSide;
+    join._hashes = join._equatesKeys && hashesKeys && usesHashJoin && isa<CrossProduct>(junction._op);
+}
+
+// A conjunct reading both sides of the junction. Its cone is cloned where the junction
+// stands, so it reads nothing computed after the junction.
+bool matchJoinConjunct(Value conjunct,
+                       FilterOp filter,
+                       const PatternJunction& junction,
+                       const SeedPattern& pattern,
+                       bool usesHashJoin,
+                       JoinConjunct& join) {
+    join._conjunct = conjunct;
+    join._filter = filter;
+    collectRowCone({conjunct}, filter->getBlock(), join._cone);
+
+    bool readsTheOtherSide = false;
+    for (const Value input : join._cone._inputs) {
+        const Value climbed = climbFilters(input);
+
+        if (llvm::is_contained(junction._otherResults, climbed)) {
+            readsTheOtherSide = true;
+        } else if (const Value patternColumn = junctionSource(junction, climbed)) {
+            collectPatternInputs(patternColumn, pattern, join._patternInputs);
+        } else if (!isComputedAhead(input, junction._op)) {
+            return false;
+        }
+    }
+
+    readJoinKeys(conjunct, junction, usesHashJoin, join);
+
+    return readsTheOtherSide && !join._patternInputs.empty();
+}
+
+bool matchJunctionJoins(const CheapestRoot& match,
+                        const RowEstimator& estimator,
+                        const DBPassContext& context,
+                        JunctionJoins& joins) {
+    const SeedPattern& pattern = match._pattern;
+    PatternJunction& junction = joins._junction;
+
+    Yield yield = dyn_cast<Yield>(match._end);
+    CrossProduct product = yield ? dyn_cast<CrossProduct>(yield->getParentOp()) : CrossProduct();
+    Unwind unwind = dyn_cast<Unwind>(match._end);
+
+    if (product) {
+        const bool holdsThePatternAlone = llvm::all_of(yield->getBlock()->without_terminator(), [&pattern](Operation& op) {
+            return pattern._ops.contains(&op) || computesFromTheRow(&op);
+        });
+
+        if (!holdsThePatternAlone) {
+            return false;
+        }
+
+        readProductJunction(product, yield->getParentRegion() == &product.getLeftFactor(), junction);
+        joins._crossedRows = estimateFactorRows(*junction._otherFactor, estimator);
+    } else if (unwind && !unwind.getColumnsToFilter().empty()) {
+        readUnwindJunction(unwind, junction);
+        if (!unwindsOverThePatternAlone(junction, pattern, match._orderedOps)) {
+            return false;
+        }
+
+        joins._crossedRows = estimateUnwoundRows(unwind);
+    } else {
+        return false;
+    }
+
+    for (const Value output : junction._patternOutputs) {
+        Operation* const def = output.getDefiningOp();
+        if (!def || !pattern._ops.contains(def)) {
+            return false;
+        }
+    }
+
+    llvm::SmallVector<std::pair<Value, FilterOp>, 4> conjuncts;
+    FilterStack stack(junction._op);
+    for (FilterOp filter = stack.getReader(); filter && stack.isExclusiveTo(filter); filter = stack.getReader()) {
+        stack.climbTo(filter);
+
+        llvm::SmallVector<Value, 4> filterConjuncts;
+        collectConjuncts(filter.getMask(), filterConjuncts);
+        for (const Value conjunct : filterConjuncts) {
+            conjuncts.emplace_back(conjunct, filter);
+        }
+    }
+
+    // Equalities go first, so the filter right over a rebuilt junction is one fuse_hash_join
+    // can fuse with it into a hash join
+    std::stable_partition(conjuncts.begin(), conjuncts.end(), [](const std::pair<Value, FilterOp>& conjunct) {
+        return static_cast<bool>(conjunct.first.getDefiningOp<EqOp>());
+    });
+
+    for (const auto& [conjunct, filter] : conjuncts) {
+        JoinConjunct& join = joins._joins.emplace_back();
+        if (!matchJoinConjunct(conjunct, filter, junction, pattern, context._usesHashJoin, join)) {
+            joins._joins.pop_back();
+        }
+    }
+
+    return !joins._joins.empty();
+}
+
+bool isStepEvent(const WalkEvent& event) {
+    return event._kind == WalkEvent::Kind::Forward || event._kind == WalkEvent::Kind::Backward;
+}
+
+// The walk crossing the junction's other side in ahead of its event @param position, after
+// which each join conjunct runs before the next step once the steps have bound what it reads
+void crossWalkAt(const JunctionJoins& joins,
+                 Value start,
+                 llvm::ArrayRef<WalkEvent> walk,
+                 size_t position,
+                 llvm::SmallVectorImpl<WalkEvent>& events) {
+    llvm::DenseSet<Value> bound {start};
+    llvm::SmallBitVector joined(joins._joins.size());
+
+    const auto joinBound = [&joins, &bound, &joined, &events]() {
+        for (size_t index = 0; index < joins._joins.size(); index++) {
+            const JoinConjunct& join = joins._joins[index];
+            const bool readsBound = llvm::all_of(join._patternInputs, [&bound](void* input) {
+                return bound.contains(Value::getFromOpaquePointer(input));
+            });
+
+            if (!joined.test(index) && readsBound) {
+                events.push_back(WalkEvent {._kind = WalkEvent::Kind::Join, ._join = &join});
+                joined.set(index);
+            }
+        }
+    };
+
+    bool crossed = false;
+    for (size_t index = 0; index < walk.size(); index++) {
+        const WalkEvent& event = walk[index];
+        const bool isStep = isStepEvent(event);
+
+        if (index == position) {
+            events.push_back(WalkEvent {._kind = WalkEvent::Kind::Cross});
+            crossed = true;
+            joinBound();
+        } else if (crossed && isStep) {
+            joinBound();
+        }
+
+        events.push_back(event);
+
+        if (isStep) {
+            bindStep(*event._step, bound);
+        }
+    }
+
+    if (!crossed) {
+        events.push_back(WalkEvent {._kind = WalkEvent::Kind::Cross});
+    }
+
+    joinBound();
+}
+
+void collectScanLabelFilters(const SeedPattern& pattern,
+                             Value node,
+                             llvm::SmallPtrSetImpl<Operation*>& absorbed,
+                             llvm::SmallVectorImpl<Attribute>& labels) {
+    for (FilterOp filter : pattern._filters) {
+        CheckLabelConstraint check = filter.getMask().getDefiningOp<CheckLabelConstraint>();
+        const ArrayAttr conjunction = check ? check.getConjunction() : ArrayAttr();
+        if (!conjunction) {
+            continue;
+        }
+
+        GetNodeLabelSet labelSet = check.getLabelsetIds().getDefiningOp<GetNodeLabelSet>();
+        if (!labelSet || patternOrigin(labelSet.getInputNodes(), pattern) != node) {
+            continue;
+        }
+
+        absorbed.insert(filter.getOperation());
+        for (const Attribute label : conjunction) {
+            if (!llvm::is_contained(labels, label)) {
+                labels.push_back(label);
+            }
+        }
+    }
+}
+
+bool fusesIntoScanByPropertyValue(FilterOp filter, Value start, const SeedPattern& pattern) {
+    const auto readsTheStart = [&pattern, start](Value column) {
+        return patternOrigin(column, pattern) == start;
+    };
+
+    const MaskCone cone = collectMaskCone(filter.getMask());
+    if (!llvm::all_of(cone._inputs, readsTheStart)) {
+        return false;
+    }
+
+    llvm::SmallVector<Value> conjuncts;
+    collectConjuncts(filter.getMask(), conjuncts);
+
+    return llvm::any_of(conjuncts, [&readsTheStart](Value conjunct) {
+        EqOp equality = conjunct.getDefiningOp<EqOp>();
+        PropertyEquality property;
+        return equality && matchPropertyEquality(equality, property) && readsTheStart(property._read.getInputNodes());
+    });
+}
+
+// The types each hop of the pattern keeps by a filter of its own type column, which a later
+// pass fuses into the hop
+void collectHopTypeChecks(const SeedPattern& pattern, llvm::DenseMap<Operation*, ArrayAttr>& hopTypes) {
+    for (FilterOp filter : pattern._filters) {
+        CheckEdgeTypeConstraint check = filter.getMask().getDefiningOp<CheckEdgeTypeConstraint>();
+        const OpResult edgeTypes = check ? dyn_cast<OpResult>(check.getEdgeTypeIds()) : OpResult();
+        if (!edgeTypes) {
+            continue;
+        }
+
+        Operation* const hop = edgeTypes.getOwner();
+        if (isEdgeHop(hop) && edgeTypes.getResultNumber() == EDGE_TYPES_RESULT) {
+            hopTypes[hop] = check.getEdgeTypes();
+        }
+    }
+}
+
+// The work a walk does: the rows each op it emits builds, the scan of its first node, then
+// each filter and each hop, and the edges each hop reads. A property equality in the first
+// filter makes that scan and filter one scan by property value, which emits only the rows
+// the filter keeps, and a hop emits only the edges of the types its own filter keeps, as
+// the by-type hop it becomes, though it reads every edge of the nodes it leaves. Crossing a
+// junction's other side in makes a row per pair, unless it is the hash join fuse_hash_join
+// makes of the product and the equality right after it, which reads each side once. An
+// equality of a key of each side keeps one pair in as many as the distinct keys of the side
+// holding more, as PostgreSQL estimates a join of columns it holds no statistics of.
+double estimateWalkCost(const SeedPattern& pattern,
+                        Value start,
+                        ArrayAttr startLabels,
+                        llvm::ArrayRef<WalkEvent> events,
+                        const JunctionJoins* joins,
+                        const RowEstimator& estimator) {
+    const auto nodeOf = [&pattern, joins](Value column) {
+        const Value patternColumn = joins ? junctionSource(joins->_junction, climbFilters(column)) : Value();
+        return patternOrigin(patternColumn ? patternColumn : column, pattern);
+    };
+
+    llvm::DenseMap<Operation*, ArrayAttr> hopTypes;
+    collectHopTypeChecks(pattern, hopTypes);
+
+    WalkKnowledge knowledge;
+    double rows = estimator.getNodeCount();
+    if (startLabels) {
+        rows *= estimator.keepLabelled(ArrayAttr::get(startLabels.getContext(), {startLabels}), start, knowledge);
+    }
+
+    const bool startsWithFilter = !events.empty() && events.front()._kind == WalkEvent::Kind::Filter;
+    const bool scansByPropertyValue = startsWithFilter && fusesIntoScanByPropertyValue(events.front()._filter, start, pattern);
+
+    double cost = scansByPropertyValue ? 0 : rows;
+    double crossedPatternRows = 0;
+    for (size_t index = 0; index < events.size(); index++) {
+        const WalkEvent& event = events[index];
+        bool buildsRows = true;
+
+        switch (event._kind) {
+            case WalkEvent::Kind::RootLabels: {
+                const ArrayAttr rootLabels = cast<ScanNodesByLabel>(pattern._root).getLabels();
+                rows *= estimator.keepLabelled(ArrayAttr::get(rootLabels.getContext(), {rootLabels}), pattern._root->getResult(0), knowledge);
+            }
+            break;
+            case WalkEvent::Kind::Filter: {
+                FilterOp filter = event._filter;
+                rows *= estimator.getSelectivity(filter.getMask(), nodeOf, knowledge);
+            }
+            break;
+            case WalkEvent::Kind::Forward: {
+                const PatternStep& step = *event._step;
+                const HopEstimate hop = estimator.walkHop(step._op, false, step._from, step._to, hopTypes.lookup(step._op), knowledge);
+                cost += rows * hop._edgesRead;
+                rows *= hop._rows;
+            }
+            break;
+            case WalkEvent::Kind::Backward: {
+                const PatternStep& step = *event._step;
+                const HopEstimate hop = estimator.walkHop(step._op, true, step._to, step._from, hopTypes.lookup(step._op), knowledge);
+                cost += rows * hop._edgesRead;
+                rows *= hop._rows;
+            }
+            break;
+            case WalkEvent::Kind::Cross: {
+                const bool joinsNext = index + 1 < events.size() && events[index + 1]._kind == WalkEvent::Kind::Join;
+                const bool hashes = joinsNext && events[index + 1]._join->_hashes;
+                if (hashes) {
+                    cost += rows + joins->_crossedRows;
+                    buildsRows = false;
+                }
+
+                crossedPatternRows = rows;
+                rows *= joins->_crossedRows;
+            }
+            break;
+            case WalkEvent::Kind::Join: {
+                const JoinConjunct& join = *event._join;
+                if (join._equatesKeys) {
+                    const double patternKeys = std::min(DEFAULT_DISTINCT_VALUES, crossedPatternRows);
+                    const double otherKeys = std::min(DEFAULT_DISTINCT_VALUES, joins->_crossedRows);
+                    rows /= std::max({patternKeys, otherKeys, 1.0});
+                } else {
+                    rows *= estimator.getSelectivity(join._conjunct, nodeOf, knowledge);
+                }
+            }
+            break;
+        }
+
+        if (buildsRows) {
+            cost += rows;
+        }
+    }
+
+    return cost;
+}
+
+// A walk crossing the other side in once nothing but join conjuncts is left leaves the
+// junction and the filters over it as they stand
+void settleCross(CheapestRoot& match) {
+    llvm::SmallVector<WalkEvent>& events = match._events;
+    const auto cross = llvm::find_if(events, [](const WalkEvent& event) {
+        return event._kind == WalkEvent::Kind::Cross;
+    });
+
+    const bool joinsAlone = std::all_of(std::next(cross), events.end(), [](const WalkEvent& event) {
+        return event._kind == WalkEvent::Kind::Join;
+    });
+
+    if (joinsAlone) {
+        events.erase(cross, events.end());
+    } else {
+        match._crossesJunction = true;
+    }
+}
+
+bool matchCheapestRoot(Operation* scan, const RowEstimator& estimator, const DBPassContext& context, CheapestRoot& match) {
+    SeedPattern& pattern = match._pattern;
+    if (!collectRootedPattern(scan, match) || !analyzePattern(pattern, match._orderedOps) || pattern._steps.empty()) {
+        return false;
+    }
+
+    const JunctionJoins* const joins = matchJunctionJoins(match, estimator, context, match._joins) ? &match._joins : nullptr;
+
+    const Value root = scan->getResult(0);
+    ScanNodesByLabel rootScan = dyn_cast<ScanNodesByLabel>(scan);
+    const ArrayAttr rootLabels = rootScan ? rootScan.getLabels() : ArrayAttr();
+
+    llvm::SmallVector<WalkEvent> written;
+    collectWrittenWalk(match, written);
+
+    llvm::SmallVector<WalkEvent> crossedWritten;
+    if (joins) {
+        crossWalkAt(*joins, root, written, written.size(), crossedWritten);
+    }
+
+    const llvm::ArrayRef<WalkEvent> writtenWalk = joins ? crossedWritten : written;
+
+    double cheapest = estimateWalkCost(pattern, root, rootLabels, writtenWalk, joins, estimator) / REROOT_GAIN_FACTOR;
+    bool foundCheaper = false;
+
+    const auto considerWalk = [&](Value candidate, ArrayAttr startLabels, llvm::ArrayRef<WalkEvent> events) {
+        const double cost = estimateWalkCost(pattern, candidate, startLabels, events, joins, estimator);
+        if (cost < cheapest) {
+            cheapest = cost;
+            foundCheaper = true;
+
+            match._start = candidate;
+            match._labels = startLabels;
+            match._events.assign(events.begin(), events.end());
+        }
+    };
+
+    llvm::SmallVector<Value> candidates {root};
+    for (const PatternStep& step : pattern._steps) {
+        candidates.push_back(step._to);
+    }
+
+    for (const Value candidate : candidates) {
+        if (!isWalkableFrom(pattern, candidate)) {
+            continue;
+        }
+
+        const bool isTheRoot = candidate == root;
+
+        llvm::SmallVector<Attribute> labels;
+        if (isTheRoot && rootLabels) {
+            labels.append(rootLabels.begin(), rootLabels.end());
+        }
+
+        llvm::SmallPtrSet<Operation*, 4> absorbed;
+        collectScanLabelFilters(pattern, candidate, absorbed, labels);
+        const ArrayAttr startLabels = labels.empty() ? ArrayAttr() : ArrayAttr::get(scan->getContext(), labels);
+
+        llvm::SmallVector<WalkEvent> events;
+        if (!planWalk(pattern, candidate, absorbed, isTheRoot || !rootLabels, events)) {
+            continue;
+        }
+
+        if (joins) {
+            // Crossed in only ahead of a step or at the end, the filters a scan or a hop is
+            // followed by stay beside it, where the passes fusing them into it look for them
+            for (size_t position = 0; position <= events.size(); position++) {
+                const bool beforeAStepOrTheEnd = position == events.size() || isStepEvent(events[position]);
+                if (!beforeAStepOrTheEnd) {
+                    continue;
+                }
+
+                llvm::SmallVector<WalkEvent> crossedEvents;
+                crossWalkAt(*joins, candidate, events, position, crossedEvents);
+                considerWalk(candidate, startLabels, crossedEvents);
+            }
+        } else {
+            considerWalk(candidate, startLabels, events);
+        }
+    }
+
+    if (foundCheaper && joins) {
+        settleCross(match);
+    }
+
+    return foundCheaper;
+}
+
+void rerootAtCheapestNode(CheapestRoot& match, mlir::RewriterBase& rewriter) {
+    const SeedPattern& pattern = match._pattern;
+    Operation* const rootOp = pattern._root;
+    const Location loc = rootOp->getLoc();
+    const Type nodesType = rootOp->getResult(0).getType();
+
+    rewriter.setInsertionPoint(match._end);
+
+    Value scanned;
+    if (match._labels) {
+        scanned = rewriter.create<ScanNodesByLabel>(loc, nodesType, match._labels).getResult();
+    } else {
+        scanned = rewriter.create<ScanNodes>(loc, nodesType).getResult();
+    }
+
+    PatternReplay replay(pattern, rewriter, loc);
+    if (match._crossesJunction) {
+        replay.setJunction(&match._joins._junction);
+    }
+
+    replay.bind(match._start, scanned);
+    replay.walk(match._events);
+
+    if (match._crossesJunction) {
+        const JunctionJoins& joins = match._joins;
+        Operation* const junctionOp = joins._junction._op;
+
+        for (const Value result : junctionOp->getResults()) {
+            rewriter.replaceAllUsesWith(result, replay.materializeJunctionResult(result));
+        }
+
+        for (const JoinConjunct& join : joins._joins) {
+            dropConjunct(join._filter, join._conjunct, rewriter);
+        }
+
+        rewriter.eraseOp(junctionOp);
+    } else {
+        const auto readOutsideThePattern = [&pattern](OpOperand& use) {
+            return !pattern._ops.contains(use.getOwner());
+        };
+
+        for (Operation* const op : match._orderedOps) {
+            for (Value result : op->getResults()) {
+                if (llvm::any_of(result.getUses(), readOutsideThePattern)) {
+                    result.replaceUsesWithIf(replay.materialize(result), readOutsideThePattern);
+                }
+            }
+        }
+    }
+
+    for (Operation* const op : llvm::reverse(match._orderedOps)) {
+        op->dropAllUses();
+        rewriter.eraseOp(op);
+    }
+}
+
+struct RerootPatternAtCheapestNode : public impl::RerootPatternAtCheapestNodeBase<RerootPatternAtCheapestNode> {
+    RerootPatternAtCheapestNode() {}
+
+    RerootPatternAtCheapestNode(const DBPassContext* context)
+        : _context(context)
+    {
+    }
+
+    void runOnOperation() override {
+        if (!_context->_view) {
+            return;
+        }
+
+        const RowEstimator estimator(*_context->_view);
+
+        const DBPassContext& context = *_context;
+        runWorklist<ScanNodes, ScanNodesByLabel>(getOperation(), [&estimator, &context](Operation* op, mlir::RewriterBase& rewriter) {
+            CheapestRoot match;
+            if (!matchCheapestRoot(op, estimator, context, match)) {
+                return false;
+            }
+
+            rerootAtCheapestNode(match, rewriter);
+            return true;
+        });
+    }
+
+private:
+    const DBPassContext* _context {&defaultPassContext};
 };
 
 // The node scans a column's rows come off, in factor order. A cross product's rows are its
@@ -9551,6 +12543,10 @@ std::unique_ptr<Pass> createFuseHashJoin(const DBPassContext* context) {
 
 std::unique_ptr<Pass> createCountFromMetadata(const DBPassContext* context) {
     return std::make_unique<CountFromMetadata>(context);
+}
+
+std::unique_ptr<Pass> createRerootPatternAtCheapestNode(const DBPassContext* context) {
+    return std::make_unique<RerootPatternAtCheapestNode>(context);
 }
 
 }

@@ -39,7 +39,7 @@ def UnnestUnwindComprehension : Pass<"unnest_unwind_comprehension"> {
 }
 
 def FuseScanByNodeIDs : Pass<"fuse_scan_by_node_ids"> {
-    let summary = "Fuse a node scan and its node-ID disjunction filter into a const_scan_nodes";
+    let summary = "Fuse a node scan and its filter on node IDs, an OR of equalities to an ID and IN tests over a list of IDs, into a const_scan_nodes";
     let dependentDialects = ["mlir::db::DB"];
 }
 
@@ -123,6 +123,11 @@ def RerootPatternAtSeed : Pass<"reroot_pattern_at_seed"> {
     let dependentDialects = ["mlir::db::DB"];
 }
 
+def RerootPatternAtCheapestNode : Pass<"reroot_pattern_at_cheapest_node"> {
+    let summary = "Walk a pattern out from the node the graph's counts say makes the fewest rows, rather than from the node the query writes first, and cross in the rows a filter joins it to where that filter can run, rather than after the whole pattern";
+    let dependentDialects = ["mlir::db::DB"];
+}
+
 def FuseHashJoin : Pass<"fuse_hash_join"> {
     let summary = "Fuse a cross product and the equality filter over it into a hash_join";
     let dependentDialects = ["mlir::db::DB"];
@@ -149,12 +154,22 @@ def FuseExploreHopLabels : Pass<"fuse_explore_hop_labels"> {
 }
 
 def SinkMakePath : Pass<"sink_make_path"> {
-    let summary = "Build a named path after the filters that only carry it, over the rows they keep";
+    let summary = "Build a named path again after each filter that carries it, over the rows the filter keeps";
+    let dependentDialects = ["mlir::db::DB"];
+}
+
+def SinkIntoOptionalMatch : Pass<"sink_into_optional_match"> {
+    let summary = "Take the size of a list, or nodes(), relationships() or length() of a path, an optional match binds inside its pattern, and pad the result instead";
     let dependentDialects = ["mlir::db::DB"];
 }
 
 def FusePathElements : Pass<"fuse_path_elements"> {
     let summary = "Read the nodes, the relationships or the length of a named path over one walk off the walk's handles instead of the path it builds";
+    let dependentDialects = ["mlir::db::DB"];
+}
+
+def FusePathLength : Pass<"fuse_path_length"> {
+    let summary = "Read the size of the list a walk's handles expand to off the handles instead of expanding them";
     let dependentDialects = ["mlir::db::DB"];
 }
 
@@ -184,11 +199,21 @@ def FuseExploreDistinctEnds : Pass<"fuse_explore_distinct_ends"> {
 }
 
 def CountPathRows : Pass<"count_path_rows"> {
-    let summary = "Count the rows a path was built over instead of building the path to count it";
+    let summary = "Count the rows a path was built over, or the handles a walk's list was expanded from, instead of building the path or the list";
+}
+
+def CanonicalizeCoalesce : Pass<"canonicalize_coalesce"> {
+    let summary = "Drop the arguments of a coalesce no row takes its value out of or no row reaches, and replace a coalesce left with one argument by the value of that argument";
+    let dependentDialects = ["mlir::db::DB"];
+}
+
+def HoistUnconditionalRegions : Pass<"hoist_unconditional_regions"> {
+    let summary = "Compute the region of a CASE or a coalesce that every row reaches before the op, as a column it carries: the first condition of a CASE and the first argument of a coalesce";
+    let dependentDialects = ["mlir::db::DB"];
 }
 
 def TrimUnreadColumns : Pass<"trim_unread_columns"> {
-    let summary = "Drop the columns no later op reads from hops, filters, cuts, sorts, products, grouping ops, calls, CASEs and the ops over the elements of a list";
+    let summary = "Drop the columns no later op reads from hops, filters, cuts, sorts, products, grouping ops, calls, CASEs, optional matches and the ops over the elements of a list, and the values computed per row that nothing reads";
     let dependentDialects = ["mlir::db::DB"];
 }
 

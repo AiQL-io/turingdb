@@ -5,7 +5,6 @@
 #include <stddef.h>
 #include <string>
 
-#include "EntityList.h"
 #include "columns/KindTypes.h"
 #include "map/MapEntryView.h"
 #include "metadata/PropertyNull.h"
@@ -55,8 +54,7 @@ public:
         NodeID,
         EdgeID,
         PathRef,
-        Path,
-        EntityList,
+        GraphPath,
         LabelSetID,
         LabelSet,
         EdgeTypeID,
@@ -77,6 +75,7 @@ public:
         types::Embedding::Primitive,
         types::DateTime::Primitive,
         types::Duration::Primitive,
+        types::Point::Primitive,
         std::optional<EntityID>,
         std::optional<NodeID>,
         std::optional<EdgeID>,
@@ -93,6 +92,7 @@ public:
         std::optional<types::Embedding::Primitive>,
         std::optional<types::DateTime::Primitive>,
         std::optional<types::Duration::Primitive>,
+        std::optional<types::Point::Primitive>,
         std::optional<std::string>,
         std::optional<ValueType>,
         std::optional<ChangeID>,
@@ -103,10 +103,9 @@ public:
         Column*,
         ListView,
         std::optional<ListView>,
-        ListElementView,
-        std::optional<ListElementView>,
+        CellView,
+        std::optional<CellView>,
         MapView,
-        MapEntryView,
         std::optional<MapView>
     >;
 

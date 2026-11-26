@@ -3,7 +3,7 @@
   "graph": "simpledb",
   "query": "WITH [{a: 1}, 2] AS xs RETURN xs[0].a, xs[1].a",
   "expect": {
-    "result": "xs[0].a,xs[1].a\n1,null"
+    "result": "EXEC ERROR\nType mismatch: a value of type 'Integer' has no property 'a'"
   },
   "tags": [
     "map",

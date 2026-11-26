@@ -36,6 +36,8 @@ jobs:
     # GitHub runs pull_request workflows for every PR of a stack as if it targeted main. The
     # top PR's tree holds every commit below it, so only the top one builds.
     if: github.event.pull_request.stack == null || github.event.pull_request.stack.position == github.event.pull_request.stack.size
+    # Regress drives the npm package build-wasm packs, so the build waits for it
+    needs: build-wasm
     strategy:
       # Don't cancel the whole matrix when one job fails: on the shared
       # self-hosted runners a single transient flake would otherwise cancel the
@@ -59,7 +61,7 @@ jobs:
     # heavy LLVM/MLIR compiles trips the OOM killer ("Killed signal terminated
     # program cc1plus"). BUILD_JOBS feeds dependencies.sh; CTEST_PARALLEL_LEVEL
     # caps the test run. The wheel build ignores CMAKE_BUILD_PARALLEL_LEVEL and
-    # runs make -j nproc.
+    # runs ninja -j nproc.
     env:
       BUILD_JOBS: 4
       CMAKE_BUILD_PARALLEL_LEVEL: 4
@@ -227,18 +229,14 @@ jobs:
     - name: Setup Python
       run: uv python install ${{ matrix.python_version }}
 
+    # Only for nightlies: a tagged build leaves the version to setuptools-scm, which is
+    # what has produced every release on PyPI so far. The npm package asks the same
+    # script for the same commit's version in its own format, so the two agree.
     - name: Compute version override
       id: version
       if: inputs.dev_version_suffix != ''
       run: |
-        # Always bump patch and add a dev suffix so nightlies never collide with a published tag version on PyPI,
-        # including the edge case where HEAD sits exactly on the latest tag (distance == 0).
-        DESC=$(git describe --tags --match 'v*' --first-parent --abbrev=0)
-        TAG_VERSION=${DESC#v}
-        IFS='.' read -r MAJOR MINOR PATCH <<< "$TAG_VERSION"
-        PATCH=${PATCH:-0}
-        PATCH=$((PATCH + 1))
-        VERSION="${MAJOR}.${MINOR}.${PATCH}.dev${{ inputs.dev_version_suffix }}"
+        VERSION=$(scripts/project_version.py --format pep440 --dev-suffix '${{ inputs.dev_version_suffix }}')
         echo "version=$VERSION" >> "$GITHUB_OUTPUT"
         echo "Computed version override: $VERSION"
 
@@ -259,7 +257,7 @@ jobs:
     - name: Run unit tests
       run: |
         cd build
-        make test ARGS="--output-on-failure"
+        ctest --output-on-failure
 
     # Every unit test binary links the engine and MLIR statically, about 130 MB each:
     # the 631 of them take 63 GB, and no later step runs them. Keeping them through
@@ -335,15 +333,21 @@ jobs:
     - name: Disk usage (before regress)
       run: df -h
 
-    # The json_escape_properties regress test shells out to `node`, which the
-    # GitHub-hosted ubuntu ARM images don't ship (the x86/turing runners do).
-    # Installed here (not in install_build_tools.sh) to keep node out of the
-    # dependency cache key, since it is only a regress-runtime dependency.
-    - name: Install Node.js (GitHub-hosted ARM)
-      if: contains(matrix.os, 'arm')
+    # The journey_planner_npm regress test runs the npm client on node. Installed here
+    # (not in install_build_tools.sh) to keep node out of the dependency cache key, since
+    # it is only a regress-runtime dependency.
+    - name: Install Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: 'lts/*'
+        node-version: '22'
+
+    # The npm package build-wasm packed from this commit, which journey_planner_npm
+    # finds in npm/ as the other tests find the wheel in wheel/.
+    - name: Download npm package
+      uses: actions/download-artifact@v4
+      with:
+        name: turingdb-npm-package
+        path: npm
 
     # The regress suite assumes exclusive use of the host (fixed port 6666 and a
     # host-wide `pkill -9 turingdb`), but several self-hosted runner instances share
@@ -372,3 +376,75 @@ jobs:
     - name: Reclaim disk (self-hosted)
       if: always() && runner.os == 'Linux' && contains(matrix.os, 'turing')
       uses: ./.github/actions/clean-self-hosted-runner
+
+  # The npm client, built with emscripten. A separate job rather than a step in the
+  # matrix above: one tarball serves every platform, so it must not be rebuilt per
+  # os/python combination, and it shares no build tree with the native compiler.
+  build-wasm:
+    name: Build npm package
+    # Only the top PR of a stack builds, as for the native build that needs this job
+    if: github.event.pull_request.stack == null || github.event.pull_request.stack.position == github.event.pull_request.stack.size
+    runs-on: ubuntu-24.04
+
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 500
+
+    - name: Fetch tags
+      run: git fetch --tags --force
+
+    # The decoder compiles spdlog's bundled fmt header-only; external/expected is
+    # in-tree. Nothing else the wasm build needs comes from a submodule, so this
+    # skips the LLVM/OpenBLAS/curl trees the native build pulls.
+    - name: Checkout spdlog
+      run: |
+        attempt=1
+        until git submodule update --init --depth 1 external/spdlog; do
+            if [ "$attempt" -ge 3 ]; then
+                echo "Submodule init failed after $attempt attempts"
+                exit 1
+            fi
+            echo "Submodule init attempt $attempt failed; retrying after backoff"
+            sleep $((attempt * 10))
+            attempt=$((attempt + 1))
+        done
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22'
+
+    - name: Resolve pinned Emscripten version
+      id: emscripten
+      run: echo "version=$(grep -oP '^EMSCRIPTEN_VERSION=\"\K[^\"]+' dependencies.sh)" >> "$GITHUB_OUTPUT"
+
+    # emsdk lives at the workspace root rather than in external/dependencies, where
+    # dependencies.sh puts it: that tree is the native build's cache entry, and saving
+    # a whole LLVM build under an emsdk key would waste the runner's disk.
+    - name: Cache emsdk
+      id: cache-emsdk
+      uses: actions/cache@v4
+      with:
+        path: emsdk
+        key: emsdk-${{ steps.emscripten.outputs.version }}
+
+    - name: Install Emscripten
+      if: steps.cache-emsdk.outputs.cache-hit != 'true'
+      run: |
+        git clone https://github.com/emscripten-core/emsdk.git emsdk
+        ./emsdk/emsdk install ${{ steps.emscripten.outputs.version }}
+        ./emsdk/emsdk activate ${{ steps.emscripten.outputs.version }}
+
+    - name: Build npm package
+      run: |
+        source ./emsdk/emsdk_env.sh
+        ./build_npm.sh
+      env:
+        DEV_VERSION_SUFFIX: ${{ inputs.dev_version_suffix }}
+
+    - name: Upload npm package artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: turingdb-npm-package
+        path: npm/*.tgz

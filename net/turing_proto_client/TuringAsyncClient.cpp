@@ -19,6 +19,7 @@
 #include "HTTPUtils.h"
 #include "TuringProtoDecoder.h"
 #include "TuringProtoHeaders.h"
+#include "TuringResponseHead.h"
 #include "TuringException.h"
 #include "TuringSink.h"
 #include "TuringSinkColumnContainer.h"
@@ -38,28 +39,6 @@ constexpr size_t HEADERS_END_SIZE = 4;
 
 // Size of the CRLF that follows every HTTP/1.1 chunk body.
 constexpr size_t CRLF_SIZE = 2;
-
-// Parses the integer status code from an HTTP/1.1 status line —
-// "HTTP/1.1 200 OK" -> 200. Throws TuringException on malformed input.
-int parseStatusCode(std::string_view statusLine) {
-    const size_t space1 = statusLine.find(' ');
-    if (space1 == std::string_view::npos) {
-        throw TuringException("Malformed HTTP response status line");
-    }
-    const std::string_view afterVersion = statusLine.substr(space1 + 1);
-    const size_t space2 = afterVersion.find(' ');
-    const std::string_view codeStr = (space2 == std::string_view::npos)
-                                       ? afterVersion
-                                       : afterVersion.substr(0, space2);
-    int statusCode = 0;
-    for (const char c : codeStr) {
-        if (c < '0' || c > '9') {
-            throw TuringException("Malformed HTTP status code");
-        }
-        statusCode = statusCode * 10 + (c - '0');
-    }
-    return statusCode;
-}
 
 // Inverse of net::http::writeHexU32. Lowercases each digit first so the a-f
 // and A-F cases collapse into one branch.
@@ -132,7 +111,7 @@ TuringAsyncClient::TuringAsyncClient(const std::string& remoteAddress,
     _remotePort(remotePort),
     _localMem(localMem),
     _inBuf(bufferCapacity),
-    _sink(_localMem, &_embeddingBuffer, &_listBuffer, &_mapBuffer),
+    _sink(_localMem, &_embeddingBuffer, &_pathBuffer, &_listBuffer, &_mapBuffer),
     _dfMan(std::make_unique<db::DataframeManager>()),
     _df(std::make_unique<db::Dataframe>()),
     _dataframeContainer(std::make_unique<TuringSinkColumnContainer>(_df.get(), _dfMan.get())),
@@ -272,14 +251,9 @@ TuringAsyncClient::AsyncIOProgress TuringAsyncClient::recvToHTTPHeaderScratchBuf
 
         if (headerEnd != std::string_view::npos) {
             const std::string_view headerBlock(_httpScratch.data(), headerEnd);
-            const size_t crlf = headerBlock.find("\r\n");
-            const std::string_view statusLine = (crlf == std::string_view::npos)
-                                                  ? headerBlock
-                                                  : headerBlock.substr(0, crlf);
-            const int statusCode = parseStatusCode(statusLine);
-            if (statusCode != 200) {
-                throw TuringException("Server returned HTTP " + std::to_string(statusCode));
-            }
+            TuringResponseHead head;
+            TuringResponseHead::parse(headerBlock, head);
+            head.throwIfNoPackets();
 
             _scratchHead = headerEnd + HEADERS_END_SIZE;
             _chunkFramingBufOffset = 0;
@@ -353,10 +327,7 @@ TuringAsyncClient::RecvState TuringAsyncClient::processChunkSize() {
     }
     const size_t payloadSize = _incomingHTTPChunkSize - ProtoHeader::wireSize();
 
-    _inBuf.reset();
-    if (payloadSize > _inBuf.capacity()) {
-        throw TuringException("Server proto payload exceeds client inbuf capacity");
-    }
+    _inBuf.reset(payloadSize);
 
     _protoHeaderRecvIovecs = {
         {
@@ -378,11 +349,16 @@ TuringAsyncClient::RecvState TuringAsyncClient::processCrlf() {
 
     if (_incomingHTTPChunkSize == 0) {
         // Terminator chunk fully consumed: the response stream is complete.
-        return RecvState::Done;
-    }
+        if (_protocolError) {
+            throw TuringException("Protocol error from server: " + *_protocolError);
+        } else if (!_sawTerminalPacket) {
+            throw TuringException("The response ended before the END packet");
+        }
 
-    if (_sawTerminalPacket) {
-        throw TuringException("Unexpected proto packet after END/ERROR");
+        if (_errorMessage) {
+            _res.setMessage(*_errorMessage);
+        }
+        return RecvState::Done;
     }
 
     processProtoPacket();
@@ -397,6 +373,11 @@ void TuringAsyncClient::processProtoPacket() {
     const ProtoHeader responseHeader = ProtoHeader::decode(_protoHeaderBuf.data(), _protoHeaderBuf.size());
     if (responseHeader._dataLen != _inBuf.size()) {
         throw TuringException("Proto header dataLen does not match chunk payload size");
+    }
+
+    const bool continuesProtocolError = _protocolError && responseHeader._type == MessageTypes::PROTOCOL_ERROR;
+    if (_sawTerminalPacket && !continuesProtocolError) {
+        throw TuringException("Unexpected proto packet after END/ERROR");
     }
 
     switch (responseHeader._type) {
@@ -437,15 +418,16 @@ void TuringAsyncClient::processProtoPacket() {
         break;
 
         case MessageTypes::ERROR: {
-            if (_inBuf.size() < sizeof(db::QueryStatus::Status)) {
+            if (_errorMessage) {
+                _errorMessage->append(_inBuf.data(), _inBuf.size());
+            } else if (_inBuf.size() < sizeof(db::QueryStatus::Status)) {
                 throw TuringException("Invalid ERROR packet payload size");
+            } else {
+                db::QueryStatus::Status status;
+                memcpy(&status, _inBuf.data(), sizeof(status));
+                _res.setStatus(status);
+                _errorMessage.emplace(_inBuf.data() + sizeof(status), _inBuf.size() - sizeof(status));
             }
-
-            db::QueryStatus::Status status;
-            memcpy(&status, _inBuf.data(), sizeof(status));
-            _res.setStatus(status);
-            _res.setMessage(std::string_view(_inBuf.data() + sizeof(status),
-                                             _inBuf.size() - sizeof(status)));
             // ERROR is not the response terminator — the server still emits an END packet
             // afterwards (with the elapsed time) even when the query failed. Mirrors the
             // binary protocol semantics: the END is what closes the response stream.
@@ -453,8 +435,11 @@ void TuringAsyncClient::processProtoPacket() {
         break;
 
         case MessageTypes::PROTOCOL_ERROR:
-            throw TuringException("Protocol error from server: "
-                                  + std::string(_inBuf.data(), _inBuf.size()));
+            if (!_protocolError) {
+                _protocolError.emplace();
+            }
+            _protocolError->append(_inBuf.data(), _inBuf.size());
+            _sawTerminalPacket = true;
         break;
 
         default:
@@ -515,7 +500,8 @@ void TuringAsyncClient::buildRequest(const std::string& query, const db::Paramet
     _sendBuffer += _remotePort;
     _sendBuffer += "\r\n";
 
-    _sendBuffer += "Content-type: application/turing-proto\r\n";
+    _sendBuffer += CONTENT_TYPE_HEADER;
+    _sendBuffer += "\r\n";
     _sendBuffer += "Content-Length: ";
     _sendBuffer += std::to_string(bodySize);
     _sendBuffer += "\r\n";
@@ -533,6 +519,15 @@ void TuringAsyncClient::buildRequest(const std::string& query, const db::Paramet
 }
 
 void TuringAsyncClient::send() {
+    try {
+        continueSend();
+    } catch (...) {
+        disconnect();
+        throw;
+    }
+}
+
+void TuringAsyncClient::continueSend() {
     if (!_sending) {
         return;
     }
@@ -569,6 +564,8 @@ db::QueryStatus TuringAsyncClient::sendQuery(const std::string& query,
         throw TuringException(fmt::format("The graph name is {} bytes, more than the {} bytes the binary protocol allows",
                                           _graphName.length(),
                                           MAX_WIRE_SIZE));
+    } else if (!isConnected()) {
+        throw TuringException("The client is not connected: call connect() before sending a query");
     }
 
     // Prime the per-query state and stage the request, then make the first send/recv
@@ -591,6 +588,15 @@ db::QueryStatus TuringAsyncClient::sendQuery(const std::string& query,
 /**--------------------------------**/
 
 void TuringAsyncClient::recv() {
+    try {
+        continueRecv();
+    } catch (...) {
+        disconnect();
+        throw;
+    }
+}
+
+void TuringAsyncClient::continueRecv() {
     while (true) {
         switch (_recvState) {
             case RecvState::ScratchBuffer: {
@@ -668,6 +674,7 @@ void TuringAsyncClient::reset() {
     // live for the client's lifetime, so it is reset in place (which also resets the sink).
     _inBuf.reset();
     _embeddingBuffer.clear();
+    _pathBuffer.clear();
     _stringBuffer.clear();
     _listBuffer.clear();
     _mapBuffer.clear();
@@ -682,4 +689,6 @@ void TuringAsyncClient::reset() {
     _res = db::QueryStatus();
     _callbackFired = false;
     _sawTerminalPacket = false;
+    _errorMessage.reset();
+    _protocolError.reset();
 }

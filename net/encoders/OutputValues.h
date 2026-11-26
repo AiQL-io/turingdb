@@ -5,7 +5,7 @@
 
 #include "GraphPath.h"
 #include "ID.h"
-#include "list/ListElementView.h"
+#include "CellView.h"
 #include "OptionalLike.h"
 #include "TypeUtils.h"
 #include "map/MapEntryView.h"
@@ -19,7 +19,6 @@
 namespace db {
 
 class ColumnMask;
-class EntityList;
 
 template <typename T>
 struct IsHash : std::false_type {};
@@ -63,22 +62,16 @@ concept IsBool = std::is_same_v<T, CustomBool>
               || OptionalBool<T>;
 
 template <typename T>
-concept IsPath = std::is_same_v<T, Path>;
-
-template <typename T>
-concept IsEntityList = std::is_same_v<T, EntityList>;
+concept IsPath = std::is_same_v<T, GraphPath>;
 
 template <typename T>
 concept IsListView = std::is_same_v<TypeUtils::unwrap_optional_t<T>, ListView>;
 
 template <typename T>
-concept IsListElement = std::is_same_v<TypeUtils::unwrap_optional_t<T>, ListElementView>;
+concept IsCell = std::is_same_v<TypeUtils::unwrap_optional_t<T>, CellView>;
 
 template <typename T>
 concept IsMap = std::is_same_v<TypeUtils::unwrap_optional_t<T>, MapView>;
-
-template <typename T>
-concept IsMapEntry = std::is_same_v<T, MapEntryView>;
 
 template <typename T>
 concept IsNull = std::is_same_v<T, PropertyNull>;
@@ -92,6 +85,9 @@ concept IsDateTime = std::is_same_v<TypeUtils::unwrap_optional_t<T>, types::Date
 template <typename T>
 concept IsDuration = std::is_same_v<TypeUtils::unwrap_optional_t<T>, types::Duration::Primitive>;
 
+template <typename T>
+concept IsPoint = std::is_same_v<TypeUtils::unwrap_optional_t<T>, types::Point::Primitive>;
+
 struct ColumnTypeGenerator {
     std::string& _name;
 
@@ -103,6 +99,8 @@ struct ColumnTypeGenerator {
             _name = fmt::format("DateTime");
         } else if constexpr (IsDuration<T>) {
             _name = fmt::format("Duration");
+        } else if constexpr (IsPoint<T>) {
+            _name = fmt::format("Point");
         } else if constexpr (IsUInt64<T>) {
             _name = fmt::format("UInt64");
         } else if constexpr (IsInt64<T>) {
@@ -118,17 +116,13 @@ struct ColumnTypeGenerator {
         } else if constexpr (IsPath<T>) {
             _name = fmt::format("Path");
         } else if constexpr (IsNull<T>) {
-            _name = fmt::format("NULL");
-        } else if constexpr (IsEntityList<T>) {
-            _name = fmt::format("EntityList");
+            _name = fmt::format("Null");
         } else if constexpr (IsListView<T>) {
             _name = fmt::format("List");
-        } else if constexpr (IsListElement<T>) {
-            _name = fmt::format("ListElement");
+        } else if constexpr (IsCell<T>) {
+            _name = fmt::format("Cell");
         } else if constexpr (IsMap<T>) {
             _name = fmt::format("Map");
-        } else if constexpr (IsMapEntry<T>) {
-            _name = fmt::format("MapValue");
         } else {
             COMPILE_ERROR("Unknown column type");
         }

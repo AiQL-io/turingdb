@@ -18,9 +18,11 @@
 #include "expr/LogicalExpr.h"
 #include "expr/PatternComprehensionExpr.h"
 #include "expr/PropertyExpr.h"
+#include "expr/PropertyLookupExpr.h"
 #include "expr/SymbolExpr.h"
 #include "expr/UnaryExpr.h"
 #include "stmt/CallStmt.h"
+#include "stmt/CallSubqueryStmt.h"
 #include "stmt/ReturnStmt.h"
 #include "stmt/MatchStmt.h"
 #include "stmt/NextSegmentStmt.h"
@@ -48,15 +50,6 @@ using namespace db;
 
 namespace {
 
-bool isChainableComparison(BinaryOperator op) {
-    return op == BinaryOperator::Equal
-           || op == BinaryOperator::NotEqual
-           || op == BinaryOperator::LessThan
-           || op == BinaryOperator::GreaterThan
-           || op == BinaryOperator::LessThanOrEqual
-           || op == BinaryOperator::GreaterThanOrEqual;
-}
-
 const BinaryExpr* getListComprehensionHead(const Expr* head) {
     if (head->getKind() != Expr::Kind::BINARY || head->isParenthesized()) {
         return nullptr;
@@ -81,6 +74,27 @@ const Pattern* getPredicatePattern(const Expr* expr) {
     }
 
     return static_cast<const ExistsExpr*>(expr)->getPredicatePattern();
+}
+
+// `p = (a)-->(b)` names the path of a pattern comprehension: it parses as an equality between
+// a bare variable and the pattern
+const BinaryExpr* getNamedPathHead(const Expr* head) {
+    if (head->getKind() != Expr::Kind::BINARY || head->isParenthesized()) {
+        return nullptr;
+    }
+
+    const BinaryExpr* binary = static_cast<const BinaryExpr*>(head);
+    const Expr* variable = binary->getLHS();
+
+    const bool namesAPath = binary->getOperator() == BinaryOperator::Equal
+                            && variable->getKind() == Expr::Kind::SYMBOL
+                            && !variable->isParenthesized()
+                            && getPredicatePattern(binary->getRHS());
+    if (!namesAPath) {
+        return nullptr;
+    }
+
+    return binary;
 }
 
 bool appendHopOperand(CypherAST* ast, Expr* operand, const SourceLocation& location, PatternElement* hop) {
@@ -138,17 +152,11 @@ FunctionInvocation* createNormalFormInvocation(CypherAST* ast,
                                                std::string_view functionName,
                                                Expr* string,
                                                UnicodeNormalForm form) {
-    QualifiedName* name = QualifiedName::create(ast);
-    name->addName(Symbol::create(ast, functionName));
-
     ExprChain* arguments = ExprChain::create(ast);
     arguments->add(string);
     arguments->add(LiteralExpr::create(ast, NormalFormLiteral::create(ast, form)));
 
-    FunctionInvocation* invocation = FunctionInvocation::create(ast, name);
-    invocation->setArguments(arguments);
-
-    return invocation;
+    return ParserUtils::createInvocation(ast, functionName, arguments);
 }
 
 }
@@ -267,66 +275,27 @@ NodePattern* ParserUtils::createNodePattern(CypherAST* ast,
     return node;
 }
 
-bool ParserUtils::createWhenOperand(CypherAST* ast,
-                                    const CallSubqueryStmt::Branches& branches,
-                                    const SourceLocation& location,
-                                    UnionQuery::Branch& operand) {
-    SourceManager* sourceManager = ast->getSourceManager();
+EdgePattern* ParserUtils::createEdgePattern(CypherAST* ast,
+                                            Symbol* symbol,
+                                            LabelExpr* labelExpr,
+                                            QuantifiedPath* range,
+                                            MapLiteral* properties,
+                                            WhereClause* where) {
+    EdgePattern* edge = EdgePattern::create(ast, range, EdgePattern::Direction::Undirected);
+    edge->setSymbol(symbol);
+    edge->setLabelExpr(labelExpr);
+    edge->setProperties(properties);
+    edge->setWhere(where);
 
-    CallSubqueryStmt* call = CallSubqueryStmt::create(ast, branches);
-    call->setHasScopeClause(true);
-    sourceManager->setLocation(call, location);
-
-    StmtContainer* stmts = StmtContainer::create(ast);
-    stmts->add(call);
-    sourceManager->setLocation(stmts, location);
-
-    SinglePartQuery* query = SinglePartQuery::create(ast);
-    query->setStmts(stmts);
-    sourceManager->setLocation(query, location);
-
-    operand = {query, false, call};
-
-    const ReturnStmt* branchReturn = branches.front()._query->getReturnStmt();
-    if (!branchReturn) {
-        return true;
-    }
-
-    const Projection* branchProjection = branchReturn->getProjection();
-    if (branchProjection->isReturningAll()) {
-        return false;
-    }
-
-    Projection* projection = Projection::create(ast);
-    sourceManager->setLocation(projection, location);
-
-    for (const Projection::ReturnItem& item : branchProjection->items()) {
-        const Expr* expr = std::get<Expr*>(item);
-
-        std::string_view name = expr->getName();
-        if (name.empty() && expr->getKind() == Expr::Kind::SYMBOL) {
-            name = static_cast<const SymbolExpr*>(expr)->getSymbol()->getName();
-        }
-
-        if (name.empty()) {
-            return false;
-        }
-
-        SymbolExpr* column = SymbolExpr::create(ast, Symbol::create(ast, name));
-        sourceManager->setLocation(column, location);
-        projection->addExpr(column);
-    }
-
-    ReturnStmt* returnStmt = ReturnStmt::create(ast, projection);
-    sourceManager->setLocation(returnStmt, location);
-    query->setReturnStmt(returnStmt);
-
-    return true;
+    return edge;
 }
 
-bool ParserUtils::returnsUnaliasedItem(const CallSubqueryStmt::Branches& segment) {
-    for (const CallSubqueryStmt::Branch& branch : segment) {
-        const ReturnStmt* returnStmt = branch._query->getReturnStmt();
+bool ParserUtils::returnsUnaliasedItem(const RegularQuery* segment) {
+    std::vector<const SinglePartQuery*> queries;
+    RegularQuery::collectSingleQueries(segment, queries);
+
+    for (const SinglePartQuery* query : queries) {
+        const ReturnStmt* returnStmt = query->getReturnStmt();
         if (!returnStmt) {
             continue;
         }
@@ -359,14 +328,13 @@ SinglePartQuery* ParserUtils::createNextQuery(CypherAST* ast,
     sourceManager->setLocation(query, location);
 
     for (size_t index = 0; index < segments.size(); index++) {
-        const CallSubqueryStmt::Branches& segment = segments[index];
+        RegularQuery* segment = segments[index];
         const bool endsTheChain = index + 1 == segments.size();
 
-        const CallSubqueryStmt::Branch& firstBranch = segment.front();
-        SinglePartQuery* first = firstBranch._query;
+        SinglePartQuery* first = segment->getFirstSingleQuery();
         ReturnStmt* returnStmt = first->getReturnStmt();
 
-        const bool composite = segment.size() > 1 || firstBranch._condition;
+        const bool composite = segment->getKind() != QueryCommand::Kind::SINGLE_PART_QUERY;
 
         if (!composite && (returnStmt || endsTheChain)) {
             ast->nestQuery(first);
@@ -459,7 +427,7 @@ CallSubqueryStmt* ParserUtils::createForeach(CypherAST* ast,
     body->setStmts(stmts);
     sourceManager->setLocation(body, location);
 
-    CallSubqueryStmt* call = CallSubqueryStmt::create(ast, {{body, false, {}}});
+    CallSubqueryStmt* call = CallSubqueryStmt::create(ast, body);
     call->setHasScopeClause(true);
     call->setImportsEverything(true);
     sourceManager->setLocation(call, location);
@@ -495,11 +463,21 @@ ExistsExpr* ParserUtils::createPatternPredicate(CypherAST* ast,
 
     SinglePartQuery* body = createPatternBody(ast, pattern, location);
 
-    ExistsExpr* predicate = ExistsExpr::create(ast, {body});
+    ExistsExpr* predicate = ExistsExpr::create(ast, body);
     predicate->setPredicatePattern(pattern);
     ast->getSourceManager()->setLocation(predicate, location);
 
     return predicate;
+}
+
+ExistsExpr* ParserUtils::findPatternPredicate(Expr* argument) {
+    if (argument->getKind() != Expr::Kind::EXISTS) {
+        return nullptr;
+    }
+
+    ExistsExpr* predicate = static_cast<ExistsExpr*>(argument);
+
+    return predicate->getPredicatePattern() ? predicate : nullptr;
 }
 
 PropertyExpr* ParserUtils::createParenthesizedPropertyAccess(CypherAST* ast, Expr* base, Symbol* propertyName) {
@@ -515,6 +493,44 @@ PropertyExpr* ParserUtils::createParenthesizedPropertyAccess(CypherAST* ast, Exp
     fullName->addName(propertyName);
 
     return PropertyExpr::create(ast, fullName);
+}
+
+Expr* ParserUtils::createPropertyLookup(CypherAST* ast, Expr* base, Symbol* propertyName) {
+    PropertyExpr* variableProperty = createParenthesizedPropertyAccess(ast, base, propertyName);
+    if (variableProperty) {
+        return variableProperty;
+    }
+
+    return PropertyLookupExpr::create(ast, base, propertyName->getName());
+}
+
+Expr* ParserUtils::createPropertyChain(CypherAST* ast, QualifiedName* chain, const SourceLocation& location) {
+    SourceManager* sourceManager = ast->getSourceManager();
+    const QualifiedName::Symbols& names = chain->names();
+
+    const auto locateUpTo = [sourceManager, &location](Expr* read, const Symbol* lastName) {
+        const SourceLocation* lastNameLocation = sourceManager->getLocation(reinterpret_cast<uintptr_t>(lastName));
+        sourceManager->setLocation(read, SourceLocation::join(location, *lastNameLocation));
+    };
+
+    QualifiedName* variableProperty = chain;
+    if (names.size() > 2) {
+        variableProperty = QualifiedName::create(ast);
+        variableProperty->addName(names[0]);
+        variableProperty->addName(names[1]);
+    }
+
+    Expr* value = PropertyExpr::create(ast, variableProperty);
+    locateUpTo(value, names[1]);
+
+    for (size_t index = 2; index < names.size(); index++) {
+        const Symbol* name = names[index];
+
+        value = PropertyLookupExpr::create(ast, value, name->getName());
+        locateUpTo(value, name);
+    }
+
+    return value;
 }
 
 EntityTypeExpr* ParserUtils::createLabelTest(CypherAST* ast, Expr* operand, LabelExpr* labelExpr) {
@@ -564,6 +580,16 @@ Expr* ParserUtils::createSubtraction(CypherAST* ast,
     return subtraction;
 }
 
+FunctionInvocation* ParserUtils::createInvocation(CypherAST* ast, std::string_view functionName, ExprChain* arguments) {
+    QualifiedName* name = QualifiedName::create(ast);
+    name->addName(Symbol::create(ast, functionName));
+
+    FunctionInvocation* invocation = FunctionInvocation::create(ast, name);
+    invocation->setArguments(arguments);
+
+    return invocation;
+}
+
 FunctionInvocation* ParserUtils::createNormalizeInvocation(CypherAST* ast, Expr* string, UnicodeNormalForm form) {
     return createNormalFormInvocation(ast, "normalize", string, form);
 }
@@ -610,7 +636,8 @@ Expr* ParserUtils::createComprehension(CypherAST* ast,
                                        Expr* projection,
                                        const SourceLocation& headLocation) {
     const BinaryExpr* listHead = getListComprehensionHead(head);
-    const Pattern* predicatePattern = getPredicatePattern(head);
+    const BinaryExpr* namedPathHead = getNamedPathHead(head);
+    const Pattern* predicatePattern = getPredicatePattern(namedPathHead ? namedPathHead->getRHS() : head);
 
     const bool walksAPath = predicatePattern
                             && projection
@@ -633,6 +660,11 @@ Expr* ParserUtils::createComprehension(CypherAST* ast,
         Pattern* pattern = Pattern::create(ast);
         for (PatternElement* element : predicatePattern->elements()) {
             pattern->addElement(element);
+        }
+
+        if (namedPathHead) {
+            Symbol* pathSymbol = static_cast<SymbolExpr*>(namedPathHead->getLHS())->getSymbol();
+            pattern->elements().front()->setPathSymbol(pathSymbol);
         }
 
         pattern->setWhere(where);
@@ -669,12 +701,17 @@ EmbeddingLiteral* ParserUtils::listExprToEmbeddingLiteral(CypherAST* ast, const 
     return EmbeddingLiteral::create(ast, std::move(data));
 }
 
-void ParserUtils::markStandaloneCall(const SinglePartQuery* query) {
-    if (query->getReturnStmt()) {
+void ParserUtils::markStandaloneCall(const RegularQuery* query) {
+    if (query->getKind() != QueryCommand::Kind::SINGLE_PART_QUERY) {
         return;
     }
 
-    const StmtContainer* stmts = query->getStmts();
+    const SinglePartQuery* single = static_cast<const SinglePartQuery*>(query);
+    if (single->getReturnStmt()) {
+        return;
+    }
+
+    const StmtContainer* stmts = single->getStmts();
     if (!stmts) {
         return;
     }
@@ -700,7 +737,7 @@ void ParserUtils::startComparisonChain(CypherAST* ast,
                                        const SourceLocation& rhsLocation,
                                        const SourceLocation& chainLocation) {
     chain._expr = BinaryExpr::create(ast, op, lhs, rhs);
-    chain._rightOperand = isChainableComparison(op) ? rhs : nullptr;
+    chain._rightOperand = rhs;
     chain._rightOperandLocation = rhsLocation;
 
     ast->getSourceManager()->setLocation(chain._expr, chainLocation);
@@ -713,24 +750,10 @@ void ParserUtils::extendComparisonChain(CypherAST* ast,
                                         const SourceLocation& rhsLocation,
                                         const SourceLocation& chainLocation) {
     SourceManager* const sourceManager = ast->getSourceManager();
-    const bool chains = isChainableComparison(op);
-
-    // IN and the two IS tests take a right side of their own, so what stands to their left
-    // is the comparison before them rather than the operand it ended on
-    if (!chains || !chain._rightOperand) {
-        chain._expr = BinaryExpr::create(ast, op, chain._expr, rhs);
-        chain._rightOperand = chains ? rhs : nullptr;
-        chain._rightOperandLocation = rhsLocation;
-
-        sourceManager->setLocation(chain._expr, chainLocation);
-        return;
-    }
 
     // A link spans the two operands it compares, not the chain that ended on the left
     // one: a diagnostic about `2 < 'a'` of `1 < 2 < 'a'` underlines that much
-    SourceLocation comparisonLocation = chain._rightOperandLocation;
-    comparisonLocation._endLine = rhsLocation._endLine;
-    comparisonLocation._endColumn = rhsLocation._endColumn;
+    const SourceLocation comparisonLocation = SourceLocation::join(chain._rightOperandLocation, rhsLocation);
 
     BinaryExpr* const comparison = BinaryExpr::create(ast, op, chain._rightOperand, rhs);
     sourceManager->setLocation(comparison, comparisonLocation);
@@ -740,6 +763,27 @@ void ParserUtils::extendComparisonChain(CypherAST* ast,
     chain._rightOperandLocation = rhsLocation;
 
     sourceManager->setLocation(chain._expr, chainLocation);
+}
+
+Expr* ParserUtils::createIsTest(CypherAST* ast,
+                                Expr* operand,
+                                const IsTest& test,
+                                const SourceLocation& testLocation,
+                                const SourceLocation& location) {
+    if (test._normalForm) {
+        return createIsNormalized(ast, operand, *test._normalForm, test._negated, location);
+    }
+
+    SourceManager* const sourceManager = ast->getSourceManager();
+
+    Expr* null = LiteralExpr::create(ast, NullLiteral::create(ast));
+    sourceManager->setLocation(null, testLocation);
+
+    const BinaryOperator nullTest = test._negated ? BinaryOperator::IsNotNull : BinaryOperator::IsNull;
+    Expr* nullTestExpr = BinaryExpr::create(ast, nullTest, operand, null);
+    sourceManager->setLocation(nullTestExpr, location);
+
+    return nullTestExpr;
 }
 
 Parameter* ParserUtils::createNumberedParameter(CypherAST* ast, int64_t number) {

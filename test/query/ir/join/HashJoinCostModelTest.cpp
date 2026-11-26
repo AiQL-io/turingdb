@@ -98,6 +98,31 @@ protected:
         ASSERT_TRUE(submitResult);
     }
 
+    // A hundred Point nodes, the first ten Rare as well, with three LINKS edges out of each,
+    // a RARE_LINK edge out of Rare nodes 0 and 1 into node 50, and thirty FANS edges out of
+    // node 50 alone, so a walk reaching node 50 by RARE_LINK has every FANS edge to follow.
+    void buildGraphWithRareLinks() {
+        buildGraph(100, 10, 3);
+
+        auto change = _graph->newChange();
+        auto* commitBuilder = change->access().getTip();
+        auto& builder = commitBuilder->newBuilder();
+        auto& metadata = builder.getMetadata();
+
+        const EdgeTypeID rareLinkType = metadata.getOrCreateEdgeType("RARE_LINK");
+        const EdgeTypeID fansType = metadata.getOrCreateEdgeType("FANS");
+        const NodeID hub {50};
+
+        builder.addEdge(rareLinkType, NodeID {0}, hub);
+        builder.addEdge(rareLinkType, NodeID {1}, hub);
+        for (size_t fan = 60; fan < 90; fan++) {
+            builder.addEdge(fansType, hub, NodeID {fan});
+        }
+
+        const auto submitResult = change->access().submit(*_jobSystem);
+        ASSERT_TRUE(submitResult);
+    }
+
     // The db program the pipeline leaves for a query on this graph, as text.
     void generate(std::string_view query, const mlir::db::DBPassContext& context, std::string& program) {
         const FrozenCommitTx transaction = _graph->openTransaction();
@@ -170,6 +195,22 @@ TEST_F(HashJoinCostModelTest, keepsTheProductUnderALimitTheJoinCannotRepay) {
     EXPECT_FALSE(fuses("MATCH (n), (m) WHERE n.name = m.name RETURN n, m LIMIT 1"));
 }
 
+// A limit of zero rows is met before the product reads a pair, where the join would read
+// all 400 build rows to emit nothing.
+TEST_F(HashJoinCostModelTest, keepsTheProductUnderALimitOfZero) {
+    buildGraph(400, 0);
+
+    EXPECT_FALSE(fuses("MATCH (n), (m) WHERE n.name = m.name RETURN n, m LIMIT 0"));
+    EXPECT_FALSE(fuses("MATCH (n), (m) WHERE n.name = m.name WITH n, m LIMIT 0 RETURN count(*)"));
+}
+
+// A limit of zero past a count bounds the groups, not the pairs the count reads first.
+TEST_F(HashJoinCostModelTest, fusesUnderALimitOfZeroOverACount) {
+    buildGraph(400, 0);
+
+    EXPECT_TRUE(fuses("MATCH (n), (m) WHERE n.name = m.name RETURN count(*) LIMIT 0"));
+}
+
 // A limit the product cannot meet within a chunk of the build side leaves the join in
 // place: 400 rows against a budget of 3 is not the early exit a smaller side would be.
 TEST_F(HashJoinCostModelTest, fusesUnderALimitTooLargeToCutTheProductShort) {
@@ -205,6 +246,23 @@ TEST_F(HashJoinCostModelTest, buildsTheSideTheLabelsNarrow) {
 
     generate("MATCH (n), (m:Rare) WHERE n.name = m.name RETURN n, m", forced, program);
     EXPECT_LT(program.find("} factor {"), program.find("db.scan_nodes_by_label")) << program;
+}
+
+// A property equality keeps a tenth of the nodes it reads, the System R default, so the
+// four hundred named nodes filtered to one name are forty rows against the four hundred
+// of the bare scan, and the filtered side is the one to hold.
+TEST_F(HashJoinCostModelTest, buildsTheSideItsFilterNarrows) {
+    buildGraph(400, 0);
+
+    const FrozenCommitTx transaction = _graph->openTransaction();
+    const GraphReader reader = transaction.readGraph();
+    const GraphView view = reader.getView();
+    const mlir::db::DBPassContext forced {&view, true, true};
+
+    std::string program;
+    generate("MATCH (n {name: 'point3'}), (m) WHERE n.name = m.name RETURN n, m", forced, program);
+
+    EXPECT_LT(program.find("} factor {"), program.find("db.scan_nodes_by_property_value")) << program;
 }
 
 // A factor a hop seeds carries a row per edge, not per node, and the graph counts those
@@ -267,6 +325,67 @@ TEST_F(HashJoinCostModelTest, sizesAFactorThroughTheListItUnwinds) {
     EXPECT_LT(program.find("db.cross_product"), program.find("} factor {")) << program;
 }
 
+// A join makes as many rows as its smaller side, so the first MATCH joins the 20 pairs to
+// the 400 nodes in 20 rows. Read as the product its equality keeps a tenth of, they would
+// be 800, twice b's scan: the second join holds the 20 rows and streams the scan.
+TEST_F(HashJoinCostModelTest, sizesAJoinByItsSmallerSide) {
+    buildGraph(400, 0);
+
+    const FrozenCommitTx transaction = _graph->openTransaction();
+    const GraphReader reader = transaction.readGraph();
+    const GraphView view = reader.getView();
+    const mlir::db::DBPassContext forced {&view, true, true};
+
+    std::string pairs;
+    for (size_t pair = 0; pair < 20; pair++) {
+        pairs += pair == 0 ? "[" : ", [";
+        pairs += "'" + _names[2 * pair] + "', '" + _names[2 * pair + 1] + "']";
+    }
+
+    std::string program;
+    generate("UNWIND [" + pairs + "] AS p "
+             "MATCH (a:Point {name: p[0]}) MATCH (b:Point {name: p[1]}) RETURN a, b",
+             forced,
+             program);
+
+    const size_t outerJoin = program.find("db.hash_join");
+    ASSERT_NE(outerJoin, std::string::npos) << program;
+
+    const size_t innerJoin = program.find("db.hash_join", outerJoin + 1);
+    ASSERT_NE(innerJoin, std::string::npos) << program;
+    EXPECT_LT(program.find("} factor {"), innerJoin) << program;
+}
+
+// Each MATCH crosses the unwound rows with the 400 nodes and keeps those whose name is a
+// key the row reads off its pair, so each is a cut the join takes, and no OR of the keys
+// is evaluated per node in its place.
+TEST_F(HashJoinCostModelTest, fusesTheKeyLookupsOfUnwoundRows) {
+    buildGraph(400, 0);
+
+    const FrozenCommitTx transaction = _graph->openTransaction();
+    const GraphReader reader = transaction.readGraph();
+    const GraphView view = reader.getView();
+    const mlir::db::DBPassContext context {&view, false, true};
+
+    std::string program;
+    generate("UNWIND [['point1', 'point2'], ['point3', 'point4']] AS p "
+             "MATCH (a:Point {name: p[0]}) MATCH (b:Point {name: p[1]}) RETURN a, b",
+             context,
+             program);
+
+    const size_t firstJoin = program.find("db.hash_join");
+    ASSERT_NE(firstJoin, std::string::npos) << program;
+    EXPECT_NE(program.find("db.hash_join", firstJoin + 1), std::string::npos) << program;
+    EXPECT_EQ(program.find("db.cross_product"), std::string::npos) << program;
+
+    generate("UNWIND ['point1', 'point2', 'point3'] AS x MATCH (a:Point {name: x}) RETURN a",
+             context,
+             program);
+
+    EXPECT_NE(program.find("db.hash_join"), std::string::npos) << program;
+    EXPECT_EQ(program.find("db.or"), std::string::npos) << program;
+}
+
 // The two overrides: forcing takes every cut the pass matches whatever the estimate says,
 // and clearing use takes none.
 TEST_F(HashJoinCostModelTest, forcingFusesTheSmallestProduct) {
@@ -296,6 +415,56 @@ TEST_F(HashJoinCostModelTest, clearingUseFusesTheLargestProduct) {
 
     EXPECT_EQ(program.find("db.hash_join"), std::string::npos) << program;
     EXPECT_NE(program.find("db.cross_product"), std::string::npos) << program;
+}
+
+// An edge scan by type is read at the edges of its type: the two RARE_LINK edges against the
+// hundred nodes of the bare scan, so the edges are the side to hold, where every edge of the
+// graph would have been 308.
+TEST_F(HashJoinCostModelTest, sizesAnEdgeScanByItsType) {
+    buildGraphWithRareLinks();
+
+    const FrozenCommitTx transaction = _graph->openTransaction();
+    const GraphReader reader = transaction.readGraph();
+    const GraphView view = reader.getView();
+    const mlir::db::DBPassContext forced {&view, true, true};
+
+    std::string program;
+    generate("MATCH (a)-[:RARE_LINK]->(b), (m) WHERE b.name = m.name RETURN a, m", forced, program);
+
+    EXPECT_LT(program.find("} factor {"), program.find("RARE_LINK")) << program;
+}
+
+// A typed hop out of the ten Rare nodes makes the two edges of its type, not the 3.2 edges
+// of every type each Rare node has, so it is the side to hold against the ten.
+TEST_F(HashJoinCostModelTest, sizesAHopByTheEdgesOfItsType) {
+    buildGraphWithRareLinks();
+
+    const FrozenCommitTx transaction = _graph->openTransaction();
+    const GraphReader reader = transaction.readGraph();
+    const GraphView view = reader.getView();
+    const mlir::db::DBPassContext forced {&view, true, true};
+
+    std::string program;
+    generate("MATCH (m:Rare), (n:Rare)-[:RARE_LINK]->(x) WHERE m.name = x.name RETURN m, x", forced, program);
+
+    EXPECT_LT(program.find("} factor {"), program.find("RARE_LINK")) << program;
+}
+
+// Both RARE_LINK edges reach node 50, which has all thirty FANS edges, so the two hops make
+// sixty rows rather than the 0.6 the average FANS out-degree of the hundred nodes gives, and
+// the ten Rare nodes are the side to hold.
+TEST_F(HashJoinCostModelTest, sizesASecondHopByTheNodesTheFirstReaches) {
+    buildGraphWithRareLinks();
+
+    const FrozenCommitTx transaction = _graph->openTransaction();
+    const GraphReader reader = transaction.readGraph();
+    const GraphView view = reader.getView();
+    const mlir::db::DBPassContext forced {&view, true, true};
+
+    std::string program;
+    generate("MATCH (m:Rare), (n:Rare)-[:RARE_LINK]->(h)-[:FANS]->(x) WHERE m.name = x.name RETURN m, x", forced, program);
+
+    EXPECT_LT(program.find("RARE_LINK"), program.find("} factor {")) << program;
 }
 
 int main(int argc, char** argv) {

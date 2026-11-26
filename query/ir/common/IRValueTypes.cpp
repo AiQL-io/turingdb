@@ -1,7 +1,9 @@
 #include "IRValueTypes.h"
 
+#include "mlir/IR/BuiltinAttributes.h"
 #include "mlir/IR/Builders.h"
 
+#include "StorageEnums.h"
 #include "StorageTypes.h"
 
 #include "IRException.h"
@@ -56,7 +58,7 @@ mlir::Type db::valueTypeToElementType(mlir::OpBuilder& builder, ValueType valueT
         break;
 
         case ValueType::List:
-            return mlir::storage::ListType::get(builder.getContext(), builder.getNoneType());
+            return builder.getType<mlir::storage::ListType>(builder.getType<mlir::storage::AnyType>());
         break;
 
         case ValueType::DateTime:
@@ -65,6 +67,10 @@ mlir::Type db::valueTypeToElementType(mlir::OpBuilder& builder, ValueType valueT
 
         case ValueType::Duration:
             return mlir::storage::DurationType::get(builder.getContext());
+        break;
+
+        case ValueType::Point:
+            return mlir::storage::PointType::get(builder.getContext());
         break;
 
         case ValueType::Map:
@@ -91,6 +97,8 @@ ValueType db::elementTypeToValueType(mlir::Type elementType) {
         return ValueType::DateTime;
     } else if (mlir::isa<mlir::storage::DurationType>(elementType)) {
         return ValueType::Duration;
+    } else if (mlir::isa<mlir::storage::PointType>(elementType)) {
+        return ValueType::Point;
     } else if (mlir::isa<mlir::storage::MapType>(elementType)) {
         return ValueType::Map;
     } else if (mlir::isa<mlir::Float64Type>(elementType)) {
@@ -107,6 +115,46 @@ ValueType db::elementTypeToValueType(mlir::Type elementType) {
     }
 
     return ValueType::Int64;
+}
+
+bool db::namesPropertyElementTypes(mlir::DictionaryAttr types) {
+    if (!types) {
+        return true;
+    }
+
+    for (const mlir::NamedAttribute entry : types) {
+        const mlir::TypeAttr typeAttr = mlir::dyn_cast<mlir::TypeAttr>(entry.getValue());
+        const bool namesAnElementType = typeAttr && elementTypeToValueType(typeAttr.getValue()) != ValueType::Invalid;
+        if (!namesAnElementType) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool db::namesImportedPropertyTypes(mlir::storage::GraphImportFormat format, mlir::DictionaryAttr types) {
+    if (!types) {
+        return true;
+    }
+
+    for (const mlir::NamedAttribute entry : types) {
+        const mlir::TypeAttr typeAttr = mlir::dyn_cast<mlir::TypeAttr>(entry.getValue());
+        if (!typeAttr) {
+            return false;
+        }
+
+        const ValueType type = elementTypeToValueType(typeAttr.getValue());
+        const bool readsJsonlType = format == mlir::storage::GraphImportFormat::Jsonl
+                                 && (type == ValueType::DateTime || type == ValueType::Duration || type == ValueType::Point);
+        const bool readsParquetType = format == mlir::storage::GraphImportFormat::Parquet && type == ValueType::Duration;
+
+        if (!readsJsonlType && !readsParquetType) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 mlir::Type db::unwoundElementType(mlir::MLIRContext* context, mlir::Type sourceElement) {

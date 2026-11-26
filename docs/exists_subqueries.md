@@ -23,6 +23,11 @@ MATCH (p:Person) WHERE EXISTS { MATCH (p)-[:KNOWS_WELL]->(k) WHERE k.age = p.age
 The pattern shorthand is one MATCH the parser builds; everything below reads the same for
 both.
 
+The pattern predicate `(p)-[:KNOWS_WELL]->()` and its function form
+`exists((p)-[:KNOWS_WELL]->())` parse into the same body, but bind no new variable. `exists()`
+takes a pattern and nothing else: Neo4j 5 dropped `exists(p.name)`, which is
+`p.name IS NOT NULL`.
+
 EXISTS is correlated and imports nothing: every variable in flight is readable inside the
 body, under no scope clause, and stays readable through the whole of it - a WITH inside the
 body carries those variables past the barrier rather than descoping them, as a CALL carries
@@ -41,10 +46,12 @@ A body can be a UNION. It holds for a row when any branch produces a row for it,
 generated as one `db.exists_subquery` per branch, ORed together. A branch needs no RETURN,
 but if one branch has a RETURN every branch must return the same columns.
 
-Out of scope: the conditional `WHEN ... THEN { } ELSE { }` body, which the grammar has no
-clause for at all. `test/query/ir/subquery/ExistsNeo4jManualTest.cpp` holds it, skipping with what is
-missing and keeping the rows the manual documents, so it is the test to make pass when its
-clause lands.
+A body can be a WHEN: `EXISTS { WHEN p.age > 35 THEN { ... } ELSE { ... } }` holds for a row
+when the branch its predicates pick produces a row for it. Its predicates read the
+variables in flight as the branches do. A body that is a WHEN, or a UNION nested in one,
+is one `db.exists_subquery` over the `db.conditional`, run one input row at a time. A single
+query of such a body that returns nothing yields one constant column, so the op holding
+the branches has rows to answer for.
 
 ## 2. Ops
 
@@ -78,13 +85,16 @@ A body whose own dataflow keeps each row paired with the input row it came from 
 tag, and the whole step is answered in one walk. A barrier inside the body carries the tag
 past it under a hidden name no clause can spell, exactly as a CALL body's tag is carried.
 
-A body that cannot - one that aggregates, sorts, cuts or dedups - runs one input row at a
-time, under an `nl.each_row` loop over the step's rows, and a row is marked when the body
-yielded anything at all for it. The rest of the query goes on inside that loop, where every
-column of the step is bound a row at a time, so the boolean stays row-aligned with them.
-`runsPerRow` in `DBLowering.cpp` answers for both this op and `db.call_subquery`, and a
-limit inside a per-row body is hoisted into that body's step, so its budget resets per input
-row.
+A body that cannot - one that aggregates, sorts, cuts, dedups, unions or branches - runs one
+input row at a time, under an `nl.each_row` loop over the step's rows and the buffer's tag.
+The accumulator is opened over the whole step, and the body marks the row whose tag the loop
+hands it, `nl.exists_mark %state, row %r, (...)`, when it yielded anything at all for it. The
+booleans are read over the step once the loop closes, so the op is one value per row in
+flight on either path, and it stands in a CASE, a comprehension, a reduce or an UNWIND as
+any expression does. An outer LIMIT budgets the loops feeding the step, not the loop over
+single rows. `runsPerRow` in `DBLowering.cpp` answers for both this op and
+`db.call_subquery`, and a limit inside a per-row body is hoisted into that body's step, so
+its budget resets per input row.
 
 ## 4. Tests
 

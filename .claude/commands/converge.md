@@ -12,7 +12,7 @@ at the end carrying the fixes and the tests. `REVIEW.md` records the whole run a
 committed.
 
 `$ARGUMENTS` may carry an effort level (`low`, `medium`, `high`, `xhigh`, `max`) and a
-review target (a PR number, a branch, a path, or a jj change id). Default: `high`, and the
+review target (a PR number, a branch, a path, or a jj change id). Default: `xhigh`, and the
 target phase 0 works out.
 
 Run in **jj mode** when `$ARGUMENTS` contains `jj`, or when `jj root` succeeds in the working
@@ -172,10 +172,11 @@ convergence decision reads. Format below.
   code prints today.
 - Query-level behaviour is tested on `SimpleGraph::createSimpleGraph` (link
   `turing_db_examples_s`), not on a purpose-built graph.
-- Build and run it. A brand-new target needs a regeneration first, and never `cmake ..`:
+- Build and run it. Ninja regenerates the build first when a CMakeLists.txt changed, so a
+  brand-new target builds directly. Never `cmake ..`:
 
   ```bash
-  cd build && make cmake_check_build_system && make -j8 test_<area>_<name>
+  cd build && ninja -j8 test_<area>_<name>
   ./test/<area>/test_<area>_<name>
   ```
 
@@ -198,7 +199,7 @@ Correctness findings first, then simplification, then efficiency.
 - After the simplification and efficiency fixes, re-run every target the loop has built and
   the targets that already covered the files you touched: `ctest -R <pattern>` from
   `build/`.
-- Do not run `make run_regress`. It drives the classic pipeline, so it says nothing about
+- Do not run `ninja run_regress`. It drives the classic pipeline, so it says nothing about
   work in `query/ir/`, and on this machine its native pass fails for unrelated reasons.
 - Never `git checkout --`, `git reset --hard` or `git stash`. The tree holds the user's
   uncommitted work and nothing can restore it. A fix that turns out wrong is edited back
@@ -240,7 +241,7 @@ later section can write `C2 reopened`.
 ```markdown
 # Converge — <target> — <date>
 
-## Iteration 1 — code-review high
+## Iteration 1 — code-review xhigh
 
 ### Correctness
 C1 `query/ir/DBLowering.cpp:412` — the limit attribute is signed, so a negative literal

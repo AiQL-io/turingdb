@@ -29,6 +29,7 @@ namespace rv = ranges::views;
 bool ParquetNodeVisitor::onFileStart(const parquet::FileMetaData& metadata) {
     const parquet::SchemaDescriptor* schema = metadata.schema();
     const int numColumns = metadata.num_columns();
+    const ParquetGeometry geometry(metadata);
 
     for (int columnIndex = 0; columnIndex < numColumns; columnIndex++) {
         const parquet::ColumnDescriptor* desc = schema->Column(columnIndex);
@@ -53,7 +54,7 @@ bool ParquetNodeVisitor::onFileStart(const parquet::FileMetaData& metadata) {
             _lblColIdx = columnIndex;
             _lblMaxDefLevel = maxDefLevel;
         } else {
-            discoverPropertyColumn(columnIndex, path, *desc);
+            discoverPropertyColumn(columnIndex, path, *desc, geometry);
         }
     }
 
@@ -283,6 +284,16 @@ void ParquetNodeVisitor::addNodeProperty(NodeID id,
         case ValueType::Duration: {
             const int64_t value = _propInt64Vals.at(columnIndex)[valueIndex];
             builder.addNodeProperty<types::Duration>(id, prop.propertyTypeID, types::Duration::Primitive {value});
+        }
+        break;
+
+        case ValueType::Point: {
+            const std::string& wkb = _propByteArrayVals.at(columnIndex).at(valueIndex);
+
+            Point point;
+            if (ParquetGeometry::readPoint(prop.name, wkb, prop.geometryCRS, point)) {
+                builder.addNodeProperty<types::Point>(id, prop.propertyTypeID, point);
+            }
         }
         break;
 

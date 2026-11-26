@@ -2,6 +2,7 @@
 
 #include <stddef.h>
 
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -32,10 +33,13 @@ public:
     void readKeys(IDT entity, std::vector<std::string_view>& keys);
 
     template <TypedInternalID IDT>
+    void readIDs(IDT entity, std::vector<PropertyTypeID>& ids);
+
+    template <TypedInternalID IDT>
     void readEntries(IDT entity, std::vector<Entry>& entries);
 
     template <TypedInternalID IDT>
-    bool readEntry(IDT entity, std::string_view key, Entry& entry);
+    bool readValue(IDT entity, std::string_view name, MapBuffer<>::MapItemVariant& value);
 
 private:
     struct Property {
@@ -55,6 +59,8 @@ private:
     std::vector<Property> _properties;
     std::vector<PropertyTypeID> _decided;
     std::vector<bool> _isDecided;
+    std::string _resolvedName;
+    PropertyType _resolvedType;
 
     template <TypedInternalID IDT>
     void collect(IDT entity);
@@ -69,10 +75,27 @@ private:
     void collectUpdates(IDT entity);
 
     template <TypedInternalID IDT>
+    bool readCommittedValue(IDT entity, PropertyTypeID id, MapBuffer<>::MapItemVariant& value) const;
+
+    template <TypedInternalID IDT>
+    bool readPendingValue(IDT entity, const PropertyType& type, MapBuffer<>::MapItemVariant& value);
+
+    template <TypedInternalID IDT>
+    const CommitWriteBuffer::SupportedTypeVariant* findUpdate(IDT entity, PropertyTypeID id);
+
+    bool readWrittenValue(const PropertyType& type,
+                          const CommitWriteBuffer::SupportedTypeVariant& written,
+                          MapBuffer<>::MapItemVariant& value);
+
+    template <TypedInternalID IDT>
+    const CommitWriteBuffer::UntypedProperties& getPendingProperties(IDT entity) const;
+
+    template <TypedInternalID IDT>
     bool isPending(IDT entity) const;
 
     void addWritten(PropertyTypeID id, const CommitWriteBuffer::SupportedTypeVariant& value);
     void add(PropertyTypeID id, const MapBuffer<>::MapItemVariant& value);
+    PropertyType findPropertyType(std::string_view name);
     std::string_view getName(PropertyTypeID id) const;
     ValueType getValueType(PropertyTypeID id) const;
 };

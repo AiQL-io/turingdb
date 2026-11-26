@@ -1,3 +1,11 @@
+# The request body and query helpers the tests over the binary protocol share.
+add_library(turing_net_test_proto_s STATIC ProtoTestUtils.cpp)
+target_link_libraries(turing_net_test_proto_s
+    PUBLIC  turing_query_result_formatter_s
+            turing_db_proto_client_s
+            turing_db_net_encoders)
+target_include_directories(turing_net_test_proto_s PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+
 add_turing_test(test_net_http_parser HTTPParserTest.cpp)
 
 add_turing_test(test_net_turing_proto_framing TuringProtoFramingTest.cpp)
@@ -10,35 +18,49 @@ add_turing_test(test_net_turing_proto_parameter_reader TuringProtoParameterReade
 
 add_turing_test(test_net_turing_proto_request_body TuringProtoRequestBodyTest.cpp)
 
-add_turing_test(test_net_json_encoder JsonEncoderTest.cpp)
-
 add_turing_test(test_net_proto_analyze_error ProtoAnalyzeErrorTest.cpp)
 
 add_turing_test(test_net_turing_client TuringClientTest.cpp)
 
+add_turing_test(test_net_turing_client_timeout TuringClientTimeoutTest.cpp)
+
 add_turing_test(test_net_turing_async_client_connect TuringAsyncClientConnectTest.cpp)
 
 add_turing_test(test_net_turing_proto_endtoend TuringProtoEndToEndTest.cpp)
-target_sources(test_net_turing_proto_endtoend PRIVATE
-    ${CMAKE_SOURCE_DIR}/test/query-test-suite/QueryResultFormatter.cpp)
-
-target_include_directories(test_net_turing_proto_endtoend PRIVATE
-    ${CMAKE_SOURCE_DIR}/test/query-test-suite)
 
 add_turing_test(test_net_turing_proto_empty_result TuringProtoEmptyResultTest.cpp)
 
-add_turing_test(test_net_json_encoder_double JsonEncoderDoubleTest.cpp)
-
 add_turing_test(test_net_request_too_large RequestTooLargeTest.cpp)
+
+add_turing_test(test_net_request_status RequestStatusTest.cpp)
 
 add_turing_test(test_net_version_param VersionParamTest.cpp)
 
 add_turing_test(test_net_change_id_param ChangeIDParamTest.cpp)
 
-add_turing_test(test_net_json_parameters JsonParametersTest.cpp)
+add_turing_test(test_net_protocol_error_closes_connection ProtocolErrorClosesConnectionTest.cpp)
+target_sources(test_net_protocol_error_closes_connection PRIVATE ProtoServerTest.cpp)
+
+add_turing_test(test_net_turing_client_buffer TuringClientBufferTest.cpp)
+target_sources(test_net_turing_client_buffer PRIVATE ProtoServerTest.cpp)
 
 add_turing_test(test_net_turing_proto_parameters TuringProtoParametersTest.cpp)
-target_sources(test_net_turing_proto_parameters PRIVATE
-    ${CMAKE_SOURCE_DIR}/test/query-test-suite/QueryResultFormatter.cpp)
-target_include_directories(test_net_turing_proto_parameters PRIVATE
-    ${CMAKE_SOURCE_DIR}/test/query-test-suite)
+
+add_turing_test(test_net_client_after_protocol_error ClientAfterProtocolErrorTest.cpp)
+target_sources(test_net_client_after_protocol_error PRIVATE ProtoServerTest.cpp)
+
+add_turing_test(test_net_chunk_missing_bytes ChunkMissingBytesTest.cpp)
+
+add_turing_test(test_net_split_error_message SplitErrorMessageTest.cpp)
+target_sources(test_net_split_error_message PRIVATE ProtoServerTest.cpp)
+
+add_turing_test(test_net_payload_size_limit PayloadSizeLimitTest.cpp)
+
+add_turing_test(test_net_unsent_request_keeps_connection UnsentRequestKeepsConnectionTest.cpp)
+target_sources(test_net_unsent_request_keeps_connection PRIVATE ProtoServerTest.cpp)
+
+add_turing_test(test_net_response_without_end ResponseWithoutEndTest.cpp)
+
+add_turing_test(test_net_protocol_error_response ProtocolErrorResponseTest.cpp)
+
+add_turing_test(test_net_server_buffer_limit ServerBufferLimitTest.cpp)

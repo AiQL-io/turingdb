@@ -7,7 +7,7 @@ We wish to support the CYPHER map type as a stored property value; https://neo4j
 
 `storage/map/` mirrors `storage/list/`. `MapBuffer` stores entries contiguously and hands out a
 `MapView`: a span over `MapEntryView`s. An entry is laid out as a 16-byte `std::string_view` key,
-a one-byte `MapBufferTypeTag`, then the bytes of the value.
+a one-byte `CellTag`, then the bytes of the value.
 
 The key is a view. So is a string or embedding value, and a list or nested map value is a view
 into another buffer. A `MapBuffer` therefore owns none of the data a map refers to.
@@ -40,43 +40,17 @@ to a map (`WITH {a: 1} AS m RETURN m.a`), a stored map property (`n.attrs.key`) 
 expression returns (`startNode(r).attrs.key`). `db.map_key` carries the key as a `StrAttr` and
 lowers one-for-one to `nl.map_key`.
 
-The result is a `!storage.map_element` chunk: `ColumnVector<MapEntryView>`, one entry per row,
-viewing the entry the map already holds, so the read copies nothing. A row whose map holds no
-such key, and a row holding no map, read an entry under that same key tagged `Null`, built once
-per statement and shared by all of them - so every row of the column names the key it was read
-under. The null therefore lives in the entry's own tag, and the column is never wrapped in a
-`nullable`.
+A map entry is a key and a cell: `MapEntryView::getValue()` views the `[tag][value]` bytes that
+follow the key, which are laid out as a list element's are. The result of a key read is a
+`!storage.any` chunk, `ColumnVector<CellView>`, one cell per row, viewing the value the map
+already holds, so the read copies nothing. A row whose map holds no such key, and a null row, read
+`CellView::nullElement()`. The null therefore lives in the cell's own tag, and the column is
+never wrapped in a `nullable`.
 
-The binary protocol writes the column as `MAP_ENTRY_VIEW`: `[mapByteSize]` then one
-`[keyLen][key][tag][value]` entry per row, which is what a map's own entries are. The column is
-therefore one map of as many entries as it has rows, and both sides reuse the map path -
-`writeMapView` without its header going out, `beginMap` and the ordinary drain coming back.
-Every row repeats the key, since the encoder sees only columns and the schema is declared
-before any row exists; TUR-112 tracks giving a column type somewhere to say such a thing once.
-
-Renderers print the value alone, not the pair: a cell of the column is the value the key named.
-`JsonEncoder::encodeValue(MapEntryView)`, `TuringShell::asString` and
-`QueryResultFormatter::valueToString` write the value, and their `encodeEntry` /
-`entryAsString` / `entryToString` siblings are what add the key for an entry read inside its
-map.
-
-`IS (NOT) NULL` reads the entry's tag, the way it reads a list element's: a key the map does
-not hold, a row holding no map and a key whose stored value is null all answer alike. That is
-what `operator==(MapEntryView, PropertyNull)` in `storage/list/ListElementOrder.h` is for, and
-why it has to be declared - `PropertyNull.h`'s fallback would answer false for a type it knows
-nothing about.
-
-`=` and `<>` compare an entry against a value of a known type, and against another entry. The
-entry holds its own type, so it is equal only to a value of that type holding the same thing:
-`n.attrs.x = '1'` is false where `x` holds `1`. The kernels are the `MapEntryView` overloads of
-`TuringEqual` and `TuringNotEqual`, admitted by `MapEntryKindPairs` in `AllowedKinds.h`.
-
-They return `std::optional<CustomBool>`, because an entry tagged `Null` answers unknown rather
-than false. `binaryResultElement` has to declare the result `nullable<i1>` to match, which is
-what `comparesAMapValue` is for: a map value's null is in its tag, so comparing one is
-three-valued whatever the column's shape. `IS (NOT) NULL` is excluded from that rule, since its
-kernel answers about the tag rather than being made unknown by it, and so stays two-valued. The
-two decisions are made independently and nothing checks them against each other - TUR-135.
+From there a map value is any other value of type any: the binary protocol writes it as a
+`CELL_VIEW` column, the renderers print it as a cell, and `IS NULL`, `=`, `<>`, the
+orderings, `IN`, `keys()`, `properties()` and the index read it through the `CellView`
+kernels.
 
 So `WHERE n.attrs.x = 1` drops the rows whose map holds no `x`, and `WHERE NOT (n.attrs.x = 1)`
 drops them too.
@@ -84,25 +58,58 @@ drops them too.
 Beyond that and `keys()` / `properties()` below, a map value is passed through and rendered.
 Ordering by one, deduplicating on one, doing arithmetic on one and writing one back with `SET` are
 all rejected, `ORDER BY` and `DISTINCT` by the chunk-kind selectors rather than by the analyzer,
-so they read as `Unsupported chunk element type`. So is `m.a.b`, a key of a map another map holds.
-The bracket form reads a key computed per row, so a key written in the query is sent to the dotted
-form - `m.key`, `xs[0].a` - and `m.a['b']` is sent there too, which leaves a nested key with no
-spelling the query can write. A key computed per row still reaches one (`m.a[k]`). So is unwinding
-one: `UNWIND m.l AS x` is turned away with `UNWIND requires a list, not 'MapValue'`, whatever the
-entry's tag holds.
+so they read as `Unsupported chunk element type`. So is unwinding one: `UNWIND m.l AS x` is turned
+away with `UNWIND requires a list, not 'MapValue'`, whatever the entry's tag holds.
+
+The bracket form reads a key too. Where `m` is a map, a node, a relationship or a loaded row,
+`m['key']` is analyzed as its dotted form `m.key` (`IndexExpr::getDottedForm`), and grouping and
+ordering match the two as one expression: `WITH {a: 1} AS m RETURN m['a']` is 1, and `p['age']` is
+the integer `p.age` is. On a tagged cell, `m['key']` is emitted as a `db.dynamic_map_key` over the
+key as a constant, the op `m[k]` emits for a key computed per row. That read raises on a datetime
+or a duration, where `m.key` reads the component. A map literal is read by a key computed per row
+the same way: `UNWIND ['a', 'b', 'c'] AS k RETURN {a: 1, b: 'x'}[k]` is 1, x and null.
+
+An index held in a tagged cell can be a position on one row and a key on the next, so `c[i]` with
+such an `i` emits `db.container_index` where `c` is a list, a map or a tagged cell. Neo4j's
+ContainerIndex expression reads it the same way. A row whose base holds a list and whose index
+holds an integer reads the element, as `db.list_index` does. A row whose base holds a map, a node
+or an edge and whose index holds a string reads the value under that key, as `db.dynamic_map_key`
+does. A null base or a null index reads null, and any other pair raises: `UNWIND [1, 'a'] AS b
+RETURN [1, 2, 3][b]` raises on the row holding `'a'`. The error names the index the base takes and
+the type the row held, as the analyzer words it: `A list index expression must be an integer, not
+'String'` there, and `A map is indexed by a string key, not by 'Integer'` for `UNWIND [1, 'k'] AS b
+RETURN {k: 1}[b]`. A base holding 1 raises `Index operator [] can only be applied to a list, a
+map, a node or a relationship, not 'Integer'`. An integer, a string or a null index keeps the op it
+emitted before.
 
 # Reading through a nested value
 
+`m.a.b` reads `b` out of the value `m.a` holds, as `n.attrs.b` reads it out of a stored map. The
+parser reads a dotted chain as Neo4j does: a `PropertyExpr` holds a variable and one name, and each
+further name is a `PropertyLookupExpr` over the value before it, so `m.a.b.c` is `((m.a).b).c`, the
+tree its parenthesised spelling builds. `WITH {d: {e: 1}} AS m RETURN m.d.e` is 1, and
+`MATCH (n:Person) RETURN n.nosuch.x` is null on every row, as a key of null is.
+
 A map value is a tagged cell, so a read through one asks the row's tag rather than the column's
 type. `m[k].b` reads `b` out of the map `m[k]` holds, and `m.l[0]` reads the first element of
-the list `m.l` holds. Where the tag says something else the key read answers a `Null`-tagged
-entry, as a key the map does not hold does, and the index answers no element at all.
+the list `m.l` holds. Where the tag says a node or an edge the key read answers its property,
+and where it says a datetime or a duration the dotted form answers the component the key names,
+as Neo4j does: `WITH {d: datetime('2020-03-04T00:00:00Z')} AS m WITH m.d AS d RETURN d.year`
+is 2020. Any other value has no key, and the key read raises on it, as `d[k]` does on a
+datetime or a duration. Where the tag says no list the index raises too. A null reads null.
+
+A key read is speculatable only where its operand provably holds maps, nodes, edges and nulls
+alone, and an index or a slice only where its operand holds lists and nulls alone.
+`holdsOnlyNullOr` (`DBHeldTags`) walks the operand back to where its values were made: through
+every op implementing `ColumnCarrierOpInterface` (a filter, a sort, a limit, a hop, an unwind's
+carry set, a factor, an OPTIONAL MATCH, a UNION branch, a CASE), and from a key or element read
+to the literal, `db.make_map` or `db.make_list` it reads. So `row.s.name` in
+`UNWIND [{s: {name: 'Remy'}}, {s: null}] AS row MATCH (a {name: row.s.name})` can still be sunk
+into its factor as a hash join key, and so can `row.src` after `WITH row ORDER BY row.src`.
 
 A key read takes a cell column wherever it takes a map column: `holdsAMapPerRow` says so in
 `DBLowering` and in the two nl verifiers, and `NLExecutor::selectMapRead` takes the `MapView`
-out of the tag. An index takes one the same way: `isIndexableChunk` admits
-`!storage.map_element`, `ListIndexImpl` carries the `MapEntryView` overloads, and
-`MapEntryKindPairs` admits their column pairs in `AllowedKinds.h`. The result is the
+out of the tag. An index takes a cell column the same way, and the result is the
 `nullable<any>` every index gives.
 
 A map held in a list reads through those same two paths, since `xs[0]` hands back a
@@ -117,6 +124,54 @@ A `ListContainer` keeps the map elements of its lists in a `MapContainer` of its
 first use (`ListContainer::getMaps`). A `MapContainer` holds its list values in a `ListContainer`
 by value, so the two types nest, but the objects form a tree. `EncodedList` encodes a map element
 as `[u64 length][EncodedMap bytes]`.
+
+# Map projection
+
+`v {.name, .*, rank: v.age + 1, x}` builds a map out of `v`, a node, a relationship, a map, a
+datetime, a duration or a point. `.key` holds `v.key`, null where `v` has no such property, and
+`.*` every property of `v`. On a datetime, a duration or a point `.key` holds the component
+`v.key` reads: `WITH duration({hours: 1}) AS d RETURN d {.hours, x: 1}` is `{hours: 1, x: 1}`.
+These values have no properties, so `.*` and a name that is no component are rejected by the
+analyzer where `v` is typed one of them, and raise on the row where a tagged cell holds one.
+`key: expr` holds the expression, and `x` the variable `x` under the key `x`. A later entry
+shadows an earlier one under the same key, as in a map literal: `v {x: 1 / 0, x: 2}` is
+`{x: 2}`, and `v {.name, name: 1 / 0}` raises. An entry wins over the property `.*` reads under
+its key wherever the `.*` stands, as in Neo4j: `p {name: 'x', .*}` and `p {.*, name: 'x'}` both
+hold the name 'x'. `.*` shadows no entry, so `p {name: 1 / 0, .*}` raises. A null `v` projects
+to null and computes none of its items.
+
+The AST keeps the projection as a `MapProjectionExpr`; the analyzer reads each `.key` as the
+`v.key` property read. Codegen emits a `db.make_map` of the entries and, where the projection
+reads every property, a `db.merge_maps` of it over `db.properties` of `v`. The map is built in
+a `db.lazy_case` on `v IS NOT NULL`, so only the rows where `v` is not null compute it.
+
+`db.merge_maps` lowers one-for-one to `nl.merge_maps`. Row r holds every key the operands hold
+at row r, under the value of the last operand holding it, sorted on key. A row where an operand
+holds no map gets no map.
+
+`(n {key: value})` is also a node pattern. Where a pattern may start, as in
+`WHERE (n {name: 'x'})-->()`, the projection is read as one: its entries become the node's
+properties. Any other item makes it no node pattern.
+
+`collect()` gathers maps as it gathers lists. A null map is dropped, and `collect(DISTINCT m)`
+compares maps entry by entry.
+
+# A repeated key
+
+A map written with a repeated key holds the last entry under it and never computes an earlier
+one, as Neo4j does: `RETURN {x: 1 / 0, x: 2}` is `{x: 2}`. The earlier entry is still analyzed.
+`RETURN {x: y, x: 2}` is an analysis error where `y` is not defined, and
+`UNWIND [1, 2] AS i RETURN {x: count(i), x: 2}` aggregates to one row. `MapLiteral` keeps every
+entry it was written with, and `getHeldEntries()` the last one under each key, which is all
+codegen translates. A map projection marks its shadowed items (`MapProjectionExpr::Item`'s
+`_shadowed`).
+
+A pattern's property map is read by its clause. MATCH and OPTIONAL MATCH read every entry as an
+equality, and so do the patterns of EXISTS, COUNT and COLLECT subqueries, pattern predicates and
+pattern comprehensions: `MATCH (n {name: 'Adam', name: 'Remy'})` matches nothing, and
+`MATCH (n:Person {age: 1 / 0, age: 32})` raises. CREATE and MERGE write the held entries alone:
+`CREATE (n:P {a: 1 / 0, a: 2})` writes 2, and `MERGE (n:P {a: 1, a: 2})` matches and creates on
+`a = 2`.
 
 # keys() and properties()
 
