@@ -7,6 +7,12 @@
 
 using namespace fs;
 
+namespace {
+
+constexpr size_t DIRECT_IO_BLOCK_SIZE = 4096;
+
+}
+
 Result<FilePageWriter> FilePageWriter::open(const Path& path, size_t pageSize) {
 #ifdef __APPLE__
     const int access = O_WRONLY | O_CREAT | O_TRUNC;
@@ -80,10 +86,13 @@ void FilePageWriter::finish() {
     }
 
     if (_buffer.size() > 0) {
-        if (_buffer.size() != _buffer.capacity()) {
-            std::memset(_buffer.data() + _buffer.size(), 0, _buffer.avail());
-        }
         flush();
+    }
+
+    if (_fileEnd > 0) {
+        if (::ftruncate(_fd, static_cast<off_t>(_fileEnd)) != 0) {
+            _error = Error(ErrorType::WRITE_FILE, errno);
+        }
         sync();
     }
 
@@ -92,10 +101,6 @@ void FilePageWriter::finish() {
 }
 
 void FilePageWriter::nextPage() {
-    if (_buffer.size() != _buffer.capacity()) {
-        std::memset(_buffer.data() + _buffer.size(), 0, _buffer.avail());
-    }
-
     flush();
 }
 
@@ -106,6 +111,7 @@ void FilePageWriter::seek(size_t offset) {
         _error = Error(ErrorType::COULD_NOT_SEEK, errno);
     }
 
+    _offset = offset;
     _written = 0;
 }
 
@@ -114,7 +120,14 @@ void FilePageWriter::reserveSpace(size_t byteCount) {
 }
 
 void FilePageWriter::flush() {
-    ssize_t remainingBytes = buffer().capacity();
+    const size_t usedBytes = _buffer.size();
+    const size_t pageBytes = _buffer.capacity();
+    const size_t alignedUsedBytes = (usedBytes + DIRECT_IO_BLOCK_SIZE - 1) / DIRECT_IO_BLOCK_SIZE * DIRECT_IO_BLOCK_SIZE;
+    const size_t bytesToWrite = std::min(alignedUsedBytes, pageBytes);
+
+    std::memset(_buffer.data() + usedBytes, 0, bytesToWrite - usedBytes);
+
+    ssize_t remainingBytes = static_cast<ssize_t>(bytesToWrite);
     ssize_t bytesWritten = 0;
 
     while (remainingBytes > 0) {
@@ -134,5 +147,14 @@ void FilePageWriter::flush() {
         remainingBytes -= nbytes;
     }
 
+    // The zero tail of the page is left unwritten, so the filesystem keeps it as a hole
+    if (bytesToWrite < pageBytes) {
+        if (::lseek(_fd, static_cast<off_t>(pageBytes - bytesToWrite), SEEK_CUR) < 0) {
+            _error = Error(ErrorType::COULD_NOT_SEEK, errno);
+        }
+    }
+
+    _offset += pageBytes;
+    _fileEnd = std::max(_fileEnd, _offset);
     _buffer.resize(0);
 }
