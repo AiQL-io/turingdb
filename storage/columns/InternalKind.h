@@ -6,6 +6,7 @@
 #include <string>
 
 #include "EntityList.h"
+#include "ID.h"
 #include "columns/KindTypes.h"
 #include "map/MapEntryView.h"
 #include "metadata/PropertyNull.h"
@@ -25,7 +26,7 @@ class TemplateLabelSet;
 template <std::integral TType, size_t TCount>
 class TemplateLabelSetHandle;
 
-using LabelSet = TemplateLabelSet<uint64_t, 4>;
+using LabelSet = TemplateLabelSet<uint64_t, LABELSET_INTEGER_COUNT>;
 
 template <typename T>
 class ColumnVector;

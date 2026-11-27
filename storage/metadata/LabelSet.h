@@ -205,7 +205,7 @@ private:
     std::array<TType, TCount> _integers {};
 };
 
-using LabelSet = TemplateLabelSet<uint64_t, 4>;
+using LabelSet = TemplateLabelSet<uint64_t, LABELSET_INTEGER_COUNT>;
 
 }
 
