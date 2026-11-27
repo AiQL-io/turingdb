@@ -72,6 +72,13 @@ public:
     /// @returns true if stores a value or explicit NULL for @param entityID 
     bool hasEntry(EntityID entityID) const { return _entityIndexMap.contains(entityID); }
 
+    /// @returns true if the value at @param index is the one a read of its ID returns
+    bool isReadEntry(size_t index) const {
+        const auto it = _entityIndexMap.find(_ids[index]);
+
+        return it != _entityIndexMap.end() && it->second == index;
+    }
+
     bool empty() const { return size() == 0 && _nullIds.empty(); }
 
     ValueType getValueType() const { return _valueType; }

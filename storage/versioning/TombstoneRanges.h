@@ -20,6 +20,11 @@ public:
     template <TypedInternalID IDT>
     void populateRanges(const std::vector<EntityID>& unfilteredContainer);
 
+    // Also leaves out the entries @param superseded marks: values a newer one replaces
+    template <TypedInternalID IDT>
+    void populateRanges(const std::vector<EntityID>& unfilteredContainer,
+                        const std::vector<bool>& superseded);
+
     const NonDeletedRanges& getRanges() const { return _nonDeletedRanges; };
     size_t getNumRemainingEntities() const { return _numRemainingEntities; };
 
