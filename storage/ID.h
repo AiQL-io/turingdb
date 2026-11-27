@@ -110,6 +110,8 @@ using EdgeID = ID<uint64_t, 2>;
 using EdgeTypeID = ID<uint64_t, 3>;
 using PropertyTypeID = ID<uint16_t, 4>;
 using LabelID = ID<uint64_t, 5>;
+// 64-bit words in a node's label set: a graph holds at most 64 * this many labels
+inline constexpr size_t LABELSET_INTEGER_COUNT = 64;
 using LabelSetID = ID<uint32_t, 6>;
 using PathRef = ID<uint64_t, 7>;
 

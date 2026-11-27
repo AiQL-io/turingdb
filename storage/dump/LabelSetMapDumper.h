@@ -22,7 +22,7 @@ public:
     static constexpr size_t PAGE_HEADER_STRIDE = sizeof(uint64_t);
 
     // LabelSet stride
-    static constexpr size_t LABELSET_STRIDE = LabelSet::IntegerSize * LabelSet::IntegerCount;
+    static constexpr size_t LABELSET_STRIDE = sizeof(LabelSet::IntegerType) * LabelSet::IntegerCount;
 
     // Avail space in data page
     static constexpr size_t PAGE_AVAIL = DumpConfig::PAGE_SIZE - PAGE_HEADER_STRIDE;

@@ -14,8 +14,6 @@ public:
                                                  + sizeof(uint64_t)  // LabelSet count
                                                  + sizeof(uint64_t); // Page count
 
-    static constexpr size_t LABELSET_STRIDE = sizeof(LabelSet);
-
     explicit LabelSetMapLoader(fs::FilePageReader& reader)
         : _reader(reader)
     {
@@ -43,10 +41,13 @@ public:
             return DumpError::result(DumpErrorType::COULD_NOT_READ_LABELSETS);
         }
 
-        if (it.get<uint64_t>() != LabelSet::IntegerCount) {
+        // A graph written when label sets had fewer words loads with the words it lacks left empty
+        const uint64_t storedCount = it.get<uint64_t>();
+        if (storedCount == 0 || storedCount > LabelSet::IntegerCount) {
             return DumpError::result(DumpErrorType::COULD_NOT_READ_LABELSETS);
         }
 
+        const size_t storedStride = sizeof(LabelSet::IntegerType) * storedCount;
         const uint64_t labelsetsCount = it.get<uint64_t>();
         const uint64_t pageCount = it.get<uint64_t>();
         LabelSet labelset;
@@ -69,11 +70,11 @@ public:
             const size_t countInPage = it.get<uint64_t>();
 
             for (size_t j = 0; j < countInPage; j++) {
-                if (it.remainingBytes() < LABELSET_STRIDE) {
+                if (it.remainingBytes() < storedStride) {
                     return DumpError::result(DumpErrorType::COULD_NOT_READ_LABELSETS);
                 }
 
-                for (size_t k = 0; k < LabelSet::IntegerCount; k++) {
+                for (size_t k = 0; k < storedCount; k++) {
                     labelsetData[k] = it.get<LabelSet::IntegerType>();
                 }
                 labelsets.getOrCreate(labelset);
