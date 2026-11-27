@@ -33,6 +33,11 @@ Adds a commit on the head whose single data part replaces all data parts of the 
 the command that reduces the number of data parts. Run `SQUASH COMMITS` after it to drop the
 commits, and with them the data parts, that the merge made unreachable.
 
+A `SET` does not change a value in place: it adds the new value, or an explicit null, to a newer
+data part, and reads look the data parts up newest first. The merged data part keeps, for every
+entity and property, only the value such a read returns. Older values, and values a newer null
+cleared, are left out.
+
 An open change on the graph being merged blocks the merge. Open changes on other graphs do not.
 
 ## Background compaction

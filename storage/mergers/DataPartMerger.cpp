@@ -1,5 +1,8 @@
 #include "DataPartMerger.h"
 
+#include <unordered_set>
+#include <vector>
+
 #include <range/v3/view/enumerate.hpp>
 
 #include "datapart/DataPart.h"
@@ -61,25 +64,43 @@ std::unique_ptr<DataPartBuilder> DataPartMerger::merge(DataPartSpan dataParts) c
     // after deletion
     std::unordered_set<PropertyTypeID> emptyNodeProperties;
     std::unordered_set<PropertyTypeID> emptyEdgeProperties;
-    // Loop over all the dataparts and count the number of values of each property (skippping tombstones)
-    // We also caculate and store the ranges of the container to keep in this loop
-    //
-    for (const auto& [idx, dataPart] : dataParts | rv::enumerate) {
-        for (const auto& [propertyID, propertyContainer] : dataPart->nodeProperties()) {
-            const auto [it, inserted] = nodeRangesPerPart[idx].emplace(propertyID, tombstones);
-            auto& tombstoneRanges = it->second;
+    // Count the values of each property to keep, and store the ranges of each container to keep.
+    // A value is kept if a read returns it: its entity is not deleted, no newer datapart holds a
+    // value or an explicit NULL for it, and it is the entry its own datapart reads. A SET adds
+    // its value to a newer datapart, so the older ones of that entity are dropped here.
+    // The dataparts are visited newest first, the order in which reads look them up.
+    std::unordered_map<PropertyTypeID, std::unordered_set<EntityID>> nodeIDsSeen;
+    std::unordered_map<PropertyTypeID, std::unordered_set<EntityID>> edgeIDsSeen;
 
-            tombstoneRanges.populateRanges<NodeID>(propertyContainer->ids());
-            _nodePropertiesCount[propertyID] += tombstoneRanges.getNumRemainingEntities();
+    const auto keepReadValues = [&]<TypedInternalID IDT>(const PropertyManager& properties,
+                                                        std::unordered_map<PropertyTypeID, TombstoneRanges>& rangesOfPart,
+                                                        std::unordered_map<PropertyTypeID, std::unordered_set<EntityID>>& idsSeen,
+                                                        std::unordered_map<PropertyTypeID, size_t>& counts) {
+        for (const auto& [propertyID, propertyContainer] : properties) {
+            const auto& ids = propertyContainer->ids();
+            auto& seen = idsSeen[propertyID];
+
+            std::vector<bool> superseded(ids.size());
+            for (size_t i = 0; i < ids.size(); i++) {
+                superseded[i] = seen.contains(ids[i]) || !propertyContainer->isReadEntry(i);
+            }
+
+            const auto [it, inserted] = rangesOfPart.emplace(propertyID, tombstones);
+            auto& keptRanges = it->second;
+
+            keptRanges.template populateRanges<IDT>(ids, superseded);
+            counts[propertyID] += keptRanges.getNumRemainingEntities();
+
+            seen.insert(ids.begin(), ids.end());
+            seen.insert(propertyContainer->nullIds().begin(), propertyContainer->nullIds().end());
         }
+    };
 
-        for (const auto& [propertyID, propertyContainer] : dataPart->edgeProperties()) {
-            const auto [it, inserted] = edgeRangesPerPart[idx].emplace(propertyID, tombstones);
-            auto& tombstoneRanges = it->second;
+    for (size_t idx = dataParts.size(); idx-- > 0;) {
+        const auto& dataPart = dataParts[idx];
 
-            tombstoneRanges.populateRanges<EdgeID>(propertyContainer->ids());
-            _edgePropertiesCount[propertyID] += tombstoneRanges.getNumRemainingEntities();
-        }
+        keepReadValues.template operator()<NodeID>(dataPart->nodeProperties(), nodeRangesPerPart[idx], nodeIDsSeen, _nodePropertiesCount);
+        keepReadValues.template operator()<EdgeID>(dataPart->edgeProperties(), edgeRangesPerPart[idx], edgeIDsSeen, _edgePropertiesCount);
     }
 
     const auto& prevMetadata = _graphView.metadata();

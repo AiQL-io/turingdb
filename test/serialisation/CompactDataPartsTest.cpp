@@ -65,6 +65,11 @@ protected:
     }
 
     void submitPerson(std::string_view name) {
+        submit(fmt::format(R"(CREATE (n:Person {{name: "{}"}}))", name));
+    }
+
+    // Runs @param queryText in a change of its own, so it lands in a data part of its own
+    void submit(std::string_view queryText) {
         ChangeID change = ChangeID::head();
         {
             SystemAccessor system = _env->getSystemManager().accessUnique();
@@ -73,8 +78,25 @@ protected:
             change = result.value()->id();
         }
 
-        ASSERT_TRUE(query(fmt::format(R"(CREATE (n:Person {{name: "{}"}}))", name), change).isOk());
+        const QueryStatus status = query(queryText, change);
+        ASSERT_TRUE(status.isOk()) << status.getError();
         ASSERT_TRUE(query("CHANGE SUBMIT", change).isOk());
+    }
+
+    Rows rowsOf(std::string_view queryText) {
+        RowSink sink;
+        const QueryStatus status = query(queryText, ChangeID::head(), &sink);
+        EXPECT_TRUE(status.isOk()) << status.getError();
+
+        Rows rows;
+        sink.sortedRows(rows);
+
+        return rows;
+    }
+
+    // Every one of @param count rows holds @param value
+    static Rows rowsOfValue(size_t count, std::string_view value) {
+        return Rows(count, Row {std::string {value}});
     }
 
     size_t countEntries(std::string_view directoryName) const {
@@ -236,6 +258,74 @@ TEST_F(CompactDataPartsTest, anOpenChangeOnTheMergedGraphBlocksTheMerge) {
 
     EXPECT_FALSE(query("MERGE_DATAPARTS").isOk());
     EXPECT_EQ(commitsBefore, countEntries("commits"));
+}
+
+// More records than the sort keeps in insertion order, each updated in several data parts:
+// the merged part must hold the value a read returned before the merge, the newest one
+TEST_F(CompactDataPartsTest, mergeKeepsTheNewestValueOfAnUpdatedNodeProperty) {
+    constexpr size_t RECORDS = 40;
+    constexpr size_t UPDATES = 6;
+
+    std::string create = "CREATE ";
+    for (size_t i = 0; i < RECORDS; i++) {
+        create += fmt::format(R"({}(:Record {{key: {}, value: "rev0"}}))", i ? ", " : "", i);
+    }
+    submit(create);
+
+    for (size_t update = 1; update <= UPDATES; update++) {
+        submit(fmt::format(R"(MATCH (r:Record) SET r.value = "rev{}")", update));
+    }
+
+    const Rows expected = rowsOfValue(RECORDS, fmt::format("rev{}", UPDATES));
+    ASSERT_EQ(expected, rowsOf("MATCH (r:Record) RETURN r.value"));
+
+    ASSERT_TRUE(query("MERGE_DATAPARTS").isOk());
+    EXPECT_EQ(expected, rowsOf("MATCH (r:Record) RETURN r.value"));
+
+    restartServer();
+    EXPECT_EQ(expected, rowsOf("MATCH (r:Record) RETURN r.value"));
+}
+
+TEST_F(CompactDataPartsTest, mergeKeepsTheNewestValueOfAnUpdatedEdgeProperty) {
+    constexpr size_t LINKS = 40;
+    constexpr size_t UPDATES = 6;
+
+    std::string create = "CREATE ";
+    for (size_t i = 0; i < LINKS; i++) {
+        create += fmt::format(R"({}(:From {{key: {}}})-[:Link {{value: "rev0"}}]->(:To {{key: {}}}))", i ? ", " : "", i, i);
+    }
+    submit(create);
+
+    for (size_t update = 1; update <= UPDATES; update++) {
+        submit(fmt::format(R"(MATCH (:From)-[l:Link]->(:To) SET l.value = "rev{}")", update));
+    }
+
+    const Rows expected = rowsOfValue(LINKS, fmt::format("rev{}", UPDATES));
+    ASSERT_EQ(expected, rowsOf("MATCH (:From)-[l:Link]->(:To) RETURN l.value"));
+
+    ASSERT_TRUE(query("MERGE_DATAPARTS").isOk());
+    EXPECT_EQ(expected, rowsOf("MATCH (:From)-[l:Link]->(:To) RETURN l.value"));
+
+    restartServer();
+    EXPECT_EQ(expected, rowsOf("MATCH (:From)-[l:Link]->(:To) RETURN l.value"));
+}
+
+// A property set to null in a newer data part hides the older value; the merge must not bring it back
+TEST_F(CompactDataPartsTest, mergeKeepsAPropertySetToNullCleared) {
+    submit(R"(CREATE (:Record {key: 1, value: "old"}), (:Record {key: 2, value: "kept"}))");
+    submit(R"(MATCH (r:Record {key: 1}) SET r.value = null)");
+
+    const Rows cleared = rowsOf("MATCH (r:Record {key: 1}) RETURN r.value");
+    ASSERT_EQ(1, cleared.size());
+    ASSERT_NE(Row {"old"}, cleared.front());
+
+    ASSERT_TRUE(query("MERGE_DATAPARTS").isOk());
+    EXPECT_EQ(cleared, rowsOf("MATCH (r:Record {key: 1}) RETURN r.value"));
+    EXPECT_EQ(Rows {{"kept"}}, rowsOf("MATCH (r:Record {key: 2}) RETURN r.value"));
+
+    restartServer();
+    EXPECT_EQ(cleared, rowsOf("MATCH (r:Record {key: 1}) RETURN r.value"));
+    EXPECT_EQ(Rows {{"kept"}}, rowsOf("MATCH (r:Record {key: 2}) RETURN r.value"));
 }
 
 int main(int argc, char** argv) {
